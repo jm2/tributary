@@ -28,6 +28,9 @@
 //! (local, Subsonic, Jellyfin, Plex, DAAP, radio) are managed by the
 //! sidebar and are completely independent of the active output.
 
+use std::rc::Rc;
+
+use super::equalizer::EqSettings;
 use super::{PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::local::resolver::ResolvedLocalMedia;
@@ -80,6 +83,57 @@ pub trait AudioOutput {
     fn supervision_lapsed(&self) -> bool {
         false
     }
+
+    /// Whether this output can render the application-side equalizer
+    /// (docs/equalizer.md capability matrix). Only the local pipeline
+    /// owns a decoder-to-sink chain in process; AirPlay, Chromecast, and
+    /// MPD receivers render audio end-to-end, so the honest answer there
+    /// is `false`. The settings UI renders the controls disabled with a
+    /// closed-form explanation whenever this returns `false`.
+    fn supports_equalizer(&self) -> bool {
+        false
+    }
+
+    /// The current equalizer state this output holds. Defaults to the
+    /// fresh-install contract state for outputs without an equalizer.
+    fn equalizer_settings(&self) -> EqSettings {
+        EqSettings::default()
+    }
+
+    /// Apply a new equalizer state. A no-op for outputs that report
+    /// [`supports_equalizer`](Self::supports_equalizer) as `false`: no
+    /// DSP runs, and the persisted settings stay untouched by the
+    /// receiving side (the local pipeline owns the state file).
+    fn apply_equalizer_settings(&self, _settings: EqSettings) {}
+
+    /// Force a re-read of the persisted equalizer state and return what
+    /// is now in effect. A no-op default returning the current state for
+    /// outputs without an equalizer.
+    fn reload_equalizer_settings(&self) -> EqSettings {
+        self.equalizer_settings()
+    }
+
+    /// Register the settings panel's display-resync closure (refinery
+    /// round 3, PR 220). An output whose equalizer engine can change its
+    /// recorded state asynchronously — the local pipeline's parked
+    /// limiter edit, adopted by a main-context poll — invokes the
+    /// closure on the GTK main context when, and only when, a recorded
+    /// value lands that differs from the previously recorded one, so an
+    /// already-open panel re-reads the recorded state instead of keeping
+    /// the walk-back it displayed. The closure is a display refresh, not
+    /// an edit: it must never re-apply. A no-op default for outputs
+    /// without an asynchronous equalizer seam; the closure is dropped.
+    /// Registration replaces any previous closure (the panel is rebuilt
+    /// per presentation).
+    fn connect_equalizer_resync(&self, _on_resync: Rc<dyn Fn()>) {}
+
+    /// Synchronously flush any pending equalizer persistence this output
+    /// still owes to disk. The normal close-request drain invokes this
+    /// while the output is still alive: the process exits via
+    /// `std::process::exit` after the GTK main loop unwinds, so `Drop`
+    /// cannot be relied on to run a still-armed debounced save. A no-op
+    /// for outputs without an equalizer engine.
+    fn flush_equalizer_for_shutdown(&self) {}
 
     // ── Playback controls ───────────────────────────────────────────
 
