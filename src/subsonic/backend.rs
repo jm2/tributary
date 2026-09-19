@@ -1401,59 +1401,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_stream_carries_the_library_container_descriptor() {
-        let service = MockHttpService::start(vec![
-            MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
-                serde_json::json!({"subsonic-response": {"status": "ok"}}),
-            )),
-            MockRoute::get("/gateway/rest/getArtists.view").reply(MockResponse::json(
-                serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "artists": {"index": [{"artist": [
-                            {"id": "descriptor-artist", "name": "Descriptor Artist"}
-                        ]}]}
-                    }
-                }),
-            )),
-            MockRoute::get("/gateway/rest/getArtist.view")
-                .with_query("id", "descriptor-artist")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "artist": {
-                            "id": "descriptor-artist",
-                            "name": "Descriptor Artist",
-                            "album": [
-                                {"id": "descriptor-album", "name": "Descriptor Album"}
-                            ]
-                        }
-                    }
-                }))),
-            MockRoute::get("/gateway/rest/getAlbum.view")
-                .with_query("id", "descriptor-album")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "album": {
-                            "id": "descriptor-album",
-                            "name": "Descriptor Album",
-                            "song": [
-                                {
-                                    "id": "flac-track",
-                                    "title": "Lossless",
-                                    "suffix": "flac"
-                                },
-                                {
-                                    "id": "opaque-track",
-                                    "title": "Opaque",
-                                    "suffix": "ape"
-                                }
-                            ]
-                        }
-                    }
-                }))),
-        ])
-        .await;
+        let service = MockHttpService::start(descriptor_catalogue_routes()).await;
         let password = Uuid::new_v4().to_string();
         let backend = SubsonicBackend::connect(
             "fixture",
@@ -1483,22 +1431,90 @@ mod tests {
                 .resolve_stream(&track_id)
                 .await
                 .expect("descriptor resolution");
-            if title == "Lossless" {
-                assert_eq!(
-                    resolved.representation(),
-                    MediaRepresentation::buffered(MediaContainer::Flac),
-                    "library suffix flac must label the resolved stream"
-                );
-            } else {
-                assert_eq!(title, "Opaque");
-                assert_eq!(
-                    resolved.representation(),
-                    MediaRepresentation::buffered_unknown(),
-                    "an unrecognized suffix must stay explicitly unknown"
-                );
-            }
+            assert_resolved_descriptor_matches_library(&resolved, &title);
         }
         service.finish().await;
+    }
+
+    fn descriptor_catalogue_routes() -> Vec<MockRoute> {
+        let mut routes = vec![
+            MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/gateway/rest/getArtists.view").reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artists": {"index": [{"artist": [
+                            {"id": "descriptor-artist", "name": "Descriptor Artist"}
+                        ]}]}
+                    }
+                }),
+            )),
+        ];
+        routes.push(descriptor_artist_route());
+        routes.push(descriptor_album_route());
+        routes
+    }
+
+    fn descriptor_artist_route() -> MockRoute {
+        MockRoute::get("/gateway/rest/getArtist.view")
+            .with_query("id", "descriptor-artist")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artist": {
+                        "id": "descriptor-artist",
+                        "name": "Descriptor Artist",
+                        "album": [
+                            {"id": "descriptor-album", "name": "Descriptor Album"}
+                        ]
+                    }
+                }
+            })))
+    }
+
+    fn descriptor_album_route() -> MockRoute {
+        MockRoute::get("/gateway/rest/getAlbum.view")
+            .with_query("id", "descriptor-album")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {
+                        "id": "descriptor-album",
+                        "name": "Descriptor Album",
+                        "song": [
+                            {
+                                "id": "flac-track",
+                                "title": "Lossless",
+                                "suffix": "flac"
+                            },
+                            {
+                                "id": "opaque-track",
+                                "title": "Opaque",
+                                "suffix": "ape"
+                            }
+                        ]
+                    }
+                }
+            })))
+    }
+
+    fn assert_resolved_descriptor_matches_library(resolved: &ResolvedHttpRequest, title: &str) {
+        if title == "Lossless" {
+            assert_eq!(
+                resolved.representation(),
+                MediaRepresentation::buffered(MediaContainer::Flac),
+                "library suffix flac must label the resolved stream"
+            );
+        } else {
+            assert_eq!(title, "Opaque");
+            assert_eq!(
+                resolved.representation(),
+                MediaRepresentation::buffered_unknown(),
+                "an unrecognized suffix must stay explicitly unknown"
+            );
+        }
     }
 
     #[tokio::test]

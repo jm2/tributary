@@ -2323,45 +2323,73 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn untyped_upstream_content_type_is_filled_from_the_descriptor() {
-        const ADVERTISED_HOST: &str = "cast-untyped.invalid";
+    struct AdvertisedCapture {
+        client: UpstreamMediaClient,
+        captures: tokio::sync::mpsc::UnboundedReceiver<(Uri, HeaderMap)>,
+        upstream_abort: tokio::task::AbortHandle,
+        advertised_endpoint: Url,
+        route_origin: Url,
+        upstream_addr: SocketAddr,
+    }
 
-        let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
+    async fn start_advertised_capture(
+        advertised_host: &'static str,
+        upstream_path: &str,
+    ) -> AdvertisedCapture {
+        let (upstream_addr, captures, upstream_abort) = start_capture_server().await;
         let client = test_upstream_client(
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(1),
         );
         let advertised_endpoint = Url::parse(&format!(
-            "http://{ADVERTISED_HOST}:{}/untyped/stream",
+            "http://{advertised_host}:{}{upstream_path}",
             upstream_addr.port()
         ))
         .expect("extensionless advertised endpoint");
         let route_origin = Url::parse(&format!(
-            "http://{ADVERTISED_HOST}:{}/",
+            "http://{advertised_host}:{}/",
             upstream_addr.port()
         ))
         .expect("advertised origin");
-        let resolved = |representation| {
-            ResolvedHttpRequest::new(advertised_endpoint.clone())
-                .expect("resolved untyped request")
-                .with_advertised_route(
-                    AdvertisedHttpRoute::new(&route_origin, [upstream_addr])
-                        .expect("exact-origin advertised route"),
-                )
-                .expect("matching advertised route")
-                .with_representation(representation)
-        };
+        AdvertisedCapture {
+            client,
+            captures,
+            upstream_abort,
+            advertised_endpoint,
+            route_origin,
+            upstream_addr,
+        }
+    }
+
+    fn resolved_advertised_request(
+        capture: &AdvertisedCapture,
+        representation: MediaRepresentation,
+    ) -> ResolvedHttpRequest {
+        ResolvedHttpRequest::new(capture.advertised_endpoint.clone())
+            .expect("resolved untyped request")
+            .with_advertised_route(
+                AdvertisedHttpRoute::new(&capture.route_origin, [capture.upstream_addr])
+                    .expect("exact-origin advertised route"),
+            )
+            .expect("matching advertised route")
+            .with_representation(representation)
+    }
+
+    #[tokio::test]
+    async fn untyped_upstream_content_type_is_filled_from_the_descriptor() {
+        let mut capture = start_advertised_capture("cast-untyped.invalid", "/untyped/stream").await;
 
         // Known container: the descriptor labels the response the receiver sees.
         let mut receiver_headers = HeaderMap::new();
         receiver_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+        let request = resolved_advertised_request(
+            &capture,
+            MediaRepresentation::buffered(MediaContainer::Flac),
+        );
         let response = proxy_upstream(
-            &client,
-            &UpstreamRequest::Resolved(Box::new(resolved(MediaRepresentation::buffered(
-                MediaContainer::Flac,
-            )))),
+            &capture.client,
+            &UpstreamRequest::Resolved(Box::new(request)),
             &receiver_headers,
         )
         .await;
@@ -2371,10 +2399,11 @@ mod tests {
             Some(&HeaderValue::from_static("audio/flac")),
             "an untyped upstream must be labeled from the validated descriptor"
         );
-        let (_, captured_headers) = tokio::time::timeout(Duration::from_secs(2), captures.recv())
-            .await
-            .expect("capture timeout")
-            .expect("captured request");
+        let (_, captured_headers) =
+            tokio::time::timeout(Duration::from_secs(2), capture.captures.recv())
+                .await
+                .expect("capture timeout")
+                .expect("captured request");
         assert_eq!(
             captured_headers.get(header::RANGE),
             Some(&HeaderValue::from_static("bytes=2-5")),
@@ -2382,9 +2411,11 @@ mod tests {
         );
 
         // Explicit unknown container: no invented label.
+        let request =
+            resolved_advertised_request(&capture, MediaRepresentation::buffered_unknown());
         let response = proxy_upstream(
-            &client,
-            &UpstreamRequest::Resolved(Box::new(resolved(MediaRepresentation::buffered_unknown()))),
+            &capture.client,
+            &UpstreamRequest::Resolved(Box::new(request)),
             &HeaderMap::new(),
         )
         .await;
@@ -2394,7 +2425,7 @@ mod tests {
             "an unknown container must stay unlabeled, not mislabeled"
         );
 
-        upstream_abort.abort();
+        capture.upstream_abort.abort();
     }
 
     #[tokio::test]
