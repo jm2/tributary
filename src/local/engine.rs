@@ -8774,32 +8774,77 @@ mod tests {
     /// Linux errno values for the inotify capacity failures, kept as raw
     /// numbers to avoid a libc dev-dependency: EMFILE (24) means
     /// `fs.inotify.max_user_instances` is exhausted, ENOSPC (28) means
-    /// `fs.inotify.max_user_watches` is exhausted. EPERM (1) is the
-    /// manufactured non-capacity control in the decision tests.
+    /// `fs.inotify.max_user_watches` is exhausted. Gated to Linux because
+    /// `raw_os_error()` is only meaningful in the target OS's namespace —
+    /// see `is_inotify_capacity_errno`.
+    #[cfg(target_os = "linux")]
     const EMFILE: i32 = 24;
+    #[cfg(target_os = "linux")]
     const ENOSPC: i32 = 28;
+
+    /// A manufactured non-capacity control for the decision tests. On Linux
+    /// it is a real errno outside the capacity set; off Linux the predicate
+    /// is unconditionally false and this case documents that.
     const EPERM: i32 = 1;
 
     /// True only when `error` is the documented shared-host capacity
     /// condition: the kernel refused inotify state because a per-user limit
-    /// is exhausted — EMFILE (instances), ENOSPC (watch descriptors), or
-    /// notify's explicit `MaxFilesWatch`. Every other error — a backend
-    /// initialization, configuration, or platform regression such as EPERM —
-    /// must fail the test instead of skipping it, so this predicate is
-    /// deliberately narrow and unit-tested in both directions below.
+    /// is exhausted — EMFILE (instances) or ENOSPC (watch descriptors) on
+    /// Linux, or notify's explicit portable `MaxFilesWatch`. Every other
+    /// error — a backend initialization, configuration, or platform
+    /// regression such as EPERM — must fail the test instead of skipping
+    /// it, so this predicate is deliberately narrow and unit-tested in both
+    /// directions below.
     fn is_watcher_backend_capacity_error(error: &notify::Error) -> bool {
         match &error.kind {
-            notify::ErrorKind::Io(io_error) => {
-                matches!(io_error.raw_os_error(), Some(EMFILE | ENOSPC))
-            }
+            notify::ErrorKind::Io(io_error) => is_inotify_capacity_errno(io_error.raw_os_error()),
             notify::ErrorKind::MaxFilesWatch => true,
             _ => false,
         }
     }
 
+    /// Linux errno namespace: 24 and 28 are the inotify per-user capacity
+    /// limits, so they alone identify host saturation here.
+    #[cfg(target_os = "linux")]
+    fn is_inotify_capacity_errno(raw_os_error: Option<i32>) -> bool {
+        matches!(raw_os_error, Some(EMFILE | ENOSPC))
+    }
+
+    /// Non-Linux errno namespaces: `raw_os_error()` reports the host OS's
+    /// codes, where 24 and 28 mean unrelated things (per-process fd
+    /// exhaustion on macOS, unrelated Win32 errors on Windows), so no raw
+    /// errno identifies inotify capacity here — only notify's own
+    /// `MaxFilesWatch` kind does.
+    #[cfg(not(target_os = "linux"))]
+    fn is_inotify_capacity_errno(raw_os_error: Option<i32>) -> bool {
+        let _ = raw_os_error;
+        false
+    }
+
     #[test]
     fn watcher_backend_capacity_decision_skips_capacity_errors() {
-        // Positive control: each documented host-capacity class maps to skip.
+        // Positive control: the portable capacity class maps to skip on
+        // every target. The Linux errno classes are covered on Linux by
+        // `watcher_backend_capacity_decision_skips_linux_capacity_errnos`.
+        let capacity_errors = [(
+            "notify MaxFilesWatch",
+            notify::Error::new(notify::ErrorKind::MaxFilesWatch),
+        )];
+        for (name, error) in capacity_errors {
+            assert!(
+                is_watcher_backend_capacity_error(&error),
+                "{name} is host capacity and must skip"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_backend_capacity_decision_skips_linux_capacity_errnos() {
+        // Positive control: each documented Linux host-capacity errno maps
+        // to skip. Raw errno values are only the inotify capacity set on
+        // Linux, so this control is target-gated like the predicate arm it
+        // exercises.
         let capacity_errors = [
             (
                 "EMFILE (max_user_instances)",
@@ -8812,10 +8857,6 @@ mod tests {
                 notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
                     ENOSPC,
                 ))),
-            ),
-            (
-                "notify MaxFilesWatch",
-                notify::Error::new(notify::ErrorKind::MaxFilesWatch),
             ),
         ];
         for (name, error) in capacity_errors {
@@ -8830,7 +8871,9 @@ mod tests {
     fn watcher_backend_capacity_decision_fails_non_capacity_errors() {
         // A backend, configuration, or platform regression is a real defect:
         // the only tests exercising real watcher installation must fail, not
-        // skip.
+        // skip. Off Linux every Io errno is a non-capacity host error, so
+        // these cases additionally pin the portable predicate to
+        // MaxFilesWatch-only skips there.
         let non_capacity_errors = [
             (
                 "EPERM (hardened runner)",
