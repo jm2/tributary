@@ -1,10 +1,22 @@
 # Codacy repository configuration.
 #
-# Test fixtures under tests/fixtures/ are data served by the test doubles,
-# not analyzed code. Several scenarios are intentionally malformed (for
-# example tests/fixtures/bot_review_gate/malformed-pr-record/pr.1.json, which
-# proves the bot-review-gate publisher fails closed on an unreadable pull
-# request record), so static analysis of them can only produce false
+# Only the recorded / intentionally malformed DATA under tests/fixtures/ is
+# excluded from analysis: JSON scenario records (including malformed ones such
+# as tests/fixtures/bot_review_gate/malformed-pr-record/pr.1.json, which proves
+# the bot-review-gate publisher fails closed on an unreadable pull request
+# record), binary audio samples, and the extensionless recorded response
+# bodies named `fail`. Static analysis of that data can only produce false
 # positives.
+#
+# The executable test doubles ARE analyzed code:
+# tests/fixtures/bot_review_gate/gh_stub.sh and
+# tests/fixtures/bot_review_gate/preflight_gh_stub.sh simulate the GitHub API
+# surface (pagination, fingerprinting, fail-loud exits) and are loaded via
+# include_str! by tests/bot_review_gate/harness.rs and
+# tests/bot_review_gate/preflight_support.rs.
 exclude_paths:
-  - "tests/fixtures/**"
+  - "tests/fixtures/**/*.json"
+  - "tests/fixtures/**/*.flac"
+  - "tests/fixtures/**/*.ogg"
+  - "tests/fixtures/**/*.mp3"
+  - "tests/fixtures/**/fail"
