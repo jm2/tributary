@@ -3645,6 +3645,61 @@ pub fn display_tracks(
     column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
 }
 
+/// Publish a committed full-library snapshot exactly as the
+/// `LibraryEvent::FullSync` arm does: convert the authoritative rows,
+/// refresh playlist and playback-queue state, store the per-source
+/// projection, and — when local is the active source — synchronously
+/// redisplay the local library via [`display_local_tracks`].
+///
+/// Extracted verbatim from the event loop so the Q4 responsiveness
+/// benchmark times the same unit production runs — conversion through
+/// folder-model rebuild, everything the main loop blocks on during a
+/// FullSync — instead of a display-only slice of it
+/// (tr-am6qr corrective round 2, thread PRRT_kwDOR1IXks6j8AJ5).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_full_sync_publication(
+    tracks: &[crate::architecture::models::Track],
+    active_source_key: &Rc<RefCell<String>>,
+    playback_session: &Rc<RefCell<PlaybackSession>>,
+    source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
+    master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
+    track_store: &gtk::gio::ListStore,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+    status_label: &gtk::Label,
+    column_view: &gtk::ColumnView,
+    app_config: &Rc<RefCell<preferences::AppConfig>>,
+) {
+    let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
+
+    refresh_active_playlist_uris(active_source_key, master_tracks, &objects);
+
+    // A bulk change — a renamed album, a reconciliation — can
+    // move the files behind tracks the queue is holding. The
+    // queue owns identities, not rows, so it re-resolves them
+    // from the snapshot rather than being rebuilt from the view.
+    refresh_playback_queue(playback_session, &objects);
+
+    // Store per-source.
+    source_tracks
+        .borrow_mut()
+        .insert("local".to_string(), objects.clone());
+
+    // Display only if local is the active source.
+    if *active_source_key.borrow() == "local" {
+        display_local_tracks(
+            &objects,
+            track_store,
+            master_tracks,
+            browser_widget,
+            browser_state,
+            status_label,
+            column_view,
+            app_config,
+        );
+    }
+}
+
 /// Display the built-in local-library projection and restore its filesystem
 /// folder model after [`display_tracks`] clears source-specific browsing state.
 /// Every full local display goes through this helper so returning from a
@@ -3974,36 +4029,19 @@ fn setup_library_events(
             match event {
                 LibraryEvent::FullSync(tracks) => {
                     info!(count = tracks.len(), "Received full library sync");
-
-                    let objects: Vec<TrackObject> =
-                        tracks.iter().map(arch_track_to_object).collect();
-
-                    refresh_active_playlist_uris(&active_source_key, &master_tracks, &objects);
-
-                    // A bulk change — a renamed album, a reconciliation — can
-                    // move the files behind tracks the queue is holding. The
-                    // queue owns identities, not rows, so it re-resolves them
-                    // from the snapshot rather than being rebuilt from the view.
-                    refresh_playback_queue(&playback_session, &objects);
-
-                    // Store per-source.
-                    source_tracks
-                        .borrow_mut()
-                        .insert("local".to_string(), objects.clone());
-
-                    // Display only if local is the active source.
-                    if *active_source_key.borrow() == "local" {
-                        display_local_tracks(
-                            &objects,
-                            &track_store,
-                            &master_tracks,
-                            &browser_widget,
-                            &browser_state,
-                            &status_label,
-                            &column_view,
-                            &app_config,
-                        );
-                    }
+                    apply_full_sync_publication(
+                        &tracks,
+                        &active_source_key,
+                        &playback_session,
+                        &source_tracks,
+                        &master_tracks,
+                        &track_store,
+                        &browser_widget,
+                        &browser_state,
+                        &status_label,
+                        &column_view,
+                        &app_config,
+                    );
                 }
 
                 LibraryEvent::TrackUpserted(track) => {
@@ -4998,6 +5036,7 @@ mod identity_tests {
         let source_connect = include_str!("source_connect.rs");
         let radio_source = include_str!("radio.rs");
         let helper_marker = ["display_local_", "tracks("].concat();
+        let publication_marker = ["apply_full_sync_", "publication("].concat();
 
         let fallback = window_source
             .split_once("fn display_local_fallback(")
@@ -5009,6 +5048,16 @@ mod identity_tests {
             .and_then(|(_, rest)| rest.split_once("LibraryEvent::TrackUpserted(track) => {"))
             .map(|(body, _)| body)
             .expect("full-sync body");
+        // The FullSync publication unit lives directly before the local
+        // display helper it ends with; bounding the slice there keeps the
+        // assertion pinned to the unit's own body.
+        let full_sync_unit = window_source
+            .split_once(&["fn apply_full_sync_", "publication("].concat())
+            .and_then(|(_, rest)| {
+                rest.split_once(&["pub(super) fn display_local_", "tracks("].concat())
+            })
+            .map(|(body, _)| body)
+            .expect("full-sync publication unit body");
         let local_selection = source_connect
             .split_once("if playlist_id.is_none() && key == \"local\" {")
             .and_then(|(_, rest)| rest.split_once("// ── Playlist source:"))
@@ -5020,14 +5069,15 @@ mod identity_tests {
             .map(|(body, _)| body)
             .expect("radio local-fallback body");
 
-        for (path, body) in [
-            ("lifecycle fallback", fallback),
-            ("full sync", full_sync),
-            ("sidebar selection", local_selection),
-            ("radio consent fallback", radio_fallback),
+        for (path, body, marker) in [
+            ("lifecycle fallback", fallback, &helper_marker),
+            ("full sync", full_sync, &publication_marker),
+            ("full sync publication unit", full_sync_unit, &helper_marker),
+            ("sidebar selection", local_selection, &helper_marker),
+            ("radio consent fallback", radio_fallback, &helper_marker),
         ] {
             assert!(
-                body.contains(&helper_marker),
+                body.contains(marker),
                 "{path} must restore local folder browsing"
             );
         }
@@ -5035,7 +5085,7 @@ mod identity_tests {
         assert_eq!(
             window_source.match_indices(&helper_marker).count(),
             3,
-            "window.rs must contain the helper plus its fallback and FullSync calls"
+            "window.rs must contain the helper plus its fallback and publication-unit calls"
         );
         assert_eq!(
             source_connect.match_indices(&helper_marker).count(),
@@ -5046,6 +5096,11 @@ mod identity_tests {
             radio_source.match_indices(&helper_marker).count(),
             1,
             "the radio consent fallback must use the shared helper exactly once"
+        );
+        assert_eq!(
+            window_source.match_indices(&publication_marker).count(),
+            2,
+            "window.rs must contain the publication unit plus its FullSync-arm call"
         );
     }
 
