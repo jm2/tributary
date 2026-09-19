@@ -8787,6 +8787,15 @@ mod tests {
     /// is unconditionally false and this case documents that.
     const EPERM: i32 = 1;
 
+    /// The same numerals the Linux arm matches, kept for the inverse
+    /// control below: off Linux they live in the host OS's errno namespace
+    /// (per-process fd exhaustion on macOS, unrelated Win32 codes on
+    /// Windows) and must never read as inotify capacity.
+    #[cfg(not(target_os = "linux"))]
+    const RAW_ERRNO_24: i32 = 24;
+    #[cfg(not(target_os = "linux"))]
+    const RAW_ERRNO_28: i32 = 28;
+
     /// True only when `error` is the documented shared-host capacity
     /// condition: the kernel refused inotify state because a per-user limit
     /// is exhausted — EMFILE (instances) or ENOSPC (watch descriptors) on
@@ -8910,6 +8919,32 @@ mod tests {
             assert!(
                 !is_watcher_backend_capacity_error(&error),
                 "{name} is not host capacity and must fail the test"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn watcher_backend_capacity_decision_fails_capacity_errnos_on_non_linux() {
+        // Inverse control for
+        // `watcher_backend_capacity_decision_skips_linux_capacity_errnos`:
+        // the numerals 24/28 are inotify capacity only in the Linux errno
+        // namespace. Off Linux they mean unrelated host conditions (macOS 24
+        // is per-process fd exhaustion; Windows 24/28 are unrelated Win32
+        // codes), and classifying either as capacity would false-skip the
+        // only real-watcher-installation tests on CI's macOS and Windows
+        // legs. Pin them to the fail-loudly path here.
+        let host_namespace_numerals = [
+            ("raw 24 (non-Linux namespace)", RAW_ERRNO_24),
+            ("raw 28 (non-Linux namespace)", RAW_ERRNO_28),
+        ];
+        for (name, raw) in host_namespace_numerals {
+            let error = notify::Error::new(notify::ErrorKind::Io(
+                std::io::Error::from_raw_os_error(raw),
+            ));
+            assert!(
+                !is_watcher_backend_capacity_error(&error),
+                "{name} must not be classified as inotify capacity off Linux"
             );
         }
     }
