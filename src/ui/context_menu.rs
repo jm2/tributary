@@ -4131,7 +4131,18 @@ pub mod tests {
         // has seen every row: pump until all rows are recorded, yielding to
         // the frame clock between sweeps (bounded, then asserted by the
         // caller's position check).
-        let context = glib::MainContext::default();
+        //
+        // Same constraint as `realized_tracklist_for_drag_test`: never pump
+        // the process-global default context from a widget test thread.
+        // Parallel non-widget tests leave thread-affine glib sources pending
+        // on the global default context (tr-8wtab), and dispatching one of
+        // those on this thread trips glib's ThreadGuard inside a
+        // non-unwinding C trampoline and aborts the whole test binary. The
+        // widget session's thread-default context only ever holds sources
+        // this same thread scheduled; the expect documents the invariant
+        // that this helper runs inside a widget test session.
+        let context = glib::MainContext::thread_default()
+            .expect("widget_test_session::with_session pushes a thread-default context");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while recorded.borrow().len() < expected_rows && std::time::Instant::now() < deadline {
             while context.pending() {
@@ -4147,9 +4158,15 @@ pub mod tests {
 
     #[cfg(not(target_os = "macos"))]
     fn realized_drop_rows(recorded: &Rc<RefCell<Vec<gtk::ListItem>>>) -> Vec<RealizedDropRow> {
+        // connect_setup records each ListItem before GTK binds it, and GTK
+        // may keep spare list items that are set up but never bound: their
+        // position() is INVALID_LIST_POSITION. Filter those out so the
+        // caller's exact-position assertion sees only bound rows — a genuine
+        // under-bind still fails there with the full expected-vs-actual diff.
         let mut rows = recorded
             .borrow()
             .iter()
+            .filter(|list_item| list_item.position() != gtk::INVALID_LIST_POSITION)
             .map(|list_item| {
                 let row_box = list_item
                     .child()
