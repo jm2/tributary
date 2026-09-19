@@ -1566,4 +1566,128 @@ mod tests {
         assert!(!rendered.contains(&password));
         service.finish().await;
     }
+
+    /// A `tracing` layer capturing the rendered fields of every WARN- or
+    /// ERROR-level event emitted under it.
+    struct DiagnosticSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for DiagnosticSink {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if !matches!(
+                event.metadata().level(),
+                &tracing::Level::WARN | &tracing::Level::ERROR
+            ) {
+                return;
+            }
+            let mut visitor = DiagnosticVisitor { fields: Vec::new() };
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(format!(
+                "{} {}",
+                event.metadata().level(),
+                visitor.fields.join(" ")
+            ));
+        }
+    }
+
+    struct DiagnosticVisitor {
+        fields: Vec<String>,
+    }
+
+    impl tracing::field::Visit for DiagnosticVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    fn capture_diagnostics(body: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(DiagnosticSink(std::sync::Arc::clone(&sink)));
+        // The default dispatcher is scoped to `body`, which drives the fixture
+        // runtime on this same thread so the captured events belong to it.
+        tracing::subscriber::with_default(subscriber, body);
+        let captured = sink.lock().unwrap().clone();
+        captured
+    }
+
+    /// A catalogue whose single artist reports `songCount` as a string — a
+    /// server-controlled wrong type — carrying `sentinel` as that value.
+    async fn catalogue_with_wrong_type_song_count(sentinel: &str) -> MockHttpService {
+        MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [
+                        {"artist": [{"id": "artist-id", "name": "Fixture Artist"}]}
+                    ]}
+                }
+            }))),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "artist-id")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "artist-id",
+                            "name": "Fixture Artist",
+                            "album": [{
+                                "id": "album-id",
+                                "name": "Fixture Album",
+                                "songCount": sentinel
+                            }]
+                        }
+                    }
+                }))),
+        ])
+        .await
+    }
+
+    /// The catalogue refresh logs per-artist failures at WARN with the error
+    /// rendered through its `Display`. That diagnostic must carry the fixed
+    /// parse category without the server-controlled wrong-type value.
+    #[test]
+    fn captured_catalogue_warning_omits_remote_response_content() {
+        let sentinel = "SUBSONIC-LOG-SENTINEL-6a4d";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime");
+        let captured = capture_diagnostics(|| {
+            runtime.block_on(async {
+                let service = catalogue_with_wrong_type_song_count(sentinel).await;
+                let password = Uuid::new_v4().to_string();
+                let backend =
+                    SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+                        .await;
+                assert!(backend.is_ok(), "per-artist parse failure is skipped");
+                service.finish().await;
+            });
+        });
+
+        let warning = captured
+            .iter()
+            .find(|line| line.contains("Failed to fetch artist detail, skipping"))
+            .unwrap_or_else(|| panic!("expected the production catalogue warning: {captured:?}"));
+        assert!(
+            warning.contains("unexpected type or shape"),
+            "sanitized category missing from logging: {warning}"
+        );
+        assert!(
+            !warning.contains(sentinel),
+            "remote content leaked into tracing: {warning}"
+        );
+    }
 }

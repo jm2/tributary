@@ -1653,6 +1653,42 @@ mod tests {
     }
 
     #[test]
+    fn remote_json_parse_failures_keep_category_without_response_content() {
+        let sentinel = "UI-PARSE-SENTINEL-1b7e";
+        let body = format!(r#""{sentinel}""#);
+        let error = crate::architecture::remote_json::parse_remote_json::<u32>(
+            "Failed to parse remote JSON",
+            body.as_bytes(),
+        )
+        .expect_err("wrong-type body must fail");
+
+        // The fixed categories consumers rely on are preserved...
+        assert_eq!(
+            remote_failure_category(&error),
+            RemoteFailureCategory::Response
+        );
+        assert_eq!(
+            crate::source_registry::failure_category(&error),
+            crate::source_lifecycle::FailureCategory::InvalidResponse
+        );
+
+        // ...while every user-facing and diagnostic projection stays
+        // content-free.
+        let category = remote_failure_category(&error);
+        assert!(!category.as_str().contains(sentinel));
+        assert!(!category.log_message().contains(sentinel));
+        assert!(!category.user_message("Subsonic").contains(sentinel));
+        let rendered = format!(
+            "{error:?}\n{error}\n{}",
+            crate::architecture::remote_json::rendered_error_chain(&error)
+        );
+        assert!(
+            !rendered.contains(sentinel),
+            "UI/log projection leaked response content: {rendered}"
+        );
+    }
+
+    #[test]
     fn remote_failure_messages_are_localized_for_every_catalog() {
         const BACKEND: &str = "TestBackend";
         let categories = [

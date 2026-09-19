@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::remote_json::parse_remote_json;
 use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
@@ -220,10 +221,7 @@ impl JellyfinClient {
             .map_err(|error| response_body_error("Failed to parse auth response", error))?;
 
         let auth_resp: JellyfinAuthResponse =
-            serde_json::from_slice(&body).map_err(|e| BackendError::ParseError {
-                message: format!("Failed to parse auth response: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            parse_remote_json("Failed to parse auth response", &body)?;
 
         let api_key = auth_resp.access_token;
         let user_id = auth_resp.user.id;
@@ -416,10 +414,7 @@ impl JellyfinClient {
             .await
             .map_err(|error| response_body_error("Failed to parse Jellyfin JSON", error))?;
 
-        let body = serde_json::from_slice::<T>(&body).map_err(|e| BackendError::ParseError {
-            message: format!("Failed to parse Jellyfin JSON: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+        let body = parse_remote_json::<T>("Failed to parse Jellyfin JSON", &body)?;
 
         Ok(body)
     }
@@ -595,7 +590,9 @@ mod tests {
 
     use axum::http::{Method, StatusCode};
 
+    use crate::architecture::remote_json::rendered_error_chain;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+    use crate::jellyfin::api::JellyfinItemsResponse;
 
     use super::*;
 
@@ -912,5 +909,86 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains(&api_key));
         assert!(!rendered.contains(&user_id));
+    }
+
+    /// A Jellyfin auth body whose `User` is a string instead of the expected
+    /// object makes `serde_json` quote the wrong-type value. The production
+    /// authentication path must drop it rather than log or surface it.
+    #[tokio::test]
+    async fn auth_parse_failures_omit_response_content_from_diagnostics() {
+        let sentinel = "JELLYFIN-AUTH-PARSE-SENTINEL-7e02";
+        let service = MockHttpService::start(vec![MockRoute::new(
+            Method::POST,
+            "/Users/AuthenticateByName",
+        )
+        .reply(MockResponse::json(serde_json::json!({
+            "User": sentinel,
+            "AccessToken": "fixture-token"
+        })))])
+        .await;
+        let password = uuid::Uuid::new_v4().to_string();
+        let error = JellyfinClient::authenticate(&service.base_url(), "fixture-user", &password)
+            .await
+            .err()
+            .expect("wrong-type auth body must fail");
+        service.finish().await;
+
+        assert_parse_error_omits(&error, sentinel, &["fixture-token", &password]);
+    }
+
+    /// A Jellyfin catalogue body whose `TotalRecordCount` is a string instead
+    /// of the expected integer exercises the generic catalogue parser with a
+    /// short and a large sentinel value.
+    #[tokio::test]
+    async fn catalogue_parse_failures_omit_response_content_from_diagnostics() {
+        let cases = [
+            "JELLYFIN-CATALOGUE-SENTINEL-3c88".to_string(),
+            format!(
+                "{}{}",
+                "w".repeat(48 * 1024),
+                "JELLYFIN-LARGE-SENTINEL-a5f1"
+            ),
+        ];
+
+        for payload in cases {
+            let service = MockHttpService::start(vec![MockRoute::get("/Users/user-id/Items")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": payload
+                })))])
+            .await;
+            let client =
+                JellyfinClient::new(&service.base_url(), "api-key", "user-id").expect("client");
+            let error = client
+                .get::<JellyfinItemsResponse>("Users/user-id/Items")
+                .await
+                .expect_err("wrong-type catalogue body must fail");
+            service.finish().await;
+
+            assert_parse_error_omits(&error, &payload, &["api-key"]);
+        }
+    }
+
+    /// Assert a parse failure retains no response content and keeps the fixed
+    /// category in its message.
+    fn assert_parse_error_omits(error: &BackendError, payload: &str, secrets: &[&str]) {
+        match error {
+            BackendError::ParseError { message, source } => {
+                assert!(source.is_none(), "content-bearing source retained");
+                assert!(
+                    message.contains("unexpected type or shape"),
+                    "unexpected category: {message}"
+                );
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        let rendered = format!("{error:?}\n{error}\n{}", rendered_error_chain(error));
+        assert!(!rendered.contains(payload), "response content leaked");
+        for secret in secrets {
+            // Do not interpolate `secret` into the failure message: the CodeQL
+            // cleartext-logging query treats the panic payload as a log sink,
+            // and this assertion exists precisely to keep secrets out of one.
+            assert!(!rendered.contains(secret), "credential leaked");
+        }
     }
 }

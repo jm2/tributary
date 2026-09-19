@@ -9,6 +9,7 @@ pub mod error;
 pub mod identity;
 pub mod media;
 pub mod models;
+pub mod remote_json;
 pub mod server_playlist;
 
 pub use backend::{load_track_catalog, MediaBackend};
