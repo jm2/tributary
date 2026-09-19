@@ -635,20 +635,42 @@ fn arm_pending_clip_swap_completion(
     let playbin = playbin.clone();
     let seams = Rc::clone(seams);
     let poll_state = Rc::clone(state_rc);
-    glib::timeout_add_local(
-        Duration::from_millis(PENDING_CLIP_SWAP_POLL_MS),
-        move || match poll_pending_clip_swap_tick(&poll_state) {
-            PendingClipSwapPoll::StillParked => glib::ControlFlow::Continue,
-            PendingClipSwapPoll::ChainRetired => glib::ControlFlow::Break,
-            PendingClipSwapPoll::Adopted(installed, requested) => {
-                if let Some(loaded) = reconcile_adopted_clip_swap(&poll_state, installed, requested)
-                {
-                    reissue_loaded_clip_policy(&playbin, &poll_state, &seams, loaded);
+    // Attach the poll to the CURRENT thread-default main context — the
+    // context the caller is running on — instead of unconditionally to
+    // the global default: `glib::timeout_add_local` hardcodes the
+    // default context (and acquires it, so an off-main-thread caller
+    // panics while the UI thread owns it). On the UI thread the
+    // thread-default context IS the default one, so production behavior
+    // is unchanged. In the test harness every clip-swap test runs under
+    // its own context ([`tests::with_own_main_context`]), so its poll
+    // can only ever be dispatched by that same test's thread — a
+    // concurrent test driving its own context can never pick up a
+    // foreign poll, which previously tripped glib's `ThreadGuard`
+    // (wrong-thread access) nondeterministically whenever one test
+    // armed the poll in the window before another test's drive ran.
+    // `spawn_local` is the non-`Send`-closure equivalent of an attached
+    // timeout source: glib exposes no local timeout constructor that
+    // targets a chosen context.
+    let context = glib::MainContext::thread_default().unwrap_or_else(glib::MainContext::default);
+    context.spawn_local(async move {
+        loop {
+            glib::timeout_future(Duration::from_millis(PENDING_CLIP_SWAP_POLL_MS)).await;
+            match poll_pending_clip_swap_tick(&poll_state) {
+                // `StillParked` keeps the loop polling (the next
+                // `timeout_future` is already the next iteration).
+                PendingClipSwapPoll::StillParked => {}
+                PendingClipSwapPoll::ChainRetired => break,
+                PendingClipSwapPoll::Adopted(installed, requested) => {
+                    if let Some(loaded) =
+                        reconcile_adopted_clip_swap(&poll_state, installed, requested)
+                    {
+                        reissue_loaded_clip_policy(&playbin, &poll_state, &seams, loaded);
+                    }
+                    break;
                 }
-                glib::ControlFlow::Break
             }
-        },
-    );
+        }
+    });
 }
 
 /// Notify the registered panel resync after a reconciliation moved the
@@ -681,15 +703,26 @@ fn notify_panel_resync(state_rc: &Rc<RefCell<EqEngineState>>, previous: equalize
 fn schedule_eq_save_for(state_rc: &Rc<RefCell<EqEngineState>>) {
     let next_generation = state_rc.borrow().save_generation.wrapping_add(1);
     state_rc.borrow_mut().save_generation = next_generation;
+    // A persistence-suppressed state (transient config read failure in
+    // production; every caller-discipline test player by fixture
+    // discipline) must not attach the debounced writer at all. The
+    // attach is itself an observable effect: an attached main-context
+    // closure outlives the code path that scheduled it, and in the
+    // test suite a once-source left behind by one test would later be
+    // dispatched from a foreign test thread driving the shared default
+    // context, tripping glib's ThreadGuard (wrong-thread drop). The
+    // gate below already returned before any write; hoisting it ahead
+    // of the attach keeps the suppression total while leaving the
+    // allowed path byte-for-byte unchanged.
+    if !equalizer_persistence_allowed(&state_rc.borrow()) {
+        return;
+    }
     let state = Rc::clone(state_rc);
     glib::timeout_add_local_once(
         Duration::from_millis(equalizer::SAVE_DEBOUNCE_MS),
         move || {
             let state = state.borrow_mut();
             if state.save_generation != next_generation {
-                return;
-            }
-            if !equalizer_persistence_allowed(&state) {
                 return;
             }
             let _ = equalizer::save_equalizer_settings_to_disk(&state.settings);
@@ -2887,35 +2920,50 @@ mod tests {
             .complete_pending_limiter_edit(installed)
     }
 
-    /// Drive the global default main context — under `CONTEXT_DRIVE_LOCK`,
-    /// exactly as the UI loop would — until `done` observes the settled
-    /// condition on the player's EQ state, or the bounded deadline
-    /// passes. Returns whether the condition was observed. Extracted so
-    /// the transaction tests stay within their method-length budgets
-    /// (Codacy, PR 220 head cea20fe); behavior is unchanged.
+    /// Run `body` with a per-test thread-default main context. Every
+    /// source the body arms (the parked clip-swap completion poll)
+    /// attaches to the *thread-default* context, so it lands on a
+    /// context that only this test's thread ever drives. A concurrently
+    /// running test iterating its own context can then never dispatch a
+    /// foreign source — before this isolation, a source armed by one
+    /// test but not yet dispatched by it was picked up by another
+    /// test's drive on the shared global default context, and glib's
+    /// `ThreadGuard` (wrong-thread access) panicked the victim test
+    /// non-deterministically under `cargo test`'s default parallelism.
+    fn with_own_main_context(body: impl FnOnce()) {
+        glib::MainContext::new()
+            .with_thread_default(body)
+            .expect("a fresh, unowned main context is always acquirable");
+    }
+
+    /// Drive the current test's thread-default main context — under
+    /// `CONTEXT_DRIVE_LOCK`, exactly as the UI loop would — until `done`
+    /// observes the settled condition on the player's EQ state, or the
+    /// bounded deadline passes. Returns whether the condition was
+    /// observed. Extracted so the transaction tests stay within their
+    /// method-length budgets (Codacy, PR 220 head cea20fe); the
+    /// thread-default resolution is the round-4 flake fix — see
+    /// [`with_own_main_context`].
     fn drive_context_until_eq_state(
         player: &Player,
         done: impl Fn(&EqEngineState) -> bool,
     ) -> bool {
         use std::time::{Duration, Instant};
 
-        let context = glib::MainContext::default();
+        let context = glib::MainContext::thread_default()
+            .expect("clip-swap tests run inside with_own_main_context");
         let _guard = CONTEXT_DRIVE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        context
-            .with_thread_default(|| {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    context.iteration(false);
-                    if done(&player.eq_state.borrow()) {
-                        return true;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                false
-            })
-            .unwrap_or(false)
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            context.iteration(false);
+            if done(&player.eq_state.borrow()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 
     /// Regression (refinery R1, PR 220 audit): a clip-protection toggle
@@ -2928,58 +2976,60 @@ mod tests {
     /// in-flight graph.
     #[test]
     fn pending_clip_swap_records_pre_edit_truth_then_reconciles_on_completion() {
-        use equalizer::ClipProtection;
+        with_own_main_context(|| {
+            use equalizer::ClipProtection;
 
-        if !eq_engine_plugins_available() {
-            return;
-        }
-        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+            if !eq_engine_plugins_available() {
+                return;
+            }
+            let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
 
-        // The user requests the same toggle. The pending guard must
-        // refuse the dynamic edit, skip the pause/relink fallback
-        // entirely, and record the pre-edit truth while in flight.
-        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
-        {
-            let state = player.eq_state.borrow();
-            assert!(state.settings.enabled);
-            assert_eq!(
+            // The user requests the same toggle. The pending guard must
+            // refuse the dynamic edit, skip the pause/relink fallback
+            // entirely, and record the pre-edit truth while in flight.
+            apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+            {
+                let state = player.eq_state.borrow();
+                assert!(state.settings.enabled);
+                assert_eq!(
                 state.settings.clip_protection,
                 ClipProtection::Soft,
                 "the recorded protection must stay at the pre-edit truth while the edit is parked"
             );
-            let chain = state.chain.as_ref().expect("chain retained");
-            assert!(chain.has_pending_limiter_edit());
-            assert!(
+                let chain = state.chain.as_ref().expect("chain retained");
+                assert!(chain.has_pending_limiter_edit());
+                assert!(
                 chain.clip_protection_installed(),
                 "the parked transaction reports the pre-edit truth: the limiter is still routed"
             );
-            assert!(!chain.topology_wedged());
-        }
+                assert!(!chain.topology_wedged());
+            }
 
-        // The callback finishes its surgery and publishes the outcome;
-        // the main-context poll adopts it and reconciles the recorded
-        // state.
-        let accepted = complete_pending_edit(&player, true);
-        assert!(accepted, "the parked transaction accepted its publication");
-        let adopted = drive_context_until_eq_state(&player, |state| {
-            state.settings.clip_protection == ClipProtection::Off
+            // The callback finishes its surgery and publishes the outcome;
+            // the main-context poll adopts it and reconciles the recorded
+            // state.
+            let accepted = complete_pending_edit(&player, true);
+            assert!(accepted, "the parked transaction accepted its publication");
+            let adopted = drive_context_until_eq_state(&player, |state| {
+                state.settings.clip_protection == ClipProtection::Off
+            });
+            assert!(adopted, "the parked completion was never adopted");
+            {
+                let state = player.eq_state.borrow();
+                assert_eq!(
+                    state.settings.clip_protection,
+                    ClipProtection::Off,
+                    "the settled truth is reconciled on the main context"
+                );
+                let chain = state.chain.as_ref().expect("chain retained");
+                assert!(!chain.has_pending_limiter_edit());
+                assert!(
+                    !chain.clip_protection_installed(),
+                    "the adopted removal left the graph without the limiter"
+                );
+                assert!(!chain.topology_wedged());
+            }
         });
-        assert!(adopted, "the parked completion was never adopted");
-        {
-            let state = player.eq_state.borrow();
-            assert_eq!(
-                state.settings.clip_protection,
-                ClipProtection::Off,
-                "the settled truth is reconciled on the main context"
-            );
-            let chain = state.chain.as_ref().expect("chain retained");
-            assert!(!chain.has_pending_limiter_edit());
-            assert!(
-                !chain.clip_protection_installed(),
-                "the adopted removal left the graph without the limiter"
-            );
-            assert!(!chain.topology_wedged());
-        }
     }
 
     /// Regression (refinery round 3, PR 220): when the main-context poll
@@ -2990,35 +3040,37 @@ mod tests {
     /// the edit was parked.
     #[test]
     fn adopted_clip_swap_notifies_the_panel_resync_when_the_recorded_value_changes() {
-        use equalizer::ClipProtection;
+        with_own_main_context(|| {
+            use equalizer::ClipProtection;
 
-        if !eq_engine_plugins_available() {
-            return;
-        }
-        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
-        // The user's Off toggle parks across the engagement window: the
-        // recorded state stays at the pre-edit Soft (the walk-back the
-        // open panel displays).
-        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
-        let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
-        let hits = std::rc::Rc::clone(&resyncs);
-        player.connect_equalizer_resync(std::rc::Rc::new(move || {
-            hits.set(hits.get() + 1);
-        }));
+            if !eq_engine_plugins_available() {
+                return;
+            }
+            let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+            // The user's Off toggle parks across the engagement window: the
+            // recorded state stays at the pre-edit Soft (the walk-back the
+            // open panel displays).
+            apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+            let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let hits = std::rc::Rc::clone(&resyncs);
+            player.connect_equalizer_resync(std::rc::Rc::new(move || {
+                hits.set(hits.get() + 1);
+            }));
 
-        // The parked surgery succeeds: the recorded value moves Soft →
-        // Off on the main context, and the resync fires for it.
-        let accepted = complete_pending_edit(&player, true);
-        assert!(accepted, "the parked transaction accepted its publication");
-        let adopted = drive_context_until_eq_state(&player, |state| {
-            state.settings.clip_protection == ClipProtection::Off
+            // The parked surgery succeeds: the recorded value moves Soft →
+            // Off on the main context, and the resync fires for it.
+            let accepted = complete_pending_edit(&player, true);
+            assert!(accepted, "the parked transaction accepted its publication");
+            let adopted = drive_context_until_eq_state(&player, |state| {
+                state.settings.clip_protection == ClipProtection::Off
+            });
+            assert!(adopted, "the parked completion was never adopted");
+            assert_eq!(
+                resyncs.get(),
+                1,
+                "the moved recorded value must notify the panel resync exactly once"
+            );
         });
-        assert!(adopted, "the parked completion was never adopted");
-        assert_eq!(
-            resyncs.get(),
-            1,
-            "the moved recorded value must notify the panel resync exactly once"
-        );
     }
 
     /// Regression (refinery round 3, PR 220), the echo-safety control:
@@ -3028,39 +3080,42 @@ mod tests {
     /// of the apply handlers' echo-safety violation.
     #[test]
     fn adopted_clip_swap_stays_silent_when_the_recorded_value_is_unchanged() {
-        use equalizer::ClipProtection;
+        with_own_main_context(|| {
+            use equalizer::ClipProtection;
 
-        if !eq_engine_plugins_available() {
-            return;
-        }
-        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
-        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
-        let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
-        let hits = std::rc::Rc::clone(&resyncs);
-        player.connect_equalizer_resync(std::rc::Rc::new(move || {
-            hits.set(hits.get() + 1);
-        }));
+            if !eq_engine_plugins_available() {
+                return;
+            }
+            let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+            apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+            let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let hits = std::rc::Rc::clone(&resyncs);
+            player.connect_equalizer_resync(std::rc::Rc::new(move || {
+                hits.set(hits.get() + 1);
+            }));
 
-        // The parked surgery restores the pre-edit layout: the chain
-        // keeps its limiter, so the reconciled Soft equals the recorded
-        // Soft and the poll must stay silent.
-        let accepted = complete_pending_edit(&player, false);
-        assert!(accepted, "the parked transaction accepted its publication");
-        let adopted = drive_context_until_eq_state(&player, |state| !state.clip_swap_poll_armed);
-        assert!(adopted, "the parked completion was never adopted");
-        {
-            let state = player.eq_state.borrow();
+            // The parked surgery restores the pre-edit layout: the chain
+            // keeps its limiter, so the reconciled Soft equals the recorded
+            // Soft and the poll must stay silent.
+            let accepted = complete_pending_edit(&player, false);
+            assert!(accepted, "the parked transaction accepted its publication");
+            let adopted =
+                drive_context_until_eq_state(&player, |state| !state.clip_swap_poll_armed);
+            assert!(adopted, "the parked completion was never adopted");
+            {
+                let state = player.eq_state.borrow();
+                assert_eq!(
+                    state.settings.clip_protection,
+                    ClipProtection::Soft,
+                    "the rollback must leave the recorded pre-edit truth in place"
+                );
+            }
             assert_eq!(
-                state.settings.clip_protection,
-                ClipProtection::Soft,
-                "the rollback must leave the recorded pre-edit truth in place"
+                resyncs.get(),
+                0,
+                "an unchanged recorded value must not notify the panel resync"
             );
-        }
-        assert_eq!(
-            resyncs.get(),
-            0,
-            "an unchanged recorded value must not notify the panel resync"
-        );
+        });
     }
 
     /// Regression (refinery round 4, PR 220 A2 — *Live-reconfiguration
@@ -3222,79 +3277,81 @@ mod tests {
     /// schedule, panel resync, and installed topology.
     #[test]
     fn stale_parked_clip_swap_completion_supersedes_and_reissues_the_loaded_policy() {
-        use equalizer::ClipProtection;
+        with_own_main_context(|| {
+            use equalizer::ClipProtection;
 
-        if !eq_engine_plugins_available() {
-            return;
-        }
-        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+            if !eq_engine_plugins_available() {
+                return;
+            }
+            let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
 
-        // Apply #1: the user requests Off; the edit parks across the
-        // engagement window (the chain refuses a second topology edit),
-        // the pre-edit Soft stays recorded, and the parked edit's
-        // generation is stamped for staleness detection.
-        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
-        {
-            let state = player.eq_state.borrow();
-            assert_eq!(
-                state.settings.clip_protection,
-                ClipProtection::Soft,
-                "the pre-edit truth stays recorded while the edit is parked"
-            );
-            assert!(state
-                .chain
-                .as_ref()
-                .expect("chain retained")
-                .has_pending_limiter_edit());
-        }
-
-        let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
-        let hits = std::rc::Rc::clone(&resyncs);
-        player.connect_equalizer_resync(std::rc::Rc::new(move || {
-            hits.set(hits.get() + 1);
-        }));
-
-        // Apply #2: a newer user action loads a snapshot with the clip
-        // policy unchanged (Soft) — no new toggle, but the parked edit's
-        // completion is now a stale outcome from an older generation.
-        apply_serialized(&player, eq_enabled_settings(ClipProtection::Soft));
-
-        // The stale completion settles: the parked Off surgery reports
-        // the limiter removed. The adoption must not record Off.
-        let accepted = complete_pending_edit(&player, true);
-        assert!(accepted, "the parked transaction accepted its publication");
-        let settled = drive_context_until_eq_state(&player, |state| {
-            !state.clip_swap_poll_armed
-                && !state
+            // Apply #1: the user requests Off; the edit parks across the
+            // engagement window (the chain refuses a second topology edit),
+            // the pre-edit Soft stays recorded, and the parked edit's
+            // generation is stamped for staleness detection.
+            apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+            {
+                let state = player.eq_state.borrow();
+                assert_eq!(
+                    state.settings.clip_protection,
+                    ClipProtection::Soft,
+                    "the pre-edit truth stays recorded while the edit is parked"
+                );
+                assert!(state
                     .chain
                     .as_ref()
-                    .map(|chain| chain.has_pending_limiter_edit())
-                    .unwrap_or(true)
-        });
-        assert!(
-            settled,
-            "the stale completion was never adopted and reissued"
-        );
-        {
-            let state = player.eq_state.borrow();
-            assert_eq!(
-                state.settings.clip_protection,
-                ClipProtection::Soft,
-                "the loaded policy must win: the stale Off outcome is superseded and reissued"
-            );
-            let chain = state.chain.as_ref().expect("chain retained");
+                    .expect("chain retained")
+                    .has_pending_limiter_edit());
+            }
+
+            let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let hits = std::rc::Rc::clone(&resyncs);
+            player.connect_equalizer_resync(std::rc::Rc::new(move || {
+                hits.set(hits.get() + 1);
+            }));
+
+            // Apply #2: a newer user action loads a snapshot with the clip
+            // policy unchanged (Soft) — no new toggle, but the parked edit's
+            // completion is now a stale outcome from an older generation.
+            apply_serialized(&player, eq_enabled_settings(ClipProtection::Soft));
+
+            // The stale completion settles: the parked Off surgery reports
+            // the limiter removed. The adoption must not record Off.
+            let accepted = complete_pending_edit(&player, true);
+            assert!(accepted, "the parked transaction accepted its publication");
+            let settled = drive_context_until_eq_state(&player, |state| {
+                !state.clip_swap_poll_armed
+                    && !state
+                        .chain
+                        .as_ref()
+                        .map(|chain| chain.has_pending_limiter_edit())
+                        .unwrap_or(true)
+            });
             assert!(
-                chain.clip_protection_installed(),
-                "the reissued Soft policy must leave the limiter installed"
+                settled,
+                "the stale completion was never adopted and reissued"
             );
-            assert!(!chain.topology_wedged());
-            assert!(!chain.has_pending_limiter_edit());
-        }
-        assert_eq!(
-            resyncs.get(),
-            1,
-            "the adoption supersedes silently and the reissue notifies the panel exactly once"
-        );
+            {
+                let state = player.eq_state.borrow();
+                assert_eq!(
+                    state.settings.clip_protection,
+                    ClipProtection::Soft,
+                    "the loaded policy must win: the stale Off outcome is superseded and reissued"
+                );
+                let chain = state.chain.as_ref().expect("chain retained");
+                assert!(
+                    chain.clip_protection_installed(),
+                    "the reissued Soft policy must leave the limiter installed"
+                );
+                assert!(!chain.topology_wedged());
+                assert!(!chain.has_pending_limiter_edit());
+            }
+            assert_eq!(
+                resyncs.get(),
+                1,
+                "the adoption supersedes silently and the reissue notifies the panel exactly once"
+            );
+        });
     }
 
     /// Regression (refinery round 4, PR 220 A1, persisted-state side):
@@ -3303,52 +3360,54 @@ mod tests {
     /// stale outcome never persisting over any reloaded field.
     #[test]
     fn stale_parked_clip_swap_completion_preserves_the_reloaded_settings() {
-        use equalizer::ClipProtection;
+        with_own_main_context(|| {
+            use equalizer::ClipProtection;
 
-        if !eq_engine_plugins_available() {
-            return;
-        }
-        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
-        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+            if !eq_engine_plugins_available() {
+                return;
+            }
+            let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+            apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
 
-        let reloaded = EqSettings {
-            preamp_db: -6.0,
-            bands_db: {
-                let mut bands = [0.0; 10];
-                bands[3] = 2.0;
-                bands
-            },
-            ..eq_enabled_settings(ClipProtection::Soft)
-        };
-        apply_serialized(&player, reloaded);
+            let reloaded = EqSettings {
+                preamp_db: -6.0,
+                bands_db: {
+                    let mut bands = [0.0; 10];
+                    bands[3] = 2.0;
+                    bands
+                },
+                ..eq_enabled_settings(ClipProtection::Soft)
+            };
+            apply_serialized(&player, reloaded);
 
-        let accepted = complete_pending_edit(&player, true);
-        assert!(accepted, "the parked transaction accepted its publication");
-        let settled = drive_context_until_eq_state(&player, |state| {
-            !state.clip_swap_poll_armed
-                && !state
+            let accepted = complete_pending_edit(&player, true);
+            assert!(accepted, "the parked transaction accepted its publication");
+            let settled = drive_context_until_eq_state(&player, |state| {
+                !state.clip_swap_poll_armed
+                    && !state
+                        .chain
+                        .as_ref()
+                        .map(|chain| chain.has_pending_limiter_edit())
+                        .unwrap_or(true)
+            });
+            assert!(
+                settled,
+                "the stale completion was never adopted and reissued"
+            );
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings, reloaded,
+                "the stale adoption must preserve every reloaded field, gains included"
+            );
+            assert!(
+                state
                     .chain
                     .as_ref()
-                    .map(|chain| chain.has_pending_limiter_edit())
-                    .unwrap_or(true)
+                    .expect("chain retained")
+                    .clip_protection_installed(),
+                "the reissued Soft policy must leave the limiter installed"
+            );
         });
-        assert!(
-            settled,
-            "the stale completion was never adopted and reissued"
-        );
-        let state = player.eq_state.borrow();
-        assert_eq!(
-            state.settings, reloaded,
-            "the stale adoption must preserve every reloaded field, gains included"
-        );
-        assert!(
-            state
-                .chain
-                .as_ref()
-                .expect("chain retained")
-                .clip_protection_installed(),
-            "the reissued Soft policy must leave the limiter installed"
-        );
     }
 
     /// Regression (refinery R1, PR 220 audit): while a limiter edit is
@@ -3359,45 +3418,66 @@ mod tests {
     /// and a later apply retries the removal.
     #[test]
     fn pending_clip_swap_defers_the_equalizer_uninstall() {
-        if !eq_engine_plugins_available() {
-            return;
-        }
-        let playbin = eq_test_playbin();
-        let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
-        let chain = equalizer::EqChain::build(&settings).expect("chain builds");
-        playbin.set_property("audio-filter", Some(&chain.bin));
-        let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
-        player.eq_test_seams.borrow_mut().playing = Some(true);
+        with_own_main_context(|| {
+            if !eq_engine_plugins_available() {
+                return;
+            }
+            let playbin = eq_test_playbin();
+            let settings = eq_enabled_settings(equalizer::ClipProtection::Soft);
+            let chain = equalizer::EqChain::build(&settings).expect("chain builds");
+            playbin.set_property("audio-filter", Some(&chain.bin));
+            let player = eq_test_player(playbin.clone(), eq_state_with(Some(chain), settings));
+            player.eq_test_seams.borrow_mut().playing = Some(true);
 
-        player
-            .eq_state
-            .borrow_mut()
-            .chain
-            .as_mut()
-            .expect("chain installed")
-            .inject_pending_limiter_edit(equalizer::ClipProtection::Off);
+            player
+                .eq_state
+                .borrow_mut()
+                .chain
+                .as_mut()
+                .expect("chain installed")
+                .inject_pending_limiter_edit(equalizer::ClipProtection::Off);
 
-        let next = EqSettings {
-            enabled: false,
-            clip_protection: equalizer::ClipProtection::Off,
-            ..settings
-        };
-        apply_serialized(&player, next);
+            let next = EqSettings {
+                enabled: false,
+                clip_protection: equalizer::ClipProtection::Off,
+                ..settings
+            };
+            apply_serialized(&player, next);
 
-        let state = player.eq_state.borrow();
-        assert!(
-            state.settings.enabled,
-            "the uninstall is deferred: the bin stays recorded as installed"
-        );
-        assert_eq!(
-            state.settings.clip_protection,
-            equalizer::ClipProtection::Soft,
-            "the deferred uninstall records the pre-edit truth, not the requested Off"
-        );
-        let chain = state.chain.as_ref().expect("chain retained on defer");
-        assert!(chain.has_pending_limiter_edit());
-        assert!(chain.clip_protection_installed());
-        assert!(installed_audio_filter(&playbin).is_some());
+            let state = player.eq_state.borrow();
+            assert!(
+                state.settings.enabled,
+                "the uninstall is deferred: the bin stays recorded as installed"
+            );
+            assert_eq!(
+                state.settings.clip_protection,
+                equalizer::ClipProtection::Soft,
+                "the deferred uninstall records the pre-edit truth, not the requested Off"
+            );
+            let chain = state.chain.as_ref().expect("chain retained on defer");
+            assert!(chain.has_pending_limiter_edit());
+            assert!(chain.clip_protection_installed());
+            assert!(installed_audio_filter(&playbin).is_some());
+            drop(state);
+
+            // Teardown (test hygiene, round-4 flake): the deferred edit armed
+            // a poll timeout on the process-global default context
+            // (`attempt_clip_protection_edit` arms it for any parked edit,
+            // pre-injected ones included). A local source left attached here
+            // would outlive this test and later be dispatched from a foreign
+            // test thread driving the shared context, tripping glib's
+            // ThreadGuard (wrong-thread drop). Publish the parked outcome and
+            // drive the context until the poll disarms, exactly as the
+            // adoption regressions above do.
+            let accepted = complete_pending_edit(&player, true);
+            assert!(
+                accepted,
+                "the parked uninstall accepted its deferred publication"
+            );
+            let disarmed =
+                drive_context_until_eq_state(&player, |state| !state.clip_swap_poll_armed);
+            assert!(disarmed, "the deferred edit's poll never disarmed");
+        });
     }
 
     /// Regression (refinery R3, PR 220 audit): the normal close-request
