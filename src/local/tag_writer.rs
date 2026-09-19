@@ -1546,7 +1546,11 @@ fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+// The Windows arm never fails, but it keeps the unix arm's fallible signature
+// so the shared call sites thread both platforms through the same
+// `?`/match handling unchanged.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
@@ -3167,8 +3171,15 @@ mod tests {
         let target = LocalMutationTarget::capture(&selected);
 
         // Same resolved pathname, entirely different directory object, with
-        // a fresh lookalike file at the same leaf name.
-        std::fs::remove_dir_all(&real).expect("remove the resolved directory");
+        // a fresh lookalike file at the same leaf name. The original objects
+        // are renamed aside rather than removed: a rename keeps their inodes
+        // allocated, so the replacement directory and lookalike file can
+        // never alias the captured dev+ino identities through filesystem
+        // inode reuse (observed as a spurious TargetEdited on some CI
+        // filesystems). The replacement is then guaranteed to fail the
+        // parent-identity comparison on every platform.
+        let displaced = directory.path.join("real-music-displaced");
+        std::fs::rename(&real, &displaced).expect("move the resolved directory aside");
         std::fs::create_dir(&real).expect("install a replacement directory");
         let impostor = b"a lookalike in a replaced directory".to_vec();
         std::fs::write(&track, &impostor).expect("install a lookalike file");
