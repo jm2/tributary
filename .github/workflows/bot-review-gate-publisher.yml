@@ -122,7 +122,11 @@ name: Bot review gate publisher
 #     request appear green. Every candidate evaluation therefore only RECORDS
 #     its findings; one shared verdict — success only when every candidate is
 #     clean, failure when any of them is not (fail-if-any-fail) — is
-#     published at the end.
+#     published at the end. Candidates are selected from the discovery read
+#     by open state only: when a closed dirty sibling leaves the shared head,
+#     the closed announcer trigger re-announces the commit and the recompute
+#     publishes the fresh shared verdict for the remaining open pull
+#     requests.
 #   * A pending or failing result is merge-blocking only once the live `main`
 #     ruleset marks "Bot Review Gate" as required. docs/dependency-updates.md
 #     records the exact rollout order and the live-PR verification step.
@@ -714,11 +718,29 @@ jobs:
           # the pull request's requested_reviewers list — GitHub's own
           # record, not a bot-asserted signal. The endpoint returns one
           # document (it does not paginate), and a query failure fails
-          # closed like every other evidence read.
+          # closed like every other evidence read. A successful response
+          # is shape-validated too: the handshake filter matches logins
+          # out of this document, so a malformed 200 body would yield no
+          # matches and read as "no outstanding requests" — silently
+          # dropping an in-flight re-review handshake while the
+          # reviewer's stale approval still counted. Only an object
+          # whose `.users` is an array of objects with non-empty string
+          # logins passes through (an empty `users` array is the
+          # endpoint's legitimate "no outstanding requests" shape).
           if ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
               > "${pages_dir}/requested-reviewers.json"; then
             echo "Requested-reviewers query failed; failing closed." >&2
             record_blocked "${verdict_base}" "Requested-reviewers query failed; failing closed."
+            return 1
+          fi
+          if ! jq -e 'type == "object"
+                      and (.users | type == "array")
+                      and all(.users[];
+                              type == "object"
+                              and (.login | type == "string" and length > 0))' \
+              "${pages_dir}/requested-reviewers.json" > /dev/null; then
+            echo "Requested-reviewers record was malformed; failing closed." >&2
+            record_blocked "${verdict_base}" "Requested-reviewers record was malformed; failing closed."
             return 1
           fi
 

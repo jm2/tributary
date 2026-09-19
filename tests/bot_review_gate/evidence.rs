@@ -390,3 +390,24 @@ fn a_failed_requested_reviewers_query_fails_closed() {
         "Requested-reviewers query failed; failing closed.",
     );
 }
+
+#[test]
+fn a_malformed_requested_reviewers_body_fails_closed() {
+    // A 200 that is not the endpoint's shape is a query failure wearing a
+    // success: the handshake filter matches logins out of the document, so
+    // a malformed body would yield no matches and read as "no outstanding
+    // requests" — silently dropping the in-flight re-review handshake this
+    // scenario stages while the reviewer's at-head review kept counting.
+    // The scenario is otherwise the postdating-request block: fail-open
+    // would pass green, so only the malformed-record refusal satisfies it.
+    let output = run_scenario(
+        "requested-review-malformed-body",
+        "pull_request",
+        Some(HEAD_SHA),
+    );
+    assert_blocked(
+        &output,
+        &[],
+        "Requested-reviewers record was malformed; failing closed.",
+    );
+}
