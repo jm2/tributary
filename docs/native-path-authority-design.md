@@ -632,10 +632,12 @@ favor of the id-keyed lookup.
 
 ### 6.3 Import / export
 
-- **XSPF export** writes the location from the decoded native path using a
-  canonical percent-encoded form of the native bytes (XSPF `<location>` is XML
-  text, so raw invalid bytes cannot appear). The exact mapping is defined with
-  the codec and covered by tests. Until that mapping ships (R11d), export must
+- **XSPF export** writes the location from the decoded native path using the
+  canonical native-codec location defined in §6.3.1 (XSPF `<location>` is XML
+  text, so raw invalid bytes cannot appear; the §6.3.1 payload is
+  XML-special-free by construction). The mapping is total for every
+  representable platform path and covered by Test 10's round-trip fixture
+  families. Until the location mapping ships (R11d), export must
   **fail closed**: encountering any non-authoritative row (U+FFFD display text,
   `native_path_state` 0 or 3, or `native_path IS NULL`) aborts the whole
   export with an `Err` **before** serialization or atomic persistence begins,
@@ -644,11 +646,56 @@ favor of the id-keyed lookup.
   silently incomplete playlist artifact, and it never emits a lossy
   `display_path` location. This is part of the §7 baseline and must land
   before schema/scanner activation, so an intermediate build can never export
-  a false locator for a newly enrolled row.
-- **XSPF import** decodes the percent-encoded location losslessly back to a
-  native path and matches by native key first; the metadata/duration fingerprint
+  a false locator for a newly enrolled row. An authoritative row whose display
+  text is exact (valid UTF-8, no U+FFFD) may export its display text as the
+  location in an intermediate state — for such a row the display text equals
+  the decoded native locator byte-for-byte (§7), so the emission is lossless
+  and needs no mapping; the §6.3.1 grammar becomes mandatory exactly when
+  invalid-byte rows must export (R11d).
+- **XSPF import** decodes the location losslessly back to a native path per
+  §6.3.1 and matches by native key first; the metadata/duration fingerprint
   fallback (`ImportedTrackMatchIndex`, `playlist_io.rs:591-700`) is unchanged
   and remains lower precedence.
+
+#### 6.3.1 Canonical XSPF location encoding (native codec mapping)
+
+The XSPF `<location>` for an authoritative native row is exactly that row's
+canonical native key string (§3.1) as produced by the absolute-path entry
+point (§3.2):
+
+```text
+location := native-scheme ":" lowercase-hex-payload
+native-scheme := "unix" | "windows-utf16le" | "portable-utf8"
+```
+
+- **Escape set (total).** Every native code unit is hex-encoded; no character
+  is ever emitted raw. `%`, path separators, `?`/`#`, whitespace, and the
+  Windows drive/UNC prefixes are all carried inside the hex payload (the
+  `windows-utf16le` scheme encodes the full absolute path including its
+  prefix, §3.2), so no URI-reserved or XML-special character ever appears in
+  the location and no percent-escape processing ever applies to it. There is
+  no separate platform-tag representation: the scheme token **is** the
+  platform tag (and the format version, §3.1).
+- **Encode.** The location is `NativePath::encode_absolute`'s output verbatim
+  (§3.2); the mapping is total for every representable platform path subject
+  to the §3.3 encoded-size bound. An over-bound path refuses at encode time,
+  so no authorized rollout slice depends on an undefined mapping.
+- **Non-canonical spellings are refused.** Import treats a location as native
+  authority only when it decodes (`decode_absolute`, §3.2) and re-encodes
+  byte-for-byte identically (the §3.1 canonicality discipline). Uppercase
+  hex, an odd-length payload, an embedded NUL, or an unknown or
+  platform-mismatched scheme refuse the location as native authority with a
+  closed diagnostic: it is never re-encoded, never "corrected", and never
+  interpreted lossily.
+- **Distinction from ordinary file URIs.** A location whose scheme is not one
+  of the three tokens — `file:`, `http:`, a relative reference, or any other
+  scheme — is never treated as native authority; it flows to the unchanged
+  fingerprint fallback at lower precedence, exactly as today.
+- **Round-trip fixtures.** Test 10 (§8) enumerates the required fixture
+  families: invalid Unix bytes, `%`-bearing names, separator-lookalike and
+  escape-lookalike spellings inside names, malformed Windows UTF-16 and
+  drive/UNC prefixes (codec-grain, via `windows-utf16le`), and the refusal of
+  every non-canonical spelling on import.
 - `playlist_entries.match_file_path` stays display/fingerprint text but must
   never be the sole authority; local matching prefers
   `playlist_entries.local_track_id` and the native row.
@@ -694,6 +741,20 @@ for unrepresentable input, the boundary is:
 - **Localized user-visible reasons** for quarantined/unavailable rows, added to
   every supported locale catalog, mirroring the folder-root unavailable-message
   pattern.
+
+**Exact-display authoritative rows are not refused.** The refusal boundary is
+keyed on rows whose display text does not exactly render the native locator:
+any display containing U+FFFD (a lossy rendering or a literal replacement
+character — indistinguishable at display grain, so both refuse),
+`native_path_state` 0 or 3, and `native_path IS NULL`. An authoritative row
+(state 1) whose display is exact — valid UTF-8 containing no U+FFFD — has
+display text equal to its decoded native locator byte-for-byte, so a
+display-path consumer acting on it acts on the same path the native key
+decodes to. Such a row is safe for every display-path consumer in every
+intermediate rollout state (§9): the action is lossless and grants no false
+authority, which is why the baseline refuses nothing about it. Refusing it
+would break ordinary valid-UTF-8 paths in intermediate builds for no safety
+gain, contradicting this section's "only removes false authority" contract.
 
 This baseline only removes false authority and changes no stored data, so it is
 safe to land alone, and it must precede any native-row enrollment.
@@ -743,8 +804,21 @@ Required tests:
 9. **Codec unit tests.** Round-trip, canonicality rejection (uppercase hex,
    odd length, NUL, unknown scheme), and the size bound, mirroring
    `identity.rs` tests.
-10. **Import/export round-trip.** XSPF export/import of a non-UTF-8 location
-    preserves the native key.
+10. **Import/export round-trip (§6.3.1 grammar).** XSPF export/import of a
+    non-UTF-8 location preserves the native key. The fixture families, all
+    asserting export→import byte-identical native keys (decode-then-re-encode
+    equality) and a successful open of the original file, are at least:
+    (a) invalid Unix bytes (`a\xff.flac` via `OsString::from_vec`,
+    `#[cfg(unix)]`); (b) `%`-bearing names (`50% off.flac`, and a
+    `%ff`-spelled name that must NOT be percent-decoded — the hex payload
+    carries it literally); (c) separator-lookalike and escape-lookalike
+    spellings inside a single name component (a literal `\` in a Unix name, a
+    name containing `2F`); (d) malformed Windows UTF-16 (an unpaired
+    surrogate) plus drive (`C:`) and UNC (`\\server\share`) prefixes, at
+    codec grain through the `windows-utf16le` scheme, mirroring the
+    filesystem-free grain of Test 9; and every non-canonical spelling —
+    uppercase hex, odd-length payload, embedded NUL, unknown scheme, and an
+    ordinary `file:` URI — is refused by import as native authority (§6.3.1).
 11. **Old-binary / open-database rejection trace (F3).** Simulate a pre-R11
     consumer: a prepared `SELECT file_path FROM tracks` and an insert naming
     `file_path` both fail closed ("no such column"); the
@@ -764,13 +838,33 @@ Required tests:
     pre-R11 statements (§4.5). Assert
     row ids, ratings, play counts, history, and playlist references are
     byte-identical across the upgrade.
-12. **Intermediate-version integration matrix (F2).** For every independently
-    landable slice state (R11a baseline only; R11a+R11b; R11b without R11c;
-    R11c without R11d), run the resolver, tag-write, export, and stale-removal
-    paths against (a) an invalid-byte row whose display contains U+FFFD,
-    (b) a literal replacement-character row, and (c) an authoritative native
-    row before its consumer has shipped; assert a closed refusal with no
-    wrong-file open, no write, and no lossy export.
+12. **Intermediate-version integration matrix (F2, round-5 A2).** For every
+    independently landable slice state (R11a baseline only; R11a+R11b; R11b
+    without R11c; R11c without R11d), run the resolver, tag-write, export, and
+    stale-removal paths against each row class below and assert the stated
+    per-consumer outcome — no wrong-file open, no write to an unproven target,
+    and no lossy export in any cell:
+    - **(a) Invalid-byte row whose display contains U+FFFD:** closed refusal
+      from every consumer in every state.
+    - **(b) Literal replacement-character row:** closed refusal from every
+      consumer in every state — at display grain it is indistinguishable from
+      a lossy rendering, so it refuses with the U+FFFD class (§7).
+    - **(c) Authoritative native row whose display is not exact (contains
+      U+FFFD — lossy or literal) before its consumer has shipped:** closed
+      refusal from each consumer until that consumer's native-aware path
+      ships (resolver and tag-write until R11c; export until R11d). The
+      R11a+R11b cell of this class is the newly-enrolled invalid-byte row and
+      is the regression cell that proves F2 stays closed.
+    - **(d) Authoritative native row whose display is exact (valid UTF-8, no
+      U+FFFD):** the explicitly positive outcome in every state, asserted per
+      consumer — in R11a+R11b the resolver opens exactly the path the native
+      key decodes to, the tag write targets it, export emits the exact
+      display text as a lossless location (the R11d mapping is not required
+      for an exact-display row), and stale removal keys membership on it with
+      no wrong removal; assert no refusal and no lossy substitution.
+      Exact-display rows are safe for display-path consumers in every
+      intermediate state because the display text equals the decoded locator
+      (§7).
 13. **Migration reference preservation and failure injection (rebuild gate).**
     Run migration `000021` against a populated database: several `tracks` rows
     covering states 2 and 3, live `playlist_entries` rows whose non-NULL
@@ -845,20 +939,27 @@ not expose a newly-lossless row to a consumer that cannot prove it.
    Activation is gated on R11a: the binary refuses to write the marker or enroll
    native rows unless the fail-closed baseline is compiled in (§4.5). New rows
    (including invalid-byte paths) enroll with authority; existing consumers
-   remain fail-closed for them until R11c/R11d.
+   refuse the lossy-display ones and act on valid-UTF-8 ones through display
+   text, which equals their decoded locator (§7), until R11c/R11d give the
+   consumers native-aware paths.
 3. **R11c — playback + tag-write authority.** Resolver decodes `native_path`;
    tag-write target id-keyed; coordinate the R1 content-revision boundary.
-4. **R11d — import/export + Rhythmbox.** Lossless XSPF location mapping; export
+4. **R11d — import/export + Rhythmbox.** Lossless XSPF location mapping
+   (§6.3.1); export
    switches from the baseline whole-export `Err` refusal to lossless emission
    only for authoritative rows; decide and document the Rhythmbox non-UTF-8
    scope.
 5. **R11e — legacy cleanup.** Remove any remaining display-as-authority fallback
    once scans prove the native keys; keep `display_path` display-only.
 
-Ordering rationale: R11a closes the active harm and establishes the invariant
-"no consumer acts on a row it cannot prove"; R11b may then safely introduce
-native rows because every consumer already fails closed for anything it cannot
-prove. Consumers gain lossless capability only after the baseline, never before.
+Ordering rationale: R11a closes the active harm by making every consumer
+refuse unproven display text — any row whose display does not exactly render
+its native locator (U+FFFD-bearing lossy or literal-replacement displays, and
+non-authoritative states, §7). Exact-display authoritative rows need no
+refusal: their display text equals the decoded locator, so display-path
+action on them is lossless in every intermediate state (§7). On that
+narrowed-but-precise invariant, R11b may then safely introduce native rows.
+Consumers gain lossless capability only after the baseline, never before.
 The §7 baseline may be split into independently landable per-consumer commits,
 but no schema/scanner activation may precede the complete baseline.
 
@@ -866,8 +967,17 @@ but no schema/scanner activation may precede the complete baseline.
 landable state (R11a only; R11a+R11b; R11b without R11c; R11c without R11d), run
 the resolver, tag-write, export, and stale-removal paths against (a) an
 invalid-byte row whose display contains U+FFFD, (b) a literal
-replacement-character row, and (c) an authoritative native row before its
-consumer has shipped, and assert a closed refusal. This proves each slice is
+replacement-character row, and (c) an authoritative native row whose display
+is not exact — it contains U+FFFD, the lossy-or-literal class a display-path
+consumer cannot distinguish — before its consumer has shipped, and assert a
+closed refusal; plus (d) an authoritative native row whose display is exact
+(valid UTF-8, no U+FFFD), asserting the explicitly positive per-consumer
+outcome: the resolver opens exactly the path the native key decodes to, the
+tag write targets it, export emits the exact display text as a lossless
+location, and stale removal keys membership on it — no refusal, no lossy
+substitution. Exact-display rows are safe in every intermediate state because
+the display text equals the decoded locator (§7); the refusal classes are
+exactly the rows whose display does not. This proves each slice is
 safe alone, not only the final architecture.
 
 ## 10. Open questions and coordination
@@ -881,9 +991,6 @@ safe alone, not only the final architecture.
 - **R1 / #248 interface.** The exact field/function through which the decoded
   native path and the content revision cross into tag-write authority is owned
   by R1; R11 supplies the locator and will not duplicate R1's revision logic.
-- **XSPF percent-encoding details.** Define one canonical byte-level
-  percent-encoding and reject non-canonical spellings, matching the codec's
-  canonicality discipline.
 - **Two colliding rows in the UI.** Confirm the localized presentation for
   identical display text that resolves to distinct files.
 - **Migration table rebuild on large libraries.** The rebuild copies every
@@ -1206,6 +1313,88 @@ doc-only; labeled j9R3F to match the review thread.
 Nothing in this revision expands product behavior; every change makes the
 contract stricter. The thread stays unresolved until this head lands and the
 fix is independently re-verified.
+
+### 13.5 Revision 7 mapping (round-5 review of `adc85ffb`)
+
+Revision 7 answers the two P2 findings verified first-hand in
+`refinery-20260919T1310Z-adc85ff-tr-ldhwt-round5/report.md` (PR #283 at head
+`adc85ffbece5e7b859a1c52fae05f25a95c47a6d`; threads j_WFJ and j_WFM, both
+answering @codex at the exact head). All corrections are doc-only; labeled A1/
+A2 to match the review report.
+
+#### A1 (thread j_WFJ) — the lossless XSPF URI encoding was claimed but never defined
+
+- **Finding:** §6.3's export bullet claimed the location used "a canonical
+  percent-encoded form of the native bytes" with "the exact mapping defined
+  with the codec", but no codec section defined any mapping — §10 still
+  listed "XSPF percent-encoding details" as an open question while §9's R11d
+  was authorized on top of it. Which code units are encoded, how separators,
+  `%`, drive/UNC prefixes, and platform tags are represented, and how import
+  distinguishes the encoding from an ordinary file URI were all unspecified.
+- **Required correction:** define the canonical grammar with its inverse and
+  round-trip fixtures (or refuse unrepresentable paths and withdraw the
+  claim), and delete or retarget the §10 open item.
+- **Where changed:** added §6.3.1 — the location grammar
+  `native-scheme ":" lowercase-hex` reusing §3.1's three scheme tokens
+  verbatim (the scheme token is the platform tag), the total escape set
+  (every code unit hex-encoded, so `%`, separators, and drive/UNC prefixes
+  never appear raw and no percent-escape processing applies), encode via
+  `NativePath::encode_absolute` with the §3.3 bound checked at encode time,
+  import canonicality by decode-then-re-encode equality with closed refusal
+  of non-canonical spellings, and the scheme-token distinction from ordinary
+  `file:`/`http:` URIs (which flow to the unchanged fingerprint fallback);
+  §6.3's export and import bullets now cite §6.3.1 and state the
+  intermediate-state exact-display export rule; §9's R11d cites §6.3.1; the
+  §10 open item is deleted (the mapping is defined, so no authorized slice
+  depends on an open question).
+- **Validation added:** Test 10's explicit round-trip fixture families —
+  invalid Unix bytes, `%`-bearing names (never percent-decoded), separator-
+  and escape-lookalike spellings inside a name component, malformed Windows
+  UTF-16 plus drive/UNC prefixes at codec grain, and import refusal of every
+  non-canonical spelling including ordinary `file:` URIs.
+
+#### A2 (thread j_WFM) — the intermediate matrix demanded refusal of valid-UTF-8 state-1 rows the baseline never refuses
+
+- **Finding:** §9's mandatory intermediate matrix required a closed refusal
+  for "(c) an authoritative native row before its consumer has shipped", and
+  the ordering rationale claimed consumers "already fail closed for anything
+  they cannot prove". But every §7/§6.3 mechanism keys refusal on U+FFFD
+  display text, `native_path_state` 0/3, or NULL `native_path` — a newly
+  enrolled authoritative row (state 1) whose native path is valid UTF-8 has
+  exact display text and passes every defined check, so in R11a+R11b the
+  display-path consumers act on it instead of refusing, contradicting the
+  letter of class (c) and the fail-closed claim.
+- **Required correction:** either the baseline refuses state-1 rows per
+  unshipped consumer, or the invariant and matrix are narrowed to rows whose
+  display is not exact with an explicit exact-display safety statement; the
+  §8.12 matrix must state the class-(c) row shape and the per-consumer
+  refusal/no-refusal expectation either way.
+- **Choice and where changed:** the design narrows the invariant and matrix
+  (the second option). Refusing exact-display rows would break ordinary
+  valid-UTF-8 paths in intermediate builds for no safety gain, contradicting
+  §7's "only removes false authority" contract — for an exact-display row
+  the display text equals the decoded locator, so display-path action is
+  lossless and grants no false authority. §7 gains the explicit
+  "Exact-display authoritative rows are not refused" paragraph defining the
+  refusal boundary (U+FFFD-bearing lossy or literal displays, state 0/3,
+  NULL `native_path`) and the exact-display safety statement; §9's ordering
+  rationale states the narrowed invariant precisely and drops the overbroad
+  "anything it cannot prove" claim; §9's R11b bullet states per-row-class
+  intermediate behavior; §9's intermediate-matrix paragraph narrows class
+  (c) to authoritative rows whose display contains U+FFFD and adds class
+  (d) with the positive per-consumer assertions.
+- **Validation added:** §8.12 (Test 12) rewritten as the per-class,
+  per-consumer matrix — (a)/(b) refuse in every state; (c) refuses per
+  consumer until that consumer ships, with the R11a+R11b newly-enrolled
+  invalid-byte cell pinned as the F2 regression cell; (d) asserts the
+  explicitly allowed-and-lossless outcome per consumer in every state,
+  including the required R11a+R11b valid-UTF-8 state-1 row through resolver,
+  tag-write, export, and stale-removal.
+
+Nothing in this revision expands product behavior; the XSPF grammar makes an
+implicit claim explicit and the rollout invariant more precise. The threads
+stay unresolved until this head lands and the fixes are independently
+re-verified.
 
 ## Appendix A — Lossy conversion inventory (`src/local/`)
 
