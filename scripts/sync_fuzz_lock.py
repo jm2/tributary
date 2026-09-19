@@ -946,6 +946,38 @@ def validate_bounded_package_changes(
         replacements,
     )
 
+    # A reviewed removal authorizes pruning its old closure; it never
+    # authorizes leaving that closure behind. A submission that drops only
+    # the removed direct edge while retaining the removed package — or any
+    # member of its old closure — as an unreachable [[package]] record
+    # passes every bounds check above: nothing disappeared from the record
+    # set, so removed_identities stays empty, and a pure removal has no new
+    # roots whose after-closure could require reachability. Real cargo
+    # resolution prunes unreachable records, so every surviving member of a
+    # removal closure must remain reachable from the fuzz workspace root.
+    # Unification survivors are unaffected: a retained consumer's edge
+    # keeps its record reachable, and only true orphans are named here.
+    removal_roots = {
+        (transition.name, transition.current_fuzz_version)
+        for transition in transitions
+        if transition.target_root_version is None
+    }
+    if removal_roots:
+        removal_closure = dependency_closure_identities(
+            before_fuzz_lock, removal_roots
+        )
+        workspace = workspace_package(after_fuzz_lock, "tributary")
+        after_reachable = dependency_closure_identities(
+            after_fuzz_lock, {(workspace["name"], workspace["version"])}
+        )
+        orphaned = (removal_closure & after_records.keys()) - after_reachable
+        if orphaned:
+            raise PolicyError(
+                "fuzz lock repair dropped a removed dependency's direct edge "
+                "but retained unreachable old-closure package records: "
+                f"{sorted(orphaned)}"
+            )
+
 
 def validate_submitted_fuzz_update(
     base_root_lock: dict[str, Any],

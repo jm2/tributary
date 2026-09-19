@@ -266,7 +266,10 @@ class FuzzLockPolicyTests(unittest.TestCase):
             {"local-ip": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
         )
         base_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
-        submitted_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        # The submitted lock performs the removal exactly: the removed
+        # direct edge, the local-ip record, and its edge closure record are
+        # all pruned (cargo never leaves unreachable records behind).
+        submitted_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"]})
         manifest = {"dependencies": {"kept": "1"}}
 
         self.assertEqual(
@@ -382,7 +385,9 @@ class FuzzLockPolicyTests(unittest.TestCase):
             {"local-ip-address": ["1.0.0"], "kept": ["1.0.0"], "edge": ["1.0.0"]},
         )
         stale_fuzz["package"][1]["dependencies"] = ["edge 1.0.0"]
-        repaired_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "edge": ["1.0.0"]})
+        # The repaired lock is a real cargo regeneration: the removed
+        # local-ip-address closure (including its edge record) is pruned.
+        repaired_fuzz = lock(["kept 1.0.0"], {"kept": ["1.0.0"]})
         return base, current, base_fuzz, stale_fuzz, repaired_fuzz
 
     def _patch_main_fixtures(self, *, mode: str) -> tuple[dict, list[bytes]]:
@@ -586,9 +591,12 @@ class FuzzLockPolicyTests(unittest.TestCase):
         # The same removal shape with the retained consumer's edge unchanged
         # is a pure prune: a@1.0.0 and mid@1.0.0 drop inside the removal's
         # old closure, every surviving edge keeps its exact reviewed target,
-        # and the proof succeeds.
+        # and the proof succeeds. The retained consumers hang off the
+        # workspace root, so their shared@1.0.0 record stays reachable; the
+        # shared@2.0.0 record loses its last reachers (a and mid) and is
+        # pruned, as cargo always does.
         base = lock(
-            ["a 1.0.0"],
+            ["a 1.0.0", "unrelated 1.0.0", "drift 1.0.0"],
             {
                 "a": ["1.0.0"],
                 "mid": ["1.0.0"],
@@ -604,15 +612,16 @@ class FuzzLockPolicyTests(unittest.TestCase):
         base["package"][5]["dependencies"] = ["shared 1.0.0"]
         base["package"][6]["dependencies"] = ["shared 1.0.0"]
         pruned_fuzz = lock(
-            [],
+            ["unrelated 1.0.0", "drift 1.0.0"],
             {
-                "shared": ["1.0.0", "2.0.0"],
+                "shared": ["1.0.0"],
                 "unrelated": ["1.0.0"],
                 "drift": ["1.0.0"],
             },
         )
+        # package order: tributary, shared@1, unrelated, drift.
+        pruned_fuzz["package"][2]["dependencies"] = ["shared 1.0.0"]
         pruned_fuzz["package"][3]["dependencies"] = ["shared 1.0.0"]
-        pruned_fuzz["package"][4]["dependencies"] = ["shared 1.0.0"]
 
         sync_fuzz_lock.validate_bounded_package_changes(
             base,
@@ -720,12 +729,14 @@ class FuzzLockPolicyTests(unittest.TestCase):
         base["package"][5]["dependencies"] = ["shared 1.0.0", "shared 2.0.0"]
         pruned_fuzz = lock(
             ["b 1.0.0"],
-            {"b": ["1.0.0"], "shared": ["1.0.0", "2.0.0"], "x": ["1.0.0"]},
+            {"b": ["1.0.0"], "shared": ["1.0.0"], "x": ["1.0.0"]},
         )
-        # package order: tributary, b, shared@1, shared@2, x. x drops only
-        # the span-internal shared@2.0.0 edge; shared@1.0.0 stays exact.
+        # package order: tributary, b, shared@1, x. x drops only the
+        # span-internal shared@2.0.0 edge, and the shared@2.0.0 record is
+        # pruned with it — nothing reaches it any more, and cargo never
+        # leaves unreachable records behind. shared@1.0.0 stays exact.
         pruned_fuzz["package"][1]["dependencies"] = ["x 1.0.0"]
-        pruned_fuzz["package"][4]["dependencies"] = ["shared 1.0.0"]
+        pruned_fuzz["package"][3]["dependencies"] = ["shared 1.0.0"]
 
         sync_fuzz_lock.validate_bounded_package_changes(
             base,
@@ -734,6 +745,119 @@ class FuzzLockPolicyTests(unittest.TestCase):
             pruned_fuzz,
             [sync_fuzz_lock.Transition("a", "1.0.0", None)],
         )
+
+    def test_removal_rejects_unreachable_old_closure_records(self):
+        # Codex P2 regression (thread j8ZCE): a removal submission that
+        # drops ONLY the removed direct edge while retaining the removed
+        # package and its whole transitive closure as unreachable
+        # [[package]] records must be rejected. removed_identities stays
+        # empty because nothing disappeared, and a pure removal has no new
+        # roots, so only the after-workspace reachability proof can name
+        # the orphans.
+        base = lock(
+            ["foo 1.0.0"],
+            {"foo": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        # package order: tributary, foo, bar. foo reaches bar.
+        base["package"][1]["dependencies"] = ["bar 2.0.0"]
+        current = lock([], {})
+        base_fuzz = lock(
+            ["foo 1.0.0"],
+            {"foo": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+        # The submitted lock drops the tributary->foo edge but keeps both
+        # foo and its transitive bar as unreachable records.
+        orphaned_fuzz = lock(
+            [],
+            {"foo": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        orphaned_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+
+        with self.assertRaisesRegex(
+            sync_fuzz_lock.PolicyError,
+            r"retained unreachable old-closure package records: "
+            r"\[\('bar', '2\.0\.0'\), \('foo', '1\.0\.0'\)\]",
+        ):
+            sync_fuzz_lock.validate_submitted_fuzz_update(
+                base,
+                current,
+                base_fuzz,
+                orphaned_fuzz,
+                {"dependencies": {}},
+            )
+
+    def test_removal_performed_exactly_prunes_closure_records(self):
+        # The j8ZCE shape performed exactly: the removed package and its
+        # whole transitive closure are pruned, not retained, so the proof
+        # succeeds unchanged.
+        base = lock(
+            ["foo 1.0.0"],
+            {"foo": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        base["package"][1]["dependencies"] = ["bar 2.0.0"]
+        current = lock([], {})
+        base_fuzz = lock(
+            ["foo 1.0.0"],
+            {"foo": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+        pruned_fuzz = lock([], {})
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            base_fuzz,
+            pruned_fuzz,
+            {"dependencies": {}},
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("foo", "1.0.0", None)],
+        )
+        self.assertEqual(remaining, [])
+
+    def test_removal_allows_retained_consumer_reaching_old_closure(self):
+        # A retained consumer keeps part of the removed closure reachable:
+        # kept@1.0.0 already depends on bar@2.0.0 in the base graph, so bar
+        # survives the foo removal as a live record while foo itself is
+        # pruned. Reachable closure survivors are not orphans, so the proof
+        # succeeds.
+        base = lock(
+            ["foo 1.0.0", "kept 1.0.0"],
+            {"foo": ["1.0.0"], "kept": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        # package order: tributary, foo, kept, bar. Both foo and kept
+        # reach bar in the base graph.
+        base["package"][1]["dependencies"] = ["bar 2.0.0"]
+        base["package"][2]["dependencies"] = ["bar 2.0.0"]
+        current = lock(["kept 1.0.0"], {"kept": ["1.0.0"], "bar": ["2.0.0"]})
+        current["package"][1]["dependencies"] = ["bar 2.0.0"]
+        base_fuzz = lock(
+            ["foo 1.0.0", "kept 1.0.0"],
+            {"foo": ["1.0.0"], "kept": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        base_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+        base_fuzz["package"][2]["dependencies"] = ["bar 2.0.0"]
+        pruned_fuzz = lock(
+            ["kept 1.0.0"],
+            {"kept": ["1.0.0"], "bar": ["2.0.0"]},
+        )
+        # package order: tributary, kept, bar. kept keeps its bar edge.
+        pruned_fuzz["package"][1]["dependencies"] = ["bar 2.0.0"]
+
+        requested, remaining = sync_fuzz_lock.validate_submitted_fuzz_update(
+            base,
+            current,
+            base_fuzz,
+            pruned_fuzz,
+            {"dependencies": {"kept": "1"}},
+        )
+        self.assertEqual(
+            requested,
+            [sync_fuzz_lock.Transition("foo", "1.0.0", None)],
+        )
+        self.assertEqual(remaining, [])
 
     def test_transition_tied_rebind_rejects_pure_edge_drop(self):
         # Round-2 Codex P2 regression (M2): the transition-tied exception
