@@ -466,21 +466,34 @@ impl MediaContainer {
         }
     }
 
+    /// Canonical ticket suffix plus accepted library-supplied aliases for
+    /// each container, in one row per variant. This table is the single
+    /// authority for receiver-visible extensions: [`Self::ticket_suffix`]
+    /// emits only the canonical column and [`Self::from_suffix`] accepts the
+    /// canonical suffix plus its aliases — nowhere else. New variants must
+    /// add a row here; the exhaustive `content_type` match keeps the build
+    /// honest if one is added without it.
+    const CONTAINER_SUFFIX_TABLE: &'static [(Self, &'static str, &'static [&'static str])] = &[
+        (Self::Mp3, "mp3", &["mp3"]),
+        (Self::Flac, "flac", &["flac"]),
+        (Self::Ogg, "ogg", &["ogg", "ogx"]),
+        (Self::Oga, "oga", &["oga"]),
+        (Self::Opus, "opus", &["opus"]),
+        (Self::Wav, "wav", &["wav"]),
+        (Self::Aac, "aac", &["aac"]),
+        (Self::M4a, "m4a", &["m4a", "m4b", "mp4"]),
+        (Self::Aiff, "aiff", &["aiff", "aif"]),
+        (Self::Wma, "wma", &["wma"]),
+    ];
+
     /// The ticket-path suffix for this container. Only exact allowlist
     /// strings may be appended to the opaque loopback ticket path.
     pub fn ticket_suffix(self) -> &'static str {
-        match self {
-            Self::Mp3 => "mp3",
-            Self::Flac => "flac",
-            Self::Ogg => "ogg",
-            Self::Oga => "oga",
-            Self::Opus => "opus",
-            Self::Wav => "wav",
-            Self::Aac => "aac",
-            Self::M4a => "m4a",
-            Self::Aiff => "aiff",
-            Self::Wma => "wma",
-        }
+        Self::CONTAINER_SUFFIX_TABLE
+            .iter()
+            .find(|(container, _, _)| *container == self)
+            .map(|(_, suffix, _)| *suffix)
+            .expect("every MediaContainer variant has a CONTAINER_SUFFIX_TABLE row")
     }
 
     /// Validate a server-supplied suffix against the container allowlist.
@@ -491,19 +504,11 @@ impl MediaContainer {
     /// `None`; callers must treat that as "unknown", never fall back to a
     /// guessed container.
     pub fn from_suffix(suffix: &str) -> Option<Self> {
-        match suffix.to_ascii_lowercase().as_str() {
-            "mp3" => Some(Self::Mp3),
-            "flac" => Some(Self::Flac),
-            "ogg" | "ogx" => Some(Self::Ogg),
-            "oga" => Some(Self::Oga),
-            "opus" => Some(Self::Opus),
-            "wav" => Some(Self::Wav),
-            "aac" => Some(Self::Aac),
-            "m4a" | "m4b" | "mp4" => Some(Self::M4a),
-            "aiff" | "aif" => Some(Self::Aiff),
-            "wma" => Some(Self::Wma),
-            _ => None,
-        }
+        let normalized = suffix.to_ascii_lowercase();
+        Self::CONTAINER_SUFFIX_TABLE
+            .iter()
+            .find(|(_, _, aliases)| aliases.contains(&normalized.as_str()))
+            .map(|(container, _, _)| *container)
     }
 }
 
