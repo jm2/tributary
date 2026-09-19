@@ -1227,6 +1227,32 @@ fn build_properties_action(
         media_keys,
     };
 
+    // Selection-time filesystem evidence for the pending local pathnames.
+    // Menu build and admission are separated by the menu's whole visible
+    // lifetime, during which a pathname can be replaced; the admission
+    // validates its admitted objects against this capture before the dialog
+    // may open. The capture starts on a blocking worker the moment the menu
+    // is built — never the UI thread — and the residual gap is only its own
+    // scheduling: scheduler-scale, not the menu's human-scale lifetime.
+    let pending_local_paths = distinct_pending_local_paths(&track_infos);
+    let menu_time_locals = if pending_local_paths.is_empty() {
+        None
+    } else {
+        let (menu_time_tx, menu_time_rx) =
+            tokio::sync::oneshot::channel::<Option<MenuTimeLocals>>();
+        mutation_context.rt_handle.spawn(async move {
+            let captured =
+                tokio::task::spawn_blocking(move || capture_menu_time_locals(&pending_local_paths))
+                    .await;
+            let _ = menu_time_tx.send(captured.ok());
+        });
+        Some(menu_time_rx)
+    };
+    // The receiver is consumed exactly once, by the action's first
+    // activation; a Mutex lets the Fn closure hand it over without moving
+    // out of the capture.
+    let menu_time_locals = std::sync::Mutex::new(menu_time_locals);
+
     let props_action = gtk::gio::SimpleAction::new("properties", None);
     let win_for_props: Option<adw::ApplicationWindow> = mutation_context
         .column_view
@@ -1261,6 +1287,12 @@ fn build_properties_action(
         // location is never surfaced.
         let pending_removable = distinct_pending_mutations(&track_infos);
         let pending_locals = distinct_pending_local_paths(&track_infos);
+        // The menu-time anchor is consumed exactly once, here at activation;
+        // the blocking worker then awaits the probe and validates against it.
+        let menu_time_locals = menu_time_locals
+            .lock()
+            .expect("menu-time capture mutex")
+            .take();
         let registry = registry_for_props.clone();
         let registry_for_catalogue = registry.clone();
         let rt_handle = rt_handle_for_props.clone();
@@ -1273,16 +1305,25 @@ fn build_properties_action(
         rt_handle.spawn(async move {
             // Phase 1: admit each distinct local pathname to an exact
             // object — filesystem identification can block on removable and
-            // network media, so it must never run on the UI thread.
+            // network media, so it must never run on the UI thread — and
+            // prove every admitted object is exactly the object the
+            // menu-time capture snapshotted before the dialog may see it.
             let locals = if pending_locals.is_empty() {
                 std::collections::HashMap::new()
             } else {
                 match tokio::task::spawn_blocking(move || {
-                    capture_pending_locals(&pending_locals)
+                    capture_and_validate_pending_locals(&pending_locals, menu_time_locals)
                 })
                 .await
                 {
-                    Ok(locals) => locals,
+                    Ok(Ok(locals)) => locals,
+                    Ok(Err(reason)) => {
+                        tracing::warn!(
+                            "local properties admission refused ({reason}); surfacing the cancelled action"
+                        );
+                        let _ = tx.send_blocking(None);
+                        return;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             %error,
@@ -1564,6 +1605,79 @@ fn capture_pending_locals(
         .iter()
         .map(|path| (path.clone(), LocalMutationTarget::capture(path)))
         .collect()
+}
+
+/// The menu-time capture one action's probe delivers, awaited by the
+/// admission worker before it may validate its own capture.
+type MenuTimeLocals = std::collections::HashMap<std::path::PathBuf, LocalMutationTarget>;
+
+/// The receiver half of the menu-time probe: `Some(capture)` delivers the
+/// evidence, `None` means the probe's worker failed before it could capture.
+type MenuTimeLocalsRx = tokio::sync::oneshot::Receiver<Option<MenuTimeLocals>>;
+
+/// Capture selection-time filesystem evidence for the pending local
+/// pathnames — the menu-time anchor the admission validates against.
+///
+/// Started the moment the menu is built, on a blocking worker:
+/// identification can block on removable and network media, so it must never
+/// run on the UI thread. Deliberately not `capture_pending_locals`: that fn
+/// parks while a test holds the admission gate, and this capture is
+/// evidence, not admission — it must complete regardless of any held gate.
+fn capture_menu_time_locals(paths: &[std::path::PathBuf]) -> MenuTimeLocals {
+    paths
+        .iter()
+        .map(|path| (path.clone(), LocalMutationTarget::capture(path)))
+        .collect()
+}
+
+/// Whether every admitted target is exactly the object captured when the
+/// menu was built: for each admitted pathname, the menu-time map must hold
+/// a target for the same pathname admitting the same selection — identical
+/// evidence, or the identical capture-failure category when the selection
+/// carried no evidence. A pathname the menu-time capture never saw is a
+/// wiring fault and refuses; the admitted map always covers exactly the
+/// pending pathnames, so the admitted side drives the comparison.
+fn menu_time_capture_still_holds(menu_time: &MenuTimeLocals, admitted: &MenuTimeLocals) -> bool {
+    admitted.iter().all(|(path, admitted_target)| {
+        menu_time
+            .get(path)
+            .is_some_and(|captured| captured.admits_same_selection(admitted_target))
+    })
+}
+
+/// Phase 1 of the Properties admission: admit every distinct pending local
+/// pathname, then prove each admitted object is exactly the object the
+/// menu-time capture snapshotted before the dialog may see it.
+///
+/// Menu build and admission are separated by the menu's whole visible
+/// lifetime, during which a pathname can be replaced; without the anchor, a
+/// replacement would be admitted and later overwritten under the selection's
+/// catalogue metadata. The comparison is fail-closed: any mismatch, missing
+/// menu-time target, lost probe, or an already-consumed anchor refuses the
+/// whole activation — surfaced as the cancelled action, never a partial
+/// dialog. The residual gap is only the probe's own start after menu build —
+/// scheduler-scale, not the menu's human-scale lifetime.
+fn capture_and_validate_pending_locals(
+    paths: &[std::path::PathBuf],
+    menu_time: Option<MenuTimeLocalsRx>,
+) -> Result<MenuTimeLocals, &'static str> {
+    let menu_time = match menu_time {
+        Some(rx) => match rx.blocking_recv() {
+            Ok(Some(capture)) => capture,
+            Ok(None) => return Err("the menu-time local capture failed"),
+            Err(_) => return Err("the menu-time local capture was lost"),
+        },
+        // The receiver is consumed by the first activation of an action, and
+        // the menu never offers a second activation of the same action; an
+        // unanchored admission refuses rather than trusting a pathname
+        // nobody captured.
+        None => return Err("the menu-time local evidence was already consumed"),
+    };
+    let admitted = capture_pending_locals(paths);
+    if !menu_time_capture_still_holds(&menu_time, &admitted) {
+        return Err("a selected pathname's object changed between menu build and admission");
+    }
+    Ok(admitted)
 }
 
 /// The admitted targets a Properties activation opens the dialog with.
@@ -2858,6 +2972,46 @@ pub mod tests {
                 PathBuf::from("/music/first.flac"),
                 PathBuf::from("/music/second.flac"),
             ]
+        );
+    }
+
+    #[test]
+    fn menu_time_capture_holds_when_every_admitted_path_still_matches() {
+        // The menu-time map is the anchor: a pathname captured at menu build
+        // that admits the same selection at activation — here, the same
+        // twice-failing capture category — holds the comparison, and an
+        // admitted set with nothing to validate holds vacuously.
+        let path = PathBuf::from("/definitely/not/here.flac");
+        let menu_time: AdmittedLocals = std::iter::once((
+            path.clone(),
+            crate::local::tag_writer::LocalMutationTarget::capture(&path),
+        ))
+        .collect();
+        let admitted_target = crate::local::tag_writer::LocalMutationTarget::capture(&path);
+        let admitted: AdmittedLocals = std::iter::once((path, admitted_target)).collect();
+
+        assert!(
+            menu_time_capture_still_holds(&menu_time, &admitted),
+            "the unchanged selection must hold the menu-time comparison"
+        );
+        assert!(
+            menu_time_capture_still_holds(&menu_time, &AdmittedLocals::new()),
+            "nothing admitted means nothing to refuse"
+        );
+    }
+
+    #[test]
+    fn menu_time_capture_refuses_an_admitted_path_the_menu_never_captured() {
+        // An admitted pathname with no menu-time counterpart means the
+        // admission covers something the menu never anchored: a wiring
+        // fault that must refuse, never stitch.
+        let path = PathBuf::from("/definitely/not/here.flac");
+        let admitted_target = crate::local::tag_writer::LocalMutationTarget::capture(&path);
+        let admitted: AdmittedLocals = std::iter::once((path, admitted_target)).collect();
+
+        assert!(
+            !menu_time_capture_still_holds(&AdmittedLocals::new(), &admitted),
+            "an unanchored admitted pathname must fail the menu-time comparison"
         );
     }
 
