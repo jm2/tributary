@@ -30,6 +30,12 @@ mod tests;
 #[allow(clippy::float_cmp)] // snapped gains land on exactly representable half-steps
 pub mod widget_tests;
 
+// Round-3 resync contracts (PR 220), split out of `widget_tests` to
+// stay under the file-length gate; same cfg gate, run by the same
+// crate-wide GTK test through `widget_tests`.
+#[cfg(all(test, not(target_os = "macos")))]
+mod widget_resync_tests;
+
 pub use build::build_equalizer_group;
 
 use std::rc::Rc;
