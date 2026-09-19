@@ -8746,25 +8746,128 @@ mod tests {
     }
 
     /// Construct an idle watcher backend for tests that never install
-    /// watches, or `None` when the host cannot supply one.
+    /// watches, or `None` only when the host has no watcher capacity.
     ///
     /// `RecommendedWatcher::new` claims one inotify instance, and
     /// `fs.inotify.max_user_instances` is a per-user kernel cap. On a shared
     /// host other tenants can hold every instance, so construction fails with
     /// EMFILE no matter what the code under test does — host capacity, not a
     /// watcher-contract regression. The deterministic assertions these tests
-    /// make are unchanged on a healthy host; the caller skips instead of
-    /// failing on a saturated one.
+    /// make are unchanged on a healthy host. Any non-capacity construction
+    /// error (backend, configuration, or platform regression) panics so the
+    /// test fails loudly; the skip is scoped by
+    /// `is_watcher_backend_capacity_error`, unit-tested below.
     fn idle_watcher_backend_or_skip() -> Option<RecommendedWatcher> {
         match RecommendedWatcher::new(
             |_: notify::Result<notify::Event>| {},
             notify::Config::default(),
         ) {
             Ok(backend) => Some(backend),
-            Err(error) => {
-                eprintln!("skipping watcher test: host cannot supply a watcher backend: {error}");
+            Err(error) if is_watcher_backend_capacity_error(&error) => {
+                eprintln!("skipping watcher test: host has no watcher capacity: {error}");
                 None
             }
+            Err(error) => panic!("construct idle watcher backend: {error}"),
+        }
+    }
+
+    /// Linux errno values for the inotify capacity failures, kept as raw
+    /// numbers to avoid a libc dev-dependency: EMFILE (24) means
+    /// `fs.inotify.max_user_instances` is exhausted, ENOSPC (28) means
+    /// `fs.inotify.max_user_watches` is exhausted. EPERM (1) is the
+    /// manufactured non-capacity control in the decision tests.
+    const EMFILE: i32 = 24;
+    const ENOSPC: i32 = 28;
+    const EPERM: i32 = 1;
+
+    /// True only when `error` is the documented shared-host capacity
+    /// condition: the kernel refused inotify state because a per-user limit
+    /// is exhausted — EMFILE (instances), ENOSPC (watch descriptors), or
+    /// notify's explicit `MaxFilesWatch`. Every other error — a backend
+    /// initialization, configuration, or platform regression such as EPERM —
+    /// must fail the test instead of skipping it, so this predicate is
+    /// deliberately narrow and unit-tested in both directions below.
+    fn is_watcher_backend_capacity_error(error: &notify::Error) -> bool {
+        match &error.kind {
+            notify::ErrorKind::Io(io_error) => {
+                matches!(io_error.raw_os_error(), Some(EMFILE | ENOSPC))
+            }
+            notify::ErrorKind::MaxFilesWatch => true,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn watcher_backend_capacity_decision_skips_capacity_errors() {
+        // Positive control: each documented host-capacity class maps to skip.
+        let capacity_errors = [
+            (
+                "EMFILE (max_user_instances)",
+                notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
+                    EMFILE,
+                ))),
+            ),
+            (
+                "ENOSPC (max_user_watches)",
+                notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
+                    ENOSPC,
+                ))),
+            ),
+            (
+                "notify MaxFilesWatch",
+                notify::Error::new(notify::ErrorKind::MaxFilesWatch),
+            ),
+        ];
+        for (name, error) in capacity_errors {
+            assert!(
+                is_watcher_backend_capacity_error(&error),
+                "{name} is host capacity and must skip"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_backend_capacity_decision_fails_non_capacity_errors() {
+        // A backend, configuration, or platform regression is a real defect:
+        // the only tests exercising real watcher installation must fail, not
+        // skip.
+        let non_capacity_errors = [
+            (
+                "EPERM (hardened runner)",
+                notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
+                    EPERM,
+                ))),
+            ),
+            (
+                "non-OS io error",
+                notify::Error::new(notify::ErrorKind::Io(std::io::Error::other(
+                    "backend initialization failed",
+                ))),
+            ),
+            (
+                "notify Generic",
+                notify::Error::new(notify::ErrorKind::Generic(
+                    "backend initialization failed".to_string(),
+                )),
+            ),
+            (
+                "notify InvalidConfig",
+                notify::Error::new(notify::ErrorKind::InvalidConfig(notify::Config::default())),
+            ),
+            (
+                "notify WatchNotFound",
+                notify::Error::new(notify::ErrorKind::WatchNotFound),
+            ),
+            (
+                "notify PathNotFound",
+                notify::Error::new(notify::ErrorKind::PathNotFound),
+            ),
+        ];
+        for (name, error) in non_capacity_errors {
+            assert!(
+                !is_watcher_backend_capacity_error(&error),
+                "{name} is not host capacity and must fail the test"
+            );
         }
     }
 
@@ -8777,14 +8880,19 @@ mod tests {
 
         // install_directory_watcher fails only when the backend cannot be
         // constructed (its per-directory watch errors are logged and
-        // skipped inside), so an Err here is exactly the saturated-host
-        // condition above.
-        let Ok(mut watcher) = install_directory_watcher(&[ready.clone(), late.clone()]) else {
-            eprintln!(
-                "skipping watcher_retries_a_root_that_appears_during_bootstrap: \
-                 no watcher backend available on this host"
-            );
-            return;
+        // skipped inside). A capacity error is the saturated-host condition
+        // above and skips; any other construction error is a real watcher
+        // regression and must still fail this test.
+        let mut watcher = match install_directory_watcher(&[ready.clone(), late.clone()]) {
+            Ok(watcher) => watcher,
+            Err(error) if is_watcher_backend_capacity_error(&error) => {
+                eprintln!(
+                    "skipping watcher_retries_a_root_that_appears_during_bootstrap: \
+                     host has no watcher capacity: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("install directory watcher: {error}"),
         };
         assert!(watcher.watched_directories.contains(&ready));
         assert!(!watcher.watched_directories.contains(&late));
