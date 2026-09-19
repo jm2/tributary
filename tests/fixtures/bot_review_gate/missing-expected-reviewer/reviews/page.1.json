@@ -1,0 +1,30 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "1111111111111111111111111111111111111111",
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "cursor-clean-page.1.json"
+          },
+          "nodes": [
+            {
+              "url": "u/mer-human",
+              "state": "COMMENTED",
+              "submittedAt": "2026-09-07T10:00:00Z",
+              "databaseId": 1,
+              "commit": {
+                "oid": "2222222222222222222222222222222222222222"
+              },
+              "author": {
+                "__typename": "User",
+                "login": "octocat"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "1111111111111111111111111111111111111111",
+        "timelineItems": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "cursor-clean-timeline-page.1.json"
+          },
+          "nodes": [
+            {
+              "__typename": "ReviewRequestedEvent",
+              "createdAt": "2026-09-07T11:00:00Z",
+              "requestedReviewer": {
+                "__typename": "Bot",
+                "login": "coderabbitai"
+              }
+            },
+            {
+              "__typename": "ReviewRequestRemovedEvent",
+              "createdAt": "2026-09-07T12:00:00Z",
+              "requestedReviewer": {
+                "__typename": "Bot",
+                "login": "coderabbitai"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "description": "Read-only rollout manifest for the Tributary Bot Review Gate staged activation and the Dependabot readiness diagnostic. Secret entries name the credential store only; no secret value belongs in this file or anywhere in the repository.",
+  "rollout_owner_bead": "tr-rcvys",
+  "activation": {
+    "variable": "BOT_REVIEW_GATE_ACTIVATION",
+    "scope": "repository",
+    "inactive_values": ["", "inactive"],
+    "active_value": "active",
+    "inactive_behavior": "The Bot Review Gate publisher job is skipped before it can request the bot-review-gate-publisher environment or mint an App token. No App-authored check run is published and no merge authority is claimed; if the live main ruleset requires the App-bound Bot Review Gate context, its structural absence blocks merges rather than a workflow-token success being forged.",
+    "active_behavior": "The publisher requests the protected environment and mints the App token. A missing or wrong credential, binding, or API failure fails the job closed; an explicitly active gate never silently skips."
+  },
+  "environment": {
+    "name": "bot-review-gate-publisher",
+    "purpose": "Scopes the gate-publisher App private key to trusted default-branch deployment only.",
+    "deployment_policy": "custom branch policies naming exactly the main branch (type branch; no tags, no other branches, no wildcards); no required reviewers, no wait timer",
+    "protected_branches": false,
+    "custom_branch_policies": true
+  },
+  "apps": [
+    {
+      "name": "tributary-bot-review-gate-publisher",
+      "purpose": "Publish the App-authored Bot Review Gate check run at the evaluated head.",
+      "permissions": { "checks": "write" },
+      "credential_store": "environment:bot-review-gate-publisher",
+      "secret_names": ["BOT_REVIEW_GATE_APP_ID", "BOT_REVIEW_GATE_PRIVATE_KEY"],
+      "id_source": "repository variable BOT_REVIEW_GATE_APP_ID"
+    },
+    {
+      "name": "tributary-ruleset-reader",
+      "purpose": "Read the live main ruleset for the read-only Dependabot readiness diagnostic.",
+      "permissions": { "administration": "read" },
+      "credential_store": "dependabot",
+      "secret_names": ["RULESET_READER_APP_ID", "RULESET_READER_APP_PRIVATE_KEY"],
+      "id_source": "inside the Dependabot secret store only"
+    }
+  ],
+  "variables": [
+    {
+      "name": "BOT_REVIEW_GATE_APP_ID",
+      "scope": "repository",
+      "purpose": "Bind the required Bot Review Gate context to the gate-publisher App integration id in the live ruleset and in the Dependabot readiness diagnostic. Numeric only; an unset or non-numeric value fails closed."
+    },
+    {
+      "name": "BOT_REVIEW_GATE_ACTIVATION",
+      "scope": "repository",
+      "purpose": "The trusted default-off activation flag for staged publication."
+    }
+  ],
+  "required_status_checks": [
+    { "context": "Security Audit", "integration": "15368" },
+    { "context": "Linux (x86_64)", "integration": "15368" },
+    { "context": "Linux (aarch64)", "integration": "15368" },
+    { "context": "macOS (aarch64)", "integration": "15368" },
+    { "context": "Windows (x86_64)", "integration": "15368" },
+    { "context": "Windows (aarch64)", "integration": "15368" },
+    { "context": "Flatpak (Linux)", "integration": "15368" },
+    { "context": "MSRV", "integration": "15368" },
+    { "context": "Coverage (Linux x86_64)", "integration": "15368" },
+    { "context": "Desktop Metadata", "integration": "15368" },
+    { "context": "SHA256 Checksums", "integration": "15368" },
+    { "context": "Bot Review Gate", "integration": "variable:BOT_REVIEW_GATE_APP_ID" },
+    { "context": "CodeQL", "integration": "57789" },
+    { "context": "Analyze (python)", "integration": "57789" },
+    { "context": "Analyze (rust)", "integration": "57789" },
+    { "context": "Analyze (actions)", "integration": "57789" },
+    { "context": "Codacy Static Code Analysis", "integration": "56611" },
+    { "context": "CodeRabbit", "integration": null }
+  ],
+  "require_conversation_resolution": true,
+  "rollout_steps": [
+    "Create the tributary-bot-review-gate-publisher GitHub App with only checks:write, install it, create the bot-review-gate-publisher environment with custom deployment branch policies naming exactly the main branch (type branch; no tags, no other branches, no wildcards) and no required reviewers or wait timer, and store its credentials exclusively as that environment's secrets.",
+    "Set the repository variable BOT_REVIEW_GATE_APP_ID to the gate-publisher App's numeric id.",
+    "Create the tributary-ruleset-reader GitHub App with only administration:read and store its credentials as Dependabot secrets RULESET_READER_APP_ID and RULESET_READER_APP_PRIVATE_KEY.",
+    "Run scripts/preflight_bot_review_gate.sh; expect a staged-inactive, consistent result while activation is off.",
+    "Widen ruleset 17650907 to require every context in this manifest with the listed binding and switch on require-conversation-resolution.",
+    "Set the repository variable BOT_REVIEW_GATE_ACTIVATION to active and re-run the preflight; expect a validated result.",
+    "Validate against a live pull request: confirm every widened check reports, exercise the refresh path, and confirm the gate re-runs green at the same head after the last resolution.",
+    "Only then may a separate reviewed change re-introduce Dependabot auto-merge enablement."
+  ]
+}

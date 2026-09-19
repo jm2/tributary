@@ -169,19 +169,23 @@ raise SystemExit(64)
         self.assertEqual(calls.count("/files?"), 1)
         self.assertNotIn("safe=true", output)
 
-    def test_server_guard_rejects_h2_after_final_h1_readback(self):
-        script = workflow_run_script(
-            "dependabot-automerge",
-            "Enable exact-head auto-merge for patch & minor updates",
-        )
-        completed, calls, _ = self.run_workflow_script(
-            script,
-            heads="H1",
-            merge_head="H2",
-        )
-
-        self.assertEqual(completed.returncode, 42)
-        self.assertIn("'--match-head-commit', 'H1'", calls)
+    def test_staged_workflow_has_no_auto_merge_write_path(self):
+        # The staged implementation removes the auto-merge write path entirely
+        # (correction B in docs/dependency-updates.md): the workflow is a
+        # read-only readiness diagnostic, so there is no longer a server-side
+        # merge guard to race against. This guards the removal against
+        # regression and replaces the removed `--match-head-commit` guard test.
+        workflow = (
+            sync_fuzz_lock.REPOSITORY
+            / ".github"
+            / "workflows"
+            / "dependabot-automerge.yml"
+        ).read_text()
+        self.assertNotIn("gh pr merge", workflow)
+        self.assertNotIn("--match-head-commit", workflow)
+        self.assertNotIn("--auto", workflow)
+        self.assertNotIn("pull-requests: write", workflow)
+        self.assertNotIn("contents: write", workflow)
 
 
 class FuzzLockPolicyTests(unittest.TestCase):
