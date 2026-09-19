@@ -42,10 +42,13 @@ pub mod window_state;
 // threads — which panics or races GTK's single-threaded state on any
 // machine with a real display session. Headless CI never sees this because
 // `gtk::init` fails there and every test skips. Every widget test in this
-// crate funnels through [`widget_test_session::acquire`], which
+// crate funnels through [`widget_test_session::with_session`], which
 // serializes them behind one process-wide mutex held across `gtk::init()`
 // AND all widget construction/assertions, while keeping the display-gated
-// skip messages on machines without a display session.
+// skip messages on machines without a display session. The session also
+// pushes a dedicated main context as the thread default, so widget
+// realization never dispatches sources other tests left on the
+// process-global default context (see `acquire`).
 //
 // Note that the mutex SERIALIZES but does not give THREAD AFFINITY: a
 // second GTK-initializing `#[test]` still runs on its own worker thread
@@ -57,7 +60,7 @@ pub mod window_state;
 // join that test's body as a helper, never become a second `#[test]`.
 #[cfg(all(test, not(target_os = "macos")))]
 pub mod widget_test_session {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Mutex, OnceLock};
 
     /// The process-wide GTK test lock.
     fn lock() -> &'static Mutex<()> {
@@ -66,15 +69,42 @@ pub mod widget_test_session {
     }
 
     /// Acquires the process-wide GTK test lock, then — still holding it —
-    /// applies the display-session gate and initializes GTK at most once
-    /// per process.
+    /// applies the display-session gate, initializes GTK at most once per
+    /// process, and runs `body` with a **dedicated main context** pushed
+    /// as the calling thread's thread-default context. The push is what
+    /// makes main-context pumping safe inside the session: parallel
+    /// non-widget tests (the audio suite in particular) construct players
+    /// whose production code attaches thread-affine glib sources —
+    /// `timeout_add_local` position timers, debounced
+    /// `timeout_add_local_once` persistence saves — to the process-global
+    /// default context, and those tests never run a main loop, so the
+    /// sources stay pending there. Any test that pumped the global default
+    /// context would dispatch a foreign source on its own worker thread,
+    /// tripping glib's `ThreadGuard` ("Value accessed from different
+    /// thread than where it was created") inside a non-unwinding C
+    /// trampoline and aborting the entire test binary (tr-8wtab). Pump the
+    /// session's context instead — helpers can fetch it with
+    /// `MainContext::thread_default()`, which returns `Some` exactly
+    /// because the session pushed it — so only sources this same thread
+    /// scheduled ever dispatch. When the session pops the context, its
+    /// undrained sources are simply dropped with the thread.
     ///
-    /// Returns the guard that the caller MUST hold across every widget
-    /// construction and assertion in the test body (that is the whole
-    /// point of the lock: a second GTK-initializing test must not touch
-    /// GTK state while the first is mid-flight, on this or any other
-    /// worker thread). Returns `None` — releasing the lock — when the
-    /// caller must skip:
+    /// `body` runs entirely inside the session, so the type system — not
+    /// a returned guard — enforces that every widget construction and
+    /// assertion happens while the lock is held: a second GTK-initializing
+    /// test must not touch GTK state while the first is mid-flight, on
+    /// this or any other worker thread. The push uses glib's public,
+    /// panic-safe scoped API `MainContext::with_thread_default` (glib's
+    /// private `ThreadDefaultContext` RAII, usable here without a single
+    /// `unsafe` — which is the whole point of routing through it instead
+    /// of hand-rolling the FFI pair: the static-analysis gate counts any
+    /// new `unsafe` usage as an actionable finding). The context is
+    /// acquired, pushed, and popped again — even if `body` panics — all
+    /// before `_guard` (the GTK test mutex) is released at scope end, so
+    /// the push/pop pair never straddles a lock handoff to the next
+    /// widget test.
+    ///
+    /// Returns `None` — without calling `body` — when the caller must skip:
     ///
     /// - no display session (`$WAYLAND_DISPLAY`/`$DISPLAY` both unset):
     ///   headless GTK can still come up via its Broadway fallback, and a
@@ -97,13 +127,15 @@ pub mod widget_test_session {
     /// skipping every widget assertion behind an otherwise-green suite.
     /// Leave the variable unset for the default headless behavior, where
     /// skipping is the intended, reported outcome.
-    pub fn acquire(label: &str) -> Option<MutexGuard<'static, ()>> {
+    pub fn with_session<R>(label: &str, body: impl FnOnce() -> R) -> Option<R> {
         let fail_closed = std::env::var_os("TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED").is_some();
 
         // A panicked earlier test must not cascade into every later widget
         // test: the data the guard protects is stateless (just ordering),
-        // so a poisoned lock is safe to carry on from.
-        let guard = lock()
+        // so a poisoned lock is safe to carry on from. `_guard` is
+        // load-bearing despite its name: the binding stays alive — and the
+        // mutex locked — until `with_session` returns.
+        let _guard = lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -144,6 +176,16 @@ pub mod widget_test_session {
             }
         }
 
-        Some(guard)
+        // Push the session's dedicated main context as the thread default
+        // for exactly the duration of `body` (see the doc comment above
+        // for why the global default context is a cross-thread dispatch
+        // hazard here). A fresh context always acquires: nothing else owns
+        // it yet.
+        let context = gtk::glib::MainContext::new();
+        Some(
+            context
+                .with_thread_default(body)
+                .expect("fresh main context always acquires: nothing else owns it yet"),
+        )
     }
 }

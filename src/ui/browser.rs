@@ -1186,25 +1186,27 @@ mod tests {
     /// equivalent of an Orca row-announcement smoke test.
     #[test]
     fn gtk_widget_contracts_hold_on_one_session() {
-        // Hold the process-wide GTK test session (display gate + single
-        // `gtk::init` + serialization lock) across every widget
-        // construction and assertion below, including the context-menu
-        // helpers: GTK requires single-threaded use after initialization.
-        // See `ui::widget_test_session`.
-        let Some(_gtk_session) =
-            crate::ui::widget_test_session::acquire("gtk widget contracts test")
-        else {
+        // Run every widget construction and assertion below — including
+        // the context-menu and preferences helpers — inside the
+        // process-wide GTK test session (display gate + single `gtk::init`
+        // + serialization lock + dedicated thread-default main context):
+        // GTK requires single-threaded use after initialization. See
+        // `ui::widget_test_session`.
+        let Some(()) = crate::ui::widget_test_session::with_session(
+            "gtk widget contracts test",
+            || {
+                let (list_item, row) = make_setup_list_item();
+                assert_row_roles_presentational(&row);
+                assert_combined_bind_contract(&list_item, &row);
+                assert_unbind_reset(&list_item, &row);
+                assert_zero_count_contract(&list_item, &row);
+                assert_unbind_reset(&list_item, &row);
+
+                crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
+                crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
+            },
+        ) else {
             return;
         };
-
-        let (list_item, row) = make_setup_list_item();
-        assert_row_roles_presentational(&row);
-        assert_combined_bind_contract(&list_item, &row);
-        assert_unbind_reset(&list_item, &row);
-        assert_zero_count_contract(&list_item, &row);
-        assert_unbind_reset(&list_item, &row);
-
-        crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
-        crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
     }
 }

@@ -2398,7 +2398,19 @@ pub mod tests {
         column_view.append_column(&gtk::ColumnViewColumn::new(Some("Title"), Some(factory)));
         let window = gtk::Window::builder().child(&column_view).build();
         window.present();
-        let context = glib::MainContext::default();
+        // Pump the widget test session's thread-default main context —
+        // never the process-global default. Parallel non-widget tests (the
+        // audio suite in particular) leave thread-affine glib sources
+        // pending on the global default context (production code schedules
+        // position timers and debounced saves there, and tests never run a
+        // main loop). Dispatching one of those here — on this test's
+        // worker thread — trips glib's ThreadGuard inside a non-unwinding
+        // C trampoline and aborts the whole test binary (tr-8wtab). The
+        // session context only ever holds sources this same thread
+        // scheduled, so pumping it is safe; the expect documents the
+        // invariant that this helper runs inside a widget test session.
+        let context = glib::MainContext::thread_default()
+            .expect("widget_test_session::with_session pushes a thread-default context");
         while context.pending() {
             context.iteration(false);
         }
