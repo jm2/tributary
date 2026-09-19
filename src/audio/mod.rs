@@ -202,6 +202,16 @@ struct EqEngineState {
     /// repeating timer clears the flag when the transaction settles or
     /// dies with the chain.
     clip_swap_poll_armed: bool,
+    /// The open equalizer panel's display-resync closure (refinery
+    /// round 3, PR 220): registered by the panel build path through
+    /// [`AudioOutput::connect_equalizer_resync`], invoked by the poll's
+    /// reconciliation when — and only when — it lands a recorded value
+    /// that differs from the previously recorded one, so an already-open
+    /// panel re-reads the recorded state instead of keeping the walk-back
+    /// it displayed while the edit was parked. Single slot: the
+    /// preferences dialog is rebuilt per presentation, so a fresh panel
+    /// supersedes (and drops, widgets included) any stale registration.
+    panel_resync: Option<Rc<dyn Fn()>>,
 }
 
 /// Whether an equalizer state change may reach disk right now. The only
@@ -251,8 +261,10 @@ fn poll_pending_clip_swap_tick(state_rc: &Rc<RefCell<EqEngineState>>) -> Pending
 /// Reconcile the recorded clip protection with a settled limiter edit and
 /// persist the truth (the same recorded-vs-installed discipline the
 /// synchronous path applies). Extracted from the arming method to keep it
-/// within its method-length budget (Codacy, PR 220 head cea20fe);
-/// behavior is unchanged.
+/// within its method-length budget (Codacy, PR 220 head cea20fe). When
+/// the reconciled value differs from the previously recorded one, the
+/// registered panel resync is notified so an already-open panel re-reads
+/// the recorded state (refinery round 3, PR 220).
 fn reconcile_adopted_clip_swap(
     state_rc: &Rc<RefCell<EqEngineState>>,
     installed: bool,
@@ -278,6 +290,7 @@ fn reconcile_adopted_clip_swap(
         // path owns the recorded state now — nothing to reconcile.
         return;
     };
+    let previous = state.settings.clip_protection;
     state.settings.clip_protection = if installed {
         // The requested toggle is installed; the request was peeked from
         // the parked transaction before adoption, so it is present here.
@@ -290,6 +303,29 @@ fn reconcile_adopted_clip_swap(
     // Persist the reconciled truth through the trailing-edge debounce
     // (the same schedule the apply path uses).
     schedule_eq_save_for(state_rc);
+    notify_panel_resync(state_rc, previous);
+}
+
+/// Notify the registered panel resync after a reconciliation moved the
+/// recorded clip protection off `previous` (refinery round 3, PR 220):
+/// the open panel displayed the walk-back while the edit was parked, so
+/// it must re-read the recorded state once the settled truth lands. An
+/// adoption that records the already-recorded value — a rollback
+/// restoring the pre-edit layout — notifies nothing, the mirror image of
+/// the panel's apply handlers' echo-safety skip. The closure runs here
+/// on the main context with no engine borrow held, so it can re-read the
+/// recorded state through the output.
+fn notify_panel_resync(state_rc: &Rc<RefCell<EqEngineState>>, previous: equalizer::ClipProtection) {
+    let (recorded, resync) = {
+        let state = state_rc.borrow();
+        (state.settings.clip_protection, state.panel_resync.clone())
+    };
+    if recorded == previous {
+        return;
+    }
+    if let Some(resync) = resync {
+        resync();
+    }
 }
 
 /// The shared body of the trailing-edge debounced equalizer persistence:
@@ -482,6 +518,7 @@ impl Player {
             persistence_suppressed: eq_load_status == equalizer::EqLoadStatus::TransientReadFailure,
             retired: false,
             clip_swap_poll_armed: false,
+            panel_resync: None,
         }));
 
         #[cfg(target_os = "windows")]
@@ -881,6 +918,21 @@ impl Player {
                 equalizer::ClipProtection::Off
             }
         })
+    }
+
+    /// Register the open equalizer panel's display-resync closure
+    /// (refinery round 3, PR 220). The panel build path calls this
+    /// through the [`AudioOutput`](crate::audio::output::AudioOutput)
+    /// seam; the parked limiter edit's main-context poll invokes the
+    /// closure when its reconciliation lands a recorded clip-protection
+    /// value that differs from the previously recorded one, so the open
+    /// panel re-reads the recorded state instead of keeping the walk-back
+    /// it displayed while the edit was parked. Registration replaces any
+    /// previous closure: the preferences dialog is rebuilt per
+    /// presentation, so the newest open panel supersedes a stale one
+    /// (whose widget references drop with the replaced closure).
+    pub fn connect_equalizer_resync(&self, on_resync: Rc<dyn Fn()>) {
+        self.eq_state.borrow_mut().panel_resync = Some(on_resync);
     }
 
     /// Limiter-only topology change inside the installed bin (clip
@@ -2297,6 +2349,7 @@ mod tests {
             persistence_suppressed: true,
             retired: false,
             clip_swap_poll_armed: false,
+            panel_resync: None,
         }
     }
 
@@ -2659,6 +2712,87 @@ mod tests {
             );
             assert!(!chain.topology_wedged());
         }
+    }
+
+    /// Regression (refinery round 3, PR 220): when the main-context poll
+    /// adopts a parked limiter edit whose settled truth differs from the
+    /// previously recorded clip protection, the panel-registered resync
+    /// must fire exactly once, so an already-open panel re-reads the
+    /// recorded state instead of keeping the walk-back it displayed while
+    /// the edit was parked.
+    #[test]
+    fn adopted_clip_swap_notifies_the_panel_resync_when_the_recorded_value_changes() {
+        use equalizer::ClipProtection;
+
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+        // The user's Off toggle parks across the engagement window: the
+        // recorded state stays at the pre-edit Soft (the walk-back the
+        // open panel displays).
+        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+        let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let hits = std::rc::Rc::clone(&resyncs);
+        player.connect_equalizer_resync(std::rc::Rc::new(move || {
+            hits.set(hits.get() + 1);
+        }));
+
+        // The parked surgery succeeds: the recorded value moves Soft →
+        // Off on the main context, and the resync fires for it.
+        let accepted = complete_pending_edit(&player, true);
+        assert!(accepted, "the parked transaction accepted its publication");
+        let adopted = drive_context_until_eq_state(&player, |state| {
+            state.settings.clip_protection == ClipProtection::Off
+        });
+        assert!(adopted, "the parked completion was never adopted");
+        assert_eq!(
+            resyncs.get(),
+            1,
+            "the moved recorded value must notify the panel resync exactly once"
+        );
+    }
+
+    /// Regression (refinery round 3, PR 220), the echo-safety control:
+    /// an adoption landing the already-recorded value — a rollback
+    /// restoring the pre-edit layout — must notify nothing. The panel
+    /// already displays that value; a notification would be the mirror
+    /// of the apply handlers' echo-safety violation.
+    #[test]
+    fn adopted_clip_swap_stays_silent_when_the_recorded_value_is_unchanged() {
+        use equalizer::ClipProtection;
+
+        if !eq_engine_plugins_available() {
+            return;
+        }
+        let player = eq_player_with_pending_clip_edit(ClipProtection::Off);
+        apply_serialized(&player, eq_enabled_settings(ClipProtection::Off));
+        let resyncs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let hits = std::rc::Rc::clone(&resyncs);
+        player.connect_equalizer_resync(std::rc::Rc::new(move || {
+            hits.set(hits.get() + 1);
+        }));
+
+        // The parked surgery restores the pre-edit layout: the chain
+        // keeps its limiter, so the reconciled Soft equals the recorded
+        // Soft and the poll must stay silent.
+        let accepted = complete_pending_edit(&player, false);
+        assert!(accepted, "the parked transaction accepted its publication");
+        let adopted = drive_context_until_eq_state(&player, |state| !state.clip_swap_poll_armed);
+        assert!(adopted, "the parked completion was never adopted");
+        {
+            let state = player.eq_state.borrow();
+            assert_eq!(
+                state.settings.clip_protection,
+                ClipProtection::Soft,
+                "the rollback must leave the recorded pre-edit truth in place"
+            );
+        }
+        assert_eq!(
+            resyncs.get(),
+            0,
+            "an unchanged recorded value must not notify the panel resync"
+        );
     }
 
     /// Regression (refinery R1, PR 220 audit): while a limiter edit is

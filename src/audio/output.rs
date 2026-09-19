@@ -28,6 +28,8 @@
 //! (local, Subsonic, Jellyfin, Plex, DAAP, radio) are managed by the
 //! sidebar and are completely independent of the active output.
 
+use std::rc::Rc;
+
 use super::equalizer::EqSettings;
 use super::{PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
@@ -110,6 +112,20 @@ pub trait AudioOutput {
     fn reload_equalizer_settings(&self) -> EqSettings {
         self.equalizer_settings()
     }
+
+    /// Register the settings panel's display-resync closure (refinery
+    /// round 3, PR 220). An output whose equalizer engine can change its
+    /// recorded state asynchronously — the local pipeline's parked
+    /// limiter edit, adopted by a main-context poll — invokes the
+    /// closure on the GTK main context when, and only when, a recorded
+    /// value lands that differs from the previously recorded one, so an
+    /// already-open panel re-reads the recorded state instead of keeping
+    /// the walk-back it displayed. The closure is a display refresh, not
+    /// an edit: it must never re-apply. A no-op default for outputs
+    /// without an asynchronous equalizer seam; the closure is dropped.
+    /// Registration replaces any previous closure (the panel is rebuilt
+    /// per presentation).
+    fn connect_equalizer_resync(&self, _on_resync: Rc<dyn Fn()>) {}
 
     /// Synchronously flush any pending equalizer persistence this output
     /// still owes to disk. The normal close-request drain invokes this
