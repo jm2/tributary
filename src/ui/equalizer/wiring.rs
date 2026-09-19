@@ -64,6 +64,12 @@ pub(super) fn wire_equalizer_controls(
     wire_clip_dropdown(active_output, &controls.clip_dropdown, updating);
     wire_reset_button(active_output, controls, updating);
     wire_reload_button(active_output, controls, updating);
+    wire_clip_swap_resync(
+        active_output,
+        &controls.clip_dropdown,
+        &controls.preset_dropdown,
+        updating,
+    );
 }
 
 /// Enable switch: flip the typed state's `enabled` flag, then reflect
@@ -315,6 +321,50 @@ pub(super) fn clip_menu_position(protection: ClipProtection) -> u32 {
         ClipProtection::Off => 0,
         ClipProtection::Soft => 1,
     }
+}
+
+/// Display resync for an already-open panel (refinery round 3, PR 220).
+/// A clip toggle parked across the limiter-edit engagement window is
+/// walked back on display at toggle time, but the engine's main-context
+/// poll can adopt the parked edit *later* — while the panel stays open
+/// showing that walk-back. The panel therefore registers this closure
+/// through the output's
+/// [`connect_equalizer_resync`](crate::audio::output::AudioOutput::connect_equalizer_resync);
+/// the poll's reconciliation invokes it on the main context when — and
+/// only when — the reconciled recorded value differs from the previously
+/// recorded one.
+///
+/// The resync is the mirror image of the handlers' echo-safety skip: it
+/// re-reads the recorded state through the output and re-selects the
+/// clip combo (and the preset combo, keeping the display consistent
+/// should a reconciliation ever land a named preset) under the shared
+/// re-entrancy guard. It never applies — the state is already recorded
+/// — so it can neither re-apply identical settings, arm a spurious
+/// debounced save, nor move the persisted preset to `custom`, and any
+/// late echo of its own reflection is caught by the guard and the
+/// handlers' recorded-state skips.
+fn wire_clip_swap_resync(
+    active_output: &SharedAudioOutput,
+    clip_dropdown: &gtk::DropDown,
+    preset_dropdown: &gtk::DropDown,
+    updating: &Rc<Cell<bool>>,
+) {
+    // `registering` exists so the `Ref` temporary of the registration
+    // call never overlaps the closure's capture of `closure_output`.
+    let registering = active_output.clone();
+    let closure_output = active_output.clone();
+    let updating = updating.clone();
+    let clip_dropdown = clip_dropdown.clone();
+    let preset_dropdown = preset_dropdown.clone();
+    registering
+        .borrow()
+        .connect_equalizer_resync(Rc::new(move || {
+            let recorded = closure_output.borrow().equalizer_settings();
+            updating.set(true);
+            clip_dropdown.set_selected(clip_menu_position(recorded.clip_protection));
+            preset_dropdown.set_selected(preset_menu_position(recorded.preset));
+            updating.set(false);
+        }));
 }
 
 /// Reset to Flat: bands and preamp to zero, preset to Flat; Enabled and

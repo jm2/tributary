@@ -4,6 +4,8 @@
 //! This is the default "My Computer" output that plays audio through
 //! the system's speakers or headphones via a GStreamer `playbin3` pipeline.
 
+use std::rc::Rc;
+
 use super::equalizer::EqSettings;
 use super::output::{AudioOutput, OutputType};
 use super::{Player, PlayerEventGeneration, PlayerState};
@@ -49,6 +51,10 @@ impl AudioOutput for LocalOutput {
 
     fn reload_equalizer_settings(&self) -> EqSettings {
         self.player.reload_equalizer_settings()
+    }
+
+    fn connect_equalizer_resync(&self, on_resync: Rc<dyn Fn()>) {
+        self.player.connect_equalizer_resync(on_resync);
     }
 
     fn flush_equalizer_for_shutdown(&self) {
