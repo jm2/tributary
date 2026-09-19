@@ -1170,7 +1170,10 @@ impl PolicySupervision {
     /// Supervise the activation's frozen generation.
     ///
     /// The starting publication is consumed immediately so only later
-    /// publications register as changes.
+    /// publications register as changes. Callers must subscribe before their
+    /// final generation freeze: a publication racing the start window is then
+    /// either caught by that freeze or still pending on this watch, never
+    /// silently consumed as the starting state.
     fn for_activation(live: &LastFmLivePolicy, generation: u64) -> Self {
         let mut changes = live.subscribe();
         changes.borrow_and_update();
@@ -3668,6 +3671,14 @@ pub async fn spawn_lastfm_runtime(
     let cleanup_only =
         queue_state.durable_pause == Some(storage::LastFmDurablePause::CredentialCleanupRequired);
     let epoch = LastFmAccountEpoch::INITIAL;
+    // Subscribe to live-policy publications BEFORE the final freeze. A
+    // publication's slot write precedes its watch send, and the subscription
+    // (with its starting-state consumption) precedes the freeze below, so
+    // every publication is either observed by the freeze itself or still
+    // pending on the supervisor's watch when the owner's loop first polls —
+    // a superseding publish can never be consumed as the watch's starting
+    // state and silently missed.
+    let supervision = PolicySupervision::for_activation(live_policy, activation.policy_generation);
     // The tombstone query, the blocking credential load, and the queue
     // validation above are awaits this start does not control. Freeze the live
     // slot one final time immediately before the delivery worker can observe
@@ -3779,7 +3790,7 @@ pub async fn spawn_lastfm_runtime(
             vault_lease: Some(Arc::new(vault_lease)),
         }),
         now_playing: None,
-        supervision: PolicySupervision::for_activation(live_policy, activation.policy_generation),
+        supervision,
     };
     let (completion_sender, completion) = watch::channel(LastFmRuntimeDrainState::Pending);
     let owner_task = tokio::spawn(async move {
