@@ -32,7 +32,14 @@ from urllib.parse import unquote
 INLINE_LINK_OPEN = re.compile(
     r"(?P<bang>!?)\[(?P<text>(?:[^\[\]]|\[[^\[\]]*\])*)\]\(\s*"
 )
-LINK_TAIL = re.compile(r"\s*(?:\"[^\"]*\"\s*)?\)")
+# A link tail is the optional title plus the closing parenthesis.  CommonMark
+# accepts three title delimiters — double-quoted, single-quoted, and
+# parenthesized (with balanced inner parentheses) — so a tail that knows only
+# one of them turns ``[x](missing.md 't')`` into non-link text and its broken
+# destination silently escapes the audit.
+LINK_TAIL = re.compile(
+    r"\s*(?:\"[^\"]*\"|'[^']*'|\((?:[^()]|\([^()]*\))*\))?\s*\)"
+)
 DEFINITION_LINK = re.compile(r"^\[(?P<label>[^\]]+)\]:\s*(?P<target><[^<>]*>|\S+)")
 HEADING = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>.*?)\s*#*\s*$")
 # A setext heading underline: one or more ``=`` or ``-`` characters under a
@@ -98,6 +105,99 @@ def iter_content_lines(text: str) -> Iterable[tuple[int, str]]:
         )
         if closing is not None:
             fence_char = None
+
+
+def _indent_width(line: str) -> int:
+    """Return a line's leading indentation width in columns."""
+    # CommonMark expands a tab to the next multiple of four columns, so a
+    # leading tab always reaches at least column four.
+    width = 0
+    for char in line:
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += 4 - (width % 4)
+        else:
+            break
+    return width
+
+
+def iter_prose_lines(text: str) -> Iterable[tuple[int, str]]:
+    """Yield ``(line_number, line)`` pairs outside fenced and indented code."""
+    # Link targets exist only in rendered prose.  Fenced code is literal
+    # text (the same fence rules ``iter_content_lines`` applies), and so is
+    # an *indented code block*: four-space indentation renders verbatim, so
+    # a documentation example indented into a code block must not be
+    # audited as a real link.
+    #
+    # Chosen CommonMark boundary: 4-space indentation opens a code block
+    # only when the line does not *lazily continue* an open paragraph.
+    # A paragraph line keeps the paragraph open; a blank line, a fence
+    # opener or closer, a heading, a setext underline, or any other block
+    # start (quote, list item, thematic break) closes it.  An indented
+    # line directly following paragraph text is therefore part of that
+    # paragraph — its links render and stay audited — while the first
+    # indented line after any such break starts code.  Inside the block,
+    # blank lines and continued indentation keep it open; any non-blank
+    # line with less than four indentation columns closes it.  List-item
+    # continuation lines whose content column exceeds four are an accepted
+    # approximation: they are classified as code when no paragraph is
+    # open, which errs toward skipping literal-looking content rather
+    # than auditing it.
+    fence_char: str | None = None
+    fence_len = 0
+    in_code = False
+    in_paragraph = False
+    for number, line in enumerate(text.splitlines(), start=1):
+        if fence_char is not None:
+            closing = re.fullmatch(
+                r" {0,3}" + re.escape(fence_char) + "{%d,}[ \t]*" % fence_len, line
+            )
+            if closing is not None:
+                fence_char = None
+                in_paragraph = False
+            continue
+        opening = FENCE_PATTERN.match(line)
+        if opening is not None:
+            char = opening.group("char")
+            info = opening.group("info")
+            if not (char == "`" and "`" in info):
+                # A real fence interrupts any paragraph and any indented
+                # code block started before it.
+                fence_char = char
+                fence_len = len(opening.group("fence"))
+                in_paragraph = False
+                in_code = False
+                continue
+            # A backtick run whose info string holds a backtick is literal
+            # text, not a fence opener; treat the line as ordinary prose.
+        if not line.strip():
+            # A blank line ends a paragraph but never closes an indented
+            # code block (blank lines are part of one).
+            if not in_code:
+                yield number, line
+            in_paragraph = False
+            continue
+        if in_code:
+            if _indent_width(line) >= 4:
+                continue
+            in_code = False
+        elif _indent_width(line) >= 4:
+            if in_paragraph:
+                # Lazy continuation: paragraph text renders, links are real.
+                yield number, line
+                continue
+            in_code = True
+            continue
+        if (
+            _NON_PARAGRAPH.match(line) is not None
+            or SETEXT_UNDERLINE.match(line) is not None
+            or HEADING.match(line) is not None
+        ):
+            in_paragraph = False
+        else:
+            in_paragraph = True
+        yield number, line
 
 
 def _code_span_bounds(line: str, index: int) -> tuple[int, int, int] | None:
@@ -346,7 +446,13 @@ def split_target(target: str) -> tuple[str | None, str]:
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1]
     if target.startswith("#"):
-        return "", target[1:]
+        return "", unquote(target[1:])
+    if target.startswith("//"):
+        # A protocol-relative network-path reference: browsers resolve it
+        # against the current page's scheme, so it is external even though
+        # it carries no ``scheme:`` prefix and must never reach the
+        # filesystem check as a repo-relative path.
+        return None, ""
     if not target or ABSOLUTE_TARGET.match(target):
         return None, ""
     # Query and fragment components are URL parts, not filename text: GitHub
@@ -354,7 +460,9 @@ def split_target(target: str) -> tuple[str | None, str]:
     # ends at the first ``?`` or ``#``.  The fragment still starts at the
     # first ``#`` even when a query precedes it, and percent-decoding runs
     # after the split so an encoded ``%3F`` is never mistaken for a
-    # component separator.
+    # component separator.  The fragment decodes too: browsers match a
+    # percent-decoded fragment against the rendered element IDs, so
+    # ``#caf%C3%A9`` resolves to the anchor a ``Café`` heading exposes.
     path_part = re.split(r"[?#]", target, maxsplit=1)[0]
     _, _, fragment = target.partition("#")
-    return unquote(path_part), fragment
+    return unquote(path_part), unquote(fragment)

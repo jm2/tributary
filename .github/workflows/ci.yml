@@ -54,6 +54,7 @@ jobs:
           python3 scripts/test_check_backlog_consistency.py
           python3 scripts/test_check_backlog_consistency_rework.py
           python3 scripts/test_check_backlog_consistency_rework2.py
+          python3 scripts/test_check_backlog_consistency_rework3.py
 
       - name: Verify root and fuzz lock update coherence
         if: github.event_name == 'pull_request'

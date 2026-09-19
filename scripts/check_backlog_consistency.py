@@ -42,6 +42,7 @@ from backlog_markdown import (
     document_anchors,
     iter_content_lines,
     iter_link_targets,
+    iter_prose_lines,
     split_target,
 )
 
@@ -427,6 +428,10 @@ def _check_link_target(
 
 def check_links(root: Path, markdown_files: Sequence[Path]) -> list[str]:
     """Report relative link targets and ``#anchors`` that do not resolve."""
+    # Lines are read from *prose* only: fenced code blocks and indented code
+    # blocks render verbatim, so a documentation example inside either is
+    # not a real link and must not be validated (while a link on an
+    # indented lazy paragraph continuation renders and stays audited).
     problems: list[str] = []
     anchor_cache: dict[Path, set[str]] = {}
 
@@ -436,7 +441,7 @@ def check_links(root: Path, markdown_files: Sequence[Path]) -> list[str]:
         except OSError as error:  # pragma: no cover - unreadable checkout file
             problems.append(f"link: {relative_display(root, path)} is unreadable ({error})")
             continue
-        for number, line in iter_content_lines(text):
+        for number, line in iter_prose_lines(text):
             for target in iter_link_targets(line):
                 problems.extend(
                     _check_link_target(root, path, number, target, anchor_cache))

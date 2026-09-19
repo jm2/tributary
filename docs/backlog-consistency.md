@@ -32,8 +32,15 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
 3. **Internal links and anchors.** Every relative Markdown link target must
    exist inside the repository root — a target that resolves outside the root
    (including through a symlink) is reported — and every `#anchor` into
-   another Markdown file must match a heading. Anchors are matched exactly:
-   GitHub renders heading anchors lowercased, and browsers match fragments to
+   another Markdown file must match a heading. Links are audited in rendered
+   prose only: fenced code blocks and indented code blocks render verbatim,
+   so their content is skipped, while an indented line that lazily continues
+   an open paragraph renders and stays audited. A link's optional title may
+   use any CommonMark delimiter (`"…"`, `'…'`, `(…)`); targets with an
+   explicit scheme or a leading `//` (protocol-relative) are external and
+   skipped. Anchors are matched exactly after the fragment is
+   percent-decoded, the way a browser resolves it: GitHub renders heading
+   anchors lowercased, and browsers match fragments to
    element IDs case-sensitively, so a case-mismatched fragment is broken on
    GitHub even though a case-insensitive reader might resolve it. Only
    *tracked* Markdown files are enumerated in a Git checkout
@@ -49,6 +56,8 @@ is a read-only, dependency-free checker for those invariants. It runs in the CI
 python3 scripts/check_backlog_consistency.py
 python3 scripts/test_check_backlog_consistency.py
 python3 scripts/test_check_backlog_consistency_rework.py
+python3 scripts/test_check_backlog_consistency_rework2.py
+python3 scripts/test_check_backlog_consistency_rework3.py
 ```
 
 The checker exits `0` when everything passes and `1` when any check fails; each
@@ -56,9 +65,10 @@ failure prints a `[FAIL]` line naming the rule and the location. Exit `2` is a
 usage error raised before any check runs: the task index (`--task-index`, or
 `<root>/docs/task.md` by default) does not exist, or the `--ledger` snapshot
 path does not exist. Each usage error prints a single diagnostic on stderr.
-The two test modules split the suite so each stays under the 500-line limit
+The test modules split the suite so each stays under the 500-line limit
 enforced by static analysis: the main module covers the checker invariants and
-the pass paths, and the rework module covers the corrective findings F1-F6.
+the pass paths, and each rework module covers one corrective review round
+(F1-F6, then the parser-gap rounds J1-J3 and pbF-pbL).
 
 ## Optional ledger snapshot
 
