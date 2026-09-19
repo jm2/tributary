@@ -1353,7 +1353,7 @@ A2 to match the review report.
   UTF-16 plus drive/UNC prefixes at codec grain, and import refusal of every
   non-canonical spelling including ordinary `file:` URIs.
 
-#### A2 (thread j_WFM) — the intermediate matrix demanded refusal of valid-UTF-8 state-1 rows the baseline never refuses
+#### A2 (thread j_WFM) — the intermediate matrix demanded refusals the baseline never performs
 
 - **Finding:** §9's mandatory intermediate matrix required a closed refusal
   for "(c) an authoritative native row before its consumer has shipped", and
