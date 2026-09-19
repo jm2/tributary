@@ -488,6 +488,7 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         let mut albums = Vec::new();
         let mut artists = Vec::new();
         let mut stream_locators = Vec::new();
+        let mut representations = Vec::new();
         let mut track_artwork_locators = Vec::new();
         let mut attribution_profiles: Vec<(TrackId, Option<PlaybackAttributionProfile>)> =
             Vec::new();
@@ -502,6 +503,16 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
                     let album_id = item.album_id.as_deref().map(deterministic_uuid);
                     stream_locators.push((track_id.clone(), item.id.clone()));
+                    // Same authority as the full sync: the item's container
+                    // from library metadata labels the stream, so a
+                    // search-discovered track resolves to the same
+                    // representation it would have after a sync.
+                    representations.push((
+                        track_id.clone(),
+                        MediaRepresentation::buffered_from_suffix(
+                            item.container.as_deref().unwrap_or(""),
+                        ),
+                    ));
                     track_artwork_locators.push((track_id.clone(), item.album_id.clone()));
                     // Retained rows outside the refreshed catalogue still need
                     // Last.fm attribution authority: freeze the profile from
@@ -558,6 +569,7 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
 
         let mut cache = self.cache.write().await;
         cache.stream_locator_by_track_id.extend(stream_locators);
+        cache.representation_by_track_id.extend(representations);
         for (track_id, artwork_item_id) in track_artwork_locators {
             if let Some(artwork_item_id) = artwork_item_id {
                 cache
@@ -879,6 +891,7 @@ mod tests {
                         "Id": "search-track",
                         "Name": "Fixture Search Song",
                         "Type": "Audio",
+                        "Container": "flac",
                         "Album": "Fixture Album",
                         "AlbumId": "album-1",
                         "AlbumArtist": "Fixture Artist",
@@ -926,6 +939,21 @@ mod tests {
         assert_eq!(
             search.tracks[0].rating,
             TrackRating::read_only(Some(Rating::new(43).unwrap()))
+        );
+        // A search-discovered track carries the same container authority as
+        // a synced one: its Container labels the resolved representation.
+        let searched_id = search.tracks[0]
+            .native_track_id
+            .clone()
+            .expect("searched track native ID");
+        let resolved = backend
+            .resolve_stream(&searched_id)
+            .await
+            .expect("resolve searched track");
+        assert_eq!(
+            resolved.representation(),
+            MediaRepresentation::buffered_from_suffix("flac"),
+            "search result Container=flac must label the resolved stream"
         );
 
         let requests = service.requests();

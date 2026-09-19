@@ -460,7 +460,11 @@ impl MediaContainer {
             Self::Flac => "audio/flac",
             Self::Ogg | Self::Oga | Self::Opus => "audio/ogg",
             Self::Wav => "audio/wav",
-            Self::Aac | Self::M4a => "audio/mp4",
+            // `.aac` is a raw AAC/ADTS stream — IANA registers `audio/aac`;
+            // `audio/mp4` describes MP4-framed carriage (the M4A family), so
+            // the two variants must not share a label.
+            Self::Aac => "audio/aac",
+            Self::M4a => "audio/mp4",
             Self::Aiff => "audio/aiff",
             Self::Wma => "audio/x-ms-wma",
         }
@@ -869,8 +873,12 @@ mod tests {
         assert_eq!(flac.stream(), MediaStreamKind::Buffered);
 
         let aac = MediaRepresentation::buffered_from_suffix("AAC");
-        assert_eq!(aac.content_type(), Some("audio/mp4"));
+        assert_eq!(aac.content_type(), Some("audio/aac"));
         assert_eq!(aac.ticket_suffix(), Some("aac"));
+
+        let m4a = MediaRepresentation::buffered_from_suffix("m4a");
+        assert_eq!(m4a.content_type(), Some("audio/mp4"));
+        assert_eq!(m4a.ticket_suffix(), Some("m4a"));
 
         let opus = MediaRepresentation::buffered(MediaContainer::Opus);
         assert_eq!(opus.content_type(), Some("audio/ogg"));

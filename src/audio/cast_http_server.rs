@@ -615,16 +615,16 @@ impl CastHttpServer {
         // authoritative for the ticket path: extensionless endpoints such as
         // Subsonic `stream.view` and Jellyfin `Audio/{id}/stream` would
         // otherwise leave the receiver nothing but its default and mislabel a
-        // proxied FLAC or Opus stream as `audio/mpeg`. When the descriptor is
-        // explicitly unknown, the URL's recognized extension (a Plex part key
-        // such as `/file.flac`) remains the fallback; only a known audio
-        // extension is ever copied, so the ticket path stays opaque and
-        // nothing beyond this fixed set may shape it.
+        // proxied FLAC or Opus stream as `audio/mpeg`. URL sniffing stays
+        // exclusively in the legacy branch: a deliberately-unknown resolved
+        // descriptor must survive ticket creation, so an endpoint whose URL
+        // happens to end in a recognized extension gets an extensionless
+        // ticket instead of a guess. Only the legacy branch copies a
+        // recognized URL extension, and only a known audio extension is ever
+        // copied, so the ticket path stays opaque and nothing beyond this
+        // fixed set may shape it.
         let extension = match &request {
-            UpstreamRequest::Resolved(resolved) => resolved
-                .representation()
-                .ticket_suffix()
-                .or_else(|| upstream_media_extension(resolved.endpoint())),
+            UpstreamRequest::Resolved(resolved) => resolved.representation().ticket_suffix(),
             UpstreamRequest::Legacy(url) => upstream_media_extension(url),
         };
         let ticket = match extension {
@@ -2320,6 +2320,36 @@ mod tests {
         assert!(
             !unknown_path.contains('.'),
             "explicit unknown ticket must have no extension: {unknown_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_resolved_representation_keeps_the_endpoint_extension_out_of_the_ticket() {
+        let server = CastHttpServer::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("proxy server");
+        // The endpoint ends in a recognized audio extension, but the
+        // representation is deliberately unknown: URL sniffing must not
+        // promote that extension into the ticket path, or the unknown state
+        // would not survive ticket creation.
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/items/7.mp3").expect("extensioned endpoint"),
+        )
+        .expect("resolved request")
+        .with_lease(MediaLease::new())
+        .with_representation(MediaRepresentation::buffered_unknown());
+        let ticket = server
+            .register_resolved(request)
+            .expect("active resolved ticket");
+
+        let ticket_path = Url::parse(&ticket)
+            .expect("parse unknown ticket")
+            .path()
+            .to_string();
+        assert!(
+            !ticket_path.contains('.'),
+            "an unknown resolved request must get an extensionless ticket, \
+             not the endpoint's .mp3: {ticket_path}"
         );
     }
 

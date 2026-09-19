@@ -636,6 +636,14 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             cache
                 .stream_locator_by_track_id
                 .insert(track_id.clone(), song.id.clone());
+            // Same authority as the full sync: the song's suffix from
+            // library metadata labels the stream, so a search-discovered
+            // track resolves to the same representation it would have after
+            // a sync.
+            cache.representation_by_track_id.insert(
+                track_id.clone(),
+                MediaRepresentation::buffered_from_suffix(song.suffix.as_deref().unwrap_or("")),
+            );
             if let Some(cover_art_id) = &song.cover_art {
                 cache
                     .track_artwork_locator_by_track_id
@@ -1436,6 +1444,51 @@ mod tests {
         service.finish().await;
     }
 
+    #[tokio::test]
+    async fn search_results_carry_the_library_container_descriptor() {
+        let service = MockHttpService::start(descriptor_search_catalogue_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            "user",
+            &password,
+        )
+        .await
+        .expect("descriptor fixture catalogue");
+
+        // These tracks exist only in the search response — never synced — so
+        // their representations must come from the search path itself.
+        let results = backend.search("Search", 10).await.expect("search fixture");
+        assert_eq!(results.tracks.len(), 2);
+        for track in &results.tracks {
+            let track_id = track
+                .native_track_id
+                .clone()
+                .expect("search result retains its native ID");
+            let resolved = backend
+                .resolve_stream(&track_id)
+                .await
+                .expect("resolve search result");
+            match track.title.as_str() {
+                "Search Lossless" => assert_eq!(
+                    resolved.representation(),
+                    MediaRepresentation::buffered(MediaContainer::Flac),
+                    "search suffix flac must label the resolved stream"
+                ),
+                _ => {
+                    assert_eq!(track.title, "Search Opaque");
+                    assert_eq!(
+                        resolved.representation(),
+                        MediaRepresentation::buffered_unknown(),
+                        "an unrecognized search suffix must stay explicitly unknown"
+                    );
+                }
+            }
+        }
+        service.finish().await;
+    }
+
     fn descriptor_catalogue_routes() -> Vec<MockRoute> {
         let mut routes = vec![
             MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
@@ -1498,6 +1551,36 @@ mod tests {
                     }
                 }
             })))
+    }
+
+    fn descriptor_search_route() -> MockRoute {
+        MockRoute::get("/gateway/rest/search3.view")
+            .with_query("query", "Search")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "searchResult3": {
+                        "song": [
+                            {
+                                "id": "search-flac-track",
+                                "title": "Search Lossless",
+                                "suffix": "flac"
+                            },
+                            {
+                                "id": "search-ape-track",
+                                "title": "Search Opaque",
+                                "suffix": "ape"
+                            }
+                        ]
+                    }
+                }
+            })))
+    }
+
+    fn descriptor_search_catalogue_routes() -> Vec<MockRoute> {
+        let mut routes = descriptor_catalogue_routes();
+        routes.push(descriptor_search_route());
+        routes
     }
 
     fn assert_resolved_descriptor_matches_library(resolved: &ResolvedHttpRequest, title: &str) {
