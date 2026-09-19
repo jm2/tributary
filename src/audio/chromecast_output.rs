@@ -4592,7 +4592,7 @@ mod tests {
             (MediaContainer::Mp3, "audio/mpeg"),
             (MediaContainer::Flac, "audio/flac"),
             (MediaContainer::Ogg, "audio/ogg"),
-            (MediaContainer::Aac, "audio/mp4"),
+            (MediaContainer::Aac, "audio/aac"),
         ];
         for (generation, (container, expected_type)) in cases.iter().enumerate() {
             let shared = FakeShared::new();
