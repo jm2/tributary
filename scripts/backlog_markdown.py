@@ -19,16 +19,34 @@ from urllib.parse import unquote
 #
 # Inline links are parsed in two stages: INLINE_LINK_OPEN matches the
 # ``[text](`` head, then _parse_inline_destination scans the destination with
-# GitHub's destination rules.  A plain destination may hold balanced
-# parentheses or backslash-escaped ones, so ``[design](ADR_(draft).md)``
-# resolves to the file ``ADR_(draft).md`` rather than the first-``)``
-# truncation ``ADR_(draft``; a destination must still be followed by an
-# optional quoted title and the closing parenthesis, so ``[x](file.md``
-# stays literal text exactly as GitHub renders it.
-INLINE_LINK_OPEN = re.compile(r"(?P<bang>!?)\[(?P<text>[^\]]*)\]\(\s*")
+# GitHub's destination rules.  A link label may hold one level of balanced
+# brackets, per CommonMark bracket matching, so ``[outer [inner]](x.md)``
+# is a real link whose label renders as ``outer inner``; a flat ``[^]]*``
+# can never close such a label, and the destination would silently escape
+# the audit.  A plain destination may hold balanced parentheses or
+# backslash-escaped ones, so ``[design](ADR_(draft).md)`` resolves to the
+# file ``ADR_(draft).md`` rather than the first-``)`` truncation
+# ``ADR_(draft``; a destination must still be followed by an optional
+# quoted title and the closing parenthesis, so ``[x](file.md`` stays
+# literal text exactly as GitHub renders it.
+INLINE_LINK_OPEN = re.compile(
+    r"(?P<bang>!?)\[(?P<text>(?:[^\[\]]|\[[^\[\]]*\])*)\]\(\s*"
+)
 LINK_TAIL = re.compile(r"\s*(?:\"[^\"]*\"\s*)?\)")
 DEFINITION_LINK = re.compile(r"^\[(?P<label>[^\]]+)\]:\s*(?P<target><[^<>]*>|\S+)")
 HEADING = re.compile(r"^(?P<hashes>#{1,6})\s+(?P<title>.*?)\s*#*\s*$")
+# A setext heading underline: one or more ``=`` or ``-`` characters under a
+# paragraph line.  GitHub exposes the same anchor for ``Title`` under ``====``
+# as for ``# Title``, so anchors collected from a document must recognise
+# both forms or valid ``[x](#title)`` links are reported missing.
+SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?P<underline>=+|-+)[ \t]*$")
+# A line that opens a block instead of extending a paragraph: blockquote,
+# bullet or ordered list item, thematic break, or 4-space-indented code.
+# GitHub never renders these as setext heading text, so a following
+# underline cannot turn them into an anchor.
+_NON_PARAGRAPH = re.compile(
+    r"^(?: {4}|\t| {0,3}(?:>|[-+*]\s|\d{1,9}[.)]\s|([-_*][ \t]*){3,}$))"
+)
 # A link inside a heading title.  GitHub generates heading anchors from the
 # RENDERED heading text, so ``## [API](guide.md)`` exposes ``#api``; the link
 # is replaced by its text before the slug rules apply.  The destination may
@@ -149,15 +167,38 @@ def slugify(heading: str) -> str:
     return text.replace(" ", "-")
 
 
+def _record_slug(counts: dict[str, int], title: str) -> None:
+    """Add one heading slug to *counts*, tracking duplicates for suffixing."""
+    slug = slugify(title)
+    counts[slug] = counts.get(slug, 0) + 1
+
+
 def document_anchors(path: Path) -> set[str]:
     """Return the set of anchors GitHub exposes for *path*."""
     counts: dict[str, int] = {}
     text = path.read_text(encoding="utf-8", errors="replace")
+    # Consecutive paragraph lines accumulate until an underline turns them
+    # into a setext heading or a non-paragraph line ends them; GitHub slugs
+    # a multi-line setext heading from its joined text.
+    paragraph: list[str] = []
     for _, line in iter_content_lines(text):
-        match = HEADING.match(line)
-        if match:
-            slug = slugify(match.group("title"))
-            counts[slug] = counts.get(slug, 0) + 1
+        heading = HEADING.match(line)
+        if heading is not None:
+            _record_slug(counts, heading.group("title"))
+            paragraph = []
+            continue
+        if SETEXT_UNDERLINE.match(line) is not None:
+            # An underline under a pending paragraph is a setext heading;
+            # with no pending paragraph it is a thematic break and
+            # contributes no anchor.  Either way the paragraph is consumed.
+            if paragraph:
+                _record_slug(counts, " ".join(paragraph))
+            paragraph = []
+            continue
+        if line.strip() and _NON_PARAGRAPH.match(line) is None:
+            paragraph.append(line)
+        else:
+            paragraph = []
     anchors: set[str] = set()
     for slug, count in counts.items():
         anchors.update(slug if index == 0 else f"{slug}-{index}" for index in range(count))
@@ -308,5 +349,12 @@ def split_target(target: str) -> tuple[str | None, str]:
         return "", target[1:]
     if not target or ABSOLUTE_TARGET.match(target):
         return None, ""
-    path_part, _, fragment = target.partition("#")
+    # Query and fragment components are URL parts, not filename text: GitHub
+    # resolves ``guide.md?plain=1`` to the file ``guide.md``, so the path
+    # ends at the first ``?`` or ``#``.  The fragment still starts at the
+    # first ``#`` even when a query precedes it, and percent-decoding runs
+    # after the split so an encoded ``%3F`` is never mistaken for a
+    # component separator.
+    path_part = re.split(r"[?#]", target, maxsplit=1)[0]
+    _, _, fragment = target.partition("#")
     return unquote(path_part), fragment
