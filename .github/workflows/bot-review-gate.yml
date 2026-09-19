@@ -29,6 +29,14 @@ name: Bot review gate
 #     types are best-effort coverage and the documented workflow_dispatch
 #     re-run below remains the guaranteed refresh path for a re-review
 #     request that fired no announcer run;
+#   * pull_request closed re-announces when a pull request sharing this
+#     head leaves the candidate set. Check runs bind commits, so a closed
+#     dirty sibling's failing evaluation would otherwise keep the shared
+#     verdict red at the very commit a clean open sibling still needs to
+#     merge — and closing fires no push, review, or retarget event, so
+#     the closed type is the only refresh path. The publisher recomputes
+#     its candidates on the announcement and selects only open pull
+#     requests, so the fresh shared verdict reflects the remaining set;
 #   * pull_request_review submitted/edited/dismissed re-announces when a
 #     conclusion is made, revised, or formally withdrawn;
 #   * pull_request_review_comment created re-announces when a thread is
@@ -61,7 +69,7 @@ on:
   pull_request:
     branches:
       - main
-    types: [opened, synchronize, reopened, edited, review_requested, review_request_removed]
+    types: [opened, synchronize, reopened, edited, closed, review_requested, review_request_removed]
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:

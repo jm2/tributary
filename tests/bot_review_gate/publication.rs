@@ -198,6 +198,64 @@ fn one_dirty_associate_forces_the_shared_verdict_red() {
 }
 
 #[test]
+fn the_announcer_reannounces_when_a_sibling_sharing_the_head_closes() {
+    // A closed sibling fires no push, review, or retarget event, so the
+    // closed activity type is the only refresh path that recomputes the
+    // candidate set after a dirty sibling leaves the shared head: without
+    // it, the closed sibling's failing evaluation would keep the shared
+    // verdict red at the commit a clean open sibling still needs to merge.
+    let workflow: serde_yaml::Value = serde_yaml::from_str(super::harness::BOT_REVIEW_GATE_YAML)
+        .expect("bot review gate announcer workflow must parse");
+    let on = workflow
+        .get("on")
+        .or_else(|| workflow.get(serde_yaml::Value::Bool(true)))
+        .expect("the announcer workflow must declare its triggers");
+    let types: Vec<String> = on["pull_request"]["types"]
+        .as_sequence()
+        .expect("the announcer must declare pull_request activity types")
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        types.iter().any(|activity| activity == "closed"),
+        "pull_request closed must re-announce the head so a closed sibling stops \
+         contributing to the shared verdict: {types:?}"
+    );
+}
+
+#[test]
+fn a_closed_sibling_stops_contributing_to_the_shared_verdict() {
+    // The recompute behind the closed announcer trigger: the candidates
+    // sharing the announced head are the OPEN pull requests only. The
+    // scenario stages the clean open pull request 42 beside the closed
+    // sibling 43, whose record would fail the head binding if it were
+    // still evaluated — so the refresh must drop it from the candidate
+    // set, never fetch it, and publish the green shared verdict the
+    // remaining open sibling deserves.
+    let sandbox = GateSandbox::new("closed-sibling-recompute");
+    sandbox.use_scenario("closed-sibling-recompute");
+    let output = sandbox.run("pull_request", Some(HEAD_SHA));
+    assert!(
+        output.status.success(),
+        "closing a dirty sibling must refresh the shared verdict to green:\n{}",
+        report(&output)
+    );
+    let invocations =
+        std::fs::read_to_string(sandbox.root.join("state/invocations.log")).unwrap_or_default();
+    assert!(
+        !invocations.contains("/pulls/43"),
+        "the closed sibling must leave the candidate set without being fetched:\n{invocations}"
+    );
+    let check_run = sandbox.opened_and_finalized_verdict();
+    assert!(
+        check_run.contains("name=Bot Review Gate")
+            && check_run.contains(&format!("head_sha={HEAD_SHA}"))
+            && check_run.contains("conclusion=success"),
+        "the shared verdict must be green at the evaluated head after the recompute:\n{check_run}"
+    );
+}
+
+#[test]
 fn discovery_pagination_reaches_the_candidate_on_later_pages() {
     // The association endpoint PAGINATES, and dropping later pages silently
     // shrinks the candidate set: this scenario's page 1 is a full

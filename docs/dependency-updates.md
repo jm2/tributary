@@ -302,7 +302,11 @@ earlier clean result at the head; note GitHub does not guarantee that an
 Actions run fires when the requester or requested reviewer is a bot or App,
 the common case for the gate's trusted reviewers, so these two types are
 best-effort and the targeted dispatch below remains the guaranteed refresh
-path for a re-review request that fired no announcer run), a targeted
+path for a re-review request that fired no announcer run), a pull request
+closing (`pull_request` `closed` — a sibling sharing the head leaving the
+candidate set fires no other event, so the closed type re-announces the
+commit and the publisher's open-only recompute publishes the fresh shared
+verdict for the remaining open pull requests), a targeted
 `gh workflow run bot-review-gate.yml --ref <head branch> -f pr_number=<n>`
 (`workflow_dispatch`), or a plain check re-run — every announcer completion
 fires the publisher, which re-evaluates the current

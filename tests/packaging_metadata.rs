@@ -1676,12 +1676,17 @@ fn assert_announcer_pull_request_triggers(on: &serde_yaml::Value) {
             "synchronize",
             "reopened",
             "edited",
+            "closed",
             "review_requested",
             "review_request_removed"
         ],
         "every push to a pull request must re-announce the gate at the new head; \
          `edited` covers retargeting — a base change fires edited, never synchronize, \
          and a retarget away-and-back fires no other refresh; \
+         `closed` re-announces the head when a pull request sharing it leaves the \
+         candidate set — closing fires no other event, and the publisher's open-only \
+         recompute then publishes the fresh shared verdict for the remaining open \
+         pull requests; \
          `review_requested`/`review_request_removed` re-announce the re-review \
          handshake whose outstanding request invalidates the reviewer's earlier \
          clean result at the head (best-effort coverage: GitHub does not \
