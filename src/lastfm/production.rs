@@ -2222,16 +2222,17 @@ mod tests {
         );
     }
 
-    /// A queued application activation freezes its issuing generation. When
-    /// the live policy is replaced by a still-consented, enabled successor
-    /// before the owner processes the command, the activation is spent: the
-    /// owner must refuse terminal before minting a runtime activation, so no
-    /// runtime starts and the vault is never read — the successor's source
-    /// set must never be governed under the predecessor's consent.
-    #[tokio::test]
-    async fn superseded_generation_refuses_queued_activation_before_runtime_start() {
+    /// Spawns a dormant application owner over unused vault credentials with
+    /// an attached in-memory database: the shared fixture for the queued-
+    /// activation refusal regressions below.
+    async fn spawn_owner_with_unused_vault_and_database_attached() -> (
+        LastFmLivePolicy,
+        LastFmPlaybackCoordinatorOwner,
+        LastFmApplicationHandle,
+        LastFmApplicationShutdown,
+    ) {
         let live = live_policy_for_test();
-        let (mut coordinator_owner, coordinator) = binding();
+        let (coordinator_owner, coordinator) = binding();
         let (handle, shutdown) = spawn_with_dependencies(
             coordinator,
             tokio::runtime::Handle::current(),
@@ -2249,7 +2250,53 @@ mod tests {
             .wait()
             .await
             .expect("database attached");
+        (live, coordinator_owner, handle, shutdown)
+    }
 
+    /// Asserts the owner's published snapshot records the terminal runtime-
+    /// start refusal. Completion is the observation boundary: the terminal
+    /// snapshot is published before the waiter wakes.
+    fn assert_terminal_runtime_start_refusal(handle: &LastFmApplicationHandle) {
+        let status = *handle.subscribe_status().borrow();
+        assert_eq!(status.phase, LastFmApplicationPhase::Failed);
+        assert_eq!(
+            status.failure,
+            Some(LastFmApplicationCommandError::RuntimeStart)
+        );
+    }
+
+    /// Drains the owner and asserts a clean shutdown: the drain deadline is
+    /// met, the barrier drains fully, and the playback coordinator observed
+    /// the final state.
+    async fn assert_owner_drains(
+        shutdown: LastFmApplicationShutdown,
+        coordinator_owner: &mut LastFmPlaybackCoordinatorOwner,
+    ) {
+        let barrier = shutdown.barrier();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
+                .await
+                .expect("application drain deadline"),
+            Ok(LastFmApplicationShutdownReason::Drained)
+        );
+        assert_eq!(barrier.wait().await, Ok(()));
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
+        assert_eq!(
+            coordinator_owner.shutdown(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+    }
+
+    /// A queued application activation freezes its issuing generation. When
+    /// the live policy is replaced by a still-consented, enabled successor
+    /// before the owner processes the command, the activation is spent: the
+    /// owner must refuse terminal before minting a runtime activation, so no
+    /// runtime starts and the vault is never read — the successor's source
+    /// set must never be governed under the predecessor's consent.
+    #[tokio::test]
+    async fn superseded_generation_refuses_queued_activation_before_runtime_start() {
+        let (live, mut coordinator_owner, handle, shutdown) =
+            spawn_owner_with_unused_vault_and_database_attached().await;
         let activation =
             LastFmApplicationActivation::issue_from_policy_generation(&live.snapshot())
                 .expect("generation 1 grants activation authority");
@@ -2268,27 +2315,8 @@ mod tests {
                 .expect("superseded activation deadline"),
             Err(LastFmApplicationCommandError::RuntimeStart)
         );
-        // Completion is the observation boundary: the terminal snapshot is
-        // published before the waiter wakes.
-        let status = *handle.subscribe_status().borrow();
-        assert_eq!(status.phase, LastFmApplicationPhase::Failed);
-        assert_eq!(
-            status.failure,
-            Some(LastFmApplicationCommandError::RuntimeStart)
-        );
-        let barrier = shutdown.barrier();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
-                .await
-                .expect("application drain deadline"),
-            Ok(LastFmApplicationShutdownReason::Drained)
-        );
-        assert_eq!(barrier.wait().await, Ok(()));
-        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
-        assert_eq!(
-            coordinator_owner.shutdown(),
-            LastFmPlaybackCoordinatorOutcome::Applied
-        );
+        assert_terminal_runtime_start_refusal(&handle);
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
     }
 
     /// The refusal is by generation identity, not by the successor's
@@ -2296,26 +2324,8 @@ mod tests {
     /// same terminal path, and the vault still is never read.
     #[tokio::test]
     async fn revoked_generation_refuses_queued_activation_before_runtime_start() {
-        let live = live_policy_for_test();
-        let (mut coordinator_owner, coordinator) = binding();
-        let (handle, shutdown) = spawn_with_dependencies(
-            coordinator,
-            tokio::runtime::Handle::current(),
-            Arc::new(UnusedCredentials),
-            Some(Arc::new(PendingTransport)),
-            Arc::new(FixedClock),
-            live.clone(),
-        );
-        let database = Database::connect("sqlite::memory:")
-            .await
-            .expect("in-memory database");
-        handle
-            .try_attach_database(database)
-            .expect("database admitted")
-            .wait()
-            .await
-            .expect("database attached");
-
+        let (live, mut coordinator_owner, handle, shutdown) =
+            spawn_owner_with_unused_vault_and_database_attached().await;
         let activation =
             LastFmApplicationActivation::issue_from_policy_generation(&live.snapshot())
                 .expect("generation 1 grants activation authority");
@@ -2333,25 +2343,8 @@ mod tests {
                 .expect("revoked activation deadline"),
             Err(LastFmApplicationCommandError::RuntimeStart)
         );
-        let status = *handle.subscribe_status().borrow();
-        assert_eq!(status.phase, LastFmApplicationPhase::Failed);
-        assert_eq!(
-            status.failure,
-            Some(LastFmApplicationCommandError::RuntimeStart)
-        );
-        let barrier = shutdown.barrier();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
-                .await
-                .expect("application drain deadline"),
-            Ok(LastFmApplicationShutdownReason::Drained)
-        );
-        assert_eq!(barrier.wait().await, Ok(()));
-        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
-        assert_eq!(
-            coordinator_owner.shutdown(),
-            LastFmPlaybackCoordinatorOutcome::Applied
-        );
+        assert_terminal_runtime_start_refusal(&handle);
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
     }
 
     /// The generation gate refuses only superseded authorities: a queued
@@ -2397,19 +2390,7 @@ mod tests {
         );
         assert_eq!(credentials.loads.load(Ordering::SeqCst), 1);
 
-        let barrier = shutdown.barrier();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
-                .await
-                .expect("application shutdown deadline"),
-            Ok(LastFmApplicationShutdownReason::Drained)
-        );
-        assert_eq!(barrier.wait().await, Ok(()));
-        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
-        assert_eq!(
-            coordinator_owner.shutdown(),
-            LastFmPlaybackCoordinatorOutcome::Applied
-        );
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
         source_registry.shutdown().wait().await;
     }
 }
