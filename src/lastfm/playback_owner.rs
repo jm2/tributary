@@ -9,12 +9,14 @@
 //! revalidates the exact live source; no lease, adapter, locator, or credential
 //! crosses this module.
 
+#[cfg(test)]
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use crate::architecture::MediaKey;
+#[cfg(test)]
 use crate::architecture::SourceId;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::source_registry::{PlaybackSourceReference, SourceRegistry};
@@ -24,6 +26,7 @@ use super::playback::{
     LastFmPlaybackAction, LastFmPlaybackClock, LastFmPlaybackEvidenceError, LastFmPlaybackMetadata,
     LastFmPlaybackOccurrence, LastFmPlaybackState, SystemLastFmPlaybackClock,
 };
+use super::policy::LastFmDispatchAuthority;
 use super::runtime::{
     LastFmNowPlaying, LastFmNowPlayingOutcome, LastFmPlaybackRuntimeIngress,
     LastFmRuntimeAdmissionError, LastFmRuntimeCommandError, LastFmRuntimeOperation,
@@ -249,7 +252,13 @@ impl LastFmEphemeralHandoffFreshness {
 enum LastFmPlaybackSourceKind {
     #[cfg(test)]
     Local(MediaKey),
-    Managed(PlaybackSourceReference),
+    Managed {
+        reference: PlaybackSourceReference,
+        /// The exact live policy generation whose queue-capture basis minted
+        /// this authority. Dispatch refuses the authority once the live
+        /// generation moves past it, even when the source stays opted in.
+        policy_generation: u64,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -268,10 +277,14 @@ impl LastFmPlaybackSource {
             .then_some(Self(LastFmPlaybackSourceKind::Local(media_key)))
     }
 
-    /// Capture one non-authoritative managed-source reference.
+    /// Capture one non-authoritative managed-source reference under the
+    /// exact live policy generation that authorized the mint.
     #[allow(clippy::redundant_pub_crate)]
-    pub(crate) fn managed(reference: PlaybackSourceReference) -> Self {
-        Self(LastFmPlaybackSourceKind::Managed(reference))
+    pub(crate) fn managed(reference: PlaybackSourceReference, policy_generation: u64) -> Self {
+        Self(LastFmPlaybackSourceKind::Managed {
+            reference,
+            policy_generation,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -287,7 +300,7 @@ impl LastFmPlaybackSource {
         match &self.0 {
             #[cfg(test)]
             LastFmPlaybackSourceKind::Local(_) => true,
-            LastFmPlaybackSourceKind::Managed(reference) => reference.matches_attribution(
+            LastFmPlaybackSourceKind::Managed { reference, .. } => reference.matches_attribution(
                 title,
                 artist,
                 album,
@@ -301,14 +314,28 @@ impl LastFmPlaybackSource {
     fn admit<T>(
         self,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
         admit: impl FnOnce() -> T,
     ) -> Option<T> {
         match self.0 {
             #[cfg(test)]
             LastFmPlaybackSourceKind::Local(_) => Some(admit()),
-            LastFmPlaybackSourceKind::Managed(reference) => {
-                registry.try_admit_playback_action(&reference, enabled_remote_sources, admit)
+            LastFmPlaybackSourceKind::Managed {
+                reference,
+                policy_generation,
+            } => {
+                // The captured occurrence carries the generation that
+                // authorized its mint. Once the live generation moves past
+                // it, the authority is stale and dispatch refuses even when
+                // the source remains opted in.
+                if policy_generation != authority.generation() {
+                    return None;
+                }
+                registry.try_admit_playback_action(
+                    &reference,
+                    authority.enabled_remote_sources(),
+                    admit,
+                )
             }
         }
     }
@@ -321,7 +348,7 @@ impl fmt::Debug for LastFmPlaybackSource {
             LastFmPlaybackSourceKind::Local(_) => {
                 formatter.write_str("LastFmPlaybackSource::Local(<redacted>)")
             }
-            LastFmPlaybackSourceKind::Managed(_) => {
+            LastFmPlaybackSourceKind::Managed { .. } => {
                 formatter.write_str("LastFmPlaybackSource::Managed(<redacted>)")
             }
         }
@@ -546,11 +573,11 @@ impl LastFmPlaybackHandoff {
         self,
         runtime: &LastFmPlaybackRuntimeIngress,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
     ) -> Option<Result<LastFmPlaybackRuntimeOperation, LastFmRuntimeAdmissionError>> {
         self.try_admit_with(
             registry,
-            enabled_remote_sources,
+            authority,
             |now_playing| {
                 runtime
                     .try_update_now_playing(now_playing)
@@ -580,14 +607,14 @@ impl LastFmPlaybackHandoff {
     pub(crate) fn try_admit_with_callbacks_for_test<T>(
         self,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
         admit_now_playing: impl FnOnce(LastFmNowPlaying) -> T,
         admit_enqueue: impl FnOnce(UnboundLastFmScrobble) -> T,
         admit_clear: impl FnOnce() -> T,
     ) -> Option<T> {
         self.try_admit_with(
             registry,
-            enabled_remote_sources,
+            authority,
             admit_now_playing,
             admit_enqueue,
             admit_clear,
@@ -598,7 +625,7 @@ impl LastFmPlaybackHandoff {
     fn try_admit_with<T>(
         self,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
         admit_now_playing: impl FnOnce(LastFmNowPlaying) -> T,
         admit_enqueue: impl FnOnce(UnboundLastFmScrobble) -> T,
         admit_clear: impl FnOnce() -> T,
@@ -610,15 +637,11 @@ impl LastFmPlaybackHandoff {
                 source,
                 now_playing,
             } => freshness.try_claim_now_playing(
-                || {
-                    source.admit(registry, enabled_remote_sources, || {
-                        admit_now_playing(now_playing)
-                    })
-                },
+                || source.admit(registry, authority, || admit_now_playing(now_playing)),
                 now_playing_admitted,
             ),
             LastFmPlaybackHandoffPayload::Enqueue { source, scrobble } => {
-                source.admit(registry, enabled_remote_sources, || admit_enqueue(scrobble))
+                source.admit(registry, authority, || admit_enqueue(scrobble))
             }
             LastFmPlaybackHandoffPayload::ClearNowPlaying { freshness } => {
                 freshness.try_claim_clear(admit_clear)
@@ -741,6 +764,15 @@ impl LastFmPlaybackOwnerUpdate {
         Self {
             handoff: None,
             error: None,
+        }
+    }
+
+    /// One update carrying only the terminal-retire clear handoff, used when
+    /// a dormant policy generation forces the active occurrence to retire.
+    pub(crate) fn retire_handoff(handoff: Option<LastFmPlaybackHandoff>) -> Self {
+        match handoff {
+            Some(handoff) => Self::handoff(handoff),
+            None => Self::none(),
         }
     }
 
@@ -924,16 +956,16 @@ where
         &mut self,
         load: LastFmAcceptedOutputLoad,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
     ) -> LastFmPlaybackLoadAdmission {
-        self.accept_output_load_observing(load, registry, enabled_remote_sources, || {})
+        self.accept_output_load_observing(load, registry, authority, || {})
     }
 
     fn accept_output_load_observing(
         &mut self,
         load: LastFmAcceptedOutputLoad,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
         after_owner_mutation: impl FnOnce(),
     ) -> LastFmPlaybackLoadAdmission {
         let LastFmAcceptedOutputLoad {
@@ -946,11 +978,7 @@ where
                 let admission = self.with_ephemeral_handoff_lane(|owner, lane| match kind {
                     LastFmAcceptedOutputLoadKind::Eligible(accepted) => owner
                         .accept_eligible_output_load_with_lane(
-                            *accepted,
-                            generation,
-                            registry,
-                            enabled_remote_sources,
-                            lane,
+                            *accepted, generation, registry, authority, lane,
                         ),
                     LastFmAcceptedOutputLoadKind::Ineligible => {
                         owner.reject_output_load_with_lane(lane)
@@ -969,11 +997,11 @@ where
         accepted: LastFmAcceptedPlayback,
         generation: PlayerEventGeneration,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
         lane: &mut LastFmEphemeralHandoffLaneState,
     ) -> LastFmPlaybackLoadAdmission {
         let source = accepted.source.clone();
-        match source.admit(registry, enabled_remote_sources, || {
+        match source.admit(registry, authority, || {
             self.accept_load_with_lane(accepted, generation, lane)
         }) {
             Some(update) => LastFmPlaybackLoadAdmission::Admitted(update),
@@ -1170,15 +1198,12 @@ where
     pub(crate) fn revalidate_active_source(
         &mut self,
         registry: &SourceRegistry,
-        enabled_remote_sources: &HashSet<SourceId>,
+        authority: &LastFmDispatchAuthority,
     ) -> LastFmPlaybackOwnerUpdate {
         let Some(source) = self.active.as_ref().map(|active| active.source.clone()) else {
             return LastFmPlaybackOwnerUpdate::none();
         };
-        if source
-            .admit(registry, enabled_remote_sources, || ())
-            .is_some()
-        {
+        if source.admit(registry, authority, || ()).is_some() {
             return LastFmPlaybackOwnerUpdate::none();
         }
         self.retire().map_or_else(
@@ -1752,7 +1777,7 @@ mod tests {
         );
         assert!(LastFmPlaybackSource::local(remote_key.clone()).is_none());
         let reference = PlaybackSourceReference::session(remote_key, 9).expect("valid reference");
-        let managed = LastFmPlaybackSource::managed(reference);
+        let managed = LastFmPlaybackSource::managed(reference, 1);
         assert_eq!(
             format!("{managed:?}"),
             "LastFmPlaybackSource::Managed(<redacted>)"
@@ -2162,7 +2187,10 @@ mod tests {
             local_source("revalidate-authorized"),
             active_generation,
         );
-        assert_empty(owner.revalidate_active_source(&registry, &HashSet::new()));
+        assert_empty(owner.revalidate_active_source(
+            &registry,
+            &LastFmDispatchAuthority::for_test(1, HashSet::new()),
+        ));
         let scrobble = qualify_after_playing(&mut owner, active_generation);
         assert_eq!(scrobble.duration_secs(), 100);
         assert!(owner.retire().is_some());
@@ -2182,6 +2210,7 @@ mod tests {
         );
         let source = LastFmPlaybackSource::managed(
             PlaybackSourceReference::session(remote_key, 11).expect("valid remote reference"),
+            1,
         );
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
@@ -2199,7 +2228,8 @@ mod tests {
         // Opt-in alone cannot rescue a reference minted outside this exact
         // registry instance. Losing any component of the retained authority
         // retires the occurrence terminally.
-        let enabled_remote_sources = HashSet::from([source_id]);
+        let enabled_remote_sources =
+            LastFmDispatchAuthority::for_test(1, HashSet::from([source_id]));
         expect_clear(owner.revalidate_active_source(&registry, &enabled_remote_sources));
         assert_empty(owner.revalidate_active_source(&registry, &enabled_remote_sources));
         assert_empty(owner.observe_event(&PlayerEvent::position(
@@ -2306,7 +2336,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
 
@@ -2335,6 +2365,7 @@ mod tests {
         );
         let remote_source = LastFmPlaybackSource::managed(
             PlaybackSourceReference::session(remote_key, 1).expect("valid remote reference"),
+            1,
         );
         let denied = owner.accept_output_load(
             LastFmAcceptedOutputLoad::eligible(
@@ -2360,7 +2391,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, calls) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
         let first_generation = generation(30);
@@ -2468,7 +2499,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
         let active_generation = generation(33);
@@ -2547,7 +2578,7 @@ mod tests {
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
         let admitting_registry = registry.clone();
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
         let freshness = output_freshness();
@@ -2616,6 +2647,7 @@ mod tests {
         );
         let remote_source = LastFmPlaybackSource::managed(
             PlaybackSourceReference::session(remote_key, 1).expect("valid remote reference"),
+            1,
         );
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
@@ -2627,7 +2659,7 @@ mod tests {
                 accepted(LastFmPlaybackOccurrenceIdentity::fresh(), remote_source),
             ),
             &registry,
-            &HashSet::new(),
+            &LastFmDispatchAuthority::for_test(1, HashSet::new()),
         );
 
         assert!(!denied.admitted());
@@ -2650,7 +2682,8 @@ mod tests {
         );
         let reference =
             PlaybackSourceReference::session(remote_key, 7).expect("valid remote reference");
-        let enabled_remote_sources = HashSet::from([source_id]);
+        let enabled_remote_sources =
+            LastFmDispatchAuthority::for_test(1, HashSet::from([source_id]));
 
         let now_playing = LastFmNowPlaying::try_new(LastFmTrack {
             artist: "private artist".to_owned(),
@@ -2663,7 +2696,7 @@ mod tests {
         .expect("valid now-playing metadata");
         let now_playing_handoff = LastFmPlaybackHandoff::now_playing(
             ephemeral_now_playing_freshness(),
-            LastFmPlaybackSource::managed(reference.clone()),
+            LastFmPlaybackSource::managed(reference.clone(), 1),
             now_playing,
         );
         let now_playing_calls = Cell::new(0);
@@ -2699,7 +2732,7 @@ mod tests {
         )
         .expect("valid scrobble");
         let enqueue_handoff =
-            LastFmPlaybackHandoff::enqueue(LastFmPlaybackSource::managed(reference), scrobble);
+            LastFmPlaybackHandoff::enqueue(LastFmPlaybackSource::managed(reference, 1), scrobble);
         let enqueue_calls = Cell::new(0);
         let result = enqueue_handoff.try_admit_with(
             &registry,
@@ -2729,7 +2762,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let now_playing = LastFmNowPlaying::try_new(LastFmTrack {
             artist: "artist".to_owned(),
             title: "title".to_owned(),
@@ -2796,7 +2829,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
 
@@ -2878,7 +2911,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
 
@@ -2961,7 +2994,8 @@ mod tests {
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
         let source_id = SourceId::random();
-        let enabled_remote_sources = HashSet::from([source_id]);
+        let enabled_remote_sources =
+            LastFmDispatchAuthority::for_test(1, HashSet::from([source_id]));
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
 
@@ -2982,6 +3016,7 @@ mod tests {
         );
         let remote_source = LastFmPlaybackSource::managed(
             PlaybackSourceReference::session(remote_key, 91).expect("valid remote reference"),
+            1,
         );
         let delayed_clear = expect_handoff(
             owner.accept_load(
@@ -3029,7 +3064,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
 
@@ -3093,7 +3128,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
         let active_generation = generation(44);
@@ -3149,7 +3184,7 @@ mod tests {
             .expect("test runtime");
         let registry = SourceRegistry::new(runtime.handle().clone());
         let admitting_registry = registry.clone();
-        let enabled_remote_sources = HashSet::new();
+        let enabled_remote_sources = LastFmDispatchAuthority::for_test(1, HashSet::new());
         let (clock, _) = TestClock::successful();
         let mut owner = LastFmPlaybackOwner::with_clock(clock);
 

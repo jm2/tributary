@@ -5,7 +5,7 @@
 //! `mlid`, keeps post-login catalogue work abortable, and sends one bounded
 //! logout for every session that reached server-side ownership.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,10 +16,11 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::architecture::models::RatingCapability;
-use crate::architecture::SourceId;
+use crate::architecture::{MediaKey, SourceId, TrackId};
 use crate::source_lifecycle::{FailureCategory, SourceProvenance};
 use crate::source_registry::SourceRegistry;
 
+use super::backend::assert_attribution_fails_closed_while_cache_contended;
 use super::DaapBackend;
 
 const MOCK_DEADLINE: Duration = Duration::from_secs(5);
@@ -800,4 +801,182 @@ async fn replacement_rejects_stale_epoch_stream_and_art_before_adapter_invocatio
     assert_eq!(second_server.request_count(MockEndpoint::Logout), 1);
     first_server.assert_healthy();
     second_server.assert_healthy();
+}
+
+// ── LF1-F1: raw DMAP row attribution provenance ─────────────────────────
+
+/// Build one `adbs` items response carrying four accepted rows:
+/// a metadata-gap row (no title/artist), a complete row, a
+/// server-supplied-"Unknown" row, and an album-less row.
+fn raw_row_items_response() -> Vec<u8> {
+    fn mlit(children: Vec<u8>) -> Vec<u8> {
+        tlv(b"mlit", &children)
+    }
+
+    let gap = mlit([tlv_u32(b"miid", 90), tlv(b"asfm", b"mp3")].concat());
+    let complete = mlit(
+        [
+            tlv_u32(b"miid", 101),
+            tlv(b"minm", b"Raw Complete"),
+            tlv(b"asar", b"Raw Artist"),
+            tlv(b"asal", b"Raw Album"),
+            tlv(b"astn", &3u16.to_be_bytes()),
+            tlv_u32(b"astm", 201_000),
+        ]
+        .concat(),
+    );
+    let server_unknown = mlit(
+        [
+            tlv_u32(b"miid", 102),
+            tlv(b"minm", b"Unknown"),
+            tlv(b"asar", b"Unknown"),
+            tlv(b"asal", b"Raw Album"),
+        ]
+        .concat(),
+    );
+    let album_less = mlit(
+        [
+            tlv_u32(b"miid", 103),
+            tlv(b"minm", b"Raw Bare"),
+            tlv(b"asar", b"Raw Artist"),
+        ]
+        .concat(),
+    );
+    let listing = tlv(
+        b"mlcl",
+        &[gap, complete, server_unknown, album_less].concat(),
+    );
+    tlv(b"adbs", &[tlv_u32(b"mstt", 200), listing].concat())
+}
+
+fn assert_raw_row_mint_proofs(registry: &SourceRegistry, source_id: SourceId, session_epoch: u64) {
+    let enabled = HashSet::from([source_id]);
+    let media_key_for = |native: &str| {
+        MediaKey::new(
+            source_id,
+            TrackId::remote(native).expect("bounded fixture native id"),
+        )
+    };
+
+    // Complete row: the mint boundary retains the exact provenance.
+    let complete = registry
+        .mint_session_playback_source(media_key_for("101"), session_epoch, &enabled)
+        .expect("complete row carries an attribution proof");
+    let complete_profile = complete.profile();
+    assert_eq!(complete_profile.title(), "Raw Complete");
+    assert_eq!(complete_profile.artist(), "Raw Artist");
+    assert_eq!(complete_profile.album(), Some("Raw Album"));
+
+    // Metadata-gap row: accepted for playback but carries no attribution
+    // proof — the display fallback is not authority.
+    assert!(registry
+        .mint_session_playback_source(media_key_for("90"), session_epoch, &enabled)
+        .is_none());
+
+    // A server-supplied "Unknown" is real row data, so it stays attributable
+    // and distinguishable from the synthesized fallback.
+    let server_unknown = registry
+        .mint_session_playback_source(media_key_for("102"), session_epoch, &enabled)
+        .expect("server-supplied Unknown remains attributable");
+    assert_eq!(server_unknown.profile().title(), "Unknown");
+    assert_eq!(server_unknown.profile().artist(), "Unknown");
+
+    // An absent optional album stays absent in the profile.
+    let album_less = registry
+        .mint_session_playback_source(media_key_for("103"), session_epoch, &enabled)
+        .expect("album-less row carries its provenance profile");
+    assert_eq!(album_less.profile().title(), "Raw Bare");
+    assert_eq!(album_less.profile().artist(), "Raw Artist");
+    assert_eq!(album_less.profile().album(), None);
+
+    // Unknown or stale native IDs refuse attribution.
+    assert!(registry
+        .mint_session_playback_source(media_key_for("999999"), session_epoch, &enabled)
+        .is_none());
+}
+
+async fn assert_daap_direct_raw_row_divergence(server: &MockDaapServer) {
+    // Direct-adapter leg: the same rows through login + load_catalogue prove
+    // the display-fallback/profile divergence and the contended-refresh
+    // fail-closed lookup on the concrete backend.
+    server.enqueue(
+        MockEndpoint::Items,
+        MockResponse::dmap(raw_row_items_response()),
+    );
+    let backend = DaapBackend::login("Raw rows direct", &server.base_url, None)
+        .await
+        .expect("direct raw-row login");
+    let direct_tracks = backend.load_catalogue().await.expect("direct catalogue");
+    assert_eq!(direct_tracks.len(), 4);
+    let native = |native: &str| TrackId::remote(native).expect("bounded fixture native id");
+    let gap_track = direct_tracks
+        .iter()
+        .find(|track| {
+            track
+                .native_track_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "90")
+        })
+        .expect("gap row published as a display track");
+    assert_eq!(gap_track.title, "Unknown");
+    assert!(backend
+        .catalogue_attribution_profile(&native("90"))
+        .is_none());
+
+    let complete_profile = backend
+        .catalogue_attribution_profile(&native("101"))
+        .expect("complete row retains its provenance profile");
+    assert_eq!(complete_profile.title(), "Raw Complete");
+    assert_eq!(complete_profile.album(), Some("Raw Album"));
+
+    let stale = native("999999");
+    assert!(backend.catalogue_attribution_profile(&stale).is_none());
+
+    assert_attribution_fails_closed_while_cache_contended(&backend, &native("101")).await;
+}
+
+#[tokio::test]
+async fn attribution_profiles_are_frozen_from_raw_dmap_rows() {
+    let server = MockDaapServer::start().await;
+    server.enqueue(
+        MockEndpoint::Items,
+        MockResponse::dmap(raw_row_items_response()),
+    );
+    let registry = registry();
+    let source_id = SourceId::random();
+    claim_saved(&registry, source_id);
+
+    let generation = connect_daap(
+        &registry,
+        source_id,
+        "Raw rows DAAP",
+        server.base_url.clone(),
+    );
+    let (session_epoch, tracks) = wait_for_catalogue(&registry, source_id, generation).await;
+    assert_eq!(tracks.len(), 4);
+
+    // The metadata-gap row is accepted for playback and displays the
+    // synthesized "Unknown" fallback.
+    let gap_display_title = tracks
+        .iter()
+        .find(|track| {
+            track
+                .native_track_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "90")
+        })
+        .map(|track| track.title.clone());
+    assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+
+    assert_raw_row_mint_proofs(&registry, source_id, session_epoch);
+
+    let barrier = registry.shutdown();
+    tokio::time::timeout(MOCK_DEADLINE, barrier.wait())
+        .await
+        .expect("raw-row registry shutdown must finish");
+    server.wait_for_requests(MockEndpoint::Logout, 1).await;
+
+    assert_daap_direct_raw_row_divergence(&server).await;
+
+    server.assert_healthy();
 }

@@ -199,8 +199,7 @@ async fn paused_runtime() -> PausedRuntime {
 
     let (store, save_events, save_release) = GatedCredentialStore::new(session);
     let (transport, calls, responses) = ObservedTransport::new();
-    let (handle, shutdown) = spawn_lastfm_runtime(
-        LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+    let (handle, shutdown) = spawn_lastfm_runtime_for_test(
         database.clone(),
         store.clone(),
         transport,

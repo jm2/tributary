@@ -294,14 +294,7 @@ async fn spawn_activated_runtime(
     transport: Arc<dyn LastFmTransport>,
     clock: Arc<dyn LastFmClock>,
 ) -> Result<(LastFmRuntimeHandle, LastFmRuntimeShutdown), LastFmRuntimeStartError> {
-    spawn_lastfm_runtime(
-        LastFmRuntimeActivation::issue_after_consent_and_enablement(),
-        database,
-        credentials,
-        transport,
-        clock,
-    )
-    .await
+    spawn_lastfm_runtime_for_test(database, credentials, transport, clock).await
 }
 
 fn session() -> StoredSession {

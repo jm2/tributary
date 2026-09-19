@@ -19,6 +19,7 @@ use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttp
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
+use crate::source_registry::{BoundedSearchAttributionProfiles, PlaybackAttributionProfile};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -52,6 +53,15 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Jellyfin audio item ID → artwork item ID.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Jellyfin audio item ID → Last.fm attribution profile derived
+    /// from the raw accepted protocol row before display fallbacks were
+    /// substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+    /// Bounded retention for profiles minted from search rows outside the
+    /// refreshed catalogue. Search traffic is unbounded over a session
+    /// lifetime, so these entries are capped separately and can never evict
+    /// a refreshed catalogue profile.
+    search_attribution_profiles: BoundedSearchAttributionProfiles,
 }
 
 impl LibraryCache {
@@ -62,6 +72,8 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
+            search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
         }
     }
 }
@@ -200,6 +212,7 @@ impl JellyfinBackend {
         let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for lib in music_libraries {
@@ -234,7 +247,24 @@ impl JellyfinBackend {
 
                 stream_locator_by_track_id.insert(track_id.clone(), item.id.clone());
                 if let Some(album_id) = &item.album_id {
-                    track_artwork_locator_by_track_id.insert(track_id, album_id.clone());
+                    track_artwork_locator_by_track_id.insert(track_id.clone(), album_id.clone());
+                }
+                // Attribution provenance is frozen from the raw accepted row
+                // with the same field precedence as the display converter,
+                // before any "Unknown" fallback is substituted, so a
+                // synthesized fallback can never become attribution authority.
+                if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                    item.name.clone(),
+                    item.artist_items
+                        .first()
+                        .map(|a| a.name.clone())
+                        .or_else(|| item.album_artist.clone()),
+                    item.album.clone(),
+                    item.album_artist.clone(),
+                    item.index_number,
+                    item.run_time_ticks.map(|t| t / 10_000_000),
+                ) {
+                    attribution_profiles.insert(track_id, profile);
                 }
                 all_tracks.push(track);
             }
@@ -294,6 +324,10 @@ impl JellyfinBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            attribution_profiles,
+            // A full refresh supersedes every search-only retention from the
+            // previous catalogue generation.
+            search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
         };
 
         Ok(())
@@ -374,6 +408,29 @@ impl JellyfinBackend {
     pub(crate) async fn logout_owned_session(&self) -> BackendResult<()> {
         self.client.logout_owned_session().await
     }
+
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue row by its native identity.
+    ///
+    /// Profiles are derived from the raw protocol row, before display
+    /// fallbacks are substituted, so a synthesized `"Unknown"` can never
+    /// become attribution authority. Refreshed catalogue profiles take
+    /// precedence; search-only profiles are retained separately under a
+    /// bounded eviction policy and never evict catalogue authority. The
+    /// lookup is deliberately non-blocking: a contended refresh returns
+    /// `None`, so Last.fm attribution fails closed instead of waiting on the
+    /// lifecycle state lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        let cache = self.cache.try_read().ok()?;
+        cache
+            .attribution_profiles
+            .get(track_id)
+            .cloned()
+            .or_else(|| cache.search_attribution_profiles.get(track_id).cloned())
+    }
 }
 
 // ── MediaBackend trait implementation ────────────────────────────────────
@@ -417,6 +474,8 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         let mut artists = Vec::new();
         let mut stream_locators = Vec::new();
         let mut track_artwork_locators = Vec::new();
+        let mut attribution_profiles: Vec<(TrackId, Option<PlaybackAttributionProfile>)> =
+            Vec::new();
 
         for item in &resp.items {
             match item.item_type.as_deref() {
@@ -429,6 +488,26 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     let album_id = item.album_id.as_deref().map(deterministic_uuid);
                     stream_locators.push((track_id.clone(), item.id.clone()));
                     track_artwork_locators.push((track_id.clone(), item.album_id.clone()));
+                    // Retained rows outside the refreshed catalogue still need
+                    // Last.fm attribution authority: freeze the profile from
+                    // the raw accepted row with the same field precedence as
+                    // the display converter, before any "Unknown" fallback is
+                    // substituted, so a synthesized fallback can never become
+                    // attribution authority.
+                    attribution_profiles.push((
+                        track_id.clone(),
+                        PlaybackAttributionProfile::from_remote_row(
+                            item.name.clone(),
+                            item.artist_items
+                                .first()
+                                .map(|a| a.name.clone())
+                                .or_else(|| item.album_artist.clone()),
+                            item.album.clone(),
+                            item.album_artist.clone(),
+                            item.index_number,
+                            item.run_time_ticks.map(|t| t / 10_000_000),
+                        ),
+                    ));
                     tracks.push(jellyfin_item_to_track(
                         item, track_id, uuid, artist_id, album_id,
                     ));
@@ -471,6 +550,16 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     .insert(track_id, artwork_item_id);
             } else {
                 cache.track_artwork_locator_by_track_id.remove(&track_id);
+            }
+        }
+        for (track_id, profile) in attribution_profiles {
+            // Search rows land in the bounded search-only store so
+            // unbounded search traffic can neither grow retention without
+            // limit nor evict refreshed catalogue profiles.
+            if let Some(profile) = profile {
+                cache.search_attribution_profiles.insert(track_id, profile);
+            } else {
+                cache.search_attribution_profiles.remove(&track_id);
             }
         }
 
@@ -662,6 +751,7 @@ mod tests {
 
     use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+    use crate::source_registry::MAX_SEARCH_ATTRIBUTION_PROFILES;
 
     use super::*;
 
@@ -798,6 +888,15 @@ mod tests {
         assert_eq!(cache.artists.len(), 1);
         drop(cache);
 
+        let profile_track_id = published[0]
+            .native_track_id
+            .clone()
+            .expect("fixture track retains its native ID");
+        let profile = backend
+            .catalogue_attribution_profile(&profile_track_id)
+            .expect("provenance-derived profile is retained for the accepted row");
+        assert_eq!(profile.title(), "Fixture Song");
+
         let search = backend.search("Fixture", 10).await.expect("search fixture");
         assert_eq!(search.tracks.len(), 1);
         assert_eq!(
@@ -816,6 +915,169 @@ mod tests {
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));
             assert!(request.body.is_empty());
         }
+        service.finish().await;
+    }
+
+    fn raw_row_audio_items() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "Id": "gap-row",
+                "Type": "Audio"
+            }),
+            serde_json::json!({
+                "Id": "complete-row",
+                "Name": "Raw Complete",
+                "Type": "Audio",
+                "Album": "Raw Album",
+                "AlbumId": "raw-album",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Raw Artist"}],
+                "IndexNumber": 3,
+                "RunTimeTicks": 2_010_000_000
+            }),
+            serde_json::json!({
+                "Id": "server-unknown-row",
+                "Name": "Unknown",
+                "Type": "Audio",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Unknown"}]
+            }),
+            serde_json::json!({
+                "Id": "album-less-row",
+                "Name": "Raw Bare",
+                "Type": "Audio",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Raw Artist"}]
+            }),
+        ]
+    }
+
+    fn raw_row_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"}
+                    ],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": raw_row_audio_items(),
+                    "TotalRecordCount": 4
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .reply(MockResponse::json(
+                    serde_json::json!({"Items": [], "TotalRecordCount": 0}),
+                )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .reply(MockResponse::json(
+                    serde_json::json!({"Items": [], "TotalRecordCount": 0}),
+                )),
+        ]
+    }
+
+    async fn raw_row_native_ids(backend: &JellyfinBackend) -> HashMap<String, TrackId> {
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 4);
+        let gap_display_title = cache
+            .tracks
+            .iter()
+            .find(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "gap-row")
+            })
+            .map(|track| track.title.clone());
+        assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+        cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let native = track.native_track_id.clone()?;
+                Some((native.as_str().to_string(), native))
+            })
+            .collect::<HashMap<String, TrackId>>()
+    }
+
+    fn assert_raw_row_profiles_are_frozen(
+        backend: &JellyfinBackend,
+        ids: &HashMap<String, TrackId>,
+    ) {
+        let gap_id = &ids["gap-row"];
+        let complete_id = &ids["complete-row"];
+        let server_unknown_id = &ids["server-unknown-row"];
+        let album_less_id = &ids["album-less-row"];
+
+        // Raw row with missing title and artist: accepted for playback, but
+        // carries no attribution proof — the display "Unknown" fallback is
+        // not authority.
+        assert!(backend.catalogue_attribution_profile(gap_id).is_none());
+
+        // Complete raw row: the exact provenance is retained.
+        let complete = backend
+            .catalogue_attribution_profile(complete_id)
+            .expect("complete row retains its provenance profile");
+        assert_eq!(complete.title(), "Raw Complete");
+        assert_eq!(complete.artist(), "Raw Artist");
+        assert_eq!(complete.album(), Some("Raw Album"));
+
+        // A server-supplied "Unknown" is real row data, so it stays
+        // attributable and distinguishable from the synthesized fallback.
+        let server_unknown = backend
+            .catalogue_attribution_profile(server_unknown_id)
+            .expect("server-supplied Unknown remains attributable");
+        assert_eq!(server_unknown.title(), "Unknown");
+        assert_eq!(server_unknown.artist(), "Unknown");
+
+        // An absent optional album stays absent in the profile.
+        let album_less = backend
+            .catalogue_attribution_profile(album_less_id)
+            .expect("album-less row retains its provenance profile");
+        assert_eq!(album_less.title(), "Raw Bare");
+        assert_eq!(album_less.artist(), "Raw Artist");
+        assert_eq!(album_less.album(), None);
+
+        // Unknown or stale native IDs refuse attribution.
+        let stale_id = TrackId::remote("never-refreshed").expect("bounded stale track ID");
+        assert!(backend.catalogue_attribution_profile(&stale_id).is_none());
+    }
+
+    async fn assert_raw_row_lookup_fails_closed_while_cache_contended(
+        backend: &JellyfinBackend,
+        complete_id: &TrackId,
+    ) {
+        // A contended cache (refresh in flight) fails closed instead of
+        // blocking attribution on the lifecycle lock.
+        let guard = backend.cache.write().await;
+        assert!(backend.catalogue_attribution_profile(complete_id).is_none());
+        drop(guard);
+        assert!(backend.catalogue_attribution_profile(complete_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
+        let service = MockHttpService::start(raw_row_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect raw-row fixture");
+
+        let native_by_id = raw_row_native_ids(&backend).await;
+        assert_raw_row_profiles_are_frozen(&backend, &native_by_id);
+        assert_raw_row_lookup_fails_closed_while_cache_contended(
+            &backend,
+            &native_by_id["complete-row"],
+        )
+        .await;
+
         service.finish().await;
     }
 
@@ -974,6 +1236,283 @@ mod tests {
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));
             assert!(request.headers.get(reqwest::header::REFERER).is_none());
         }
+        service.finish().await;
+    }
+
+    fn search_row_items() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "Id": "search-complete",
+                "Name": "Search Complete",
+                "Type": "Audio",
+                "Album": "Search Album",
+                "AlbumArtist": "Search Artist",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Search Artist"}],
+                "IndexNumber": 5,
+                "RunTimeTicks": 2_220_000_000i64
+            }),
+            serde_json::json!({
+                "Id": "search-gap",
+                "Type": "Audio"
+            }),
+        ]
+    }
+
+    fn search_outside_catalogue_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"}
+                    ],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("SearchTerm", "Fixture")
+                .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": search_row_items(),
+                    "TotalRecordCount": 2
+                }))),
+        ]
+    }
+
+    fn assert_search_row_provenance_profiles(backend: &JellyfinBackend) {
+        // A searched row that never went through the catalogue refresh still
+        // carries its raw provenance as Last.fm attribution authority, with
+        // the same field precedence as the refresh path.
+        let complete_id = TrackId::remote("search-complete").expect("bounded track ID");
+        let profile = backend
+            .catalogue_attribution_profile(&complete_id)
+            .expect("searched row outside the catalogue retains its provenance profile");
+        assert_eq!(profile.title(), "Search Complete");
+        assert_eq!(profile.artist(), "Search Artist");
+        assert_eq!(profile.album(), Some("Search Album"));
+
+        // A searched row without enough raw provenance fails closed instead
+        // of becoming attribution authority.
+        let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
+        assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
+        let service = MockHttpService::start(search_outside_catalogue_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect Jellyfin search fixture");
+
+        let results = backend
+            .search("Fixture", 10)
+            .await
+            .expect("search the fixture server");
+        assert_eq!(results.tracks.len(), 2);
+        assert_search_row_provenance_profiles(&backend);
+        service.finish().await;
+    }
+
+    fn eviction_audio_item(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Id": id,
+            "Name": name,
+            "Type": "Audio",
+            "Album": "Eviction Album",
+            "AlbumArtist": "Eviction Artist",
+            "ArtistItems": [{"Id": "artist-1", "Name": "Eviction Artist"}],
+            "IndexNumber": 1,
+            "RunTimeTicks": 2_000_000_000i64
+        })
+    }
+
+    fn search_eviction_routes() -> Vec<MockRoute> {
+        let mut routes = search_eviction_catalogue_routes();
+        routes.extend(search_eviction_fresh_routes());
+        routes
+    }
+
+    fn search_eviction_catalogue_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"}
+                    ],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "Audio")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [eviction_audio_item("catalogue-song", "Catalogue Song")],
+                    "TotalRecordCount": 1
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicAlbum")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("IncludeItemTypes", "MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [],
+                    "TotalRecordCount": 0
+                }))),
+        ]
+    }
+
+    fn search_eviction_fresh_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("SearchTerm", "Fresh A")
+                .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
+                .replies([
+                    MockResponse::json(serde_json::json!({
+                        "Items": [eviction_audio_item("fresh-a", "Fresh A")],
+                        "TotalRecordCount": 1
+                    })),
+                    // The repeat search below hits the same query again.
+                    MockResponse::json(serde_json::json!({
+                        "Items": [eviction_audio_item("fresh-a", "Fresh A")],
+                        "TotalRecordCount": 1
+                    })),
+                ]),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("SearchTerm", "Fresh B")
+                .with_query("IncludeItemTypes", "Audio,MusicAlbum,MusicArtist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "Items": [eviction_audio_item("fresh-b", "Fresh B")],
+                    "TotalRecordCount": 1
+                }))),
+        ]
+    }
+
+    /// Pre-fill the bounded search-only store so a couple of real searches
+    /// cross the production bound without needing thousands of requests.
+    async fn fill_search_attribution_store_to_bound(backend: &JellyfinBackend) {
+        let mut cache = backend.cache.write().await;
+        for index in 0..MAX_SEARCH_ATTRIBUTION_PROFILES {
+            let track_id = TrackId::remote(format!("fill-{index}")).expect("bounded track ID");
+            let profile = PlaybackAttributionProfile::from_remote_row(
+                Some(format!("Fill {index}")),
+                Some("Fill Artist".to_owned()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("fill profile is bounded");
+            cache.search_attribution_profiles.insert(track_id, profile);
+        }
+    }
+
+    async fn assert_search_store_state(
+        backend: &JellyfinBackend,
+        present: &[&str],
+        absent: &[&str],
+    ) {
+        let cache = backend.cache.read().await;
+        assert_eq!(
+            cache.search_attribution_profiles.len(),
+            MAX_SEARCH_ATTRIBUTION_PROFILES,
+            "search-only retention stays capped at the bound"
+        );
+        for id in present {
+            let track_id = TrackId::remote(*id).expect("bounded track ID");
+            assert!(
+                cache.search_attribution_profiles.contains_key(&track_id),
+                "{id} should still be retained"
+            );
+        }
+        for id in absent {
+            let track_id = TrackId::remote(*id).expect("bounded track ID");
+            assert!(
+                !cache.search_attribution_profiles.contains_key(&track_id),
+                "{id} should have been evicted"
+            );
+        }
+    }
+
+    async fn assert_catalogue_profile_survives_search_traffic(backend: &JellyfinBackend) {
+        let catalogue_id = TrackId::remote("catalogue-song").expect("bounded track ID");
+        let cache = backend.cache.read().await;
+        let profile = cache
+            .attribution_profiles
+            .get(&catalogue_id)
+            .cloned()
+            .expect("the refreshed catalogue profile is never evicted by search traffic");
+        drop(cache);
+        assert_eq!(profile.title(), "Catalogue Song");
+        assert_eq!(
+            backend
+                .catalogue_attribution_profile(&catalogue_id)
+                .expect("catalogue authority stays resolvable")
+                .title(),
+            "Catalogue Song"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_attribution_profiles_stay_bounded_and_never_evict_catalogue() {
+        let service = MockHttpService::start(search_eviction_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("connect Jellyfin eviction fixture");
+
+        fill_search_attribution_store_to_bound(&backend).await;
+        assert_search_store_state(&backend, &["fill-0"], &[]).await;
+        assert_catalogue_profile_survives_search_traffic(&backend).await;
+
+        backend.search("Fresh A", 10).await.expect("first search");
+        // A genuinely new identity evicts only the oldest search-only entry.
+        assert_search_store_state(&backend, &["fresh-a", "fill-1"], &["fill-0"]).await;
+        assert_catalogue_profile_survives_search_traffic(&backend).await;
+
+        // A repeat search replaces its own entry in place, evicting nothing.
+        backend.search("Fresh A", 10).await.expect("repeat search");
+        assert_search_store_state(&backend, &["fresh-a", "fill-1"], &["fill-0"]).await;
+
+        // The next fresh identity evicts the next-oldest search-only entry.
+        backend.search("Fresh B", 10).await.expect("second search");
+        assert_search_store_state(
+            &backend,
+            &["fresh-a", "fresh-b", "fill-2"],
+            &["fill-0", "fill-1"],
+        )
+        .await;
+        assert_catalogue_profile_survives_search_traffic(&backend).await;
+
         service.finish().await;
     }
 }
