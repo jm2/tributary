@@ -9,7 +9,7 @@
 //! boundary until media use.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
@@ -399,6 +399,87 @@ impl PlaybackAttributionProfile {
 impl std::fmt::Debug for PlaybackAttributionProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PlaybackAttributionProfile(<redacted>)")
+    }
+}
+
+/// Cumulative bound on search-only playback-attribution retention per source.
+///
+/// Each search response is bounded per request, but a long-lived session can
+/// issue unbounded numbers of searches, each introducing rows with fresh
+/// native identities. Profiles minted from search rows are therefore kept in
+/// a [`BoundedSearchAttributionProfiles`] store capped at this bound instead
+/// of growing an adapter's attribution cache without limit.
+pub const MAX_SEARCH_ATTRIBUTION_PROFILES: usize = 1024;
+
+/// Insertion-ordered, bounded store for playback-attribution profiles minted
+/// from search rows outside the refreshed catalogue.
+///
+/// A refreshed catalogue profile is never stored here, so search traffic can
+/// never evict it. Re-searching an already-retained native identity replaces
+/// its entry in place without evicting anything; only a genuinely new
+/// identity past the bound evicts the oldest search-only entry.
+#[derive(Debug)]
+pub struct BoundedSearchAttributionProfiles {
+    bound: usize,
+    order: VecDeque<TrackId>,
+    profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+}
+
+impl BoundedSearchAttributionProfiles {
+    /// Create an empty store with the production retention bound.
+    pub fn bounded() -> Self {
+        Self::with_bound(MAX_SEARCH_ATTRIBUTION_PROFILES)
+    }
+
+    pub fn with_bound(bound: usize) -> Self {
+        Self {
+            bound,
+            order: VecDeque::new(),
+            profiles: HashMap::new(),
+        }
+    }
+
+    /// Retain one search-minted profile. An already-retained identity is
+    /// replaced in place; a new identity past the bound evicts the oldest
+    /// search-only entry first.
+    pub fn insert(&mut self, track_id: TrackId, profile: PlaybackAttributionProfile) {
+        if let Some(retained) = self.profiles.get_mut(&track_id) {
+            *retained = profile;
+            return;
+        }
+        self.order.push_back(track_id.clone());
+        self.profiles.insert(track_id, profile);
+        while self.order.len() > self.bound {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.profiles.remove(&evicted);
+        }
+    }
+
+    /// Drop one search-minted profile, keeping insertion order intact for the
+    /// remaining entries. Catalogue profiles live in a separate map and are
+    /// unaffected.
+    pub fn remove(&mut self, track_id: &TrackId) {
+        if self.profiles.remove(track_id).is_some() {
+            if let Some(position) = self.order.iter().position(|id| id == track_id) {
+                self.order.remove(position);
+            }
+        }
+    }
+
+    pub fn get(&self, track_id: &TrackId) -> Option<&PlaybackAttributionProfile> {
+        self.profiles.get(track_id)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    #[cfg(test)]
+    pub fn contains_key(&self, track_id: &TrackId) -> bool {
+        self.profiles.contains_key(track_id)
     }
 }
 
@@ -3486,6 +3567,78 @@ mod tests {
     };
 
     use super::*;
+
+    fn search_attribution_fixture() -> PlaybackAttributionProfile {
+        PlaybackAttributionProfile::for_test("T", "A", None, None, None, None)
+    }
+
+    fn search_attribution_track(suffix: &str) -> TrackId {
+        TrackId::remote(format!("search-{suffix}")).expect("bounded track ID")
+    }
+
+    #[test]
+    fn bounded_search_profiles_evict_the_oldest_identity_past_the_bound() {
+        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
+        let first = search_attribution_track("first");
+        let second = search_attribution_track("second");
+        let third = search_attribution_track("third");
+
+        store.insert(first.clone(), search_attribution_fixture());
+        store.insert(second.clone(), search_attribution_fixture());
+        assert_eq!(store.len(), 2);
+
+        // A third distinct identity past the bound evicts the oldest entry.
+        store.insert(third.clone(), search_attribution_fixture());
+        assert_eq!(store.len(), 2);
+        assert!(
+            !store.contains_key(&first),
+            "the oldest search-only entry must be evicted first"
+        );
+        assert!(store.contains_key(&second));
+        assert!(store.contains_key(&third));
+    }
+
+    #[test]
+    fn bounded_search_profiles_replace_repeat_identities_in_place() {
+        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
+        let first = search_attribution_track("first");
+        let second = search_attribution_track("second");
+        let profile = search_attribution_fixture();
+
+        store.insert(first.clone(), profile.clone());
+        store.insert(second.clone(), profile);
+        // Re-searching a retained identity replaces its value in place
+        // without evicting the neighbor or growing the store.
+        let refreshed = PlaybackAttributionProfile::for_test("T2", "A2", None, None, None, None);
+        store.insert(first.clone(), refreshed);
+        assert_eq!(store.len(), 2);
+        assert!(
+            store.contains_key(&second),
+            "a repeat insert must not evict anything"
+        );
+        assert_eq!(store.get(&first).expect("retained identity").title(), "T2");
+    }
+
+    #[test]
+    fn bounded_search_profiles_remove_keeps_remaining_entries_ordered() {
+        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
+        let first = search_attribution_track("first");
+        let second = search_attribution_track("second");
+        let profile = search_attribution_fixture();
+
+        store.insert(first.clone(), profile.clone());
+        store.insert(second.clone(), profile);
+        store.remove(&first);
+        assert_eq!(store.len(), 1);
+        assert!(store.contains_key(&second));
+        // The freed slot is refillable: inserting a new identity does not
+        // evict the surviving neighbor.
+        let third = search_attribution_track("third");
+        store.insert(third.clone(), search_attribution_fixture());
+        assert_eq!(store.len(), 2);
+        assert!(store.contains_key(&second));
+        assert!(store.contains_key(&third));
+    }
 
     struct FakeProbe {
         close_calls: AtomicUsize,
