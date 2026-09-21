@@ -30,7 +30,7 @@ All fixtures live in the test-only module `src/local/perf_fixtures.rs`.
   album and 4 albums per artist. Each file is a minimal but valid 8 kHz mono WAV
   that the production `lofty` parser accepts **and that carries ID3v2.3
   metadata matching its directory position** (`TIT2`/`TPE1`/`TALB`/`TRCK`
-  written into a RIFF `id3 ` chunk), so the scan persists genuinely distinct
+  written into a RIFF `id3` chunk (space-padded id), so the scan persists genuinely distinct
   artists and albums. This matters because the production scan persists what
   the tag parser reads and the backend aggregates on those persisted values —
   not on directory names. An earlier revision wrote the same untagged payload
@@ -65,7 +65,10 @@ Environment variables:
 | --- | --- | --- |
 | `TRIBUTARY_Q4_TRACKS` | `10000` | Track count to generate and measure. |
 | `TRIBUTARY_Q4_RUNNER` | `$OS-$ARCH` | Human label for the reference runner. |
-| `TRIBUTARY_Q4_PARSE_DELAY_MICROS` | unset | When set, run an additional scan into a **fresh second database** with this much deterministic delay per parsed file. |
+| `TRIBUTARY_Q4_PARSE_DELAY_MICROS` | unset | Per-file parse delay in µs for the delayed scan. |
+
+Setting `TRIBUTARY_Q4_PARSE_DELAY_MICROS` runs an additional scan into a **fresh second
+database** with that much deterministic delay per parsed file.
 
 Run the harness on the same named runner you intend to set budgets on. Record
 the runner label and the raw numbers with the environment that produced them.
@@ -102,7 +105,7 @@ after a `Q4_ENVIRONMENT runner=…` header.
 | Metric | Unit | Meaning |
 | --- | --- | --- |
 | `scan_tracks_persisted` | tracks | Rows committed by the initial scan. |
-| `scan_parse_invocations` | parses | Files that entered the parse branch during the baseline scan. |
+| `scan_parse_invocations` | parses | Files that entered the parse branch in the baseline scan. |
 | `scan_albums` | albums | Distinct albums the backend reports after the scan. |
 | `scan_artists` | artists | Distinct artists the backend reports after the scan. |
 | `scan_elapsed` | ms | Wall time for the initial scan to settle. |
@@ -117,14 +120,17 @@ after a `Q4_ENVIRONMENT runner=…` header.
 | `update_burst_count` | updates | Direct-backend rating mutations in the burst. |
 | `update_burst_total` | ms | Total direct-backend burst wall time. |
 | `update_burst_per_update` | ms | Mean latency per direct-backend rating mutation. |
-| `command_fifo_commands` | commands | Rating commands enqueued through the production engine FIFO. |
+| `command_fifo_commands` | commands | Rating commands enqueued through the production FIFO. |
 | `command_fifo_flush_settlement` | ms | Enqueue-to-acknowledgement time for the `Flush` barrier. |
 | `delayed_backend_list_tracks` | ms | `list_tracks` through `DelayedBackend`. |
 | `delayed_backend_calls` | calls | Calls forwarded through the delay. |
-| `delayed_parse_scan_elapsed` | ms | Fresh-database scan with the per-file parse delay applied. Includes the full cold-scan work (parse + insert), not just the delay. |
+| `delayed_parse_scan_elapsed` | ms | Delayed fresh-DB scan including the cold-scan work. |
 | `delayed_parse_files_parsed` | parses | Files that actually entered the delayed parse branch. |
 | `delayed_parse_micros_per_file` | µs | Configured per-file delay. |
-| `delayed_parse_estimated_delay_total_ms` | ms | `delayed_parse_files_parsed × micros_per_file / 1000`; the delay component inside `delayed_parse_scan_elapsed`. |
+| `delayed_parse_estimated_delay_total_ms` | ms | Delay share of `delayed_parse_scan_elapsed`. |
+
+The estimated delay total is `delayed_parse_files_parsed × micros_per_file / 1000`, the delay
+component of `delayed_parse_scan_elapsed`.
 
 ## Baseline
 

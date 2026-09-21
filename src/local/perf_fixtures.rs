@@ -48,7 +48,10 @@ const ALBUMS_PER_ARTIST: usize = 4;
 /// Resolve a scratch directory that never lands on the small `/tmp` tmpfs.
 ///
 /// The global environment rule is `${TMPDIR:-/var/tmp}`: `/tmp` is a
-/// quota-limited RAM disk that fails writes mid-run once full.
+/// quota-limited RAM disk that fails writes mid-run once full. Non-unix
+/// hosts use `TEMP`/`TMP` (both set by Windows); the final `.` fallback
+/// only fires if the platform provides none of these variables, and the
+/// fixture cleans up its own scratch trees.
 fn scratch_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("TMPDIR") {
         return PathBuf::from(dir);
@@ -59,7 +62,10 @@ fn scratch_root() -> PathBuf {
     }
     #[cfg(not(unix))]
     {
-        std::env::temp_dir()
+        if let Some(dir) = std::env::var_os("TEMP").or_else(|| std::env::var_os("TMP")) {
+            return PathBuf::from(dir);
+        }
+        PathBuf::from(".")
     }
 }
 
