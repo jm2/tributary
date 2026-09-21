@@ -2025,7 +2025,15 @@ mod tests {
     ///   master rows, the browser snapshot, and repopulate the genre panes;
     ///   when `TRIBUTARY_Q4_UI_BENCH_TRACKS` is set it additionally times
     ///   the publication/rebuild endpoints at that scale
-    ///   ([`Self::q4_publication_contract_and_bench`], tr-am6qr).
+    ///   ([`Self::q4_publication_contract_and_bench`], tr-am6qr);
+    /// - the per-row playlist drop target must resolve the row under the
+    ///   pointer, drive the production `connect_accept`/`connect_drop`
+    ///   handlers, and forward the exact displayed candidate order
+    ///   ([`crate::ui::context_menu::tests::per_row_playlist_drop_target_drives_the_production_drop_path`]);
+    /// - the keyboard "Add to Playlist" action must carry the identical
+    ///   displayed-order candidates as the drag payload and refuse the same
+    ///   destinations
+    ///   ([`crate::ui::context_menu::tests::keyboard_add_action_matches_the_drag_payload_contract`]).
     ///
     /// This is deliberately the only GTK-initializing `#[test]` in the
     /// crate: the `ui::widget_test_session` mutex serializes but does not
@@ -2079,6 +2087,8 @@ mod tests {
                 assert_unbind_reset(&list_item, &row);
 
                 crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
+                crate::ui::context_menu::tests::per_row_playlist_drop_target_drives_the_production_drop_path();
+                crate::ui::context_menu::tests::keyboard_add_action_matches_the_drag_payload_contract();
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
                 crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
                 crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();

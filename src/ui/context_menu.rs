@@ -112,6 +112,32 @@ enum PlaylistMutationOutcome {
     Failed,
 }
 
+/// What the UI must do after a playlist add attempt resolves.
+///
+/// Extracted from [`PlaylistMutationContext::add_candidates_to_playlist`]'s
+/// result branch so the outcome → toast/refresh dispatch is unit-testable
+/// without a live window, while the real handler keeps the single production
+/// path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaylistAddFeedback {
+    /// Commit succeeded: show the success toast, then refresh the playlist.
+    Added,
+    /// The destination refused the write: show the unsupported dialog.
+    Unsupported,
+    /// The write failed or the worker vanished: show the failure dialog.
+    Failed,
+}
+
+fn playlist_add_feedback(
+    outcome: &Result<PlaylistMutationOutcome, async_channel::RecvError>,
+) -> PlaylistAddFeedback {
+    match outcome {
+        Ok(PlaylistMutationOutcome::Committed) => PlaylistAddFeedback::Added,
+        Ok(PlaylistMutationOutcome::Rejected) => PlaylistAddFeedback::Unsupported,
+        Ok(PlaylistMutationOutcome::Failed) | Err(_) => PlaylistAddFeedback::Failed,
+    }
+}
+
 #[derive(Clone)]
 struct PlaylistMutationContext {
     window: gtk::glib::WeakRef<adw::ApplicationWindow>,
@@ -212,13 +238,13 @@ impl PlaylistMutationContext {
         let context = self.clone();
         let count = candidates.len();
         gtk::glib::MainContext::default().spawn_local(async move {
-            match result_rx.recv().await {
-                Ok(PlaylistMutationOutcome::Committed) => {
+            match playlist_add_feedback(&result_rx.recv().await) {
+                PlaylistAddFeedback::Added => {
                     context.show_added(count, &playlist_name);
                     context.refresh_playlist_after_commit(&playlist_id);
                 }
-                Ok(PlaylistMutationOutcome::Rejected) => context.show_unsupported(),
-                Ok(PlaylistMutationOutcome::Failed) | Err(_) => context.show_mutation_failed(),
+                PlaylistAddFeedback::Unsupported => context.show_unsupported(),
+                PlaylistAddFeedback::Failed => context.show_mutation_failed(),
             }
         });
     }
@@ -468,13 +494,30 @@ struct ContextMenuPopupSession<'a> {
 /// No later mutation consults a URI, source label, or whatever rows happen
 /// to occupy these GTK positions.
 fn snapshot_popup_plan(session: &ContextMenuPopupSession<'_>) -> Option<ContextMenuPopupPlan> {
-    let sel = session
-        .column_view
+    popup_plan_for_models(session.column_view, session.sm)
+}
+
+/// The selection-position translation `snapshot_popup_plan` performs over
+/// the view's `MultiSelection` and the popup's sort model — the entirety of
+/// `snapshot_popup_plan`'s computation, extracted (mirroring the drop side's
+/// `resolve_playlist_drop`) so the production popup-plan path can be driven
+/// in tests.
+///
+/// Residual seam: the full session additionally carries the live
+/// [`PlaylistMutationContext`], which no test harness can construct (window,
+/// tokio runtime, source registry), so the session wrapper itself stays
+/// unexercised — this extraction keeps that wrapper a one-line forward over
+/// exactly the logic it guards.
+fn popup_plan_for_models(
+    column_view: &gtk::ColumnView,
+    sm: &gtk::SortListModel,
+) -> Option<ContextMenuPopupPlan> {
+    let sel = column_view
         .model()
         .and_then(|m| m.downcast::<gtk::MultiSelection>().ok())?;
     let selected = sel.selection();
     ContextMenuPopupPlan::from_positions(
-        (0..session.sm.n_items()).filter(|position| selected.contains(*position)),
+        (0..sm.n_items()).filter(|position| selected.contains(*position)),
     )
 }
 
@@ -503,6 +546,20 @@ fn append_context_menu_actions(
     // shown by a regular or smart playlist can be dragged onto another
     // regular playlist. Keyboard users need the same destinations from the
     // menu, so the add actions are offered in playlist views as well.
+    //
+    // The add actions commit through the same sink indirection the per-row
+    // drop performs (`PlaylistDropSink`): production forwards every
+    // activation to the live mutation context, tests inject an observer.
+    let owns_context = session.mutation_context.clone();
+    let commit_context = session.mutation_context.clone();
+    let unsupported_context = session.mutation_context.clone();
+    let owns_request = Rc::new(move |request: &super::source_navigation::SourceRequest| {
+        owns_context.owns_request(request)
+    });
+    let commit_add: PlaylistAddSink = Rc::new(move |playlist_id, playlist_name, candidates| {
+        commit_context.add_candidates_to_playlist(playlist_id, playlist_name, candidates);
+    });
+    let show_unsupported = Rc::new(move || unsupported_context.show_unsupported());
     build_add_to_playlist_actions(
         menu,
         action_group,
@@ -510,7 +567,9 @@ fn append_context_menu_actions(
         session.sm,
         &popup_plan.selection,
         interaction_request,
-        session.mutation_context,
+        owns_request,
+        commit_add,
+        show_unsupported,
     );
 
     // ── Properties… ──────────────────────────────────────────
@@ -616,16 +675,40 @@ fn attach_keyboard_context_menu(state: &WindowState, popup_menu: ContextMenuPopu
 /// playlist row than the one currently focused must add to the row the
 /// pointer actually landed on, not the row the keyboard cursor last visited.
 pub struct PlaylistRowDropContext {
-    context: PlaylistMutationContext,
     store: gtk::gio::ListStore,
+    on_drop: PlaylistDropSink,
 }
+
+/// Receives the exactly-resolved destination and payload of an accepted
+/// per-row drop. Production wires this straight to
+/// [`PlaylistMutationContext::add_candidates_to_playlist`]; tests inject an
+/// observer so the real `connect_drop` handler can be driven without a live
+/// window or database.
+type PlaylistDropSink = Rc<dyn Fn(String, String, Vec<PlaylistAddCandidate>)>;
 
 impl PlaylistRowDropContext {
     pub fn from_window(state: &WindowState) -> Self {
+        let context = PlaylistMutationContext::from_window(state);
         Self {
-            context: PlaylistMutationContext::from_window(state),
             store: state.sidebar_store.clone(),
+            on_drop: Rc::new(move |playlist_id, playlist_name, candidates| {
+                context.add_candidates_to_playlist(playlist_id, playlist_name, candidates);
+            }),
         }
+    }
+
+    /// Test-only constructor: same drop resolution as production, but the
+    /// accepted destination and payload go to `on_drop` instead of the live
+    /// mutation context.
+    ///
+    /// Gated to the exact platforms whose tests can call it: its only
+    /// caller is the per-row drop harness, which requires a display and is
+    /// therefore `not(target_os = "macos")`. Leaving this merely `#[cfg(test)]`
+    /// made the constructor dead code on macOS test builds, failing
+    /// `cargo clippy --all-targets -- -D warnings` there.
+    #[cfg(all(test, not(target_os = "macos")))]
+    fn for_test(store: gtk::gio::ListStore, on_drop: PlaylistDropSink) -> Self {
+        Self { store, on_drop }
     }
 }
 
@@ -648,34 +731,83 @@ pub fn attach_playlist_drop_target(
     let store_for_accept = drop.store.clone();
     let list_item_for_accept = list_item.clone();
     drop_target.connect_accept(move |_, drop| {
-        playlist_drop_is_acceptable(
+        accept_decision_for_drop(
+            &store_for_accept,
+            &list_item_for_accept,
             &drop.formats(),
             drop.actions(),
-            position_source(&store_for_accept, &list_item_for_accept)
-                .is_some_and(|source| source.is_editable_regular_playlist()),
         )
     });
-    let context_for_drop = drop.context.clone();
     let store_for_drop = drop.store.clone();
     let list_item_for_drop = list_item.clone();
+    let sink_for_drop = drop.on_drop.clone();
     drop_target.connect_drop(move |_, value, _, _| {
-        let Ok(payload) = value.get::<PlaylistDragPayload>() else {
+        let Some(resolved) = resolve_playlist_drop(&store_for_drop, &list_item_for_drop, value)
+        else {
             return false;
         };
-        let Some(source) = position_source(&store_for_drop, &list_item_for_drop) else {
-            return false;
-        };
-        if !source.is_editable_regular_playlist() {
-            return false;
-        }
-        context_for_drop.add_candidates_to_playlist(
-            source.playlist_id(),
-            source.name(),
-            payload.candidates,
+        sink_for_drop(
+            resolved.playlist_id,
+            resolved.playlist_name,
+            resolved.candidates,
         );
         true
     });
     row_box.add_controller(drop_target);
+}
+
+/// A per-row track drop resolved to the playlist currently bound to the row
+/// under the pointer.
+///
+/// Extracted verbatim from the `connect_drop` handler so the production
+/// resolution path — payload decode, `position_source`, and the
+/// editable-regular refusal — can be driven directly in tests without a live
+/// mutation context.
+struct ResolvedPlaylistDrop {
+    playlist_id: String,
+    playlist_name: String,
+    candidates: Vec<PlaylistAddCandidate>,
+}
+
+fn resolve_playlist_drop(
+    store: &gtk::gio::ListStore,
+    list_item: &gtk::ListItem,
+    value: &gtk::glib::Value,
+) -> Option<ResolvedPlaylistDrop> {
+    let payload = value.get::<PlaylistDragPayload>().ok()?;
+    let source = position_source(store, list_item)?;
+    if !source.is_editable_regular_playlist() {
+        return None;
+    }
+    Some(ResolvedPlaylistDrop {
+        playlist_id: source.playlist_id(),
+        playlist_name: source.name(),
+        candidates: payload.candidates,
+    })
+}
+
+/// Full production `connect_accept` decision for one row: the format/action
+/// compatibility check combined with resolving the row under the pointer to
+/// its sidebar source.
+///
+/// This is the named forwarding function the installed `connect_accept`
+/// closure calls with the row's own store/list_item and the in-flight
+/// drop's `formats()`/`actions()` — extracted (mirroring the drop side's
+/// `resolve_playlist_drop`) so the harness can drive the exact production
+/// decision the accept handler forwards to, with each realized row's real
+/// `ListItem` identity.
+fn accept_decision_for_drop(
+    store: &gtk::gio::ListStore,
+    list_item: &gtk::ListItem,
+    formats: &gtk::gdk::ContentFormats,
+    actions: gtk::gdk::DragAction,
+) -> bool {
+    playlist_drop_is_acceptable(
+        formats,
+        actions,
+        position_source(store, list_item)
+            .is_some_and(|source| source.is_editable_regular_playlist()),
+    )
 }
 
 fn position_source(store: &gtk::gio::ListStore, list_item: &gtk::ListItem) -> Option<SourceObject> {
@@ -902,7 +1034,26 @@ fn build_remove_from_playlist_action(
     );
 }
 
+/// Receives one activated "Add to Playlist" action's exact destination and
+/// payload — the playlist id, its display name, and the snapshot's
+/// candidates in displayed order. Production forwards to
+/// [`PlaylistMutationContext::add_candidates_to_playlist`], the identical
+/// mutation the per-row drop performs through [`PlaylistDropSink`]; tests
+/// inject an observer so the real action-build → activate path can be
+/// driven without a live window, navigation session or database.
+type PlaylistAddSink = Rc<dyn Fn(String, String, Vec<PlaylistAddCandidate>)>;
+
 /// Build "Add to Playlist" actions (flat list with disabled header).
+///
+/// The activation callback's guard sequence — navigation staleness,
+/// destination editability, payload presence — is the production logic and
+/// stays here verbatim. The commit and the unsupported dialog are injected
+/// as sinks so tests can drive the real action-build → activate path;
+/// production wires them to
+/// [`PlaylistMutationContext::add_candidates_to_playlist`] and
+/// [`PlaylistMutationContext::show_unsupported`] (see
+/// `append_context_menu_actions`).
+#[allow(clippy::too_many_arguments)]
 fn build_add_to_playlist_actions(
     menu: &gtk::gio::Menu,
     action_group: &gtk::gio::SimpleActionGroup,
@@ -910,7 +1061,9 @@ fn build_add_to_playlist_actions(
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
     interaction_request: Option<&super::source_navigation::SourceRequest>,
-    context: &PlaylistMutationContext,
+    owns_request: Rc<dyn Fn(&super::source_navigation::SourceRequest) -> bool>,
+    commit_add: PlaylistAddSink,
+    show_unsupported: Rc<dyn Fn()>,
 ) {
     let mut has_playlists = false;
     let candidates = collect_selected_add_candidates(sm, selection);
@@ -941,31 +1094,29 @@ fn build_add_to_playlist_actions(
                 let action_playlist_name = pl_name.clone();
                 let interaction_request = interaction_request.cloned();
                 let candidates = candidates.clone();
-                let context = context.clone();
+                let owns_request = owns_request.clone();
+                let commit_add = commit_add.clone();
+                let show_unsupported = show_unsupported.clone();
                 let sidebar_store = sidebar_store.clone();
                 add_action.connect_activate(move |_, _| {
                     let Some(request) = interaction_request.as_ref() else {
-                        context.show_unsupported();
+                        show_unsupported();
                         return;
                     };
-                    if !context.owns_request(request) {
-                        context.show_unsupported();
+                    if !owns_request(request) {
+                        show_unsupported();
                         return;
                     }
                     if !playlist_is_editable_regular(&sidebar_store, &pid) {
-                        context.show_unsupported();
+                        show_unsupported();
                         return;
                     }
 
                     let Some(candidates) = candidates.clone() else {
-                        context.show_unsupported();
+                        show_unsupported();
                         return;
                     };
-                    context.add_candidates_to_playlist(
-                        pid.clone(),
-                        action_playlist_name.clone(),
-                        candidates,
-                    );
+                    commit_add(pid.clone(), action_playlist_name.clone(), candidates);
                 });
                 action_group.add_action(&add_action);
                 menu.append(
@@ -3325,5 +3476,768 @@ pub mod tests {
         for info in &complete {
             assert!(matches!(info.target, SaveTarget::Local(_)));
         }
+    }
+
+    /// Outcome → feedback dispatch: a committed write must take the success
+    /// toast plus playlist-refresh path, a refused write the unsupported
+    /// dialog, and a failed (or vanished) worker the failure dialog.
+    /// `add_candidates_to_playlist` dispatches on exactly this mapping, so a
+    /// regression that swapped or dropped an arm would be caught here even
+    /// without a live window.
+    #[test]
+    fn playlist_add_feedback_maps_outcomes_to_toast_or_dialog() {
+        assert_eq!(
+            playlist_add_feedback(&Ok(PlaylistMutationOutcome::Committed)),
+            PlaylistAddFeedback::Added
+        );
+        assert_eq!(
+            playlist_add_feedback(&Ok(PlaylistMutationOutcome::Rejected)),
+            PlaylistAddFeedback::Unsupported
+        );
+        assert_eq!(
+            playlist_add_feedback(&Ok(PlaylistMutationOutcome::Failed)),
+            PlaylistAddFeedback::Failed
+        );
+
+        // A worker that vanishes without reporting closes the channel; the
+        // `Err` arm must still resolve, to the failure dialog.
+        let (result_tx, result_rx) = async_channel::bounded::<PlaylistMutationOutcome>(1);
+        drop(result_tx);
+        let closed = result_rx.recv_blocking();
+        assert!(closed.is_err(), "a closed channel must report Err");
+        assert_eq!(playlist_add_feedback(&closed), PlaylistAddFeedback::Failed);
+    }
+
+    // ── Production per-row drop path (GTK session) ───────────────────────
+    //
+    // The contracts below construct GtkListModel widgets, whose constructors
+    // assert `gtk::is_initialized()`. They therefore cannot be their own
+    // `#[test]` functions; they join the crate's single consolidated GTK test
+    // in `browser.rs`, which already owns the display gate and the one
+    // `gtk::init` for the process.
+
+    /// The real drag-source payload builder must hand the mutation path the
+    /// selection in displayed order — the order the rows appear under the
+    /// current sort — not store or insertion order.
+    #[cfg(not(target_os = "macos"))]
+    pub fn drag_payload_preserves_displayed_selection_order() {
+        let (sort_model, selection) = sorted_track_selection_models();
+
+        let payload = PlaylistDragPayload::from_selection(&sort_model, &selection)
+            .expect("a non-empty selection must produce a drag payload");
+        assert_eq!(
+            payload
+                .candidates
+                .iter()
+                .map(|candidate| candidate.media_key().track_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-track", "c-track"],
+            "candidates must follow displayed position order"
+        );
+    }
+
+    /// Store order (c, a, b) displayed sorted (a, b, c), first and last
+    /// displayed rows selected out of store order — the non-trivial selection
+    /// shared by the drag-payload and keyboard-equivalence contracts.
+    #[cfg(not(target_os = "macos"))]
+    fn sorted_track_selection_models() -> (gtk::SortListModel, gtk::MultiSelection) {
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for (track_id, title) in [
+            ("c-track", "Third"),
+            ("a-track", "First"),
+            ("b-track", "Second"),
+        ] {
+            let track = TrackObject::new(
+                1, title, 60, "Artist", "Album", "", "", 0, "", 0, 0, 0, "", "",
+            );
+            track.set_track_id(track_id);
+            assert!(track.set_source_id(SourceId::local()));
+            store.append(&track);
+        }
+
+        // Sort by track id, so the displayed order (a, b, c) differs from the
+        // store order (c, a, b).
+        let sorter = gtk::CustomSorter::new(|left, right| {
+            let id = |object: &glib::Object| {
+                object
+                    .downcast_ref::<TrackObject>()
+                    .expect("TrackObject row")
+                    .track_id()
+            };
+            id(left).cmp(&id(right)).into()
+        });
+        let sort_model = gtk::SortListModel::new(Some(store), Some(sorter));
+        let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
+        // Select the first and last displayed rows, out of store order. The
+        // second call must pass `unselect_rest = false`: the flag clears every
+        // other row, so chaining two `true` calls would leave only the last
+        // row selected.
+        selection.select_item(0, true);
+        selection.select_item(2, false);
+        // Guard the fixture itself: before any payload is built from this
+        // selection, exactly the first and last displayed rows must carry the
+        // selection the contracts assert against.
+        assert!(
+            selection.is_selected(0) && !selection.is_selected(1) && selection.is_selected(2),
+            "fixture must select exactly the first and last displayed rows"
+        );
+        (sort_model, selection)
+    }
+
+    /// Keyboard-equivalence contract for the "Add to Playlist" context-menu
+    /// actions — the keyboard/menu route to a playlist add, required to
+    /// behave identically to the per-row drop. The action builder collects
+    /// its candidates with `collect_selected_add_candidates` over the popup
+    /// selection snapshot and the drag source collects them through
+    /// `PlaylistDragPayload::from_selection`; both must carry the identical
+    /// candidates in displayed position order, and the keyboard destination
+    /// guard `playlist_is_editable_regular` must accept exactly the editable
+    /// regular playlists the drop target's `position_source` check accepts.
+    ///
+    /// The contract additionally drives the production construction the
+    /// popup performs end-to-end: `snapshot_popup_plan`'s computation over a
+    /// real ColumnView/MultiSelection, `build_add_to_playlist_actions` over
+    /// that plan, and one real activation through the action group, asserting
+    /// the exact destination and the identical displayed-order candidates
+    /// reach the commit sink (and that an activation without the popup's
+    /// interaction request refuses before the sink).
+    #[cfg(not(target_os = "macos"))]
+    pub fn keyboard_add_action_matches_the_drag_payload_contract() {
+        let (sort_model, selection) = sorted_track_selection_models();
+        let (sidebar, keyboard) =
+            assert_drag_and_keyboard_routes_build_identical_payloads(&sort_model, &selection);
+
+        // ── Production popup-plan → action-build → activate path ──────────
+        //
+        // The production construction the popup actually performs:
+        // `snapshot_popup_plan`'s computation (via `popup_plan_for_models`)
+        // over a real ColumnView/MultiSelection, `build_add_to_playlist_actions`
+        // over that plan, and one real activation through the action group,
+        // asserting the exact destination and the identical displayed-order
+        // candidates reach the commit sink.
+        //
+        // Residual seam: `snapshot_popup_plan` itself also takes the live
+        // `PlaylistMutationContext` through `ContextMenuPopupSession`, which
+        // no test harness can construct (window, tokio runtime, source
+        // registry); the extraction keeps that wrapper a one-line forward
+        // over exactly the logic it guards, and the commit sink injected
+        // below is wired in production to
+        // `PlaylistMutationContext::add_candidates_to_playlist`.
+        sidebar.append(&second_regular_playlist_source());
+        let column_view = gtk::ColumnView::new(Some(selection.clone()));
+        let popup_plan = popup_plan_for_models(&column_view, &sort_model)
+            .expect("the column view must carry the production MultiSelection");
+        assert_eq!(
+            popup_plan.selection.positions,
+            [0, 2],
+            "the production plan must snapshot the selected displayed positions"
+        );
+
+        assert_production_add_action_commits_displayed_order(
+            &sidebar,
+            &sort_model,
+            &popup_plan.selection,
+            &keyboard,
+        );
+        assert_add_action_without_interaction_request_refuses(
+            &sidebar,
+            &sort_model,
+            &popup_plan.selection,
+        );
+    }
+
+    /// The payload half of the keyboard-equivalence contract: the drag
+    /// source and the keyboard action builder must collect the identical
+    /// candidates in displayed position order, and the keyboard destination
+    /// guard `playlist_is_editable_regular` must accept exactly the editable
+    /// regular playlists the drop target's `position_source` check accepts.
+    ///
+    /// Returns the sidebar store (extended by the production-path half) and
+    /// the keyboard candidates, for the commit-sink equality assertion in
+    /// the production-path half.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_drag_and_keyboard_routes_build_identical_payloads(
+        sort_model: &gtk::SortListModel,
+        selection: &gtk::MultiSelection,
+    ) -> (gtk::gio::ListStore, Vec<PlaylistAddCandidate>) {
+        // The popup-plan selection snapshot: the same displayed positions the
+        // context menu captures when it is opened over the selection.
+        let keyboard_selection =
+            SelectionSnapshot::from_positions([0u32, 2]).expect("a non-empty selection snapshot");
+
+        fn track_ids(candidates: &[PlaylistAddCandidate]) -> Vec<&str> {
+            candidates
+                .iter()
+                .map(|candidate| candidate.media_key().track_id.as_str())
+                .collect()
+        }
+
+        let drag = PlaylistDragPayload::from_selection(sort_model, selection)
+            .expect("a non-empty selection must produce a drag payload");
+        let keyboard = collect_selected_add_candidates(sort_model, &keyboard_selection)
+            .expect("selected rows must resolve to add candidates");
+
+        assert_eq!(
+            track_ids(&drag.candidates),
+            ["a-track", "c-track"],
+            "the drag payload must follow displayed position order"
+        );
+        assert_eq!(
+            track_ids(&keyboard),
+            ["a-track", "c-track"],
+            "the keyboard action must carry the identical displayed-order candidates"
+        );
+        assert_eq!(
+            drag.candidates, keyboard,
+            "drag and keyboard routes must produce identical candidates"
+        );
+
+        // Keyboard destination guard: the action exists only for editable
+        // regular playlists, so activation can only mutate what the drop
+        // target's `position_source` check would have accepted.
+        let sidebar = gtk::gio::ListStore::new::<SourceObject>();
+        sidebar.append(&regular_playlist_source());
+        sidebar.append(&smart_playlist_source());
+        sidebar.append(&header_source());
+        assert!(playlist_is_editable_regular(&sidebar, "regular-id"));
+        assert!(
+            !playlist_is_editable_regular(&sidebar, "smart-id"),
+            "smart playlists must refuse the keyboard add, like the drop"
+        );
+        assert!(
+            !playlist_is_editable_regular(&sidebar, "missing-id"),
+            "an unknown playlist id must refuse the keyboard add"
+        );
+        (sidebar, keyboard)
+    }
+
+    /// The production-path half of the keyboard-equivalence contract:
+    /// `build_add_to_playlist_actions` over the real popup plan, then one
+    /// real activation through the action group —
+    /// `ActionGroup::activate_action` drives the real `connect_activate`
+    /// callback — asserting the exact destination playlist and the
+    /// identical displayed-order candidates reach the commit sink.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_production_add_action_commits_displayed_order(
+        sidebar: &gtk::gio::ListStore,
+        sort_model: &gtk::SortListModel,
+        selection: &SelectionSnapshot,
+        keyboard: &[PlaylistAddCandidate],
+    ) {
+        use gtk::gio::prelude::ActionGroupExt;
+
+        let menu = gtk::gio::Menu::new();
+        let action_group = gtk::gio::SimpleActionGroup::new();
+        let activated: KeyboardActivations = Rc::new(RefCell::new(Vec::new()));
+        let commit_add = recorded_keyboard_sink(Rc::clone(&activated));
+        let (request, owns_request) = keyboard_navigation_owns_request();
+        build_add_to_playlist_actions(
+            &menu,
+            &action_group,
+            sidebar,
+            sort_model,
+            selection,
+            Some(&request),
+            owns_request,
+            commit_add,
+            Rc::new(|| {}),
+        );
+
+        // The menu carries the disabled header plus one entry per editable
+        // regular playlist in sidebar order; the smart playlist and the
+        // header row get no destination action at all.
+        assert_eq!(
+            menu.n_items(),
+            3,
+            "the disabled header plus the two editable regular destinations"
+        );
+        assert!(
+            action_group.lookup_action("add-to-smart_id").is_none(),
+            "the smart playlist must get no keyboard add action, like the drop"
+        );
+
+        // Activate the production action for the first regular playlist and
+        // assert the exact destination playlist and the identical
+        // displayed-order candidates reach the commit sink.
+        action_group.activate_action("add-to-regular_id", None);
+        assert_eq!(
+            activated.borrow().as_slice(),
+            [(
+                "regular-id".to_string(),
+                "My Mix".to_string(),
+                keyboard.to_vec(),
+            )],
+            "activating the production action must forward the exact destination \
+             playlist and the identical displayed-order candidates"
+        );
+    }
+
+    /// The guard tail of the keyboard-equivalence contract: an activation
+    /// built without the popup's interaction request must refuse before the
+    /// commit sink.
+    #[cfg(not(target_os = "macos"))]
+    fn assert_add_action_without_interaction_request_refuses(
+        sidebar: &gtk::gio::ListStore,
+        sort_model: &gtk::SortListModel,
+        selection: &SelectionSnapshot,
+    ) {
+        use gtk::gio::prelude::ActionGroupExt;
+
+        let refused: KeyboardActivations = Rc::new(RefCell::new(Vec::new()));
+        let refusal_menu = gtk::gio::Menu::new();
+        let refusal_group = gtk::gio::SimpleActionGroup::new();
+        build_add_to_playlist_actions(
+            &refusal_menu,
+            &refusal_group,
+            sidebar,
+            sort_model,
+            selection,
+            None,
+            Rc::new(|_: &crate::ui::source_navigation::SourceRequest| true),
+            recorded_keyboard_sink(Rc::clone(&refused)),
+            Rc::new(|| {}),
+        );
+        refusal_group.activate_action("add-to-regular_id", None);
+        assert!(
+            refused.borrow().is_empty(),
+            "an activation without the popup's interaction request must not commit"
+        );
+    }
+
+    /// The popup's interaction request — a real navigation request — plus an
+    /// `owns_request` mirroring the production check over the real
+    /// `SourceNavigation` staleness logic.
+    #[cfg(not(target_os = "macos"))]
+    fn keyboard_navigation_owns_request() -> (
+        crate::ui::source_navigation::SourceRequest,
+        KeyboardOwnsRequest,
+    ) {
+        let navigation = Rc::new(RefCell::new(
+            crate::ui::source_navigation::SourceNavigation::new("playlist:regular-id"),
+        ));
+        let request = navigation.borrow_mut().select("playlist:regular-id");
+        let owns_request = {
+            let navigation = Rc::clone(&navigation);
+            Rc::new(
+                move |request: &crate::ui::source_navigation::SourceRequest| {
+                    navigation.borrow().is_current(request)
+                },
+            )
+        };
+        (request, owns_request)
+    }
+
+    /// Drives the production per-row drop path through the real widgets: a
+    /// `GtkListView` whose factory installs the same
+    /// `attach_playlist_drop_target` the sidebar uses, real `GtkListItem`
+    /// positions, and the actual `connect_drop` handler reached by emitting
+    /// the `drop` signal. Two distinct editable regular playlists are
+    /// realized, with the keyboard focus resting on one while the drop is
+    /// emitted on the other (and then reversed), so a destination resolved
+    /// from the focus or hardcoded to the first editable row fails. This is
+    /// the coverage the merged #182/#242 review thread called out as missing
+    /// when only `is_editable_regular_playlist()` was asserted.
+    #[cfg(not(target_os = "macos"))]
+    pub fn per_row_playlist_drop_target_drives_the_production_drop_path() {
+        drag_payload_preserves_displayed_selection_order();
+        let harness = PerRowDropHarness::new();
+        harness.assert_accept_resolution();
+        harness.assert_drop_routes_to_the_pointer_row();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    type RecordedDrops = Rc<RefCell<Vec<(String, String, Vec<PlaylistAddCandidate>)>>>;
+
+    #[cfg(not(target_os = "macos"))]
+    struct RealizedDropRow {
+        position: u32,
+        list_item: gtk::ListItem,
+        drop_target: gtk::DropTarget,
+    }
+
+    /// A realized sidebar-like view: one `GtkListItem` per source row, each
+    /// carrying the production drop target bound to its own position.
+    #[cfg(not(target_os = "macos"))]
+    struct PerRowDropHarness {
+        _window: gtk::Window,
+        store: gtk::gio::ListStore,
+        selection: gtk::SingleSelection,
+        rows: Vec<RealizedDropRow>,
+        dropped: RecordedDrops,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    impl PerRowDropHarness {
+        fn new() -> Self {
+            let store = gtk::gio::ListStore::new::<SourceObject>();
+            store.append(&regular_playlist_source());
+            store.append(&smart_playlist_source());
+            store.append(&second_regular_playlist_source());
+            store.append(&header_source());
+
+            // Sidebar-like keyboard focus resting on the first editable
+            // regular playlist: every drop below is then issued on a row
+            // other than the focused one, so a destination resolved from the
+            // focus (or from "the first editable row in the store") records
+            // the wrong playlist and fails these assertions.
+            let selection = gtk::SingleSelection::new(Some(store.clone()));
+            selection.set_autoselect(false);
+            selection.select_item(0, true);
+
+            let dropped: RecordedDrops = Rc::new(RefCell::new(Vec::new()));
+            let on_drop = recorded_drop_sink(Rc::clone(&dropped));
+            let drop_context = PlaylistRowDropContext::for_test(store.clone(), on_drop);
+            let (window, recorded) = realize_drop_list_view(selection.clone(), drop_context);
+
+            Self {
+                _window: window,
+                store,
+                selection,
+                rows: realized_drop_rows(&recorded),
+                dropped,
+            }
+        }
+
+        /// The accept decision sees the row under the pointer: only the two
+        /// editable regular playlist rows accept a track drag, while the
+        /// smart playlist and header rows refuse it, and a playlist-reorder
+        /// drag is always left to the reorder target.
+        ///
+        /// The production `connect_accept` closure is additionally
+        /// introspected as installed on every realized row target, so a
+        /// removed or misattached handler fails loudly. Residual seam: the
+        /// `accept` signal carries a `gdk::Drop`, which has no public
+        /// constructor and only exists in a live DND session, so the
+        /// closure's per-invocation argument forwarding cannot be
+        /// emission-tested here; the named forwarding function
+        /// `accept_decision_for_drop` — everything the closure forwards to —
+        /// is instead driven below with each row's real `ListItem` and the
+        /// mirrored formats/actions.
+        fn assert_accept_resolution(&self) {
+            use gtk::gdk::{ContentFormatsBuilder, DragAction};
+
+            assert_eq!(
+                self.rows.iter().map(|row| row.position).collect::<Vec<_>>(),
+                vec![0, 1, 2, 3],
+                "every row must be bound to its real list position"
+            );
+
+            // Handler-introspection control: a target with no connected
+            // `accept` handler must introspect as such, so the per-row
+            // assertions below prove attachment rather than being vacuously
+            // true.
+            let bare_target = gtk::DropTarget::new(
+                PlaylistDragPayload::static_type(),
+                gtk::gdk::DragAction::COPY,
+            );
+            assert!(
+                !drop_target_has_accept_handler(&bare_target),
+                "control: a DropTarget with no accept handler must introspect as unattached"
+            );
+            for row in &self.rows {
+                assert!(
+                    drop_target_has_accept_handler(&row.drop_target),
+                    "row {} must carry the production accept handler",
+                    row.position
+                );
+            }
+
+            let track_drag = ContentFormatsBuilder::new()
+                .add_type(PlaylistDragPayload::static_type())
+                .build();
+            let reorder_drag = ContentFormatsBuilder::new()
+                .add_type(glib::Type::STRING)
+                .build();
+            let accepts = |index: usize, formats: &gtk::gdk::ContentFormats, action| {
+                accept_decision_for_drop(&self.store, &self.rows[index].list_item, formats, action)
+            };
+
+            assert!(accepts(0, &track_drag, DragAction::COPY));
+            assert!(!accepts(1, &track_drag, DragAction::COPY));
+            assert!(accepts(2, &track_drag, DragAction::COPY));
+            assert!(!accepts(3, &track_drag, DragAction::COPY));
+            assert!(!accepts(0, &reorder_drag, DragAction::MOVE));
+            assert!(!accepts(0, &track_drag, DragAction::MOVE));
+        }
+
+        /// The drop handler resolves the destination from the row under the
+        /// pointer — never from the focused row, never from "the first
+        /// editable playlist" — and forwards the exact displayed candidate
+        /// order there; noneditable rows and unrelated (cancelled) drags
+        /// mutate nothing.
+        fn assert_drop_routes_to_the_pointer_row(&self) {
+            let payload = PlaylistDragPayload {
+                candidates: drag_candidates(["second-track", "first-track"]),
+            };
+            let value = payload.to_value();
+            let e = |index: usize, value: &glib::Value| {
+                emit_installed_drop(&self.rows[index].drop_target, value)
+            };
+
+            // Focus rests on the first editable playlist (set in `new`); the
+            // drop lands on the second. The sink must record the pointer
+            // row's playlist — an implementation that resolves the focused
+            // row or the first editable row would record "regular-id" here.
+            assert!(
+                e(2, &value),
+                "the second editable regular playlist row must accept the drop"
+            );
+            assert_eq!(
+                self.dropped.borrow().as_slice(),
+                [(
+                    "other-regular-id".to_string(),
+                    "Road Trip".to_string(),
+                    payload.candidates.clone()
+                )],
+                "the drop must reach the pointer row's playlist, not the focused row"
+            );
+
+            // Reverse trip: focus the second editable playlist and drop on
+            // the first, so a destination hardcoded to either end of the
+            // sidebar fails exactly one of the two drops.
+            self.selection.select_item(2, true);
+            assert!(
+                e(0, &value),
+                "the first editable regular playlist row must accept the drop"
+            );
+            assert_eq!(
+                self.dropped.borrow().as_slice(),
+                [
+                    (
+                        "other-regular-id".to_string(),
+                        "Road Trip".to_string(),
+                        payload.candidates.clone()
+                    ),
+                    (
+                        "regular-id".to_string(),
+                        "My Mix".to_string(),
+                        payload.candidates.clone()
+                    ),
+                ],
+                "each drop must reach the row under the pointer, in payload order"
+            );
+
+            // Noneditable rows refuse without reaching the mutation sink;
+            // a cancelled or unrelated drag carries no playlist payload.
+            self.assert_refusals_leave_the_sink_untouched(&e, &value);
+        }
+
+        /// The refusal tail of the routing contract: the noneditable rows
+        /// (smart playlist, header) refuse the track drag without reaching
+        /// the mutation sink, a cancelled or unrelated drag carries no
+        /// playlist payload and is declined as well, and only the two
+        /// accepted drops above may have mutated a playlist.
+        fn assert_refusals_leave_the_sink_untouched(
+            &self,
+            emit: &impl Fn(usize, &glib::Value) -> bool,
+            payload_value: &glib::Value,
+        ) {
+            assert!(!emit(1, payload_value));
+            assert!(!emit(3, payload_value));
+            let unrelated = "playlist-reorder".to_value();
+            assert!(!emit(0, &unrelated));
+            assert_eq!(
+                self.dropped.borrow().len(),
+                2,
+                "only the accepted drops may mutate a playlist"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn recorded_drop_sink(dropped: RecordedDrops) -> PlaylistDropSink {
+        Rc::new(move |playlist_id, playlist_name, candidates| {
+            dropped
+                .borrow_mut()
+                .push((playlist_id, playlist_name, candidates));
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    type KeyboardActivations = RecordedDrops;
+
+    /// Mirrors the production `owns_request` closure type
+    /// `build_add_to_playlist_actions` installs: whether the popup's
+    /// navigation session still owns the interaction request.
+    #[cfg(not(target_os = "macos"))]
+    type KeyboardOwnsRequest = Rc<dyn Fn(&crate::ui::source_navigation::SourceRequest) -> bool>;
+
+    #[cfg(not(target_os = "macos"))]
+    fn recorded_keyboard_sink(activated: KeyboardActivations) -> PlaylistAddSink {
+        Rc::new(move |playlist_id, playlist_name, candidates| {
+            activated
+                .borrow_mut()
+                .push((playlist_id, playlist_name, candidates));
+        })
+    }
+
+    /// Runtime handler introspection (`g_signal_has_handler_pending`, via
+    /// glib): whether the target carries a user `accept` handler — i.e. the
+    /// production closure `attach_playlist_drop_target` installed.
+    #[cfg(not(target_os = "macos"))]
+    fn drop_target_has_accept_handler(drop_target: &gtk::DropTarget) -> bool {
+        let (accept_signal, _) =
+            glib::subclass::SignalId::parse_name("accept", gtk::DropTarget::static_type(), false)
+                .expect("GtkDropTarget must declare the accept signal");
+        glib::signal::signal_has_handler_pending(drop_target, accept_signal, None, false)
+    }
+
+    /// Emits the installed per-row `drop` handler the way GTK itself does.
+    ///
+    /// `gtk_drop_target_emit_drop` calls `g_signal_emit_by_name(target,
+    /// "drop", value, x, y, &ret)` passing the payload-typed `GValue*`; the
+    /// signal's declared `G_TYPE_VALUE` parameter collect copies that
+    /// payload into the argument `GValue`, so the connected handler receives
+    /// exactly the `GValue` GTK delivered. glib-rs' argument validation
+    /// requires each emitted argument to carry the declared parameter type
+    /// itself and rejects the payload-typed value GTK's own C emission
+    /// passes, so the payload travels in the declared boxed `G_TYPE_VALUE`
+    /// container instead ([`glib::BoxedValue`]): validation accepts the
+    /// declared type, and the same `G_TYPE_VALUE` collect step unboxes it,
+    /// handing the installed `connect_drop` handler the identical payload
+    /// `GValue` — via `g_signal_emitv`, the same C emission machinery
+    /// `g_signal_emit_by_name` drives.
+    #[cfg(not(target_os = "macos"))]
+    fn emit_installed_drop(drop_target: &gtk::DropTarget, value: &glib::Value) -> bool {
+        let boxed = glib::BoxedValue(value.clone());
+        drop_target.emit_by_name::<bool>("drop", &[&boxed, &1.0f64, &1.0f64])
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn realize_drop_list_view(
+        selection: gtk::SingleSelection,
+        drop_context: PlaylistRowDropContext,
+    ) -> (gtk::Window, Rc<RefCell<Vec<gtk::ListItem>>>) {
+        let recorded: Rc<RefCell<Vec<gtk::ListItem>>> = Rc::new(RefCell::new(Vec::new()));
+        let factory = gtk::SignalListItemFactory::new();
+        {
+            let recorded = Rc::clone(&recorded);
+            factory.connect_setup(move |_, item| {
+                let list_item = item
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("factory list item")
+                    .clone();
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                list_item.set_child(Some(&row_box));
+                attach_playlist_drop_target(&row_box, &list_item, &drop_context);
+                recorded.borrow_mut().push(list_item);
+            });
+        }
+
+        let expected_rows = selection.n_items() as usize;
+        let list_view = gtk::ListView::new(Some(selection), Some(factory));
+        let window = gtk::Window::builder().child(&list_view).build();
+        window.present();
+        // Item binding happens on the view's frame clock after the window
+        // maps, so a single pending-event sweep can exit before the factory
+        // has seen every row: pump until all rows are recorded, yielding to
+        // the frame clock between sweeps (bounded, then asserted by the
+        // caller's position check).
+        //
+        // Same constraint as `realized_tracklist_for_drag_test`: never pump
+        // the process-global default context from a widget test thread.
+        // Parallel non-widget tests leave thread-affine glib sources pending
+        // on the global default context (tr-8wtab), and dispatching one of
+        // those on this thread trips glib's ThreadGuard inside a
+        // non-unwinding C trampoline and aborts the whole test binary. The
+        // widget session's thread-default context only ever holds sources
+        // this same thread scheduled; the expect documents the invariant
+        // that this helper runs inside a widget test session.
+        let context = glib::MainContext::thread_default()
+            .expect("widget_test_session::with_session pushes a thread-default context");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recorded.borrow().len() < expected_rows && std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        while context.pending() {
+            context.iteration(false);
+        }
+        (window, recorded)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn realized_drop_rows(recorded: &Rc<RefCell<Vec<gtk::ListItem>>>) -> Vec<RealizedDropRow> {
+        // connect_setup records each ListItem before GTK binds it, and GTK
+        // may keep spare list items that are set up but never bound: their
+        // position() is INVALID_LIST_POSITION. Filter those out so the
+        // caller's exact-position assertion sees only bound rows — a genuine
+        // under-bind still fails there with the full expected-vs-actual diff.
+        let mut rows = recorded
+            .borrow()
+            .iter()
+            .filter(|list_item| list_item.position() != gtk::INVALID_LIST_POSITION)
+            .map(|list_item| {
+                let row_box = list_item
+                    .child()
+                    .and_downcast::<gtk::Box>()
+                    .expect("row must carry the sidebar row box");
+                RealizedDropRow {
+                    position: list_item.position(),
+                    list_item: list_item.clone(),
+                    drop_target: row_drop_target(&row_box),
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.position);
+        rows
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn row_drop_target(row_box: &gtk::Box) -> gtk::DropTarget {
+        let controllers = row_box.observe_controllers();
+        (0..controllers.n_items())
+            .find_map(|index| controllers.item(index).and_downcast::<gtk::DropTarget>())
+            .expect("the row must carry the production playlist drop target")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn drag_candidates(ids: [&str; 2]) -> Vec<PlaylistAddCandidate> {
+        ids.into_iter()
+            .map(|id| {
+                PlaylistAddCandidate::Local(MediaKey::new(
+                    SourceId::local(),
+                    TrackId::new(id).expect("track id"),
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn regular_playlist_source() -> SourceObject {
+        use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+        SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "regular-id",
+            "My Mix",
+            PlaylistSidebarKind::EditableRegular,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn second_regular_playlist_source() -> SourceObject {
+        use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+        SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "other-regular-id",
+            "Road Trip",
+            PlaylistSidebarKind::EditableRegular,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn smart_playlist_source() -> SourceObject {
+        use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+        SourceObject::playlist_entry(&PlaylistSidebarEntry::new(
+            "smart-id",
+            "Smart Mix",
+            PlaylistSidebarKind::EditableSmart,
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn header_source() -> SourceObject {
+        use crate::ui::objects::HeaderKind;
+        SourceObject::header("Playlists", HeaderKind::Playlists)
     }
 }
