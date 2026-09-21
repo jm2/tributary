@@ -15566,9 +15566,11 @@ mod tests {
     /// Drive the production `run()` shape and collect the startup timeline.
     ///
     /// The command FIFO (one history mutation plus the Flush barrier) is
-    /// enqueued by the caller before the engine task is polled, and `run()`
-    /// awaits `initial_scan` before its command loop starts — so both are
-    /// structurally during-scan admissions regardless of machine speed.
+    /// enqueued by the caller before the engine task is polled, and the
+    /// scan owns the engine from startup — so both are structurally
+    /// during-scan admissions regardless of machine speed (the interleaved
+    /// `service_commands_while_scanning` loop picks them up at its txn
+    /// boundaries).
     async fn q4_collect_startup_timeline(
         event_rx: &async_channel::Receiver<LibraryEvent>,
         flush_rx: async_channel::Receiver<()>,
@@ -15680,8 +15682,11 @@ mod tests {
     /// with a history command and the shutdown Flush admitted during the
     /// initial scan. Prints `Q4_ENGINE_METRIC` lines and asserts the
     /// settlement contract: the scan publishes its snapshot, the admitted
-    /// command commits only after the scan settles, and the FIFO barrier
-    /// acks last — nothing admitted during the scan is lost or reordered.
+    /// command is serviced by the interleaved scan-time command loop (it
+    /// may commit before or after the scan settles — timing-dependent; the
+    /// scan-settle wait it used to block on is the R9 delay this engine
+    /// removed), and the FIFO barrier acks only after the scan drains —
+    /// nothing admitted during the scan is lost or reordered.
     #[ignore = "explicit Q4 measurement harness; run with --ignored (tr-am6qr)"]
     #[tokio::test]
     async fn q4_engine_startup_and_during_scan_admission_benchmark() {
@@ -15714,6 +15719,11 @@ mod tests {
             source_registry,
             invalidations,
         );
+        // Never-cancelled token: the harness mirrors a window that stays
+        // open for the whole measurement (production aborts the spawned
+        // engine task at teardown, mirrored below, so no cancellation
+        // signal is needed to end it).
+        let scan_cancellation = tokio_util::sync::CancellationToken::new();
         let engine = LibraryEngine::new(
             db.clone(),
             vec![root.clone()],
@@ -15721,11 +15731,14 @@ mod tests {
             event_tx,
             command_rx,
             services,
+            scan_cancellation,
         );
         let start = std::time::Instant::now();
 
-        // Admit during the scan: run() awaits initial_scan before its
-        // command loop, so these queue while the scan owns the engine.
+        // Admit during the scan: the engine task has not been polled yet,
+        // so both commands reach the channel while the initial scan owns
+        // the engine (service_commands_while_scanning interleaves them at
+        // its txn boundaries).
         let (flush_tx, flush_rx) = async_channel::bounded(1);
         command_tx
             .send(LibraryCommand::RecordPlaybackHistory {
@@ -15744,7 +15757,7 @@ mod tests {
         let engine_task = tokio::spawn(engine.run());
         let timeline = q4_collect_startup_timeline(&event_rx, flush_rx, COMMAND_TRACK, start).await;
 
-        // ── Settlement contract ──
+        // ── Settlement contract (R9 concurrent-service semantics) ──
         // The published snapshot covers the fixture rows plus the one
         // pre-inserted command track (the scan does not know it apart).
         assert_eq!(
@@ -15760,14 +15773,19 @@ mod tests {
             .expect("flush acknowledged by the collector loop");
         let command_applied_us = timeline
             .during_scan_command_applied_us
-            .expect("during-scan command commits and publishes after the scan");
+            .expect("during-scan command commits and publishes after admission");
         assert!(
             scan_complete_us <= flush_ack_us,
-            "the scan settles before the FIFO barrier acks"
+            "the Flush barrier drains the scan before it acks"
         );
+        // R9 removed the await-scan-before-commands ordering: the admitted
+        // command is serviced at the interleaved loop's txn boundaries, so
+        // it may commit before OR after the scan settles (timing-dependent
+        // on fixture size). The invariant that must hold in both regimes is
+        // FIFO: the command settles before the Flush barrier acks.
         assert!(
-            command_applied_us >= scan_complete_us,
-            "a command admitted during the scan applies only after the scan settles"
+            command_applied_us <= flush_ack_us,
+            "a command admitted during the scan settles before the FIFO barrier acks"
         );
         let command_row = track::Entity::find_by_id(COMMAND_TRACK)
             .one(&db)
