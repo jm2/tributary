@@ -28,6 +28,7 @@ use super::playback_coordinator::{
     LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorBinding,
     LastFmPlaybackCoordinatorOutcome,
 };
+use super::policy::{LastFmLivePolicy, LastFmPolicyGeneration};
 use super::runtime::{
     spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeBarrier, LastFmRuntimeHandle,
     LastFmRuntimeShutdown,
@@ -116,14 +117,43 @@ pub(crate) enum LastFmApplicationCommandError {
 /// Move-only authority issued after explicit consent and enablement.
 ///
 /// The exact remote-source policy is immutable after construction.  Changing
-/// it requires retiring the complete generation and issuing a successor.
+/// it requires retiring the complete generation and issuing a successor, so
+/// the authority freezes the identity of the generation whose consent issued
+/// it: once the live slot moves past that generation, the authority is spent,
+/// even when the successor is itself consented and enabled.
 #[must_use = "Last.fm activation authority must be consumed or explicitly discarded"]
 pub(crate) struct LastFmApplicationActivation {
+    policy_generation: u64,
     enabled_remote_sources: HashSet<SourceId>,
 }
 
 impl LastFmApplicationActivation {
     pub(in crate::lastfm) fn issue_after_explicit_consent_and_enablement(
+        policy_generation: u64,
+        enabled_remote_sources: HashSet<SourceId>,
+    ) -> Result<Self, LastFmApplicationAdmissionError> {
+        Self::validated(policy_generation, enabled_remote_sources)
+    }
+
+    /// Consume the current live policy generation as one activation authority.
+    ///
+    /// The exact remote-source set is taken from the generation's immutable
+    /// `activation_remote_sources` view, so the same generation that gates
+    /// queue capture also issues dispatch authority. A generation without
+    /// current consent and enablement grants no activation authority and is
+    /// refused here rather than inferring consent from a build credential,
+    /// vault record, queued row, or discoverable account.
+    pub(in crate::lastfm) fn issue_from_policy_generation(
+        generation: &LastFmPolicyGeneration,
+    ) -> Result<Self, LastFmApplicationAdmissionError> {
+        let Some(enabled_remote_sources) = generation.activation_remote_sources() else {
+            return Err(LastFmApplicationAdmissionError::InvalidSourcePolicy);
+        };
+        Self::validated(generation.generation(), enabled_remote_sources.clone())
+    }
+
+    fn validated(
+        policy_generation: u64,
         enabled_remote_sources: HashSet<SourceId>,
     ) -> Result<Self, LastFmApplicationAdmissionError> {
         if enabled_remote_sources.len() > MAX_ENABLED_REMOTE_SOURCES
@@ -134,8 +164,21 @@ impl LastFmApplicationActivation {
             return Err(LastFmApplicationAdmissionError::InvalidSourcePolicy);
         }
         Ok(Self {
+            policy_generation,
             enabled_remote_sources,
         })
+    }
+
+    /// The identity of the generation whose consent issued this authority.
+    pub(in crate::lastfm) const fn policy_generation(&self) -> u64 {
+        self.policy_generation
+    }
+
+    /// The exact remote-source set this authority freezes. Test-only so the
+    /// activation remains a move-only, content-free authority in production.
+    #[cfg(test)]
+    pub(in crate::lastfm) fn enabled_remote_sources_for_test(&self) -> &HashSet<SourceId> {
+        &self.enabled_remote_sources
     }
 }
 
@@ -321,6 +364,7 @@ struct ApplicationOwner {
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Option<Arc<dyn LastFmTransport>>,
     clock: Arc<dyn LastFmClock>,
+    live_policy: LastFmLivePolicy,
     database: Option<DatabaseConnection>,
     generation: Option<ActiveGeneration>,
     #[cfg(test)]
@@ -507,6 +551,13 @@ impl ApplicationOwner {
 
     async fn activate(
         &mut self,
+        // Consumed as the move-only proof of explicit consent only: its
+        // frozen source set is deliberately never read, because dispatch
+        // authority is re-derived from the live policy generation at every
+        // dispatch below. Its frozen issuing generation IS read below: a
+        // replacement generation — even a still-consented, enabled successor
+        // — retires the predecessor's authority, so consuming a superseded
+        // activation must never mint or start anything.
         activation: LastFmApplicationActivation,
         completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
     ) -> Result<(), LastFmApplicationShutdownError> {
@@ -542,8 +593,38 @@ impl ApplicationOwner {
             return Ok(());
         }
 
+        // The queued activation freezes the generation whose consent issued
+        // it. The live slot must still be that exact generation when the
+        // command is processed: any successor — including an enabled-to-
+        // enabled replacement — retires the predecessor's authority, and
+        // minting from the live slot would silently start a runtime under
+        // the successor's source set from the predecessor's consent. Refuse
+        // a mismatch before the runtime activation is minted and before any
+        // runtime, storage, or credential work, exactly like the
+        // superseded-generation refusals below.
+        if self.live_policy.snapshot().generation() != activation.policy_generation() {
+            self.fail_terminal_before_completion(
+                LastFmApplicationCommandError::RuntimeStart,
+                completion,
+            )?;
+            return Ok(());
+        }
+        let Some(activation) =
+            LastFmRuntimeActivation::issue_after_consent_and_enablement(&self.live_policy)
+        else {
+            // The live policy stopped granting activation authority between
+            // command acceptance and processing (revoked consent, disabled
+            // integration, or a replaced policy). Refuse before any runtime
+            // start, exactly as a superseded generation would at spawn time.
+            self.fail_terminal_before_completion(
+                LastFmApplicationCommandError::RuntimeStart,
+                completion,
+            )?;
+            return Ok(());
+        };
         let started = spawn_lastfm_runtime(
-            LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            activation,
+            &self.live_policy,
             database,
             Arc::clone(&self.credentials),
             transport,
@@ -604,10 +685,13 @@ impl ApplicationOwner {
             };
         }
 
+        // Dispatch authority stays LIVE: the coordinator re-derives the
+        // current generation's source set at every dispatch instead of
+        // freezing this activation's set.
         let Ok(coordinator) = self.coordinator.activate(
             runtime_ingress,
             self.completion_runtime.clone(),
-            activation.enabled_remote_sources,
+            self.live_policy.clone(),
         ) else {
             let drained = runtime_shutdown.shutdown().await.is_ok();
             let failure = if drained {
@@ -942,6 +1026,7 @@ impl fmt::Debug for LastFmApplicationBarrier {
 pub(crate) fn spawn_lastfm_application_owner(
     coordinator: LastFmPlaybackCoordinatorBinding,
     completion_runtime: tokio::runtime::Handle,
+    live_policy: LastFmLivePolicy,
 ) -> Result<(LastFmApplicationHandle, LastFmApplicationShutdown), LastFmApplicationOwnerClaimError>
 {
     APPLICATION_OWNER_CLAIMED
@@ -957,6 +1042,7 @@ pub(crate) fn spawn_lastfm_application_owner(
         Arc::new(OsSessionCredentialStore),
         transport,
         Arc::new(SystemLastFmClock),
+        live_policy,
     ))
 }
 
@@ -966,6 +1052,7 @@ fn spawn_with_dependencies(
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Option<Arc<dyn LastFmTransport>>,
     clock: Arc<dyn LastFmClock>,
+    live_policy: LastFmLivePolicy,
 ) -> (LastFmApplicationHandle, LastFmApplicationShutdown) {
     spawn_with_options(
         coordinator,
@@ -973,6 +1060,7 @@ fn spawn_with_dependencies(
         credentials,
         transport,
         clock,
+        live_policy,
         ApplicationSpawnOptions {
             #[cfg(test)]
             attachment_publish_gate: None,
@@ -1004,6 +1092,7 @@ fn spawn_with_options(
     credentials: Arc<dyn SessionCredentialStore>,
     transport: Option<Arc<dyn LastFmTransport>>,
     clock: Arc<dyn LastFmClock>,
+    live_policy: LastFmLivePolicy,
     options: ApplicationSpawnOptions,
 ) -> (LastFmApplicationHandle, LastFmApplicationShutdown) {
     let build_available = transport.is_some();
@@ -1031,6 +1120,7 @@ fn spawn_with_options(
         credentials,
         transport,
         clock,
+        live_policy,
         database: None,
         generation: None,
         #[cfg(test)]
@@ -1089,6 +1179,15 @@ mod tests {
     use crate::lastfm::credentials::{CredentialError, ProtectedString, StoredSession};
     use crate::lastfm::delivery::LastFmDeliveryPrimitiveError;
     use crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner;
+    use crate::lastfm::policy::LastFmPolicyGeneration;
+
+    /// One live policy slot publishing generation 1 with the same empty
+    /// opt-in set the test activations carry.
+    fn live_policy_for_test() -> LastFmLivePolicy {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+        live
+    }
     use crate::source_registry::SourceRegistry;
 
     use super::*;
@@ -1272,6 +1371,7 @@ mod tests {
             Arc::new(UnusedCredentials),
             None,
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         assert_eq!(
             handle.subscribe_status().borrow().phase,
@@ -1302,6 +1402,7 @@ mod tests {
             Arc::new(UnusedCredentials),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         let database = Database::connect("sqlite::memory:")
             .await
@@ -1341,6 +1442,7 @@ mod tests {
             Arc::new(UnusedCredentials),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: Some(AttachmentPublishGate {
                     reached: attachment_reached,
@@ -1405,9 +1507,12 @@ mod tests {
         let first_binding = first_coordinator_owner
             .bind_window(first_registry.clone())
             .expect("first window binding");
-        let (_handle, shutdown) =
-            spawn_lastfm_application_owner(first_binding, tokio::runtime::Handle::current())
-                .expect("first production owner claim");
+        let (_handle, shutdown) = spawn_lastfm_application_owner(
+            first_binding,
+            tokio::runtime::Handle::current(),
+            live_policy_for_test(),
+        )
+        .expect("first production owner claim");
 
         let second_registry = SourceRegistry::new(tokio::runtime::Handle::current());
         let mut second_coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
@@ -1415,8 +1520,12 @@ mod tests {
             .bind_window(second_registry.clone())
             .expect("second window binding");
         assert_eq!(
-            spawn_lastfm_application_owner(second_binding, tokio::runtime::Handle::current(),)
-                .unwrap_err(),
+            spawn_lastfm_application_owner(
+                second_binding,
+                tokio::runtime::Handle::current(),
+                live_policy_for_test(),
+            )
+            .unwrap_err(),
             LastFmApplicationOwnerClaimError
         );
 
@@ -1451,6 +1560,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         handle
             .try_attach_database(database)
@@ -1460,6 +1570,7 @@ mod tests {
             .expect("database attached");
 
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1467,6 +1578,7 @@ mod tests {
             .try_activate(activation)
             .expect("activation admitted");
         let duplicate = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("second well-formed activation policy");
@@ -1515,6 +1627,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         handle
             .try_attach_database(database)
@@ -1523,6 +1636,7 @@ mod tests {
             .await
             .expect("database attached");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1585,6 +1699,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: None,
                 activation_start_gate: Some(ActivationStartGate {
@@ -1602,6 +1717,7 @@ mod tests {
             .await
             .expect("database attached");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1665,6 +1781,7 @@ mod tests {
             credentials,
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         handle
             .try_attach_database(database)
@@ -1673,6 +1790,7 @@ mod tests {
             .await
             .expect("database attached");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1707,6 +1825,7 @@ mod tests {
             Some(LastFmApplicationCommandError::RuntimeTerminated)
         );
         let late = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("well-formed late activation");
@@ -1742,6 +1861,7 @@ mod tests {
             credentials,
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: None,
                 activation_start_gate: None,
@@ -1759,6 +1879,7 @@ mod tests {
             .await
             .expect("database attached");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1823,6 +1944,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
         let _current_binding = coordinator_owner
             .bind_window(source_registry.clone())
@@ -1834,6 +1956,7 @@ mod tests {
             .await
             .expect("database attached");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1889,6 +2012,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
             ApplicationSpawnOptions {
                 attachment_publish_gate: None,
                 activation_start_gate: None,
@@ -1906,6 +2030,7 @@ mod tests {
             .await
             .expect("database attached");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -1937,6 +2062,7 @@ mod tests {
             LastFmApplicationPhase::ShuttingDown
         );
         let late = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("well-formed late activation");
@@ -1986,6 +2112,7 @@ mod tests {
             credentials.clone(),
             Some(Arc::new(PendingTransport)),
             Arc::new(FixedClock),
+            live_policy_for_test(),
         );
 
         // Current-thread scheduling makes both commands cross admission
@@ -1995,6 +2122,7 @@ mod tests {
             .try_attach_database(database)
             .expect("database command queued");
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("local-only activation policy");
@@ -2021,6 +2149,7 @@ mod tests {
             LastFmApplicationPhase::Stopped
         );
         let post_close = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("well-formed post-close request");
@@ -2039,7 +2168,7 @@ mod tests {
     fn activation_policy_is_bounded_exact_and_redacted() {
         let reserved = HashSet::from([SourceId::local()]);
         assert_eq!(
-            LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(reserved)
+            LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(1, reserved)
                 .unwrap_err(),
             LastFmApplicationAdmissionError::InvalidSourcePolicy
         );
@@ -2048,11 +2177,12 @@ mod tests {
             oversized.insert(SourceId::random());
         }
         assert_eq!(
-            LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(oversized)
+            LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(1, oversized)
                 .unwrap_err(),
             LastFmApplicationAdmissionError::InvalidSourcePolicy
         );
         let activation = LastFmApplicationActivation::issue_after_explicit_consent_and_enablement(
+            1,
             HashSet::new(),
         )
         .expect("empty local-only policy is valid");
@@ -2060,5 +2190,207 @@ mod tests {
             format!("{activation:?}"),
             "LastFmApplicationActivation(<redacted>)"
         );
+    }
+
+    /// The activation authority must freeze exactly the source set the live
+    /// policy generation exposes to queue capture, so dispatch cannot admit a
+    /// source that capture never observed.
+    #[test]
+    fn activation_from_policy_generation_freezes_the_capture_set() {
+        let enabled_source = SourceId::random();
+        let generation = LastFmPolicyGeneration::for_test(4, HashSet::from([enabled_source]));
+        let activation = LastFmApplicationActivation::issue_from_policy_generation(&generation)
+            .expect("consented generation grants activation authority");
+        assert_eq!(
+            activation.enabled_remote_sources_for_test(),
+            generation.queue_capture_remote_sources()
+        );
+        assert_eq!(activation.policy_generation(), 4);
+    }
+
+    /// A generation without current consent and enablement has no activation
+    /// basis. Issuance must refuse rather than silently produce a local-only
+    /// activation from a closed or disabled policy.
+    #[test]
+    fn activation_refuses_a_generation_without_current_consent() {
+        assert_eq!(
+            LastFmApplicationActivation::issue_from_policy_generation(
+                &LastFmPolicyGeneration::default()
+            )
+            .unwrap_err(),
+            LastFmApplicationAdmissionError::InvalidSourcePolicy
+        );
+    }
+
+    /// Spawns a dormant application owner over unused vault credentials with
+    /// an attached in-memory database: the shared fixture for the queued-
+    /// activation refusal regressions below.
+    async fn spawn_owner_with_unused_vault_and_database_attached() -> (
+        LastFmLivePolicy,
+        LastFmPlaybackCoordinatorOwner,
+        LastFmApplicationHandle,
+        LastFmApplicationShutdown,
+    ) {
+        let live = live_policy_for_test();
+        let (coordinator_owner, coordinator) = binding();
+        let (handle, shutdown) = spawn_with_dependencies(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            Arc::new(UnusedCredentials),
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+            live.clone(),
+        );
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        handle
+            .try_attach_database(database)
+            .expect("database admitted")
+            .wait()
+            .await
+            .expect("database attached");
+        (live, coordinator_owner, handle, shutdown)
+    }
+
+    /// Asserts the owner's published snapshot records the terminal runtime-
+    /// start refusal. Completion is the observation boundary: the terminal
+    /// snapshot is published before the waiter wakes.
+    fn assert_terminal_runtime_start_refusal(handle: &LastFmApplicationHandle) {
+        let status = *handle.subscribe_status().borrow();
+        assert_eq!(status.phase, LastFmApplicationPhase::Failed);
+        assert_eq!(
+            status.failure,
+            Some(LastFmApplicationCommandError::RuntimeStart)
+        );
+    }
+
+    /// Drains the owner and asserts a clean shutdown: the drain deadline is
+    /// met, the barrier drains fully, and the playback coordinator observed
+    /// the final state.
+    async fn assert_owner_drains(
+        shutdown: LastFmApplicationShutdown,
+        coordinator_owner: &mut LastFmPlaybackCoordinatorOwner,
+    ) {
+        let barrier = shutdown.barrier();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), shutdown.shutdown())
+                .await
+                .expect("application drain deadline"),
+            Ok(LastFmApplicationShutdownReason::Drained)
+        );
+        assert_eq!(barrier.wait().await, Ok(()));
+        assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
+        assert_eq!(
+            coordinator_owner.shutdown(),
+            LastFmPlaybackCoordinatorOutcome::Applied
+        );
+    }
+
+    /// A queued application activation freezes its issuing generation. When
+    /// the live policy is replaced by a still-consented, enabled successor
+    /// before the owner processes the command, the activation is spent: the
+    /// owner must refuse terminal before minting a runtime activation, so no
+    /// runtime starts and the vault is never read — the successor's source
+    /// set must never be governed under the predecessor's consent.
+    #[tokio::test]
+    async fn superseded_generation_refuses_queued_activation_before_runtime_start() {
+        let (live, mut coordinator_owner, handle, shutdown) =
+            spawn_owner_with_unused_vault_and_database_attached().await;
+        let activation =
+            LastFmApplicationActivation::issue_from_policy_generation(&live.snapshot())
+                .expect("generation 1 grants activation authority");
+        let queued = handle
+            .try_activate(activation)
+            .expect("activation admitted while generation 1 is live");
+
+        // Enabled-to-enabled replacement inside the queue-processing window:
+        // generation 2 is consented and enabled, but the queued authority
+        // was issued by generation 1.
+        live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), queued.wait())
+                .await
+                .expect("superseded activation deadline"),
+            Err(LastFmApplicationCommandError::RuntimeStart)
+        );
+        assert_terminal_runtime_start_refusal(&handle);
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
+    }
+
+    /// The refusal is by generation identity, not by the successor's
+    /// consent state: a revoked or disabled replacement goes through the
+    /// same terminal path, and the vault still is never read.
+    #[tokio::test]
+    async fn revoked_generation_refuses_queued_activation_before_runtime_start() {
+        let (live, mut coordinator_owner, handle, shutdown) =
+            spawn_owner_with_unused_vault_and_database_attached().await;
+        let activation =
+            LastFmApplicationActivation::issue_from_policy_generation(&live.snapshot())
+                .expect("generation 1 grants activation authority");
+        let queued = handle
+            .try_activate(activation)
+            .expect("activation admitted while generation 1 is live");
+
+        // Consent revoked: the closed successor grants no activation
+        // authority and no longer matches the queued generation.
+        live.publish(LastFmPolicyGeneration::default());
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), queued.wait())
+                .await
+                .expect("revoked activation deadline"),
+            Err(LastFmApplicationCommandError::RuntimeStart)
+        );
+        assert_terminal_runtime_start_refusal(&handle);
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
+    }
+
+    /// The generation gate refuses only superseded authorities: a queued
+    /// activation whose issuing generation is still live activates the real
+    /// runtime and coordinator exactly as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_generation_queued_activation_still_activates() {
+        let live = live_policy_for_test();
+        let database = migrated_database().await;
+        let credentials = Arc::new(FixedCredentials::new(stored_session()));
+        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let coordinator = coordinator_owner
+            .bind_window(source_registry.clone())
+            .expect("window binding");
+        let (handle, shutdown) = spawn_with_dependencies(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            credentials.clone(),
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+            live.clone(),
+        );
+        handle
+            .try_attach_database(database)
+            .expect("database admitted")
+            .wait()
+            .await
+            .expect("database attached");
+
+        let activation =
+            LastFmApplicationActivation::issue_from_policy_generation(&live.snapshot())
+                .expect("generation 1 grants activation authority");
+        handle
+            .try_activate(activation)
+            .expect("activation admitted")
+            .wait()
+            .await
+            .expect("same-generation activation starts the runtime");
+        assert_eq!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::Active
+        );
+        assert_eq!(credentials.loads.load(Ordering::SeqCst), 1);
+
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
+        source_registry.shutdown().wait().await;
     }
 }

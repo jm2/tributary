@@ -24,6 +24,7 @@ use crate::architecture::{
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
+use crate::source_registry::{BoundedSearchAttributionProfiles, PlaybackAttributionProfile};
 
 /// Maximum number of per-artist / per-album metadata fetches kept in
 /// flight at once while loading the full library.  Bounds concurrency so a
@@ -51,6 +52,14 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Subsonic song ID → cover-art ID.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Subsonic song ID → Last.fm attribution profile derived from the
+    /// raw accepted protocol row before display fallbacks were substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+    /// Bounded retention for profiles minted from search rows outside the
+    /// refreshed catalogue. Search traffic is unbounded over a session
+    /// lifetime, so these entries are capped separately and can never evict
+    /// a refreshed catalogue profile.
+    search_attribution_profiles: BoundedSearchAttributionProfiles,
 }
 
 impl LibraryCache {
@@ -61,6 +70,8 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
+            search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
         }
     }
 }
@@ -393,6 +404,7 @@ impl SubsonicBackend {
         let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
@@ -428,7 +440,22 @@ impl SubsonicBackend {
 
                     stream_locator_by_track_id.insert(track_id.clone(), song.id.clone());
                     if let Some(cover_art_id) = &song.cover_art {
-                        track_artwork_locator_by_track_id.insert(track_id, cover_art_id.clone());
+                        track_artwork_locator_by_track_id
+                            .insert(track_id.clone(), cover_art_id.clone());
+                    }
+                    // Attribution provenance is frozen from the raw accepted
+                    // row before the display converter substitutes any
+                    // "Unknown" fallback, so a synthesized fallback can never
+                    // become Last.fm attribution authority.
+                    if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                        song.title.clone(),
+                        song.artist.clone(),
+                        song.album.clone(),
+                        None,
+                        song.track,
+                        song.duration,
+                    ) {
+                        attribution_profiles.insert(track_id, profile);
                     }
                     all_tracks.push(track);
                     artist_track_count += 1;
@@ -465,9 +492,36 @@ impl SubsonicBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            attribution_profiles,
+            // A full refresh supersedes every search-only retention from the
+            // previous catalogue generation.
+            search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
         };
 
         Ok(())
+    }
+
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue or search row by its native identity.
+    ///
+    /// Profiles are derived from the raw protocol row, before display
+    /// fallbacks are substituted, so a synthesized `"Unknown"` can never
+    /// become attribution authority. Refreshed catalogue profiles take
+    /// precedence; search-only profiles are retained separately under a
+    /// bounded eviction policy and never evict catalogue authority. The
+    /// lookup is deliberately non-blocking: a contended refresh returns
+    /// `None`, so Last.fm attribution fails closed instead of waiting on the
+    /// lifecycle state lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        let cache = self.cache.try_read().ok()?;
+        cache
+            .attribution_profiles
+            .get(track_id)
+            .cloned()
+            .or_else(|| cache.search_attribution_profiles.get(track_id).cloned())
     }
 }
 
@@ -573,9 +627,27 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             if let Some(cover_art_id) = &song.cover_art {
                 cache
                     .track_artwork_locator_by_track_id
-                    .insert(track_id, cover_art_id.clone());
+                    .insert(track_id.clone(), cover_art_id.clone());
             } else {
                 cache.track_artwork_locator_by_track_id.remove(&track_id);
+            }
+            // Retained rows outside the refreshed catalogue still need Last.fm
+            // attribution authority: freeze the profile from the raw accepted
+            // row, and drop a stale profile when the row no longer carries
+            // enough provenance. Search rows land in the bounded search-only
+            // store so unbounded search traffic can neither grow retention
+            // without limit nor evict refreshed catalogue profiles.
+            if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                song.title.clone(),
+                song.artist.clone(),
+                song.album.clone(),
+                None,
+                song.track,
+                song.duration,
+            ) {
+                cache.search_attribution_profiles.insert(track_id, profile);
+            } else {
+                cache.search_attribution_profiles.remove(&track_id);
             }
         }
 
@@ -755,6 +827,7 @@ mod tests {
 
     use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+    use crate::source_registry::MAX_SEARCH_ATTRIBUTION_PROFILES;
 
     use super::*;
 
@@ -1112,6 +1185,17 @@ mod tests {
             .expect("fixture track retains its native ID");
         assert_eq!(track_id.as_str(), "healthy-track");
         drop(cache);
+        let profile = backend
+            .catalogue_attribution_profile(&track_id)
+            .expect("provenance-derived profile is retained for the accepted row");
+        assert_eq!(profile.title(), "Healthy Track");
+        assert_eq!(profile.artist(), "Healthy Artist");
+        assert_eq!(profile.album(), Some("Healthy Album"));
+        assert!(backend
+            .catalogue_attribution_profile(
+                &TrackId::remote("missing-track").expect("bounded fixture track ID")
+            )
+            .is_none());
         assert_eq!(
             backend
                 .resolve_stream(&track_id)
@@ -1122,6 +1206,174 @@ mod tests {
             "/gateway/rest/stream.view"
         );
         assert_eq!(service.requests().len(), 6);
+        service.finish().await;
+    }
+
+    fn raw_row_album_songs() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "id": "gap-row",
+                "album": "Raw Album"
+            }),
+            serde_json::json!({
+                "id": "complete-row",
+                "title": "Raw Complete",
+                "artist": "Raw Artist",
+                "album": "Raw Album",
+                "track": 3,
+                "duration": 201
+            }),
+            serde_json::json!({
+                "id": "server-unknown-row",
+                "title": "Unknown",
+                "artist": "Unknown",
+                "album": "Raw Album"
+            }),
+            serde_json::json!({
+                "id": "album-less-row",
+                "title": "Raw Bare",
+                "artist": "Raw Artist"
+            }),
+        ]
+    }
+
+    fn raw_row_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [{"artist": [
+                        {"id": "raw-artist", "name": "Raw Artist"}
+                    ]}]}
+                }
+            }))),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "raw-artist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "raw-artist",
+                            "name": "Raw Artist",
+                            "album": [{"id": "raw-album", "name": "Raw Album"}]
+                        }
+                    }
+                }))),
+            MockRoute::get("/rest/getAlbum.view")
+                .with_query("id", "raw-album")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {
+                            "id": "raw-album",
+                            "name": "Raw Album",
+                            "song": raw_row_album_songs()
+                        }
+                    }
+                }))),
+        ]
+    }
+
+    async fn raw_row_native_ids(backend: &SubsonicBackend) -> HashMap<String, TrackId> {
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 4);
+        let gap_display_title = cache
+            .tracks
+            .iter()
+            .find(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "gap-row")
+            })
+            .map(|track| track.title.clone());
+        assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+        cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let native = track.native_track_id.clone()?;
+                Some((native.as_str().to_string(), native))
+            })
+            .collect::<HashMap<String, TrackId>>()
+    }
+
+    fn assert_raw_row_profiles_are_frozen(
+        backend: &SubsonicBackend,
+        ids: &HashMap<String, TrackId>,
+    ) {
+        let gap_id = &ids["gap-row"];
+        let complete_id = &ids["complete-row"];
+        let server_unknown_id = &ids["server-unknown-row"];
+        let album_less_id = &ids["album-less-row"];
+
+        // Raw row with missing title and artist: accepted for playback, but
+        // carries no attribution proof — the display "Unknown" fallback is
+        // not authority.
+        assert!(backend.catalogue_attribution_profile(gap_id).is_none());
+
+        // Complete raw row: the exact provenance is retained.
+        let complete = backend
+            .catalogue_attribution_profile(complete_id)
+            .expect("complete row retains its provenance profile");
+        assert_eq!(complete.title(), "Raw Complete");
+        assert_eq!(complete.artist(), "Raw Artist");
+        assert_eq!(complete.album(), Some("Raw Album"));
+
+        // A server-supplied "Unknown" is real row data, so it stays
+        // attributable and distinguishable from the synthesized fallback.
+        let server_unknown = backend
+            .catalogue_attribution_profile(server_unknown_id)
+            .expect("server-supplied Unknown remains attributable");
+        assert_eq!(server_unknown.title(), "Unknown");
+        assert_eq!(server_unknown.artist(), "Unknown");
+
+        // An absent optional album stays absent in the profile.
+        let album_less = backend
+            .catalogue_attribution_profile(album_less_id)
+            .expect("album-less row retains its provenance profile");
+        assert_eq!(album_less.title(), "Raw Bare");
+        assert_eq!(album_less.artist(), "Raw Artist");
+        assert_eq!(album_less.album(), None);
+
+        // Unknown or stale native IDs refuse attribution.
+        let stale_id = TrackId::remote("never-refreshed").expect("bounded stale track ID");
+        assert!(backend.catalogue_attribution_profile(&stale_id).is_none());
+    }
+
+    async fn assert_raw_row_lookup_fails_closed_while_cache_contended(
+        backend: &SubsonicBackend,
+        complete_id: &TrackId,
+    ) {
+        // A contended cache (refresh in flight) fails closed instead of
+        // blocking attribution on the lifecycle lock.
+        let guard = backend.cache.write().await;
+        assert!(backend.catalogue_attribution_profile(complete_id).is_none());
+        drop(guard);
+        assert!(backend.catalogue_attribution_profile(complete_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
+        let service = MockHttpService::start(raw_row_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .expect("raw-row fixture connects");
+
+        // Every accepted row becomes a display track; the metadata-gap row
+        // displays the synthesized "Unknown" fallback text.
+        let native_by_id = raw_row_native_ids(&backend).await;
+        assert_raw_row_profiles_are_frozen(&backend, &native_by_id);
+        assert_raw_row_lookup_fails_closed_while_cache_contended(
+            &backend,
+            &native_by_id["complete-row"],
+        )
+        .await;
+
         service.finish().await;
     }
 
@@ -1564,6 +1816,264 @@ mod tests {
         assert!(rendered.contains("Subsonic API error 70"));
         assert!(!rendered.contains(&server_message));
         assert!(!rendered.contains(&password));
+        service.finish().await;
+    }
+
+    fn search_outside_catalogue_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {"status": "ok", "artists": {"index": []}}
+            }))),
+            MockRoute::get("/rest/search3.view")
+                .with_query("query", "Song")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "searchResult3": {
+                            "song": [
+                                {
+                                    "id": "search-complete",
+                                    "title": "Search Complete",
+                                    "artist": "Search Artist",
+                                    "album": "Search Album",
+                                    "track": 7,
+                                    "duration": 222
+                                },
+                                {
+                                    "id": "search-gap"
+                                }
+                            ]
+                        }
+                    }
+                }))),
+        ]
+    }
+
+    fn assert_search_row_provenance_profiles(backend: &SubsonicBackend) {
+        // A searched row that never went through the catalogue refresh still
+        // carries its raw provenance as Last.fm attribution authority.
+        let complete_id = TrackId::remote("search-complete").expect("bounded track ID");
+        let profile = backend
+            .catalogue_attribution_profile(&complete_id)
+            .expect("searched row outside the catalogue retains its provenance profile");
+        assert_eq!(profile.title(), "Search Complete");
+        assert_eq!(profile.artist(), "Search Artist");
+        assert_eq!(profile.album(), Some("Search Album"));
+
+        // A searched row without enough raw provenance fails closed instead
+        // of becoming attribution authority.
+        let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
+        assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
+        let service = MockHttpService::start(search_outside_catalogue_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .expect("connect search fixture");
+
+        let results = backend
+            .search("Song", 10)
+            .await
+            .expect("search the fixture server");
+        assert_eq!(results.tracks.len(), 2);
+        assert_search_row_provenance_profiles(&backend);
+
+        assert_eq!(service.requests().len(), 3);
+        service.finish().await;
+    }
+
+    fn search_eviction_routes() -> Vec<MockRoute> {
+        let mut routes = search_eviction_catalogue_routes();
+        routes.push(search_eviction_catalogue_album_route());
+        routes.extend(search_eviction_fresh_routes());
+        routes
+    }
+
+    fn search_eviction_catalogue_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [{"artist": [
+                        {"id": "eviction-artist", "name": "Eviction Artist"}
+                    ]}]}
+                }
+            }))),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "eviction-artist")
+                .reply(MockResponse::json(serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artist": {
+                            "id": "eviction-artist",
+                            "name": "Eviction Artist",
+                            "album": [{"id": "eviction-album", "name": "Catalogue Album"}]
+                        }
+                    }
+                }))),
+        ]
+    }
+
+    fn search_eviction_catalogue_album_route() -> MockRoute {
+        MockRoute::get("/rest/getAlbum.view")
+            .with_query("id", "eviction-album")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {
+                        "id": "eviction-album",
+                        "name": "Catalogue Album",
+                        "song": [{
+                            "id": "catalogue-song",
+                            "title": "Catalogue Song",
+                            "artist": "Eviction Artist",
+                            "album": "Catalogue Album",
+                            "track": 1,
+                            "duration": 100
+                        }]
+                    }
+                }
+            })))
+    }
+
+    fn search_eviction_fresh_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/rest/search3.view")
+                .with_query("query", "Fresh A")
+                .replies([
+                    // The repeat search below hits the same query again.
+                    MockResponse::json(eviction_search_song("fresh-a", "Fresh A", 2, 120)),
+                    MockResponse::json(eviction_search_song("fresh-a", "Fresh A", 2, 120)),
+                ]),
+            MockRoute::get("/rest/search3.view")
+                .with_query("query", "Fresh B")
+                .reply(MockResponse::json(eviction_search_song(
+                    "fresh-b", "Fresh B", 3, 130,
+                ))),
+        ]
+    }
+
+    fn eviction_search_song(id: &str, title: &str, track: i64, duration: i64) -> serde_json::Value {
+        serde_json::json!({
+            "subsonic-response": {
+                "status": "ok",
+                "searchResult3": {"song": [{
+                    "id": id,
+                    "title": title,
+                    "artist": "Fresh Artist",
+                    "album": "Fresh Album",
+                    "track": track,
+                    "duration": duration
+                }]}
+            }
+        })
+    }
+
+    /// Pre-fill the bounded search-only store so a couple of real searches
+    /// cross the production bound without needing thousands of requests.
+    async fn fill_search_attribution_store_to_bound(backend: &SubsonicBackend) {
+        let mut cache = backend.cache.write().await;
+        for index in 0..MAX_SEARCH_ATTRIBUTION_PROFILES {
+            let track_id = TrackId::remote(format!("fill-{index}")).expect("bounded track ID");
+            let profile = PlaybackAttributionProfile::from_remote_row(
+                Some(format!("Fill {index}")),
+                Some("Fill Artist".to_owned()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("fill profile is bounded");
+            cache.search_attribution_profiles.insert(track_id, profile);
+        }
+    }
+
+    async fn assert_search_store_state(
+        backend: &SubsonicBackend,
+        present: &[&str],
+        absent: &[&str],
+    ) {
+        let cache = backend.cache.read().await;
+        assert_eq!(
+            cache.search_attribution_profiles.len(),
+            MAX_SEARCH_ATTRIBUTION_PROFILES,
+            "search-only retention stays capped at the bound"
+        );
+        for id in present {
+            let track_id = TrackId::remote(*id).expect("bounded track ID");
+            assert!(
+                cache.search_attribution_profiles.contains_key(&track_id),
+                "{id} should still be retained"
+            );
+        }
+        for id in absent {
+            let track_id = TrackId::remote(*id).expect("bounded track ID");
+            assert!(
+                !cache.search_attribution_profiles.contains_key(&track_id),
+                "{id} should have been evicted"
+            );
+        }
+    }
+
+    async fn assert_catalogue_profile_survives_search_traffic(backend: &SubsonicBackend) {
+        let catalogue_id = TrackId::remote("catalogue-song").expect("bounded track ID");
+        let cache = backend.cache.read().await;
+        let profile = cache
+            .attribution_profiles
+            .get(&catalogue_id)
+            .cloned()
+            .expect("the refreshed catalogue profile is never evicted by search traffic");
+        drop(cache);
+        assert_eq!(profile.title(), "Catalogue Song");
+        assert_eq!(
+            backend
+                .catalogue_attribution_profile(&catalogue_id)
+                .expect("catalogue authority stays resolvable")
+                .title(),
+            "Catalogue Song"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_attribution_profiles_stay_bounded_and_never_evict_catalogue() {
+        let service = MockHttpService::start(search_eviction_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+            .await
+            .expect("eviction fixture connects");
+
+        fill_search_attribution_store_to_bound(&backend).await;
+        assert_search_store_state(&backend, &["fill-0"], &[]).await;
+        assert_catalogue_profile_survives_search_traffic(&backend).await;
+
+        backend.search("Fresh A", 10).await.expect("first search");
+        // A genuinely new identity evicts only the oldest search-only entry.
+        assert_search_store_state(&backend, &["fresh-a", "fill-1"], &["fill-0"]).await;
+        assert_catalogue_profile_survives_search_traffic(&backend).await;
+
+        // A repeat search replaces its own entry in place, evicting nothing.
+        backend.search("Fresh A", 10).await.expect("repeat search");
+        assert_search_store_state(&backend, &["fresh-a", "fill-1"], &["fill-0"]).await;
+
+        // The next fresh identity evicts the next-oldest search-only entry.
+        backend.search("Fresh B", 10).await.expect("second search");
+        assert_search_store_state(
+            &backend,
+            &["fresh-a", "fresh-b", "fill-2"],
+            &["fill-0", "fill-1"],
+        )
+        .await;
+        assert_catalogue_profile_survives_search_traffic(&backend).await;
+
         service.finish().await;
     }
 }

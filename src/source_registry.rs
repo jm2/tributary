@@ -9,7 +9,7 @@
 //! boundary until media use.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
@@ -288,6 +288,37 @@ impl PlaybackAttributionProfile {
         )
     }
 
+    /// Build a profile from the raw accepted protocol row of one
+    /// authenticated-remote catalogue track, before any display fallback is
+    /// substituted.
+    ///
+    /// Adapter display converters synthesize `"Unknown"` titles and artists
+    /// when a server omits those fields, so a display [`Track`] can never be
+    /// the attribution source. The required title and artist must be present
+    /// on the accepted protocol row itself; a literal server-supplied
+    /// `"Unknown"` passes verbatim and stays distinguishable from a
+    /// synthesized fallback because synthesis never reaches this constructor.
+    /// A missing optional album stays absent. The value is still bounded: an
+    /// empty required title or artist, or oversized text, yields `None` so an
+    /// incomplete remote row can never become attribution authority.
+    pub(crate) fn from_remote_row(
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<u32>,
+        duration_secs: Option<u64>,
+    ) -> Option<Self> {
+        Self::bounded(
+            title?,
+            artist?,
+            album,
+            album_artist,
+            track_number,
+            duration_secs,
+        )
+    }
+
     fn bounded(
         title: String,
         artist: String,
@@ -368,6 +399,87 @@ impl PlaybackAttributionProfile {
 impl std::fmt::Debug for PlaybackAttributionProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PlaybackAttributionProfile(<redacted>)")
+    }
+}
+
+/// Cumulative bound on search-only playback-attribution retention per source.
+///
+/// Each search response is bounded per request, but a long-lived session can
+/// issue unbounded numbers of searches, each introducing rows with fresh
+/// native identities. Profiles minted from search rows are therefore kept in
+/// a [`BoundedSearchAttributionProfiles`] store capped at this bound instead
+/// of growing an adapter's attribution cache without limit.
+pub const MAX_SEARCH_ATTRIBUTION_PROFILES: usize = 1024;
+
+/// Insertion-ordered, bounded store for playback-attribution profiles minted
+/// from search rows outside the refreshed catalogue.
+///
+/// A refreshed catalogue profile is never stored here, so search traffic can
+/// never evict it. Re-searching an already-retained native identity replaces
+/// its entry in place without evicting anything; only a genuinely new
+/// identity past the bound evicts the oldest search-only entry.
+#[derive(Debug)]
+pub struct BoundedSearchAttributionProfiles {
+    bound: usize,
+    order: VecDeque<TrackId>,
+    profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+}
+
+impl BoundedSearchAttributionProfiles {
+    /// Create an empty store with the production retention bound.
+    pub fn bounded() -> Self {
+        Self::with_bound(MAX_SEARCH_ATTRIBUTION_PROFILES)
+    }
+
+    pub fn with_bound(bound: usize) -> Self {
+        Self {
+            bound,
+            order: VecDeque::new(),
+            profiles: HashMap::new(),
+        }
+    }
+
+    /// Retain one search-minted profile. An already-retained identity is
+    /// replaced in place; a new identity past the bound evicts the oldest
+    /// search-only entry first.
+    pub fn insert(&mut self, track_id: TrackId, profile: PlaybackAttributionProfile) {
+        if let Some(retained) = self.profiles.get_mut(&track_id) {
+            *retained = profile;
+            return;
+        }
+        self.order.push_back(track_id.clone());
+        self.profiles.insert(track_id, profile);
+        while self.order.len() > self.bound {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.profiles.remove(&evicted);
+        }
+    }
+
+    /// Drop one search-minted profile, keeping insertion order intact for the
+    /// remaining entries. Catalogue profiles live in a separate map and are
+    /// unaffected.
+    pub fn remove(&mut self, track_id: &TrackId) {
+        if self.profiles.remove(track_id).is_some() {
+            if let Some(position) = self.order.iter().position(|id| id == track_id) {
+                self.order.remove(position);
+            }
+        }
+    }
+
+    pub fn get(&self, track_id: &TrackId) -> Option<&PlaybackAttributionProfile> {
+        self.profiles.get(track_id)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    #[cfg(test)]
+    pub fn contains_key(&self, track_id: &TrackId) -> bool {
+        self.profiles.contains_key(track_id)
     }
 }
 
@@ -1079,11 +1191,13 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
     /// Return the exact bounded structured attribution authorized for one
     /// track by this live adapter.
     ///
-    /// Coarse source capability is deliberately insufficient. The default and
-    /// all currently shipped authenticated-remote adapters return no
-    /// per-track profile and therefore fail closed. External-file and retained
-    /// removable-media adapters are the current production overrides, both
-    /// deriving profiles only from exact real-tag provenance.
+    /// Coarse source capability is deliberately insufficient. The default
+    /// returns no per-track profile and therefore fails closed; every shipping
+    /// override derives its profile from exact source-owned provenance.
+    /// External-file and retained removable-media adapters build from real
+    /// audio tags, while the four authenticated-remote adapters build from
+    /// their own accepted server catalogue rows and remain gated by the
+    /// current policy generation's remote opt-in.
     fn playback_attribution_profile(
         &self,
         _track_id: &TrackId,
@@ -1228,6 +1342,13 @@ macro_rules! standard_remote_adapter {
                 PlaybackAttributionCapability::AuthenticatedRemote
             }
 
+            fn playback_attribution_profile(
+                &self,
+                track_id: &TrackId,
+            ) -> Option<PlaybackAttributionProfile> {
+                self.catalogue_attribution_profile(track_id)
+            }
+
             fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
                 $regular_playlist_capability
             }
@@ -1270,6 +1391,13 @@ impl LifecycleAdapter for crate::subsonic::SubsonicBackend {
 impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
     fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
         PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        self.catalogue_attribution_profile(track_id)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
@@ -1334,6 +1462,13 @@ impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
         PlaybackAttributionCapability::AuthenticatedRemote
     }
 
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        self.catalogue_attribution_profile(track_id)
+    }
+
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
         source_scoped_playlist_capability::<Self>()
     }
@@ -1395,6 +1530,13 @@ fn validate_daap_initial_catalogue(
 impl ManagedSourceAdapter for crate::daap::DaapBackend {
     fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
         PlaybackAttributionCapability::AuthenticatedRemote
+    }
+
+    fn playback_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        self.catalogue_attribution_profile(track_id)
     }
 
     fn regular_playlist_capability(&self) -> RegularPlaylistCapability {
@@ -3249,6 +3391,143 @@ impl ProvenanceClaims {
     }
 }
 
+/// Cross-module test fixture for admission seams that must exercise the real
+/// registry mint path with an authenticated-remote adapter.
+///
+/// Lives beside the registry machinery (not inside `mod tests`) so other
+/// modules' test suites can drive genuine
+/// [`SourceRegistry::mint_session_playback_source`] and
+/// [`SourceRegistry::try_admit_playback_action`] flows without duplicating
+/// the in-module fake probe. Compiled only under `cfg(test)`.
+#[cfg(test)]
+pub mod playback_attribution_fixture {
+    use super::sealed::AbortableSourceAdapter as SealedAbortable;
+    use super::{
+        lock, AdapterCloseFuture, CatalogueFuture, CloseAuthority, ManagedSourceAdapter,
+        PlaybackAttributionCapability, PlaybackAttributionProfile, SourceProvenance,
+        SourceRegistry, Track, TrackId,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal authenticated-remote adapter: publishes one fixed initial
+    /// catalogue and serves per-track attribution profiles from a private
+    /// map. Every other adapter capability stays at its deny-by-default.
+    pub struct FixtureRemoteAdapter {
+        catalogue: Vec<Track>,
+        profiles: Mutex<HashMap<TrackId, PlaybackAttributionProfile>>,
+    }
+
+    impl FixtureRemoteAdapter {
+        pub(crate) fn new(catalogue: Vec<Track>) -> Self {
+            Self {
+                catalogue,
+                profiles: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub(crate) fn with_profile(
+            self,
+            track_id: TrackId,
+            profile: PlaybackAttributionProfile,
+        ) -> Self {
+            lock(&self.profiles).insert(track_id, profile);
+            self
+        }
+    }
+
+    impl super::LifecycleAdapter for FixtureRemoteAdapter {
+        fn close(self: Arc<Self>, _authority: CloseAuthority) -> AdapterCloseFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ManagedSourceAdapter for FixtureRemoteAdapter {
+        fn playback_attribution_capability(&self) -> PlaybackAttributionCapability {
+            PlaybackAttributionCapability::AuthenticatedRemote
+        }
+
+        fn playback_attribution_profile(
+            &self,
+            track_id: &TrackId,
+        ) -> Option<PlaybackAttributionProfile> {
+            lock(&self.profiles).get(track_id).cloned()
+        }
+
+        fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
+            Box::pin(async move { Ok(self.catalogue.clone()) })
+        }
+    }
+
+    impl SealedAbortable for FixtureRemoteAdapter {}
+    impl super::AbortableSourceAdapter for FixtureRemoteAdapter {}
+
+    /// Catalogue row for one exact native track ID with fixed fixture
+    /// metadata, suitable for [`FixtureRemoteAdapter::new`].
+    pub fn fixture_track(track_id: TrackId) -> Track {
+        Track {
+            id: uuid::Uuid::new_v4(),
+            native_track_id: Some(track_id),
+            title: "Fixture Row Title".to_string(),
+            artist_name: "Fixture Row Artist".to_string(),
+            album_artist_name: None,
+            artist_id: None,
+            album_title: "Fixture Row Album".to_string(),
+            album_id: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: Some(181),
+            composer: None,
+            genre: None,
+            year: None,
+            file_path: None,
+            stream_url: None,
+            cover_art_url: None,
+            date_added: None,
+            date_modified: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: None,
+            rating: crate::architecture::models::TrackRating::unsupported(),
+            last_played: None,
+        }
+    }
+
+    /// Claim Saved provenance, connect the fixture adapter, and resolve once
+    /// the initial catalogue is accepted. Returns the live session epoch the
+    /// caller must pass to [`SourceRegistry::mint_session_playback_source`].
+    pub async fn connect_saved_remote(
+        registry: &SourceRegistry,
+        source_id: crate::architecture::SourceId,
+        adapter: FixtureRemoteAdapter,
+    ) -> u64 {
+        registry
+            .claim_provenance(source_id, SourceProvenance::Saved)
+            .expect("fixture remote provenance claim");
+        registry
+            .connect_standard::<FixtureRemoteAdapter, _, _, _>(
+                source_id,
+                |_| {},
+                move || async move { Ok(adapter) },
+            )
+            .expect("fixture remote connection admitted");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(catalogue) = registry
+                    .snapshot(source_id)
+                    .and_then(|snapshot| snapshot.catalogue)
+                {
+                    return catalogue.session_epoch;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture remote catalogue accepted")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -3288,6 +3567,78 @@ mod tests {
     };
 
     use super::*;
+
+    fn search_attribution_fixture() -> PlaybackAttributionProfile {
+        PlaybackAttributionProfile::for_test("T", "A", None, None, None, None)
+    }
+
+    fn search_attribution_track(suffix: &str) -> TrackId {
+        TrackId::remote(format!("search-{suffix}")).expect("bounded track ID")
+    }
+
+    #[test]
+    fn bounded_search_profiles_evict_the_oldest_identity_past_the_bound() {
+        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
+        let first = search_attribution_track("first");
+        let second = search_attribution_track("second");
+        let third = search_attribution_track("third");
+
+        store.insert(first.clone(), search_attribution_fixture());
+        store.insert(second.clone(), search_attribution_fixture());
+        assert_eq!(store.len(), 2);
+
+        // A third distinct identity past the bound evicts the oldest entry.
+        store.insert(third.clone(), search_attribution_fixture());
+        assert_eq!(store.len(), 2);
+        assert!(
+            !store.contains_key(&first),
+            "the oldest search-only entry must be evicted first"
+        );
+        assert!(store.contains_key(&second));
+        assert!(store.contains_key(&third));
+    }
+
+    #[test]
+    fn bounded_search_profiles_replace_repeat_identities_in_place() {
+        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
+        let first = search_attribution_track("first");
+        let second = search_attribution_track("second");
+        let profile = search_attribution_fixture();
+
+        store.insert(first.clone(), profile.clone());
+        store.insert(second.clone(), profile);
+        // Re-searching a retained identity replaces its value in place
+        // without evicting the neighbor or growing the store.
+        let refreshed = PlaybackAttributionProfile::for_test("T2", "A2", None, None, None, None);
+        store.insert(first.clone(), refreshed);
+        assert_eq!(store.len(), 2);
+        assert!(
+            store.contains_key(&second),
+            "a repeat insert must not evict anything"
+        );
+        assert_eq!(store.get(&first).expect("retained identity").title(), "T2");
+    }
+
+    #[test]
+    fn bounded_search_profiles_remove_keeps_remaining_entries_ordered() {
+        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
+        let first = search_attribution_track("first");
+        let second = search_attribution_track("second");
+        let profile = search_attribution_fixture();
+
+        store.insert(first.clone(), profile.clone());
+        store.insert(second.clone(), profile);
+        store.remove(&first);
+        assert_eq!(store.len(), 1);
+        assert!(store.contains_key(&second));
+        // The freed slot is refillable: inserting a new identity does not
+        // evict the surviving neighbor.
+        let third = search_attribution_track("third");
+        store.insert(third.clone(), search_attribution_fixture());
+        assert_eq!(store.len(), 2);
+        assert!(store.contains_key(&second));
+        assert!(store.contains_key(&third));
+    }
 
     struct FakeProbe {
         close_calls: AtomicUsize,

@@ -21,6 +21,7 @@ use super::api::{
     PlexMedia, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
+use crate::source_registry::PlaybackAttributionProfile;
 
 /// Page size requested via `X-Plex-Container-Size`.  Plex caps the number
 /// of items returned per request, so a full `library/sections/{key}/all`
@@ -56,6 +57,9 @@ struct LibraryCache {
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Plex rating key → thumbnail path.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Plex rating key → Last.fm attribution profile derived from the
+    /// raw accepted protocol row before display fallbacks were substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
 }
 
 impl LibraryCache {
@@ -66,6 +70,7 @@ impl LibraryCache {
             artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
         }
     }
 }
@@ -176,6 +181,7 @@ impl PlexBackend {
         let mut skipped_unplayable_tracks = 0usize;
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
 
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
@@ -246,14 +252,19 @@ impl PlexBackend {
 
             // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
-                let Some((track_id, track, part_key)) = cacheable_plex_track(plex_track) else {
+                let Some((track_id, track, part_key, attribution_profile)) =
+                    cacheable_plex_track(plex_track)
+                else {
                     skipped_unplayable_tracks += 1;
                     continue;
                 };
 
                 stream_locator_by_track_id.insert(track_id.clone(), part_key);
                 if let Some(thumb_path) = &plex_track.thumb {
-                    track_artwork_locator_by_track_id.insert(track_id, thumb_path.clone());
+                    track_artwork_locator_by_track_id.insert(track_id.clone(), thumb_path.clone());
+                }
+                if let Some(profile) = attribution_profile {
+                    attribution_profiles.insert(track_id, profile);
                 }
                 all_tracks.push(track);
             }
@@ -320,6 +331,7 @@ impl PlexBackend {
             artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
+            attribution_profiles,
         };
 
         Ok(())
@@ -400,6 +412,23 @@ impl PlexBackend {
     /// Return the music libraries discovered during init.
     pub fn music_libraries(&self) -> &[MusicLibrary] {
         &self.music_libraries
+    }
+
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue row by its native identity.
+    ///
+    /// Profiles are derived from the raw protocol row during refresh, before
+    /// display fallbacks are substituted, so a synthesized `"Unknown"` can
+    /// never become attribution authority. The lookup is deliberately
+    /// non-blocking: a contended refresh returns `None`, so Last.fm
+    /// attribution fails closed instead of waiting on the lifecycle state
+    /// lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        let cache = self.cache.try_read().ok()?;
+        cache.attribution_profiles.get(track_id).cloned()
     }
 }
 
@@ -588,7 +617,14 @@ fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {
     })
 }
 
-fn cacheable_plex_track(plex: &PlexTrack) -> Option<(TrackId, Track, String)> {
+fn cacheable_plex_track(
+    plex: &PlexTrack,
+) -> Option<(
+    TrackId,
+    Track,
+    String,
+    Option<crate::source_registry::PlaybackAttributionProfile>,
+)> {
     let (media, stream_locator) = plex_stream_source(plex)?;
     let track_id = TrackId::remote(plex.rating_key.clone()).ok()?;
     let track_uuid = deterministic_uuid(&plex.rating_key);
@@ -605,7 +641,23 @@ fn cacheable_plex_track(plex: &PlexTrack) -> Option<(TrackId, Track, String)> {
         artist_id,
         album_id,
     );
-    Some((track_id, track, stream_locator.to_string()))
+    // Attribution provenance is frozen from the raw accepted row before the
+    // display converter substitutes any "Unknown" fallback, so a synthesized
+    // fallback can never become Last.fm attribution authority.
+    let attribution_profile = crate::source_registry::PlaybackAttributionProfile::from_remote_row(
+        plex.title.clone(),
+        plex.grandparent_title.clone(),
+        plex.parent_title.clone(),
+        None,
+        plex.index,
+        plex.duration.map(|d| d / 1000),
+    );
+    Some((
+        track_id,
+        track,
+        stream_locator.to_string(),
+        attribution_profile,
+    ))
 }
 
 fn plex_track_to_track(
@@ -733,7 +785,7 @@ mod tests {
             plex_stream_locator(&track),
             Some("/library/parts/2/file.flac")
         );
-        let (track_id, published, stream_locator) =
+        let (track_id, published, stream_locator, attribution_profile) =
             cacheable_plex_track(&track).expect("track should be published");
         assert_eq!(track_id.as_str(), "track-id");
         assert_eq!(published.id, deterministic_uuid("track-id"));
@@ -741,6 +793,11 @@ mod tests {
         assert_eq!(published.bitrate_kbps, Some(1411));
         assert_eq!(published.format.as_deref(), Some("flac"));
         assert_eq!(stream_locator, "/library/parts/2/file.flac");
+        // The accepted row omits the required title, so no attribution
+        // authority may exist even though the display Track synthesizes
+        // an "Unknown" title fallback.
+        assert_eq!(published.title, "Unknown");
+        assert!(attribution_profile.is_none());
     }
 
     #[tokio::test]
@@ -867,6 +924,181 @@ mod tests {
             );
             assert!(request.body.is_empty());
         }
+        service.finish().await;
+    }
+
+    fn playable_media() -> serde_json::Value {
+        serde_json::json!({
+            "bitrate": 1411,
+            "audioCodec": "flac",
+            "Part": [{"key": "/library/parts/raw/file.flac"}]
+        })
+    }
+
+    fn raw_row_metadata_items() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "ratingKey": "gap-row",
+                "Media": [playable_media()]
+            }),
+            serde_json::json!({
+                "ratingKey": "complete-row",
+                "title": "Raw Complete",
+                "grandparentTitle": "Raw Artist",
+                "parentTitle": "Raw Album",
+                "index": 3,
+                "duration": 201_000,
+                "Media": [playable_media()]
+            }),
+            serde_json::json!({
+                "ratingKey": "server-unknown-row",
+                "title": "Unknown",
+                "grandparentTitle": "Unknown",
+                "Media": [playable_media()]
+            }),
+            serde_json::json!({
+                "ratingKey": "album-less-row",
+                "title": "Raw Bare",
+                "grandparentTitle": "Raw Artist",
+                "Media": [playable_media()]
+            }),
+        ]
+    }
+
+    fn raw_row_routes() -> Vec<MockRoute> {
+        vec![
+            MockRoute::get("/identity").reply(MockResponse::json(serde_json::json!({
+                "MediaContainer": {
+                    "machineIdentifier": "fixture-machine",
+                    "version": "1.0"
+                }
+            }))),
+            MockRoute::get("/library/sections").reply(MockResponse::json(serde_json::json!({
+                "MediaContainer": {
+                    "size": 1,
+                    "Directory": [
+                        {"key": "7", "title": "Music", "type": "artist", "uuid": "music-uuid"}
+                    ]
+                }
+            }))),
+            MockRoute::get("/library/sections/7/all")
+                .with_query("type", "10")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {
+                        "size": 4,
+                        "totalSize": 4,
+                        "offset": 0,
+                        "Metadata": raw_row_metadata_items()
+                    }
+                }))),
+            MockRoute::get("/library/sections/7/all")
+                .with_query("type", "9")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {"size": 0, "totalSize": 0, "offset": 0}
+                }))),
+            MockRoute::get("/library/sections/7/all")
+                .with_query("type", "8")
+                .reply(MockResponse::json(serde_json::json!({
+                    "MediaContainer": {"size": 0, "totalSize": 0, "offset": 0}
+                }))),
+        ]
+    }
+
+    async fn raw_row_native_ids(backend: &PlexBackend) -> HashMap<String, TrackId> {
+        let cache = backend.cache.read().await;
+        assert_eq!(cache.tracks.len(), 4);
+        let gap_display_title = cache
+            .tracks
+            .iter()
+            .find(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "gap-row")
+            })
+            .map(|track| track.title.clone());
+        assert_eq!(gap_display_title.as_deref(), Some("Unknown"));
+        cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let native = track.native_track_id.clone()?;
+                Some((native.as_str().to_string(), native))
+            })
+            .collect::<HashMap<String, TrackId>>()
+    }
+
+    fn assert_raw_row_profiles_are_frozen(backend: &PlexBackend, ids: &HashMap<String, TrackId>) {
+        let gap_id = &ids["gap-row"];
+        let complete_id = &ids["complete-row"];
+        let server_unknown_id = &ids["server-unknown-row"];
+        let album_less_id = &ids["album-less-row"];
+
+        // Raw row with missing title and artist: accepted for playback, but
+        // carries no attribution proof — the display "Unknown" fallback is
+        // not authority.
+        assert!(backend.catalogue_attribution_profile(gap_id).is_none());
+
+        // Complete raw row: the exact provenance is retained.
+        let complete = backend
+            .catalogue_attribution_profile(complete_id)
+            .expect("complete row retains its provenance profile");
+        assert_eq!(complete.title(), "Raw Complete");
+        assert_eq!(complete.artist(), "Raw Artist");
+        assert_eq!(complete.album(), Some("Raw Album"));
+
+        // A server-supplied "Unknown" is real row data, so it stays
+        // attributable and distinguishable from the synthesized fallback.
+        let server_unknown = backend
+            .catalogue_attribution_profile(server_unknown_id)
+            .expect("server-supplied Unknown remains attributable");
+        assert_eq!(server_unknown.title(), "Unknown");
+        assert_eq!(server_unknown.artist(), "Unknown");
+
+        // An absent optional album stays absent in the profile.
+        let album_less = backend
+            .catalogue_attribution_profile(album_less_id)
+            .expect("album-less row retains its provenance profile");
+        assert_eq!(album_less.title(), "Raw Bare");
+        assert_eq!(album_less.artist(), "Raw Artist");
+        assert_eq!(album_less.album(), None);
+
+        // Unknown or stale native IDs refuse attribution.
+        let stale_id = TrackId::remote("never-refreshed").expect("bounded stale track ID");
+        assert!(backend.catalogue_attribution_profile(&stale_id).is_none());
+    }
+
+    async fn assert_raw_row_lookup_fails_closed_while_cache_contended(
+        backend: &PlexBackend,
+        complete_id: &TrackId,
+    ) {
+        // A contended cache (refresh in flight) fails closed instead of
+        // blocking attribution on the lifecycle lock.
+        let guard = backend.cache.write().await;
+        assert!(backend.catalogue_attribution_profile(complete_id).is_none());
+        drop(guard);
+        assert!(backend.catalogue_attribution_profile(complete_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
+        let service = MockHttpService::start(raw_row_routes()).await;
+        let token = Uuid::new_v4().to_string();
+        let backend = PlexBackend::connect("fixture", &service.base_url(), &token)
+            .await
+            .expect("connect raw-row fixture");
+        crate::architecture::load_track_catalog(&backend)
+            .await
+            .expect("raw-row catalogue loads");
+
+        let native_by_id = raw_row_native_ids(&backend).await;
+        assert_raw_row_profiles_are_frozen(&backend, &native_by_id);
+        assert_raw_row_lookup_fails_closed_while_cache_contended(
+            &backend,
+            &native_by_id["complete-row"],
+        )
+        .await;
+
         service.finish().await;
     }
 
@@ -1010,6 +1242,10 @@ mod tests {
             .expect("fixture track retains its native ID");
         assert_eq!(first_id.as_str(), "track-0");
         drop(cache);
+        let profile = backend
+            .catalogue_attribution_profile(&first_id)
+            .expect("provenance-derived profile is retained for the accepted row");
+        assert!(!profile.title().is_empty());
         assert_eq!(
             backend
                 .resolve_stream(&first_id)

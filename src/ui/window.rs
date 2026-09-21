@@ -1447,11 +1447,16 @@ pub(crate) fn build_window(
     // initialization. It remains Dormant until a future consent/policy layer
     // issues the move-only activation authority; ordinary builds without
     // injected credentials perform no Last.fm database, vault, or network
-    // work.
+    // work. The live policy handle wraps the SAME shared generation slot the
+    // playback capture contexts clone, so queue capture and dispatch
+    // admission observe one authoritative live generation: capture freezes
+    // its identity into each minted occurrence, and dispatch re-derives the
+    // current generation's authority from this slot at the moment of use.
     let (lastfm_application, lastfm_application_shutdown) =
         match crate::lastfm::production::spawn_lastfm_application_owner(
             lastfm_playback.clone(),
             rt_handle.clone(),
+            crate::lastfm::policy::LastFmLivePolicy::from_shared(lastfm_policy.clone()),
         ) {
             Ok(owner) => owner,
             Err(error) => {
@@ -2101,7 +2106,11 @@ pub(crate) fn build_window(
                 // malformed record.
                 match crate::lastfm::policy::load_policy_generation(&db).await {
                     Ok(policy) => {
-                        *engine_lastfm_policy.lock().unwrap() = policy;
+                        // Recovering publish: the shared slot must stay
+                        // writable even after a poisoned lock, because the
+                        // value is replaced wholesale and re-validated on
+                        // every read.
+                        *crate::lastfm::policy::lock_policy_slot(&engine_lastfm_policy) = policy;
                     }
                     Err(error) => {
                         tracing::warn!(

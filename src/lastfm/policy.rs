@@ -19,6 +19,7 @@ use std::fmt;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use thiserror::Error;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::architecture::SourceId;
@@ -183,6 +184,22 @@ impl LastFmPolicyGeneration {
             None
         }
     }
+
+    /// Construct one consented, enabled generation for downstream tests that
+    /// must not spin up a database. The persisted store remains the only
+    /// production path; this mirrors a generation already committed at
+    /// `generation`.
+    #[cfg(test)]
+    pub(crate) fn for_test(generation: u64, enabled_remote_sources: HashSet<SourceId>) -> Self {
+        Self {
+            generation: generation.max(1),
+            consent: Some(
+                LastFmConsentRecord::try_new("en", 1).expect("valid test consent record"),
+            ),
+            enabled: true,
+            enabled_remote_sources,
+        }
+    }
 }
 
 impl fmt::Debug for LastFmPolicyGeneration {
@@ -195,6 +212,150 @@ static EMPTY_REMOTE_SOURCES: std::sync::OnceLock<HashSet<SourceId>> = std::sync:
 
 fn empty_remote_sources() -> &'static HashSet<SourceId> {
     EMPTY_REMOTE_SOURCES.get_or_init(HashSet::new)
+}
+
+/// Shared live handle to the current policy generation.
+///
+/// The UI owns one `Arc<Mutex<LastFmPolicyGeneration>>` slot, replaces its
+/// content wholesale after the migrated database loads the persisted policy,
+/// and clones the same `Arc` into every consumer. Queue capture and dispatch
+/// therefore observe one shared live generation source: capture freezes its
+/// exact identity into each minted source authority, and dispatch re-derives
+/// its authority from the same slot at the moment of use.
+///
+/// Every publication also wakes [`Self::subscribe`] watchers, so a runtime
+/// that must terminate when its issuing generation is superseded can react
+/// change-driven instead of polling the slot.
+#[derive(Clone)]
+pub struct LastFmLivePolicy {
+    slot: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
+    changes: std::sync::Arc<watch::Sender<LastFmPolicyGeneration>>,
+}
+
+impl Default for LastFmLivePolicy {
+    fn default() -> Self {
+        let initial = LastFmPolicyGeneration::default();
+        let (changes, _) = watch::channel(initial.clone());
+        Self {
+            slot: std::sync::Arc::new(std::sync::Mutex::new(initial)),
+            changes: std::sync::Arc::new(changes),
+        }
+    }
+}
+
+/// Lock the shared UI policy slot, recovering from a poisoned mutex.
+///
+/// The slot's value is replaced wholesale and re-validated on every read, so
+/// a panic while a guard is held (for example a poisoned removable-media
+/// catalogue panicking inside `play_track_at`'s queue capture) cannot leave a
+/// torn generation behind. Recovering with
+/// [`std::sync::PoisonError::into_inner`] preserves the last published
+/// generation and keeps every later consumer alive: dispatch refuses dormant
+/// generations by value, never by lock state.
+pub fn lock_policy_slot(
+    slot: &std::sync::Mutex<LastFmPolicyGeneration>,
+) -> std::sync::MutexGuard<'_, LastFmPolicyGeneration> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl LastFmLivePolicy {
+    /// Wrap an already-shared UI policy slot.
+    ///
+    /// The watch channel starts at the slot's current value: subscribers only
+    /// observe publications made after they subscribed, so pre-existing state
+    /// is read through [`Self::snapshot`], never misread as a change.
+    pub(crate) fn from_shared(
+        shared: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
+    ) -> Self {
+        let initial = lock_policy_slot(&shared).clone();
+        let (changes, _) = watch::channel(initial);
+        Self {
+            slot: shared,
+            changes: std::sync::Arc::new(changes),
+        }
+    }
+
+    /// Freeze one exact observation of the live generation.
+    pub(crate) fn snapshot(&self) -> LastFmPolicyGeneration {
+        lock_policy_slot(&self.slot).clone()
+    }
+
+    /// Publish a successor generation from the database-init path.
+    pub(crate) fn publish(&self, generation: LastFmPolicyGeneration) {
+        *lock_policy_slot(&self.slot) = generation.clone();
+        // A publication with no watchers must not fail the publish itself.
+        let _ = self.changes.send(generation);
+    }
+
+    /// Watch for live-policy publications.
+    ///
+    /// The receiver starts with the current generation marked as unseen; call
+    /// `borrow_and_update` once before the first `changed` wait to consume the
+    /// starting state so only later publications wake the watcher.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<LastFmPolicyGeneration> {
+        self.changes.subscribe()
+    }
+
+    /// The dispatch authority of the current live generation.
+    ///
+    /// `None` means the live generation grants no activation authority (the
+    /// closed default or a disabled policy), so dispatch refuses instead of
+    /// consulting an empty source set.
+    pub(crate) fn dispatch_authority(&self) -> Option<LastFmDispatchAuthority> {
+        LastFmDispatchAuthority::from_generation(&self.snapshot())
+    }
+}
+
+/// One frozen dispatch authority derived from the live policy generation.
+///
+/// Dispatch admission consumes this snapshot instead of a retained
+/// activation-time source set, so a queue occurrence captured under one
+/// generation is refused the moment the live generation moves past it, even
+/// when its source remains opted in.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LastFmDispatchAuthority {
+    generation: u64,
+    enabled_remote_sources: HashSet<SourceId>,
+}
+
+impl LastFmDispatchAuthority {
+    /// Derive the dispatch authority from one generation observation.
+    ///
+    /// `None` when the generation carries no activation authority (no current
+    /// consent or enablement).
+    pub(crate) fn from_generation(generation: &LastFmPolicyGeneration) -> Option<Self> {
+        Some(Self {
+            generation: generation.generation(),
+            enabled_remote_sources: generation.activation_remote_sources()?.clone(),
+        })
+    }
+
+    /// The exact generation identity this authority was derived from.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The current generation's remote-source opt-in set.
+    pub(crate) fn enabled_remote_sources(&self) -> &HashSet<SourceId> {
+        &self.enabled_remote_sources
+    }
+
+    /// Construct one authority for downstream tests that must not spin up a
+    /// database. The live slot remains the only production path.
+    #[cfg(test)]
+    pub(crate) fn for_test(generation: u64, enabled_remote_sources: HashSet<SourceId>) -> Self {
+        Self {
+            generation,
+            enabled_remote_sources,
+        }
+    }
+}
+
+impl fmt::Debug for LastFmDispatchAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LastFmDispatchAuthority(<redacted>)")
+    }
 }
 
 /// One complete, validated desired policy state.
@@ -713,5 +874,109 @@ mod tests {
             enabled_remote_sources: sources,
         };
         assert_eq!(format!("{policy:?}"), "LastFmPolicyGeneration(<redacted>)");
+    }
+
+    /// A queue captured under one generation cannot keep that source once a
+    /// successor generation removes it: the live capture basis and the
+    /// activation basis are both re-derived from the successor, so a disabled
+    /// source stays fail-closed at dispatch.
+    #[tokio::test]
+    async fn successor_generation_refuses_a_stale_captured_source() {
+        let db = database().await;
+        let stale_source = sample_source(11);
+        let first = commit_policy_update(
+            &db,
+            0,
+            update(Some(consent("en")), true, HashSet::from([stale_source])),
+        )
+        .await
+        .unwrap();
+        let captured = first.queue_capture_remote_sources().clone();
+        assert!(captured.contains(&stale_source));
+        assert!(first
+            .activation_remote_sources()
+            .is_some_and(|sources| sources.contains(&stale_source)));
+
+        let successor = commit_policy_update(
+            &db,
+            first.generation(),
+            update(first.consent().cloned(), true, HashSet::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(successor.generation(), first.generation() + 1);
+        assert!(!successor
+            .queue_capture_remote_sources()
+            .contains(&stale_source));
+        assert!(successor
+            .activation_remote_sources()
+            .is_some_and(|sources| !sources.contains(&stale_source)));
+    }
+
+    /// The closed default and a disabled generation carry no activation
+    /// authority, so a dispatch caller cannot infer enablement from the mere
+    /// presence of a stored generation.
+    #[tokio::test]
+    async fn disabled_generation_grants_no_capture_or_activation_authority() {
+        let db = database().await;
+        let closed = LastFmPolicyGeneration::default();
+        assert!(closed.activation_remote_sources().is_none());
+        assert!(closed.queue_capture_remote_sources().is_empty());
+
+        let disabled = commit_policy_update(
+            &db,
+            0,
+            update(
+                Some(consent("en")),
+                false,
+                HashSet::from([sample_source(12)]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(disabled.activation_remote_sources().is_none());
+        assert!(disabled.queue_capture_remote_sources().is_empty());
+    }
+
+    /// A panic while a policy guard is held (for example a poisoned removable
+    /// catalogue inside the visible-queue capture) poisons the shared slot.
+    /// Every later consumer must recover through `lock_policy_slot`: the
+    /// generation is replaced wholesale and re-validated by value, so neither
+    /// snapshot, dispatch, nor publish may cascade the poison.
+    #[test]
+    fn poisoned_policy_slot_recovers_for_snapshot_publish_and_dispatch() {
+        let live = LastFmLivePolicy::default();
+        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
+
+        // Poison the shared slot exactly like a panic under a held guard.
+        let slot = live.slot.clone();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = slot.lock().expect("hold the slot while panicking");
+            panic!("poison the policy slot");
+        }));
+        assert!(poison.is_err());
+        assert!(slot.is_poisoned());
+
+        assert_eq!(
+            live.snapshot().generation(),
+            1,
+            "snapshot must survive a poisoned slot"
+        );
+        assert!(
+            live.dispatch_authority()
+                .is_some_and(|authority| authority.generation() == 1),
+            "dispatch authority must survive a poisoned slot"
+        );
+        live.publish(LastFmPolicyGeneration::for_test(2, HashSet::new()));
+        assert_eq!(
+            live.snapshot().generation(),
+            2,
+            "publish must stay writable through a poisoned slot"
+        );
+        assert!(
+            live.dispatch_authority()
+                .is_some_and(|authority| authority.generation() == 2),
+            "the republished generation must drive dispatch after recovery"
+        );
     }
 }

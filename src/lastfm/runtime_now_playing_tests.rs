@@ -206,8 +206,7 @@ async fn fixture() -> Fixture {
     let (transport, calls, responses, retired, lifecycle, active) =
         ScriptedTransport::new(session.clone());
     let store = Arc::new(TestCredentialStore::new(session, Arc::clone(&active)));
-    let (handle, shutdown) = spawn_lastfm_runtime(
-        LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+    let (handle, shutdown) = spawn_lastfm_runtime_for_test(
         database.clone(),
         store.clone(),
         transport.clone(),
@@ -479,6 +478,7 @@ async fn ready_now_playing_result_precedes_an_already_queued_metadata_command() 
         account: None,
         transport,
         clock: Arc::new(FixedClock),
+        supervision: PolicySupervision::idle(),
     };
 
     match owner.next_event().await {
@@ -489,6 +489,9 @@ async fn ready_now_playing_result_precedes_an_already_queued_metadata_command() 
         } => assert_eq!(observed.0, generation.0),
         RuntimeEvent::NowPlaying { .. } | RuntimeEvent::Command(_) => {
             panic!("ready now-playing result must win biased arbitration")
+        }
+        RuntimeEvent::PolicyChanged => {
+            panic!("idle supervision must never observe a policy change")
         }
     }
     assert_eq!(

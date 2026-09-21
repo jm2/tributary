@@ -24,6 +24,7 @@ use crate::source_lifecycle::{
 
 use super::client::{DaapCatalogueScope, DaapClient};
 use super::dmap;
+use crate::source_registry::PlaybackAttributionProfile;
 
 // ---------------------------------------------------------------------------
 // In-memory library cache
@@ -41,6 +42,9 @@ struct LibraryCache {
     track_to_daap_id: HashMap<Uuid, u32>,
     /// DAAP item ID → validated stream format for exact at-use resolution.
     format_by_daap_id: HashMap<u32, String>,
+    /// DAAP item ID → Last.fm attribution profile derived from the raw
+    /// accepted protocol row before display fallbacks were substituted.
+    attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
 }
 
 impl LibraryCache {
@@ -53,6 +57,7 @@ impl LibraryCache {
             track_by_uuid: HashMap::new(),
             track_to_daap_id: HashMap::new(),
             format_by_daap_id: HashMap::new(),
+            attribution_profiles: HashMap::new(),
         }
     }
 }
@@ -114,6 +119,7 @@ impl DaapBackend {
         let mut track_by_uuid = HashMap::new();
         let mut track_to_daap_id = HashMap::new();
         let mut format_by_daap_id = HashMap::new();
+        let mut attribution_profiles = HashMap::new();
 
         // Aggregation maps for artists and albums.
         // Key: name (lowercased for dedup), Value: (display_name, metadata).
@@ -125,10 +131,14 @@ impl DaapBackend {
                 continue; // Skip items without an ID.
             };
 
-            let title = dmap::find_string(nodes, b"minm").unwrap_or_else(|| "Unknown".to_string());
-            let artist_name =
-                dmap::find_string(nodes, b"asar").unwrap_or_else(|| "Unknown".to_string());
-            let album_title = dmap::find_string(nodes, b"asal").unwrap_or_default();
+            let raw_title = dmap::find_string(nodes, b"minm");
+            let raw_artist_name = dmap::find_string(nodes, b"asar");
+            let raw_album_title = dmap::find_string(nodes, b"asal");
+            let title = raw_title.clone().unwrap_or_else(|| "Unknown".to_string());
+            let artist_name = raw_artist_name
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string());
+            let album_title = raw_album_title.clone().unwrap_or_default();
             let duration_ms = dmap::find_u32(nodes, b"astm");
             let track_number = dmap::find_u16(nodes, b"astn");
             let disc_number = dmap::find_u16(nodes, b"asdn");
@@ -152,9 +162,10 @@ impl DaapBackend {
 
             let duration_secs = duration_ms.map(|ms| u64::from(ms) / 1000);
 
+            let native_track_id = crate::architecture::TrackId::remote(daap_id.to_string()).ok();
             let track = Track {
                 id: track_uuid,
-                native_track_id: crate::architecture::TrackId::remote(daap_id.to_string()).ok(),
+                native_track_id: native_track_id.clone(),
                 title,
                 artist_name: artist_name.clone(),
                 album_artist_name: None,
@@ -183,6 +194,22 @@ impl DaapBackend {
             let idx = all_tracks.len();
             track_by_uuid.insert(track_uuid, idx);
             track_to_daap_id.insert(track_uuid, daap_id);
+            // Attribution provenance is frozen from the raw accepted row
+            // before the display fallbacks above substitute any "Unknown",
+            // so a synthesized fallback can never become attribution
+            // authority.
+            if let Some(track_id) = &native_track_id {
+                if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
+                    raw_title.clone(),
+                    raw_artist_name.clone(),
+                    raw_album_title.clone(),
+                    None,
+                    track_number.map(u32::from),
+                    duration_secs,
+                ) {
+                    attribution_profiles.insert(track_id.clone(), profile);
+                }
+            }
             all_tracks.push(track);
 
             // ── Aggregate artist ────────────────────────────────────
@@ -258,6 +285,7 @@ impl DaapBackend {
             track_by_uuid,
             track_to_daap_id,
             format_by_daap_id,
+            attribution_profiles,
         };
 
         Ok(cache.tracks.clone())
@@ -312,6 +340,23 @@ impl DaapBackend {
         let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
         self.client.stream_request(scope, *song_id, format)
     }
+
+    /// Return the exact Last.fm attribution profile retained for one accepted
+    /// catalogue row by its native identity.
+    ///
+    /// Profiles are derived from the raw protocol row during refresh, before
+    /// display fallbacks are substituted, so a synthesized `"Unknown"` can
+    /// never become attribution authority. The lookup is deliberately
+    /// non-blocking: a contended refresh returns `None`, so Last.fm
+    /// attribution fails closed instead of waiting on the lifecycle state
+    /// lock that the registry holds while minting.
+    pub(crate) fn catalogue_attribution_profile(
+        &self,
+        track_id: &TrackId,
+    ) -> Option<PlaybackAttributionProfile> {
+        let cache = self.cache.try_read().ok()?;
+        cache.attribution_profiles.get(track_id).cloned()
+    }
 }
 
 fn parse_daap_track_id(track_id: &TrackId) -> BackendResult<u32> {
@@ -330,6 +375,27 @@ fn unavailable_catalogue() -> BackendError {
         message: "DAAP track is unavailable in the active catalogue".to_string(),
         source: None,
     }
+}
+
+/// Prove the attribution lookup fails closed while a refresh holds the cache
+/// write lock, then succeeds once the cache is readable again. Lives beside
+/// the cache field so the real-socket lifecycle test suite can exercise
+/// contention without widening field visibility.
+#[cfg(test)]
+pub(super) async fn assert_attribution_fails_closed_while_cache_contended(
+    backend: &DaapBackend,
+    track_id: &TrackId,
+) {
+    let guard = backend.cache.write().await;
+    assert!(
+        backend.catalogue_attribution_profile(track_id).is_none(),
+        "contended cache must refuse attribution instead of blocking"
+    );
+    drop(guard);
+    assert!(
+        backend.catalogue_attribution_profile(track_id).is_some(),
+        "uncontended cache must serve the retained profile again"
+    );
 }
 
 /// Admit one canonical DAAP item identity. A duplicate `miid` is ambiguous:

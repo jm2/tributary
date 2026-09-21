@@ -163,9 +163,7 @@ mod tests {
     };
     use crate::lastfm::credentials::{LastFmAccountBinding, ProtectedString, StoredSession};
     use crate::lastfm::delivery::{LastFmClock, LastFmDeliveryPrimitiveError, LastFmTransport};
-    use crate::lastfm::runtime::{
-        spawn_lastfm_runtime, LastFmRuntimeActivation, LastFmRuntimeStartError,
-    };
+    use crate::lastfm::runtime::{spawn_lastfm_runtime_for_test, LastFmRuntimeStartError};
     use crate::lastfm::storage::{LastFmEnqueueOutcome, PendingLastFmScrobble};
 
     const SESSION_KEY: &str = "0123456789abcdef0123456789abcdef";
@@ -502,8 +500,7 @@ mod tests {
         let successor_database = database.clone();
         let successor_store = store.clone();
         let mut successor = tokio::spawn(async move {
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 successor_database,
                 successor_store,
                 Arc::new(PendingTransport),
@@ -558,8 +555,7 @@ mod tests {
         let successor_database = database.clone();
         let successor_store = store.clone();
         let mut successor = tokio::spawn(async move {
-            spawn_lastfm_runtime(
-                LastFmRuntimeActivation::issue_after_consent_and_enablement(),
+            spawn_lastfm_runtime_for_test(
                 successor_database,
                 successor_store,
                 Arc::new(PendingTransport),
