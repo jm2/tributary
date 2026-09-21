@@ -40,7 +40,10 @@ use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 use uuid::Uuid;
 
-use super::root_authority::{MountedMutationCommit, MountedMutationTarget, ObjectIdentity};
+use super::root_authority::{
+    resolve_ancestor_chain, ContentRevision, MountedMutationCommit, MountedMutationTarget,
+    MountedRootAuthority, ObjectIdentity, SelectionLocationEvidence,
+};
 // Only the unix anchored staging flow captures a staged object identity;
 // the Windows and fallback authorities prove staging identity from the
 // pathname-side commit, so the helper import must not gate their builds.
@@ -69,6 +72,19 @@ pub enum TagWritePreflightError {
     /// private sibling required for an atomic replacement.
     Unavailable,
 }
+
+impl std::fmt::Display for TagWritePreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnsupportedFormat => "the file format does not support tag writes",
+            Self::NotRegularFile => "the selection is not a regular file",
+            Self::Unavailable => "the file cannot currently be read or written",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for TagWritePreflightError {}
 
 /// Return whether `path` has the exact shape emitted for a tag-write sibling.
 ///
@@ -1089,10 +1105,638 @@ pub fn preflight_tag_write_directory_retained(
     Ok(())
 }
 
+/// Why a local properties-dialog save refused to displace the selected file.
+///
+/// This is a localized conflict: the file the user was editing is no longer
+/// the file the dialog selected, or it was edited underneath the dialog. The
+/// refusal always leaves the competing file/update in place, so the user can
+/// reopen Properties and retry against the current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTagWriteConflict {
+    /// The pathname now names a different filesystem object.
+    TargetReplaced,
+    /// The selected object's content changed in place.
+    TargetEdited,
+    /// The containing directory (or an ancestor) no longer names the selected
+    /// directory.
+    ParentChanged,
+    /// The selection could not be identified when it was captured, so no
+    /// write can be proven against it.
+    SelectionUnavailable,
+}
+
+impl std::fmt::Display for LocalTagWriteConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::TargetReplaced => "the file was replaced",
+            Self::TargetEdited => "the file was edited",
+            Self::ParentChanged => "its containing folder changed",
+            Self::SelectionUnavailable => "the file could not be identified when it was selected",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for LocalTagWriteConflict {}
+
+fn conflict_error(reason: LocalTagWriteConflict) -> anyhow::Error {
+    anyhow::Error::new(reason)
+}
+
+/// Why a local selection failed its point-in-time write-capability probe.
+///
+/// A changed target file, containing directory, or content revision is a
+/// localized conflict: the exact object the dialog selected is no longer
+/// there, and reopening Properties is the fix. Every other failure is a
+/// genuine availability problem — unsupported format, non-file, permissions,
+/// or I/O — independent of any change. Keeping the two apart lets the dialog
+/// show changed-on-disk guidance before the first write instead of collapsing
+/// a conflict into the generic read-only/unavailable explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTagPreflightError {
+    /// The selection changed on disk since capture (or could not be
+    /// identified then). Nothing may be written; reopen Properties.
+    Conflict(LocalTagWriteConflict),
+    /// The target cannot currently be written, independent of any change.
+    Unavailable(TagWritePreflightError),
+}
+
+/// Snapshot evidence that one exact local-library file was the user's
+/// selection.
+///
+/// The evidence retains the complete directory chain above the selection, not
+/// just its immediate parent: `ancestor_identities` mirrors the resolved
+/// identity of every directory from the containing directory's parent up to
+/// the filesystem root, in [`Path::ancestors`] order (nearest first). A save
+/// re-proves the whole chain, so an ancestor directory replaced between
+/// selection and save refuses the write even when the immediate parent, the
+/// file object, and the content revision all still match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalSelectionEvidence {
+    parent_identity: ObjectIdentity,
+    ancestor_identities: Vec<ObjectIdentity>,
+    file_identity: ObjectIdentity,
+    revision: ContentRevision,
+}
+
+impl LocalSelectionEvidence {
+    /// The location half of this evidence, carried unchanged to the final
+    /// commit gate.
+    ///
+    /// The save-start proofs run before any byte is staged; the commit gate
+    /// re-proves the same location evidence inside the commit lock, so an
+    /// ancestor displaced inside the save window — after the start proofs,
+    /// while the replacement is being staged — still refuses the commit
+    /// before anything is displaced.
+    fn location(&self) -> SelectionLocationEvidence {
+        SelectionLocationEvidence {
+            parent_identity: self.parent_identity,
+            ancestor_identities: self.ancestor_identities.clone(),
+        }
+    }
+}
+
+/// The outcome of re-admitting a retained selection through its authority.
+///
+/// The distinction matters to the user: a leaf that no longer opens through
+/// its still-valid parent authority was renamed or deleted since selection —
+/// the changed-on-disk condition — while every other failure is an
+/// availability problem the dialog explains with generic guidance.
+enum RetainedTargetAdmission {
+    Ready(std::sync::Arc<MountedRootAuthority>, MountedMutationTarget),
+    /// The admitted leaf no longer exists at its resolved location: it was
+    /// renamed or deleted after selection.
+    LeafMissing,
+    /// Every other authority or access failure.
+    Unavailable(std::io::Error),
+}
+
+/// Whether a leaf-reopen failure means the admitted leaf is gone.
+///
+/// The parent authority was just acquired and validated, so a miss through it
+/// is a renamed or deleted leaf — not a broken device, a refused permission,
+/// or an authority that moved. Only ENOENT- and ENOTDIR-shaped misses
+/// qualify.
+fn is_missing_leaf_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Retained selection evidence for one exact local-library file, and the only
+/// way a local properties-dialog write may replace it.
+///
+/// The dialog used to snapshot a bare pathname, so a file renamed or replaced
+/// while the dialog was open could be silently edited at its old name, and an
+/// in-place edit between the staged copy and the commit could be silently
+/// overwritten. A `LocalMutationTarget` instead snapshots the exact selected
+/// object — the file's filesystem identity, its containing directory's
+/// identity, and the resolved identity of every directory above it — together
+/// with the object's content revision.
+///
+/// Every write re-admits the file through a retained authority over that
+/// directory, proves the directory, object, and revision all still hold, and
+/// only then stages and commits through the same identity-conditioned
+/// replacement the removable-media authority uses. Any change refuses the write
+/// with a [`LocalTagWriteConflict`], preserving both the competing file/update
+/// and the staged copy. Capture is best-effort: a file that cannot be
+/// identified at selection carries no evidence and every write refuses, so a
+/// transient selection failure can never authorize a blind write.
+#[derive(Clone)]
+pub struct LocalMutationTarget {
+    path: PathBuf,
+    evidence: Option<LocalSelectionEvidence>,
+    /// Why capture could not identify the selection, when the failure is a
+    /// capability problem the dialog can name (unreadable, missing, or
+    /// non-regular). `None` with no evidence means a genuinely unprovable
+    /// selection — the fail-closed conflict bucket. A target is never
+    /// written without evidence either way.
+    capture_failure: Option<TagWritePreflightError>,
+}
+
+impl std::fmt::Debug for LocalMutationTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalMutationTarget")
+            .field("path", &self.path)
+            .field("identified", &self.evidence.is_some())
+            .field("capture_failure", &self.capture_failure)
+            .finish()
+    }
+}
+
+impl LocalMutationTarget {
+    /// Snapshot the exact object, containing directory, and content revision
+    /// currently named by `path`.
+    ///
+    /// Never fails: a file that cannot be identified at selection is retained
+    /// without evidence, and the write path refuses it rather than editing an
+    /// unproven target. A capability failure with a known category — missing,
+    /// unreadable, or non-regular — is classified so the dialog can explain
+    /// the real problem instead of a changed-on-disk conflict that a
+    /// permission or file-type issue cannot fix.
+    pub fn capture(path: &Path) -> Self {
+        match capture_local_selection_evidence(path) {
+            Ok(evidence) => Self {
+                path: path.to_path_buf(),
+                evidence: Some(evidence),
+                capture_failure: None,
+            },
+            Err(error) => Self {
+                path: path.to_path_buf(),
+                evidence: None,
+                capture_failure: classify_capture_failure(&error),
+            },
+        }
+    }
+
+    /// The exact native pathname the user selected.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether `admitted` names exactly the object this capture snapshotted.
+    ///
+    /// The context menu captures every pending local pathname the moment the
+    /// menu is built and admits the same pathnames again when Properties is
+    /// activated; the two captures are separated by the menu's whole visible
+    /// lifetime, during which a pathname can be replaced. An admission may
+    /// only proceed when it names the exact selected object: identical
+    /// selection evidence — file identity, containing-directory chain, and
+    /// content revision — or, when the selection carried no evidence either
+    /// time, the identical capture-failure category. Any evidence/category
+    /// mismatch, or a difference in any captured field, refuses the admission
+    /// instead of authorizing a write under the selection's metadata.
+    pub(crate) fn admits_same_selection(&self, admitted: &Self) -> bool {
+        match (&self.evidence, &admitted.evidence) {
+            (Some(captured), Some(admitted)) => captured == admitted,
+            // A selection that carried no evidence both times did not change
+            // in any way capture can see; the write path still refuses
+            // without evidence, so no blind write is authorized either way.
+            (None, None) => self.capture_failure == admitted.capture_failure,
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    /// Point-in-time write-capability probe for the properties dialog.
+    ///
+    /// Re-admits the selected file through its retained directory authority,
+    /// proves the selection evidence still holds, and rehearses the complete
+    /// atomic replacement shape beside the exact file. A changed target,
+    /// containing directory, or content revision is reported as a
+    /// [`LocalTagPreflightError::Conflict`] — the same localized condition the
+    /// commit refuses with — so the dialog explains "changed on disk" before
+    /// any write instead of a generic read-only/unavailable message. Advisory
+    /// only: the commit revalidates everything fail-closed. Blocking — worker
+    /// threads only.
+    pub fn preflight_write_capability(&self) -> Result<(), LocalTagPreflightError> {
+        let Some(evidence) = self.evidence.clone() else {
+            // No evidence was captured, so no write can be proven against the
+            // selection — it is never written either way. A classified
+            // capability failure keeps its own category so the dialog explains
+            // the real problem; only an unprovable selection is reported as
+            // the selection-identity conflict.
+            if let Some(failure) = self.capture_failure {
+                return Err(LocalTagPreflightError::Unavailable(failure));
+            }
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::SelectionUnavailable,
+            ));
+        };
+        let (authority, target) = match self.retained_target() {
+            RetainedTargetAdmission::Ready(authority, target) => (authority, target),
+            RetainedTargetAdmission::LeafMissing => {
+                // The admitted leaf was renamed or deleted since selection:
+                // the changed-on-disk condition, not a generic availability
+                // failure — reopening Properties is exactly the fix.
+                return Err(LocalTagPreflightError::Conflict(
+                    LocalTagWriteConflict::TargetReplaced,
+                ));
+            }
+            RetainedTargetAdmission::Unavailable(_) => {
+                return Err(LocalTagPreflightError::Unavailable(
+                    TagWritePreflightError::Unavailable,
+                ));
+            }
+        };
+        if authority.root_identity() != evidence.parent_identity {
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::ParentChanged,
+            ));
+        }
+        // The chain is re-proved above the RESOLVED containing directory —
+        // the same path capture recorded the chain from — so the comparison
+        // stays exact for a selection reached through a symlink.
+        if reprove_ancestor_chain(authority.root(), &evidence).is_err() {
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::ParentChanged,
+            ));
+        }
+        if target
+            .admitted_identity()
+            .map_err(|_| LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable))?
+            != evidence.file_identity
+        {
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetReplaced,
+            ));
+        }
+        if target
+            .content_revision()
+            .map_err(|_| LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable))?
+            != evidence.revision
+        {
+            return Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetEdited,
+            ));
+        }
+        if !supports_tag_writes(target.replacement_path()) {
+            return Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::UnsupportedFormat,
+            ));
+        }
+        // Rehearse the anchored replacement through the retained parent — the
+        // same directory object the commit resolves — so an ancestor displaced
+        // after the selection can neither take the probe siblings outside the
+        // admitted directory nor reject a write the anchored writer could
+        // safely perform.
+        #[cfg(unix)]
+        {
+            let (parent, leaf) = target.retained_directory_handle().map_err(|_| {
+                LocalTagPreflightError::Unavailable(TagWritePreflightError::Unavailable)
+            })?;
+            crate::local::tag_writer::preflight_tag_write_directory_retained(
+                &parent,
+                &leaf,
+                "the selected local file",
+            )
+            .map_err(LocalTagPreflightError::Unavailable)
+        }
+        #[cfg(not(unix))]
+        {
+            preflight_tag_write(target.replacement_path())
+                .map_err(LocalTagPreflightError::Unavailable)
+        }
+    }
+
+    /// Write tag edits to the exact file the user selected.
+    ///
+    /// This is the local-library twin of [`write_tags_with_mutation_target`]:
+    /// the selected object is re-admitted through a retained authority over its
+    /// containing directory, the selection-time directory chain, object
+    /// identity, and content revision are all re-proven, and the commit
+    /// re-proves the revision immediately before displacing anything. A file
+    /// renamed, replaced, or edited in between refuses the write with a
+    /// [`LocalTagWriteConflict`] and leaves every competing file/update intact.
+    /// Blocking — worker threads only.
+    pub fn write_tags(&self, edits: &TagEdits) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+
+        // Reject the whole edit before opening anything. A file must never be
+        // rewritten for an edit we are going to silently discard.
+        edits.validate()?;
+
+        let Some(evidence) = self.evidence.clone() else {
+            // Same discipline as the preflight: a classified capability
+            // failure is an availability error, not a changed-on-disk
+            // conflict; an unprovable selection still fails closed as the
+            // conflict. Neither path writes.
+            if let Some(failure) = self.capture_failure {
+                return Err(
+                    anyhow::Error::new(failure).context("the selected file cannot be written")
+                );
+            }
+            return Err(conflict_error(LocalTagWriteConflict::SelectionUnavailable));
+        };
+
+        let (authority, target) = match self.retained_target() {
+            RetainedTargetAdmission::Ready(authority, target) => (authority, target),
+            RetainedTargetAdmission::LeafMissing => {
+                // Same distinction as the preflight: a vanished admitted leaf
+                // is the localized TargetReplaced conflict, and the write
+                // must not chase or recreate anything at the old name.
+                return Err(conflict_error(LocalTagWriteConflict::TargetReplaced));
+            }
+            RetainedTargetAdmission::Unavailable(error) => {
+                return Err(anyhow::Error::new(error).context("the selected file is unavailable"));
+            }
+        };
+        if authority.root_identity() != evidence.parent_identity {
+            return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
+        }
+        // Same resolved-directory discipline as the preflight: the chain is
+        // re-proved above the authority's root, the path capture recorded it
+        // from.
+        if reprove_ancestor_chain(authority.root(), &evidence).is_err() {
+            return Err(conflict_error(LocalTagWriteConflict::ParentChanged));
+        }
+        if target.admitted_identity().map_err(|error| {
+            anyhow::Error::new(error).context("the selected file is unavailable")
+        })? != evidence.file_identity
+        {
+            return Err(conflict_error(LocalTagWriteConflict::TargetReplaced));
+        }
+        if target.content_revision().map_err(|error| {
+            anyhow::Error::new(error).context("the selected file is unavailable")
+        })? != evidence.revision
+        {
+            return Err(conflict_error(LocalTagWriteConflict::TargetEdited));
+        }
+
+        match write_tags_with_mutation_target_revision(
+            &target,
+            edits,
+            Some(&evidence.revision),
+            Some(&evidence.location()),
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(classify_local_write_failure(&target, &evidence, error)),
+        }
+    }
+
+    /// Re-admit the selected file through a retained authority over its
+    /// containing directory.
+    fn retained_target(&self) -> RetainedTargetAdmission {
+        let Some(parent) = self.path.parent() else {
+            return RetainedTargetAdmission::Unavailable(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the selected file has no containing directory",
+            ));
+        };
+        let Some(leaf) = self.path.file_name() else {
+            return RetainedTargetAdmission::Unavailable(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the selected file has no name",
+            ));
+        };
+        // Re-admit through the same resolved containing directory capture
+        // bound, so the identity comparisons below prove the same object on
+        // every save — including a selection reached through a symlink.
+        let resolved_parent = match resolve_authority_parent(parent) {
+            Ok(resolved_parent) => resolved_parent,
+            Err(error) => return RetainedTargetAdmission::Unavailable(error),
+        };
+        let authority = match MountedRootAuthority::acquire(&resolved_parent) {
+            Ok(authority) => std::sync::Arc::new(authority),
+            Err(error) => return RetainedTargetAdmission::Unavailable(error),
+        };
+        match authority.open_mutation_target(Path::new(leaf)) {
+            Ok(target) => RetainedTargetAdmission::Ready(authority, target),
+            Err(error) if is_missing_leaf_error(&error) => RetainedTargetAdmission::LeafMissing,
+            Err(error) => RetainedTargetAdmission::Unavailable(error),
+        }
+    }
+}
+
+impl PartialEq for LocalMutationTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.evidence == other.evidence
+            && self.capture_failure == other.capture_failure
+    }
+}
+
+impl Eq for LocalMutationTarget {}
+
+/// Resolve a selection's containing directory to the directory object the
+/// authority must bind.
+///
+/// The authority binds directories with the final component never followed
+/// (`O_NOFOLLOW`), so acquiring directly over a symlinked containing
+/// directory — a common music-library layout with top-level tracks — would
+/// refuse a selection the pathname-based addressing used to write. When the
+/// final component is a symlink, resolution follows the complete chain exactly
+/// as the old pathname addressing did and returns the RESOLVED directory: the
+/// authority root, the captured parent identity, and the recorded ancestor
+/// chain are then all defined on the same resolved object, so a symlink
+/// retargeted after admission or a resolved directory replaced in place still
+/// refuses through the identity comparisons. A path whose final component is
+/// not a symlink is returned unchanged — byte-identical to the
+/// pre-resolution behavior. On Windows the no-follow reparse refusal for a
+/// symlinked containing directory is unchanged; resolution there would pass a
+/// verbatim path through untested prefix machinery.
+#[cfg(unix)]
+fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(parent).map(|metadata| metadata.file_type().is_symlink()) {
+        Ok(false) => Ok(parent.to_path_buf()),
+        // A symlinked final component resolves through its chain. A vanished
+        // or unreadable parent fails closed through canonicalize's error,
+        // exactly as the direct acquire would have.
+        _ => std::fs::canonicalize(parent),
+    }
+}
+
+// The Windows arm never fails, but it keeps the unix arm's fallible signature
+// so the shared call sites thread both platforms through the same
+// `?`/match handling unchanged.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
+    Ok(parent.to_path_buf())
+}
+
+/// Name the capability category of a capture failure when it has one.
+///
+/// A selection that is missing, unreadable, or not a regular file can never
+/// become writable by reopening Properties, so those failures keep their own
+/// [`TagWritePreflightError`] category instead of masquerading as the
+/// changed-on-disk conflict. Only a genuinely unprovable selection — an I/O
+/// or authority error where the identity could not be established — stays
+/// unclassified and falls to the fail-closed conflict bucket. Either way a
+/// target without evidence is never written.
+fn classify_capture_failure(error: &std::io::Error) -> Option<TagWritePreflightError> {
+    // A symlinked leaf is refused by the open itself with ELOOP on unix —
+    // exactly the "symlinks are not rewritten" case, so it keeps the
+    // non-regular category. (io_error_more's FilesystemLoop kind is not yet
+    // stable, so match the errno the authority machinery already uses.)
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        return Some(TagWritePreflightError::NotRegularFile);
+    }
+    match error.kind() {
+        // The authority's marker machinery rejects anything that is not a
+        // regular file: a directory at the leaf, or a reparse point on
+        // Windows.
+        std::io::ErrorKind::InvalidData => Some(TagWritePreflightError::NotRegularFile),
+        // A selection that is gone or unreadable is an availability problem:
+        // there is nothing to prove an identity against, and no conflict with
+        // a prior selection exists.
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            Some(TagWritePreflightError::Unavailable)
+        }
+        _ => None,
+    }
+}
+
+/// Snapshot the exact directory, object, and content revision named by `path`.
+///
+/// The identities are read through the same retained-authority machinery the
+/// write uses, so the snapshot and the write agree on exactly what "the same
+/// file" means on every platform.
+fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelectionEvidence> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the selected file has no containing directory",
+        )
+    })?;
+    let leaf = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the selected file has no name",
+        )
+    })?;
+    // The authority binds the RESOLVED containing directory, so the recorded
+    // parent identity and ancestor chain describe the same object the write
+    // will re-admit — even when the user's path reaches it through a symlink.
+    let resolved_parent = resolve_authority_parent(parent)?;
+    let authority = std::sync::Arc::new(MountedRootAuthority::acquire(&resolved_parent)?);
+    let target = authority.open_mutation_target(Path::new(leaf))?;
+    let parent_identity = authority.root_identity();
+    let ancestor_identities = ancestor_identities(&resolved_parent)?;
+    let file_identity = target.admitted_identity()?;
+    let revision = target.content_revision()?;
+    Ok(LocalSelectionEvidence {
+        parent_identity,
+        ancestor_identities,
+        file_identity,
+        revision,
+    })
+}
+
+/// Snapshot the resolved identity of every directory above `parent`.
+///
+/// [`Path::ancestors`] yields `parent` itself first; the caller already
+/// retains that identity as the authority root, so the chain recorded here
+/// starts at the parent's parent and ends at the filesystem root. The chain
+/// resolves through the same [`super::root_authority`] resolver the final
+/// commit gate re-proves with, so a capture-time and save-time comparison
+/// proves the complete location of the selection with one shared definition.
+fn ancestor_identities(parent: &Path) -> std::io::Result<Vec<ObjectIdentity>> {
+    resolve_ancestor_chain(parent)
+}
+
+/// Re-prove the complete directory chain of a selection against its
+/// capture-time evidence.
+///
+/// The save path acquires a fresh authority over the parent pathname, so its
+/// root identity proves only the immediate directory; the recorded ancestor
+/// chain must be re-identified through the same pathname. A chain that no
+/// longer resolves to the recorded identities — an ancestor replaced, renamed
+/// away, or retargeted — refuses the write with
+/// [`LocalTagWriteConflict::ParentChanged`]. The proof is fail-closed: an
+/// ancestor that cannot be re-identified at all is treated as changed, never
+/// as unchanged.
+fn reprove_ancestor_chain(
+    parent: &Path,
+    evidence: &LocalSelectionEvidence,
+) -> Result<(), LocalTagWriteConflict> {
+    match ancestor_identities(parent) {
+        Ok(current) if current == evidence.ancestor_identities => Ok(()),
+        _ => Err(LocalTagWriteConflict::ParentChanged),
+    }
+}
+
+/// Re-label a local write failure as the localized conflict it represents.
+///
+/// A commit fails when a competing writer replaced the admitted file (the leaf
+/// no longer names that object) or edited it in place (the retained handle's
+/// revision changed) while the save was running. Both are the conflict the
+/// dialog explains: the competing file/update was preserved and the user must
+/// reopen Properties. Re-proving the retained target's leaf binding and content
+/// revision after the failure distinguishes them from an ordinary I/O failure.
+/// On a successful commit the target is re-anchored, so this only ever runs on
+/// the failure path.
+fn classify_local_write_failure(
+    target: &MountedMutationTarget,
+    evidence: &LocalSelectionEvidence,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    // A leaf that no longer names the admitted object was replaced (or removed)
+    // during the commit. This is checked before the revision comparison because
+    // a replacement can leave the retained handle's own revision untouched —
+    // the displaced object was never edited — so the comparison below would
+    // otherwise miss it and surface a generic failure instead.
+    if target.confirm_leaf_names_admitted_object().is_err() {
+        return conflict_error(LocalTagWriteConflict::TargetReplaced);
+    }
+    match target.content_revision() {
+        Ok(current) if current != evidence.revision => {
+            return conflict_error(LocalTagWriteConflict::TargetEdited);
+        }
+        _ => {}
+    }
+    // An ancestor above the retained parent was replaced during the save
+    // window: the retained parent object, the leaf, and the revision can all
+    // still match when the unchanged deeper chain was moved back beneath the
+    // replacement. Re-prove the complete capture-time chain and surface the
+    // localized ParentChanged conflict instead of a generic authority error.
+    if reprove_ancestor_chain(
+        target
+            .replacement_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("")),
+        evidence,
+    )
+    .is_err()
+    {
+        return conflict_error(LocalTagWriteConflict::ParentChanged);
+    }
+    error
+}
+
 /// Write tag edits to an audio file.
 ///
 /// Only fields that are `Some(...)` in `edits` are modified.
 /// This is a blocking operation — call from a background thread.
+///
+/// This pathname-addressed form carries no selection evidence: it edits
+/// whatever the path currently names. The properties dialog uses
+/// [`LocalMutationTarget`] instead, so a file replaced after selection is
+/// refused rather than silently rewritten.
 pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
@@ -1143,6 +1787,36 @@ pub fn write_tags_with_mutation_target(
     target: &MountedMutationTarget,
     edits: &TagEdits,
 ) -> Result<()> {
+    write_tags_with_mutation_target_revision(target, edits, None, None)
+}
+
+/// Write tag edits through a retained authority with an optional content
+/// revision gate and the selection's location evidence.
+///
+/// This is the revision-aware form of
+/// [`write_tags_with_mutation_target`]. When `expected_revision` is supplied,
+/// the commit re-proves the retained object's exact length and modification
+/// time after confirming the leaf still names that object and immediately
+/// before displacing anything, so a competing in-place edit inside the
+/// staged-write-to-commit window refuses the write instead of being silently
+/// overwritten. Authority flows that never captured a selection revision pass
+/// `None` and keep the prior contract.
+///
+/// When `selection` is supplied, the commit additionally re-proves the
+/// capture-time ancestor chain of the selection — inside the commit lock,
+/// immediately before anything is displaced. The save-start ancestor proof
+/// cannot cover the save window itself, and on unix the retained binding
+/// pins only the immediate parent directory, so an ancestor replaced during
+/// staging — with the unchanged deeper chain moved back beneath it — would
+/// otherwise be adopted because the parent object, the leaf identity, and
+/// the revision all still match. The refusal leaves the selection and every
+/// competing file untouched.
+pub fn write_tags_with_mutation_target_revision(
+    target: &MountedMutationTarget,
+    edits: &TagEdits,
+    expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
+) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
     }
@@ -1171,7 +1845,14 @@ pub fn write_tags_with_mutation_target(
     let source = commit
         .source_file()
         .with_context(|| "Failed to read the exact retained mutation target".to_string())?;
-    write_tag_edits_for_commit(&mut commit, source, target, edits)
+    write_tag_edits_for_commit(
+        &mut commit,
+        source,
+        target,
+        edits,
+        expected_revision,
+        selection,
+    )
 }
 
 /// Perform the staged tag replacement for an open commit section.
@@ -1190,6 +1871,8 @@ fn write_tag_edits_for_commit(
     source: File,
     target: &MountedMutationTarget,
     edits: &TagEdits,
+    expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     // Anchor the staging at the retained parent before anything is staged:
     // the pinned parent identity makes staging and the later install agree
@@ -1207,7 +1890,13 @@ fn write_tag_edits_for_commit(
         "the retained mutation target",
         edits,
         |temp, expected_staged| {
-            finish_committed_tag_replacement(commit, temp, Some(expected_staged))
+            finish_committed_tag_replacement(
+                commit,
+                temp,
+                Some(expected_staged),
+                expected_revision,
+                selection,
+            )
         },
     )
 }
@@ -1222,6 +1911,8 @@ fn write_tag_edits_for_commit(
     source: File,
     target: &MountedMutationTarget,
     edits: &TagEdits,
+    expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     let replacement_path = target.replacement_path().to_path_buf();
     atomic_tag_replacement(
@@ -1229,7 +1920,7 @@ fn write_tag_edits_for_commit(
         &replacement_path,
         "the retained mutation target",
         edits,
-        |temp| finish_committed_tag_replacement(commit, temp, None),
+        |temp| finish_committed_tag_replacement(commit, temp, None, expected_revision, selection),
     )
 }
 
@@ -1247,14 +1938,26 @@ fn write_tag_edits_for_commit(
 /// staging handle before the commit reopens the staging leaf: the commit
 /// verifies the leaf still names that exact object before anything is
 /// displaced. Path-based staging flows have no retained handle and pass
-/// `None`.
+/// `None`. `expected_revision`, when supplied, additionally proves the
+/// retained source was not edited in place before anything is displaced.
+/// `selection`, when supplied, additionally re-proves the capture-time
+/// ancestor chain of the selection in the same pre-displacement window —
+/// the save-start proof cannot cover the save window itself, and on unix
+/// the retained binding pins only the immediate parent directory.
 fn finish_committed_tag_replacement(
     commit: &mut MountedMutationCommit<'_>,
     temp: &mut TempFile,
     expected_staged_identity: Option<&ObjectIdentity>,
+    expected_revision: Option<&ContentRevision>,
+    selection: Option<&SelectionLocationEvidence>,
 ) -> Result<()> {
     commit
-        .commit_replacement(temp.path(), expected_staged_identity)
+        .commit_replacement_checked(
+            temp.path(),
+            expected_staged_identity,
+            expected_revision,
+            selection,
+        )
         .map_err(|error| {
             anyhow::Error::new(error)
                 .context("The retained mutation authority refused the tagged replacement")
@@ -2350,6 +3053,894 @@ mod tests {
             directory.temp_files().is_empty(),
             "a refused commit leaves no private sibling behind"
         );
+    }
+
+    /// Build a local selection target over a fresh fixture directory holding
+    /// one valid `silence.flac`.
+    fn local_selection_fixture(label: &str) -> (TestDirectory, PathBuf, LocalMutationTarget) {
+        let directory = TestDirectory::new(label);
+        let track = directory.audio_file(
+            "silence.flac",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        );
+        let target = LocalMutationTarget::capture(&track);
+        (directory, track, target)
+    }
+
+    /// The silence fixture bytes, used to compare preserved files.
+    fn silence_fixture_bytes() -> &'static [u8] {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/audio/silence.flac"
+        ))
+    }
+
+    /// Extract the localized conflict a refused local write must carry.
+    fn conflict_of(error: &anyhow::Error) -> LocalTagWriteConflict {
+        *error
+            .downcast_ref::<LocalTagWriteConflict>()
+            .unwrap_or_else(|| panic!("expected a localized conflict, got: {error:#}"))
+    }
+
+    /// Edit the file at `path` in place — the same filesystem object, a new
+    /// content revision — with a valid, parseable FLAC tag, simulating a
+    /// competing writer that does not replace the file.
+    fn write_competing_tag_in_place(path: &Path, competing_year: &str) {
+        let mut tagged_file = lofty::read_from_path(path).expect("read competing fixture");
+        let tag =
+            ensure_primary_tag(&mut tagged_file, "competing fixture").expect("primary tag exists");
+        tag.insert(TagItem::new(
+            ItemKey::Year,
+            ItemValue::Text(competing_year.to_string()),
+        ));
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("write the competing in-place edit");
+    }
+
+    /// The selection captured file A; A is renamed away and a different valid
+    /// FLAC B is installed at the path before Save. The save must refuse and
+    /// edit neither file.
+    #[test]
+    fn a_local_selection_refuses_a_file_replaced_before_save() {
+        let (directory, track, target) = local_selection_fixture("local-replaced-before-save");
+        let original = silence_fixture_bytes().to_vec();
+
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the selected file");
+        let stranger = b"a different file now occupies the selected pathname".to_vec();
+        std::fs::write(&track, &stranger).expect("install a different file");
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a replaced file must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetReplaced);
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the replacement"),
+            stranger,
+            "the replacement must be preserved exactly"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the displaced original"),
+            original,
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused save leaves no private sibling behind"
+        );
+    }
+
+    /// A selection reached through a symlinked containing directory — a
+    /// common library layout with top-level tracks — is admitted by the
+    /// preflight and written to the exact file behind the link. The authority
+    /// binds the RESOLVED directory, so the identity evidence and the write
+    /// agree on the same object the pathname addressing used to reach.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_containing_directory_is_admitted_and_writable() {
+        let directory = TestDirectory::new("local-symlinked-parent");
+        let real = directory.path.join("real-music");
+        std::fs::create_dir(&real).expect("create the real music directory");
+        let track = real.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        let link = directory.path.join("music");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the containing directory");
+        let selected = link.join("silence.flac");
+
+        let target = LocalMutationTarget::capture(&selected);
+        target
+            .preflight_write_capability()
+            .expect("a symlinked containing directory must be admitted");
+
+        target
+            .write_tags(&year("2026"))
+            .expect("a write through the symlinked containing directory must commit");
+
+        let tagged_file = lofty::read_from_path(&track).expect("reopen the real file");
+        let tag = tagged_file
+            .primary_tag()
+            .expect("tagged FLAC must have a primary tag");
+        assert_eq!(
+            tag.get_string(ItemKey::Year),
+            Some("2026"),
+            "the write must land on the exact file behind the link"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a committed save leaves no private sibling behind"
+        );
+    }
+
+    /// Replacing the RESOLVED containing directory between selection and save
+    /// — same resolved path, different directory object — must refuse with
+    /// the changed-on-disk conflict. Resolving symlinked containing
+    /// directories must not weaken the identity comparison the authority is
+    /// for.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_resolved_parent_directory_refuses_the_save() {
+        let directory = TestDirectory::new("local-replaced-resolved-parent");
+        let real = directory.path.join("real-music");
+        std::fs::create_dir(&real).expect("create the real music directory");
+        let track = real.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        let link = directory.path.join("music");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the containing directory");
+        let selected = link.join("silence.flac");
+        let target = LocalMutationTarget::capture(&selected);
+
+        // Same resolved pathname, entirely different directory object, with
+        // a fresh lookalike file at the same leaf name. The original objects
+        // are renamed aside rather than removed: a rename keeps their inodes
+        // allocated, so the replacement directory and lookalike file can
+        // never alias the captured dev+ino identities through filesystem
+        // inode reuse (observed as a spurious TargetEdited on some CI
+        // filesystems). The replacement is then guaranteed to fail the
+        // parent-identity comparison on every platform.
+        let displaced = directory.path.join("real-music-displaced");
+        std::fs::rename(&real, &displaced).expect("move the resolved directory aside");
+        std::fs::create_dir(&real).expect("install a replacement directory");
+        let impostor = b"a lookalike in a replaced directory".to_vec();
+        std::fs::write(&track, &impostor).expect("install a lookalike file");
+
+        let preflight = target
+            .preflight_write_capability()
+            .expect_err("a replaced resolved directory must refuse the preflight");
+        assert_eq!(
+            preflight,
+            LocalTagPreflightError::Conflict(LocalTagWriteConflict::ParentChanged),
+            "the replaced directory is a changed-on-disk condition, not an availability one"
+        );
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a replaced resolved directory must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the lookalike back"),
+            impostor,
+            "the refused save must not touch the lookalike"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused save leaves no private sibling behind"
+        );
+    }
+
+    /// A selection that is not a regular file keeps its own category: the
+    /// dialog explains a file-type problem, not a changed-on-disk conflict
+    /// that reopening Properties cannot fix. The write path refuses with the
+    /// same category, never a conflict, and never writes.
+    #[test]
+    fn a_non_regular_selection_reports_its_own_category() {
+        let directory = TestDirectory::new("local-selection-not-regular");
+        let selected = directory.path.join("not-a-track");
+        std::fs::write(&selected, b"this is a directory entry, not a tag target")
+            .expect("create the non-regular selection");
+        // Point the selection at the directory itself: an existing, readable,
+        // but non-regular filesystem object.
+        let target = LocalMutationTarget::capture(&directory.path);
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::NotRegularFile
+            )),
+            "a non-regular selection is an availability category, not a conflict"
+        );
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a non-regular selection must never be written");
+        assert_eq!(
+            error.downcast_ref::<TagWritePreflightError>(),
+            Some(&TagWritePreflightError::NotRegularFile),
+            "the write refusal must carry the file-type category, got: {error:#}"
+        );
+    }
+
+    /// Menu-time admission comparison: the context menu captures a pending
+    /// local pathname when the menu is built and admits it again when
+    /// Properties is activated. Only the exact captured object — or an
+    /// equally uncapturable one — may pass.
+    #[test]
+    fn an_admission_of_the_unchanged_object_matches_the_menu_time_capture() {
+        let directory = TestDirectory::new("local-menu-time-unchanged");
+        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
+        let menu_time = LocalMutationTarget::capture(&track);
+        let admitted = LocalMutationTarget::capture(&track);
+
+        assert!(
+            menu_time.admits_same_selection(&admitted),
+            "the unchanged object must pass the menu-time comparison"
+        );
+    }
+
+    #[test]
+    fn a_file_replaced_after_the_menu_time_capture_refuses_admission() {
+        // Same pathname, different object: the lookalike must never be
+        // admitted under the selection's evidence, or a save would
+        // overwrite it with metadata read off the original.
+        let directory = TestDirectory::new("local-menu-time-replaced-file");
+        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
+        let menu_time = LocalMutationTarget::capture(&track);
+
+        // Rename the original aside instead of removing it: a rename keeps
+        // its inode allocated, so the replacement can never alias the
+        // captured identity through filesystem inode reuse (the same
+        // discipline the save-time tests follow).
+        let displaced = directory.path.join("silence-displaced.flac");
+        std::fs::rename(&track, &displaced).expect("move the selected file aside");
+        std::fs::write(&track, b"an impostor at the same pathname")
+            .expect("install the replacement");
+        let admitted = LocalMutationTarget::capture(&track);
+
+        assert!(
+            !menu_time.admits_same_selection(&admitted),
+            "a replaced object must fail the menu-time comparison"
+        );
+    }
+
+    #[test]
+    fn an_in_place_edit_after_the_menu_time_capture_refuses_admission() {
+        // Same pathname, same object, different content: the revision no
+        // longer matches, so the admission must refuse rather than
+        // overwrite the newer content.
+        let directory = TestDirectory::new("local-menu-time-edited-in-place");
+        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
+        let menu_time = LocalMutationTarget::capture(&track);
+
+        // A different length forces a revision difference on every
+        // filesystem, independent of timestamp granularity.
+        let mut edited = silence_fixture_bytes().to_vec();
+        edited.extend_from_slice(b" plus an in-place edit");
+        std::fs::write(&track, &edited).expect("rewrite the file in place");
+        let admitted = LocalMutationTarget::capture(&track);
+
+        assert!(
+            !menu_time.admits_same_selection(&admitted),
+            "an in-place edit must fail the menu-time comparison"
+        );
+    }
+
+    #[test]
+    fn a_replaced_containing_directory_after_the_menu_time_capture_refuses_admission() {
+        // The file object and content can be recreated faithfully, but a
+        // replaced containing directory is still a different parent: the
+        // captured parent identity must refuse the lookalike's admission.
+        let directory = TestDirectory::new("local-menu-time-replaced-parent");
+        let real = directory.path.join("real-music");
+        std::fs::create_dir(&real).expect("create the containing directory");
+        let track = real.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        let menu_time = LocalMutationTarget::capture(&track);
+
+        let displaced = directory.path.join("real-music-displaced");
+        std::fs::rename(&real, &displaced).expect("move the containing directory aside");
+        std::fs::create_dir(&real).expect("install a replacement directory");
+        std::fs::write(&track, silence_fixture_bytes()).expect("install the lookalike");
+        let admitted = LocalMutationTarget::capture(&track);
+
+        assert!(
+            !menu_time.admits_same_selection(&admitted),
+            "a replaced containing directory must fail the menu-time comparison"
+        );
+    }
+
+    #[test]
+    fn a_missing_selection_captured_twice_with_the_same_failure_still_admits() {
+        // A selection that carried no evidence both times did not change in
+        // any way capture can see: the same failure category holds the
+        // comparison, and the write path refuses without evidence anyway.
+        let directory = TestDirectory::new("local-menu-time-missing-twice");
+        let missing = directory.path.join("never-there.flac");
+        let menu_time = LocalMutationTarget::capture(&missing);
+        let admitted = LocalMutationTarget::capture(&missing);
+
+        assert!(
+            menu_time.admits_same_selection(&admitted),
+            "the same missing selection must pass the menu-time comparison"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_lost_its_evidence_between_captures_refuses_admission() {
+        // Evidence at menu time but none at admission means the object the
+        // user saw is gone: the mismatch refuses instead of admitting an
+        // unproven pathname under the selection's metadata.
+        let directory = TestDirectory::new("local-menu-time-evidence-lost");
+        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
+        let menu_time = LocalMutationTarget::capture(&track);
+        std::fs::remove_file(&track).expect("remove the selected file");
+        let admitted = LocalMutationTarget::capture(&track);
+
+        assert!(
+            !menu_time.admits_same_selection(&admitted),
+            "a selection that lost its evidence must fail the menu-time comparison"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_gained_evidence_between_captures_refuses_admission() {
+        // The mirror case: no evidence at menu time but evidence at
+        // admission means something appeared at the pathname — an object
+        // the menu never anchored, which must refuse.
+        let directory = TestDirectory::new("local-menu-time-evidence-gained");
+        let track = directory.path.join("appeared.flac");
+        let menu_time = LocalMutationTarget::capture(&track);
+        std::fs::write(&track, silence_fixture_bytes()).expect("create the late object");
+        let admitted = LocalMutationTarget::capture(&track);
+
+        assert!(
+            !menu_time.admits_same_selection(&admitted),
+            "a selection that gained evidence must fail the menu-time comparison"
+        );
+    }
+
+    /// A selection named by a path that does not exist is an availability
+    /// problem, not a changed-on-disk conflict: there is no prior selection
+    /// state to conflict with.
+    #[test]
+    fn a_missing_selection_reports_unavailable() {
+        let directory = TestDirectory::new("local-selection-missing");
+        let target = LocalMutationTarget::capture(&directory.path.join("never-existed.flac"));
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::Unavailable
+            )),
+            "a missing selection is an availability category, not a conflict"
+        );
+    }
+
+    /// An unreadable selection keeps the availability category. Privileged
+    /// containers can read despite mode 000; the probe below skips those.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_selection_reports_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("local-selection-unreadable");
+        let track = directory.path.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
+        std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o000))
+            .expect("remove file permissions");
+
+        if std::fs::File::open(&track).is_ok() {
+            std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o644))
+                .expect("restore file permissions");
+            return;
+        }
+
+        let target = LocalMutationTarget::capture(&track);
+        let verdict = target.preflight_write_capability();
+        std::fs::set_permissions(&track, std::fs::Permissions::from_mode(0o644))
+            .expect("restore file permissions");
+
+        assert_eq!(
+            verdict,
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::Unavailable
+            )),
+            "an unreadable selection is an availability category, not a conflict"
+        );
+    }
+
+    /// The admitted leaf is renamed away between selection and Save: both the
+    /// preflight and the write must report the changed-on-disk conflict —
+    /// the parent authority is still valid, so the miss proves the leaf is
+    /// gone — not the generic read-only/device guidance. The displaced file
+    /// is left exactly where it was moved.
+    #[test]
+    fn a_vanished_admitted_leaf_reports_the_conflict() {
+        let (directory, track, target) = local_selection_fixture("local-leaf-vanished");
+        let original = silence_fixture_bytes().to_vec();
+
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("rename the admitted leaf away");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetReplaced
+            )),
+            "a vanished admitted leaf is a changed-on-disk conflict, not unavailability"
+        );
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a vanished admitted leaf must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetReplaced);
+
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the displaced file back"),
+            original,
+            "the admitted file must be byte-for-byte untouched at its new name"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused save leaves no private sibling behind"
+        );
+    }
+
+    /// The selected file is edited in place while the save stages and tags —
+    /// after the write-start revision proof, before the commit. The commit's
+    /// revision gate must refuse and preserve the competing edit.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_selection_refuses_an_in_place_edit_during_the_commit() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, track, target) = local_selection_fixture("local-edit-during-commit");
+        let watched_path = track.clone();
+        let competing = Arc::new(Mutex::new(false));
+        let competing_closure = Arc::clone(&competing);
+        let interposed_path = track.clone();
+
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != interposed_path.as_path() {
+                    return;
+                }
+                write_competing_tag_in_place(&watched_path, "1999");
+                *competing_closure.lock().unwrap() = true;
+            }),
+            || {
+                let error = target
+                    .write_tags(&year("2026"))
+                    .expect_err("an in-place edit must refuse the commit");
+                assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetEdited);
+            },
+        );
+
+        assert!(
+            *competing.lock().unwrap(),
+            "the competing edit must have run"
+        );
+
+        // The competing edit is preserved; the requested year never landed.
+        let tagged = lofty::read_from_path(&track).expect("reopen the competing file");
+        let tag = tagged.primary_tag().expect("primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("1999"));
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused commit leaves no staged sibling behind"
+        );
+    }
+
+    /// The selected file is replaced during the staging window — after the
+    /// write-start proof, before the commit. The commit must refuse and
+    /// preserve both the admitted file (displaced) and the newcomer.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_selection_refuses_a_replacement_during_the_commit() {
+        use std::sync::{Arc, Mutex};
+
+        let (directory, track, target) = local_selection_fixture("local-replace-during-commit");
+        let original = silence_fixture_bytes().to_vec();
+        let displaced = directory.path.join("displaced.flac");
+        let newcomer = b"a newcomer replaced the selected file mid-commit".to_vec();
+
+        let swapped = Arc::new(Mutex::new(false));
+        let swapped_closure = Arc::clone(&swapped);
+        let watched_path = track.clone();
+        let interposed_path = track.clone();
+        let displaced_closure = displaced.clone();
+        let newcomer_closure = newcomer.clone();
+
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != interposed_path.as_path() {
+                    return;
+                }
+                std::fs::rename(&watched_path, &displaced_closure)
+                    .expect("displace the admitted file");
+                std::fs::write(&watched_path, &newcomer_closure).expect("install the newcomer");
+                *swapped_closure.lock().unwrap() = true;
+            }),
+            || {
+                let error = target
+                    .write_tags(&year("2026"))
+                    .expect_err("a mid-commit replacement must refuse");
+                assert_eq!(conflict_of(&error), LocalTagWriteConflict::TargetReplaced);
+            },
+        );
+
+        assert!(*swapped.lock().unwrap(), "the replacement must have run");
+        assert_eq!(
+            std::fs::read(&track).expect("read the newcomer"),
+            newcomer,
+            "the newcomer must be preserved exactly"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read the admitted file"),
+            original,
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert!(
+            directory.temp_files().is_empty(),
+            "a refused commit leaves no staged sibling behind"
+        );
+    }
+
+    /// The selected file's containing directory is replaced before Save. The
+    /// save must refuse rather than retarget the edit into the impostor
+    /// directory, and must preserve both directories.
+    #[test]
+    fn a_local_selection_refuses_a_changed_containing_directory() {
+        let directory = TestDirectory::new("local-root-change");
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace the selected directory");
+        std::fs::create_dir(&album).expect("install an impostor directory");
+        let impostor = album.join("silence.flac");
+        std::fs::write(&impostor, b"impostor audio").expect("install impostor file");
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a changed containing directory must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+
+        assert_eq!(
+            std::fs::read(&impostor).expect("read the impostor file"),
+            b"impostor audio",
+            "the impostor directory must receive nothing"
+        );
+        let admitted = displaced_album.join("silence.flac");
+        assert_eq!(
+            std::fs::read(&admitted).expect("read the admitted file"),
+            silence_fixture_bytes(),
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// An ancestor above the unchanged containing directory is replaced
+    /// before Save. Renaming the ancestor away and moving the
+    /// inode-stable deeper chain back under a fresh ancestor leaves the
+    /// containing directory, file, and revision evidence all matching; only
+    /// the retained ancestor chain notices the swap, and the save must refuse
+    /// rather than rewrite the file through a location the selection never
+    /// admitted.
+    #[test]
+    fn a_local_selection_refuses_a_replaced_ancestor_above_an_unchanged_parent() {
+        let directory = TestDirectory::new("local-ancestor-change");
+        let library = directory.path.join("library");
+        let album = library.join("album");
+        std::fs::create_dir_all(&album).expect("create library/album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        // Replace `library` wholesale while keeping the deeper chain
+        // byte-for-byte and inode-for-inode identical: rename it aside, put a
+        // fresh directory at its old name, and move the album back in.
+        let displaced_library = directory.path.join("library-old");
+        std::fs::rename(&library, &displaced_library).expect("displace the ancestor");
+        std::fs::create_dir(&library).expect("install a fresh ancestor");
+        std::fs::rename(displaced_library.join("album"), library.join("album"))
+            .expect("move the unchanged album under the fresh ancestor");
+
+        let error = target
+            .write_tags(&year("2026"))
+            .expect_err("a replaced ancestor must refuse the save");
+        assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the relocated file"),
+            silence_fixture_bytes(),
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// The replaced-ancestor regression, replayed inside the save window:
+    /// the ancestor swap lands DURING staging — after the write-start
+    /// ancestor proof, via the pre-staging interpose — so every save-start
+    /// check has already passed. The final commit gate must still re-prove
+    /// the capture-time ancestor chain and refuse with the localized
+    /// `ParentChanged` conflict, leaving the selection byte-for-byte intact
+    /// and no private siblings under either the displaced or the fresh
+    /// ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_swapped_during_staging_refuses_the_commit_with_parent_changed() {
+        let directory = TestDirectory::new("local-ancestor-swap-during-staging");
+        let library = directory.path.join("library");
+        let album = library.join("album");
+        std::fs::create_dir_all(&album).expect("create library/album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        // The reviewed swap, replayed while the save is mid-staging: rename
+        // the library away, install a fresh directory at its old name, and
+        // move the unchanged (inode-stable) album back beneath the
+        // replacement. The retained parent object, the leaf identity, and
+        // the content revision all still match afterwards — only the
+        // ancestor chain above the parent differs.
+        let displaced_library = directory.path.join("library-old");
+        let fresh_library = library.clone();
+        let watched = track.clone();
+        let closure_displaced = displaced_library.clone();
+        with_pre_staging_interpose(
+            Box::new(move |interposed| {
+                if interposed.replacement_path() != watched.as_path() {
+                    return;
+                }
+                std::fs::rename(&fresh_library, &closure_displaced)
+                    .expect("displace the ancestor during staging");
+                std::fs::create_dir(&fresh_library)
+                    .expect("install a fresh ancestor during staging");
+                std::fs::rename(closure_displaced.join("album"), fresh_library.join("album"))
+                    .expect("move the unchanged album under the fresh ancestor");
+            }),
+            || {
+                let error = target
+                    .write_tags(&year("2026"))
+                    .expect_err("an ancestor swapped during staging must refuse the save");
+                assert_eq!(conflict_of(&error), LocalTagWriteConflict::ParentChanged);
+            },
+        );
+
+        assert_eq!(
+            std::fs::read(&track).expect("read the relocated selection"),
+            silence_fixture_bytes(),
+            "the admitted file must be byte-for-byte untouched"
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// A selection with an intact multi-level ancestor chain still saves
+    /// normally: the retained chain proof admits what did not change, so the
+    /// added ancestor check cannot regress ordinary nested-library writes.
+    #[test]
+    fn a_local_selection_with_an_intact_ancestor_chain_still_saves() {
+        let directory = TestDirectory::new("local-ancestor-intact");
+        let library = directory.path.join("library");
+        let album = library.join("album");
+        std::fs::create_dir_all(&album).expect("create library/album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+
+        let target = LocalMutationTarget::capture(&track);
+
+        target
+            .write_tags(&year("2026"))
+            .expect("an intact ancestor chain must admit the save");
+
+        let tagged = lofty::read_from_path(&track).expect("reopen the written file");
+        let tag = tagged.primary_tag().expect("primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("2026"));
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// Cancelling (dropping an uncommitted selection) performs no write and
+    /// leaves no private sibling behind.
+    #[test]
+    fn a_cancelled_local_selection_leaves_no_residue() {
+        let (directory, track, target) = local_selection_fixture("local-cancelled");
+        let original = std::fs::read(&track).expect("read the original");
+
+        drop(target);
+
+        assert_eq!(
+            std::fs::read(&track).expect("reread the file"),
+            original,
+            "a cancelled selection never touches the file"
+        );
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// A selected file inside a directory the process cannot create in must
+    /// refuse rather than half-write, leaving the file untouched and no
+    /// private sibling behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_selection_refuses_an_unwritable_containing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, track, target) = local_selection_fixture("local-readonly-parent");
+        let original = std::fs::read(&track).expect("read the original");
+        let original_permissions = std::fs::metadata(&directory.path)
+            .expect("read directory metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        std::fs::set_permissions(&directory.path, read_only_permissions)
+            .expect("make the containing directory read-only");
+
+        // A privileged or ACL-granted test process may still create here;
+        // compare against the operation itself rather than guessing from mode
+        // bits, exactly as the production preflight does.
+        let sentinel = directory.path.join("sentinel");
+        let effective_create = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sentinel)
+            .is_ok();
+        if effective_create {
+            std::fs::remove_file(&sentinel).expect("remove the privileged sentinel");
+        }
+
+        let preflight = target.preflight_write_capability();
+        let write = target.write_tags(&year("2026"));
+
+        std::fs::set_permissions(&directory.path, original_permissions)
+            .expect("restore the directory permissions");
+
+        if !effective_create {
+            assert_eq!(
+                preflight,
+                Err(LocalTagPreflightError::Unavailable(
+                    TagWritePreflightError::Unavailable
+                ))
+            );
+            assert!(
+                write.is_err(),
+                "an unwritable containing directory must refuse the save"
+            );
+            assert_eq!(
+                std::fs::read(&track).expect("reread the file"),
+                original,
+                "a refused save leaves the file byte-for-byte untouched"
+            );
+            assert!(
+                directory.temp_files().is_empty(),
+                "a refused save leaves no private sibling behind"
+            );
+        }
+    }
+
+    /// The pre-write probe must report a replaced selection as the localized
+    /// conflict the commit itself refuses with — not a generic unavailable
+    /// condition — and must write nothing.
+    #[test]
+    fn local_preflight_reports_a_replaced_selection_as_a_conflict() {
+        let (directory, track, target) = local_selection_fixture("local-preflight-replaced");
+        let original = silence_fixture_bytes().to_vec();
+
+        let displaced = directory.path.join("displaced.flac");
+        std::fs::rename(&track, &displaced).expect("displace the selected file");
+        let stranger = b"a different file now occupies the selected pathname".to_vec();
+        std::fs::write(&track, &stranger).expect("install a different file");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetReplaced
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&track).expect("read the replacement"),
+            stranger
+        );
+        assert_eq!(std::fs::read(&displaced).expect("read displaced"), original);
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// The pre-write probe must report an in-place edit as the localized
+    /// `TargetEdited` conflict, distinct from a permissions/I/O failure.
+    #[test]
+    fn local_preflight_reports_an_in_place_edit_as_a_conflict() {
+        let (directory, track, target) = local_selection_fixture("local-preflight-edited");
+        write_competing_tag_in_place(&track, "1999");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::TargetEdited
+            ))
+        );
+
+        let tagged = lofty::read_from_path(&track).expect("reopen the competing file");
+        let tag = tagged.primary_tag().expect("primary tag");
+        assert_eq!(tag.get_string(ItemKey::Year), Some("1999"));
+        assert!(directory.temp_files().is_empty());
+    }
+
+    /// The pre-write probe must report a replaced containing directory as the
+    /// localized `ParentChanged` conflict.
+    #[test]
+    fn local_preflight_reports_a_changed_containing_directory_as_a_conflict() {
+        let directory = TestDirectory::new("local-preflight-root-change");
+        let album = directory.path.join("album");
+        std::fs::create_dir(&album).expect("create album");
+        let track = album.join("silence.flac");
+        std::fs::write(&track, silence_fixture_bytes()).expect("write fixture");
+        let target = LocalMutationTarget::capture(&track);
+
+        let displaced_album = directory.path.join("displaced-album");
+        std::fs::rename(&album, &displaced_album).expect("displace the selected directory");
+        std::fs::create_dir(&album).expect("install an impostor directory");
+        let impostor = album.join("silence.flac");
+        std::fs::write(&impostor, b"impostor audio").expect("install impostor file");
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Conflict(
+                LocalTagWriteConflict::ParentChanged
+            ))
+        );
+        assert_eq!(
+            std::fs::read(&impostor).expect("read the impostor file"),
+            b"impostor audio"
+        );
+        assert_eq!(
+            std::fs::read(displaced_album.join("silence.flac")).expect("read admitted"),
+            silence_fixture_bytes()
+        );
+        assert_no_tag_write_siblings_under(&directory.path);
+    }
+
+    /// A capability failure that is not a changed selection stays typed as
+    /// unavailable, so the dialog never tells the user to reopen Properties
+    /// for a format or permissions problem.
+    #[test]
+    fn local_preflight_reports_a_capability_failure_as_unavailable() {
+        let directory = TestDirectory::new("local-preflight-unsupported");
+        let track = directory.path.join("song.wav");
+        std::fs::write(&track, b"audio").expect("write unsupported fixture");
+        let target = LocalMutationTarget::capture(&track);
+
+        assert_eq!(
+            target.preflight_write_capability(),
+            Err(LocalTagPreflightError::Unavailable(
+                TagWritePreflightError::UnsupportedFormat
+            ))
+        );
+    }
+
+    /// Repeatedly walk `root` and require no reserved tag-write sibling to
+    /// survive a refused save anywhere beneath it.
+    fn assert_no_tag_write_siblings_under(root: &Path) {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).expect("read directory") {
+                let path = entry.expect("directory entry").path();
+                assert!(
+                    !is_tag_write_temp_file(&path),
+                    "a refused save must leave no private sibling: {path:?}"
+                );
+                if path.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
     }
 
     /// Create an album directory holding the silence.flac fixture — the

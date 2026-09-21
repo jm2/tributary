@@ -239,6 +239,12 @@ properties:
   write_invalid_file: "Edycja tagów jest niedostępna, ponieważ co najmniej jeden wybrany utwór nie jest zwykłym plikiem lokalnym."
   write_unavailable: "Edycja tagów jest niedostępna, ponieważ co najmniej jeden wybrany plik lub jego folder jest tylko do odczytu albo niedostępny."
   write_device_unavailable: "To urządzenie jest obecnie tylko do odczytu lub niedostępne. W Flatpaku dodaj jego folder jako niestandardową bibliotekę w Preferencjach, aby poprosić o dostęp do zapisu."
+  write_conflict: "Co najmniej jeden wybrany plik zmienił się na dysku od otwarcia okna Właściwości. Otwórz Właściwości ponownie, aby edytować bieżące pliki."
+  save_conflict_heading: "Niektóre pliki zmieniły się na dysku"
+  save_failure_heading: "Nie udało się zapisać niektórych plików"
+  save_conflict_all: "Od otwarcia okna Właściwości %{conflicts} z %{total} plików zmieniło się na dysku. Pliki konkurencyjne pozostawiono bez zmian — otwórz Właściwości ponownie, aby edytować bieżące pliki."
+  save_conflict_mixed: "%{conflicts} z %{total} plików zmieniło się na dysku, a %{other} innych plików nie udało się zapisać; wszystkie pozostawiono bez zmian. Otwórz Właściwości ponownie dla zmienionych plików."
+  save_failure: "%{failed} z %{total} plików nie udało się zapisać i pozostawiono je bez zmian."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

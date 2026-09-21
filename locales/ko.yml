@@ -237,6 +237,12 @@ properties:
   write_invalid_file: "선택한 트랙 중 하나 이상이 일반 로컬 파일이 아니어서 태그를 편집할 수 없습니다."
   write_unavailable: "선택한 파일 또는 그 폴더 중 하나 이상이 읽기 전용이거나 사용할 수 없어 태그를 편집할 수 없습니다."
   write_device_unavailable: "이 장치는 현재 읽기 전용이거나 사용할 수 없습니다. Flatpak에서는 쓰기 권한을 요청하려면 환경 설정에서 해당 폴더를 사용자 지정 라이브러리로 추가하세요."
+  write_conflict: "속성 창을 연 뒤 선택한 파일 중 하나 이상이 디스크에서 변경되었습니다. 현재 파일을 편집하려면 속성을 다시 여십시오."
+  save_conflict_heading: "디스크에서 변경된 파일이 있습니다"
+  save_failure_heading: "일부 파일을 저장할 수 없습니다"
+  save_conflict_all: "속성 창을 연 뒤 %{total}개 중 %{conflicts}개 파일이 디스크에서 변경되었습니다. 충돌한 파일은 그대로 보존되었습니다. 현재 파일을 편집하려면 속성을 다시 여십시오."
+  save_conflict_mixed: "%{total}개 중 %{conflicts}개 파일이 디스크에서 변경되었고 나머지 %{other}개 파일은 저장할 수 없었습니다. 모두 변경되지 않고 남아 있습니다. 변경된 파일은 속성을 다시 여십시오."
+  save_failure: "%{total}개 중 %{failed}개 파일을 저장할 수 없었으며 변경되지 않고 남아 있습니다."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

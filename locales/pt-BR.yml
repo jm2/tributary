@@ -237,6 +237,12 @@ properties:
   write_invalid_file: "A edição de tags não está disponível porque pelo menos uma faixa selecionada não é um arquivo local comum."
   write_unavailable: "A edição de tags não está disponível porque pelo menos um arquivo selecionado ou sua pasta é somente leitura ou está indisponível."
   write_device_unavailable: "Este dispositivo está atualmente somente para leitura ou indisponível. No Flatpak, adicione a pasta dele como uma biblioteca personalizada nas Preferências para solicitar acesso de gravação."
+  write_conflict: "Pelo menos um arquivo selecionado mudou no disco desde que Propriedades foi aberto. Reabra Propriedades para editar os arquivos atuais."
+  save_conflict_heading: "Alguns arquivos mudaram no disco"
+  save_failure_heading: "Não foi possível salvar alguns arquivos"
+  save_conflict_all: "%{conflicts} de %{total} arquivo(s) mudaram no disco desde que Propriedades foi aberto. Os arquivos em conflito foram deixados intactos — reabra Propriedades para editar os arquivos atuais."
+  save_conflict_mixed: "%{conflicts} de %{total} arquivo(s) mudaram no disco e %{other} outro(s) arquivo(s) não puderam ser salvos; todos foram deixados inalterados. Reabra Propriedades para os arquivos alterados."
+  save_failure: "%{failed} de %{total} arquivo(s) não puderam ser salvos e foram deixados inalterados."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
