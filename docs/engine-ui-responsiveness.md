@@ -31,7 +31,9 @@ harnesses on a different runner before trusting them elsewhere.
 Harness:
 `cargo test --bin tributary q4_engine_startup_and_during_scan_admission_benchmark -- --ignored --nocapture`
 (`src/local/engine.rs` tests module). Size the fixture tree with
-`TRIBUTARY_Q4_TRACKS` (default 400).
+`TRIBUTARY_Q4_TRACKS` (default 400) — deliberately distinct from the
+large-library harness's `TRIBUTARY_Q4_LIBRARY_TRACKS` so one measurement
+cannot resize the other's fixture.
 
 The test drives the production `LibraryEngine::run()` shape on a real
 fixture directory with a trusted root row, and admits one

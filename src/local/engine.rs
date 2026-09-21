@@ -4207,6 +4207,19 @@ fn test_only_parse_delay_invocations() -> u64 {
     TEST_ONLY_PARSE_DELAY_INVOCATIONS.load(Ordering::Relaxed)
 }
 
+/// Serializes every test-only parse-delay window against the other harnesses
+/// that share the seam above.
+///
+/// The two opt-in Q4 tests live in one test binary, and `cargo test` runs
+/// ignored tests on parallel threads: an armed delay window overlapping the
+/// startup benchmark would distort its timeline and pollute the invocation
+/// counter, and both measurements reset/store the same process-wide statics.
+/// [`ParseDelayGuard`] holds this lock for its whole window and the startup
+/// benchmark holds it around its engine run. Poisoning is tolerated (the
+/// lock is taken) so one panicking measurement cannot wedge the others.
+#[cfg(test)]
+static TEST_ONLY_PARSE_DELAY_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn initial_scan(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
@@ -15540,6 +15553,10 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════
 
     /// Fixture size for the startup benchmark (`TRIBUTARY_Q4_TRACKS`).
+    ///
+    /// Deliberately distinct from the synthetic-library harness's
+    /// `TRIBUTARY_Q4_LIBRARY_TRACKS` (see `perf_fixtures`): a shared variable
+    /// would let one measurement run silently resize the other's fixture.
     fn q4_startup_fixture_track_count() -> usize {
         std::env::var("TRIBUTARY_Q4_TRACKS")
             .ok()
@@ -15727,6 +15744,12 @@ mod tests {
     /// removed), and the FIFO barrier acks only after the scan drains —
     /// nothing admitted during the scan is lost or reordered.
     #[ignore = "explicit Q4 measurement harness; run with --ignored (tr-am6qr)"]
+    // The parse-delay window inside intentionally holds a std::MutexGuard
+    // across the engine-run awaits — exclusivity with the sibling
+    // large-library harness is the point (refinery F2, PR #285). This
+    // current-thread tokio test cannot deadlock on it; only sibling
+    // test-harness threads block, which is the required serialization.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn q4_engine_startup_and_during_scan_admission_benchmark() {
         let track_count = q4_startup_fixture_track_count();
@@ -15793,6 +15816,16 @@ mod tests {
             .await
             .expect("admit during-scan Flush barrier");
 
+        // Serialize the engine run against any concurrent parse-delay
+        // window: both opt-in Q4 tests share the process-wide seam, and an
+        // overlapping armed delay would distort this timeline and pollute
+        // the invocation counter (refinery F2, PR #285). Released after the
+        // abort below, mirroring the production teardown shape. (The
+        // function-level `allow` covers the intentional hold across the
+        // timeline awaits.)
+        let parse_delay_window = super::TEST_ONLY_PARSE_DELAY_WINDOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let engine_task = tokio::spawn(engine.run());
         let timeline = q4_collect_startup_timeline(&event_rx, flush_rx, COMMAND_TRACK, start).await;
 
@@ -15866,6 +15899,9 @@ mod tests {
         // never comes.
         drop(command_tx);
         engine_task.abort();
+        // The measurement window closes only after the engine task is torn
+        // down, so a following delayed scan still holds the seam exclusively.
+        drop(parse_delay_window);
     }
 
     /// Opt-in Q4 responsiveness measurement over a fixed synthetic library.
@@ -15874,7 +15910,7 @@ mod tests {
     /// against a named reference runner with:
     ///
     /// ```text
-    /// TRIBUTARY_Q4_TRACKS=100000 \
+    /// TRIBUTARY_Q4_LIBRARY_TRACKS=100000 \
     ///   cargo test --bin tributary --release -- --ignored --nocapture \
     ///   q4_measured_large_library_responsiveness
     /// ```
@@ -15899,13 +15935,22 @@ mod tests {
             DelayedBackend, ResponsivenessReport, SyntheticLibrary,
         };
 
-        struct ParseDelayGuard;
+        struct ParseDelayGuard {
+            /// Held for the guard's whole window so a concurrent harness
+            /// cannot arm, poll, or reset the shared seam under us
+            /// (refinery F2, PR #285). Released after the delay static is
+            /// disarmed in `Drop`.
+            _window: std::sync::MutexGuard<'static, ()>,
+        }
 
         impl ParseDelayGuard {
             fn set(micros: u64) -> Self {
+                let window = super::TEST_ONLY_PARSE_DELAY_WINDOW
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 super::reset_test_only_parse_delay_invocations();
                 super::TEST_ONLY_PARSE_DELAY_MICROS.store(micros, Ordering::Relaxed);
-                Self
+                Self { _window: window }
             }
         }
 

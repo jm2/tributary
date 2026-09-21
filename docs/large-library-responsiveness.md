@@ -47,12 +47,16 @@ All fixtures live in the test-only module `src/local/perf_fixtures.rs`.
   `TEST_ONLY_PARSE_DELAY_INVOCATIONS` counter. The seam sits inside the scan's
   `spawn_blocking` parse branch and is compiled out of production builds; it is
   the same seam R9 (<https://github.com/jm2/tributary/issues/256>) needs to
-  hold a scan while exercising command admission and cancellation.
+  hold a scan while exercising command admission and cancellation. Because
+  both opt-in Q4 tests share the process-wide seam in one test binary, every
+  delay window (and the startup benchmark's engine run) holds the
+  `TEST_ONLY_PARSE_DELAY_WINDOW` mutex, so parallel `--ignored` runs cannot
+  arm the seam under each other or pollute each other's counters.
 
 ## Running the measurement
 
 ```sh
-TRIBUTARY_Q4_TRACKS=10000 \
+TRIBUTARY_Q4_LIBRARY_TRACKS=10000 \
 TRIBUTARY_Q4_PARSE_DELAY_MICROS=100 \
 TRIBUTARY_Q4_RUNNER=my-runner-label \
   cargo test --bin tributary --release -- --ignored --nocapture \
@@ -63,12 +67,18 @@ Environment variables:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TRIBUTARY_Q4_TRACKS` | `10000` | Track count to generate and measure. |
+| `TRIBUTARY_Q4_LIBRARY_TRACKS` | `10000` | Track count to generate and measure. |
 | `TRIBUTARY_Q4_RUNNER` | `$OS-$ARCH` | Human label for the reference runner. |
 | `TRIBUTARY_Q4_PARSE_DELAY_MICROS` | unset | Per-file parse delay in µs for the delayed scan. |
 
 Setting `TRIBUTARY_Q4_PARSE_DELAY_MICROS` runs an additional scan into a **fresh second
 database** with that much deterministic delay per parsed file.
+
+`TRIBUTARY_Q4_LIBRARY_TRACKS` is deliberately distinct from the engine
+startup benchmark's `TRIBUTARY_Q4_TRACKS` (default 400, see
+`docs/engine-ui-responsiveness.md`): a shared variable with different
+defaults (10 000 here) would let one measurement run silently resize the
+other's fixture.
 
 Run the harness on the same named runner you intend to set budgets on. Record
 the runner label and the raw numbers with the environment that produced them.
@@ -78,8 +88,8 @@ the runner label and the raw numbers with the environment that produced them.
 The assertions are structural, not timing-based:
 
 - the baseline scan parses every fixture file exactly once
-  (`scan_parse_invocations == TRIBUTARY_Q4_TRACKS`) and persists one row per
-  file (`scan_tracks_persisted == TRIBUTARY_Q4_TRACKS`);
+  (`scan_parse_invocations == TRIBUTARY_Q4_LIBRARY_TRACKS`) and persists one row per
+  file (`scan_tracks_persisted == TRIBUTARY_Q4_LIBRARY_TRACKS`);
 - **catalogue fan-out is asserted before any metric is recorded**: through the
   real backend, 10 000 tracks must yield 834 distinct albums across 209
   artists, and 100 000 tracks 8 334 albums across 2 084 artists (12 tracks per
@@ -87,7 +97,7 @@ The assertions are structural, not timing-based:
   numbers `expected_album_count` / `expected_artist_count` compute);
 - the delayed pass scans the same fixture into a fresh second database, so
   every row is new and every file really enters the delayed parse branch; the
-  harness asserts `delayed_parse_files_parsed == TRIBUTARY_Q4_TRACKS`, full
+  harness asserts `delayed_parse_files_parsed == TRIBUTARY_Q4_LIBRARY_TRACKS`, full
   persisted cardinality there too, **and the same album/artist fan-out**;
 - the production command-FIFO leg runs the real engine loop
   (`process_library_commands_without_watcher`), enqueues 100 `SetTrackRating`
@@ -112,7 +122,7 @@ after a `Q4_ENVIRONMENT runner=…` header.
 | `scan_events` | events | `LibraryEvent`s emitted during the scan. |
 | `scan_throughput` | tracks/s | Persisted rows per second of scan time. |
 | `backend_list_tracks` | ms | Full catalogue read through `MediaBackend`. |
-| `catalogue_retained_bytes` | bytes | Estimated retained bytes of the published snapshot. |
+| `catalogue_retained_bytes` | bytes | Estimated retained bytes of the published snapshot (fixed `Track` size plus every heap-owned string, including the backend-native track id and any `stream_url`/`cover_art_url`). |
 | `backend_list_albums` | ms | Album aggregation latency. |
 | `backend_list_artists` | ms | Artist aggregation latency. |
 | `backend_search` | ms | Filter/search latency. |
@@ -171,6 +181,12 @@ now costs real work over real fan-out (834→8 334 album groups, 209→2 084
 artist groups) — compare against the invalid collapsed-catalogue baseline
 above only to see what the collapsed shape hid, never as a regression
 reference.
+
+`catalogue_retained_bytes` in this table predates the metric fix that now
+counts the heap-native track id (and any `stream_url`/`cover_art_url`):
+with ~36-byte ids it underreported roughly 3.6 MB per 100 000 rows, so
+re-record the metric on your runner before comparing against these figures
+or setting byte budgets on them.
 
 The baseline scan is dominated by fixture-driven row insertion and root
 enrollment. The delayed pass repeats the full cold scan into a fresh database

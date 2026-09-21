@@ -36,7 +36,12 @@ use crate::architecture::TrackId;
 pub const DEFAULT_TRACK_COUNT: usize = 10_000;
 
 /// Environment variable selecting the synthetic library size.
-pub const TRACK_COUNT_ENV: &str = "TRIBUTARY_Q4_TRACKS";
+///
+/// Deliberately distinct from the engine startup benchmark's
+/// `TRIBUTARY_Q4_TRACKS` (default 400): both harnesses live in one test
+/// binary, and a shared variable with different defaults (10 000 here) would
+/// make one measurement run silently resize the other's fixture.
+pub const TRACK_COUNT_ENV: &str = "TRIBUTARY_Q4_LIBRARY_TRACKS";
 
 /// Tracks per synthetic album. Kept small so album/artist aggregation has a
 /// realistic fan-out rather than one row per album.
@@ -454,8 +459,11 @@ impl ResponsivenessReport {
 
 /// Approximate bytes retained by a published catalogue snapshot.
 ///
-/// Counts the fixed-size `Track` plus the heap bytes of every owned string, so
-/// a rebuild can be compared across catalogue sizes without a profiler.
+/// Counts the fixed-size `Track` plus the heap bytes of every owned string:
+/// the eight text fields below, the backend-native track id (a heap `String`
+/// behind [`TrackId`], stored verbatim for every local row), and the
+/// credential-free `stream_url` / `cover_art_url` references when present —
+/// so a rebuild can be compared across catalogue sizes without a profiler.
 pub fn catalogue_bytes(tracks: &[Track]) -> usize {
     tracks.iter().map(track_bytes).sum()
 }
@@ -468,7 +476,19 @@ fn track_bytes(track: &Track) -> usize {
         + track.composer.as_ref().map_or(0, String::len)
         + track.genre.as_ref().map_or(0, String::len)
         + track.file_path.as_ref().map_or(0, String::len)
-        + track.format.as_ref().map_or(0, String::len);
+        + track.format.as_ref().map_or(0, String::len)
+        + track
+            .native_track_id
+            .as_ref()
+            .map_or(0, |id| id.as_str().len())
+        + track
+            .stream_url
+            .as_ref()
+            .map_or(0, |url| url.as_str().len())
+        + track
+            .cover_art_url
+            .as_ref()
+            .map_or(0, |url| url.as_str().len());
     std::mem::size_of::<Track>() + owned
 }
 
@@ -619,5 +639,17 @@ mod tests {
         track.title = "t".repeat(50);
         let half = catalogue_bytes(std::slice::from_ref(&track));
         assert_eq!(empty - half, 50);
+        // The backend-native id is a heap `String` per row (the scan stores
+        // the SQLite id verbatim), so omitting it underreported the metric
+        // by its length × track count (refinery F1, PR #285).
+        track.native_track_id = Some(TrackId::new("native-track-id").expect("valid track id"));
+        let with_id = catalogue_bytes(std::slice::from_ref(&track));
+        assert_eq!(with_id - half, "native-track-id".len());
+        // Credential-free URL references are owned strings too; keep the
+        // `catalogue_bytes` coverage claim exact.
+        track.stream_url =
+            Some(url::Url::parse("https://stream.example/a.mp3").expect("valid stream url"));
+        let with_stream = catalogue_bytes(std::slice::from_ref(&track));
+        assert_eq!(with_stream - with_id, "https://stream.example/a.mp3".len());
     }
 }
