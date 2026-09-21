@@ -2338,10 +2338,21 @@ mod tests {
         assert_eq!(search, "new", "search text survives a later selection");
     }
 
-    /// Same-source refresh: a still-valid album selection survives an
-    /// upsert of a non-matching track, and a vanished album drops its
-    /// axis to All exactly as if the user had cleared it (issue #250).
-    fn refresh_preserves_matching_selection_and_drops_vanished_album() {
+    /// A production browser arranged for the same-source refresh
+    /// contracts: built on three Jazz/Alpha tracks with artist Alpha
+    /// and album `Album A` selected (album rows are `All`, `Album A`,
+    /// `Album B` — `All` prepended, albums sorted), and the emit log
+    /// cleared so the next `composed` reflects only the refresh under
+    /// test.
+    struct RefreshArrangement {
+        log: EmitLog,
+        browser_box: gtk::Box,
+        state: BrowserState,
+        panes: [gtk::Box; 3],
+    }
+
+    /// Build [`RefreshArrangement`].
+    fn arranged_artist_and_album_selection() -> RefreshArrangement {
         let initial = vec![
             fixture_track("Jazz", "Alpha", "Album A", "T1"),
             fixture_track("Jazz", "Alpha", "Album A", "T2"),
@@ -2350,13 +2361,22 @@ mod tests {
         let (log, cb) = recorder();
         let (browser_box, state) = build_browser(&initial, false, false, 48, cb);
         let panes = browser_panes(&browser_box).expect("panes");
-
-        // Select artist Alpha, then album "Album A" (album rows are
-        // ["All", "Album A", "Album B"] — "All" prepended, albums
-        // sorted).
         get_selection(&panes[1]).set_selected(1);
         get_selection(&panes[2]).set_selected(1);
         log.borrow_mut().clear();
+        RefreshArrangement {
+            log,
+            browser_box,
+            state,
+            panes,
+        }
+    }
+
+    /// Same-source refresh: a still-valid album selection survives an
+    /// upsert of a non-matching track, and the emit must still carry
+    /// both axes (issue #250).
+    fn refresh_preserves_matching_selection_through_upsert() {
+        let arrangement = arranged_artist_and_album_selection();
 
         // Upsert a non-matching track: the selections must survive the
         // refresh and the emit must still carry both axes.
@@ -2366,8 +2386,8 @@ mod tests {
             fixture_track("Jazz", "Alpha", "Album B", "T3"),
             fixture_track("Jazz", "Alpha", "Album C", "T4"),
         ];
-        refresh_browser_data(&browser_box, &state, &upserted);
-        let (_, artist, album, _, _) = composed(&log);
+        refresh_browser_data(&arrangement.browser_box, &arrangement.state, &upserted);
+        let (_, artist, album, _, _) = composed(&arrangement.log);
         assert_eq!(
             artist.as_deref(),
             Some("Alpha"),
@@ -2378,20 +2398,28 @@ mod tests {
             Some("Album A"),
             "refresh must preserve a still-valid album selection"
         );
-        let album_store = get_store_from_pane(&panes[2]).expect("album store");
+        let album_store = get_store_from_pane(&arrangement.panes[2]).expect("album store");
         assert_eq!(album_store.n_items(), 4, "All + the three albums");
         assert_eq!(
-            get_selected_label(&get_selection(&panes[2])).as_deref(),
+            get_selected_label(&get_selection(&arrangement.panes[2])).as_deref(),
             Some("Album A"),
             "the pane must keep displaying the preserved selection"
         );
+    }
+
+    /// Same-source refresh: deleting every track of the selected album
+    /// drops the album axis to All exactly as if the user had cleared
+    /// it, while the still-valid artist axis and the panes' displayed
+    /// selections keep agreeing (issue #250).
+    fn refresh_drops_vanished_album_and_keeps_surviving_artist() {
+        let arrangement = arranged_artist_and_album_selection();
 
         // Delete every "Album A" track: the album axis must drop to All
         // while the still-valid artist axis survives, and the panes must
         // display the agreement.
         let after_delete = vec![fixture_track("Jazz", "Alpha", "Album C", "T4")];
-        refresh_browser_data(&browser_box, &state, &after_delete);
-        let (_, artist, album, _, _) = composed(&log);
+        refresh_browser_data(&arrangement.browser_box, &arrangement.state, &after_delete);
+        let (_, artist, album, _, _) = composed(&arrangement.log);
         assert_eq!(
             album, None,
             "a vanished album must drop the axis to All (issue #250)"
@@ -2402,12 +2430,12 @@ mod tests {
             "a still-valid artist must survive the album's drop"
         );
         assert_eq!(
-            get_selected_label(&get_selection(&panes[2])),
+            get_selected_label(&get_selection(&arrangement.panes[2])),
             None,
             "the album pane must display All after its selection vanished"
         );
         assert_eq!(
-            get_selected_label(&get_selection(&panes[1])).as_deref(),
+            get_selected_label(&get_selection(&arrangement.panes[1])).as_deref(),
             Some("Alpha"),
             "the artist pane must keep displaying the surviving selection"
         );
@@ -2617,7 +2645,8 @@ mod tests {
                 // Browser data lifecycle contracts (issue #250).
                 album_selection_survives_typing_and_clearing();
                 source_replacement_resets_every_filter_axis();
-                refresh_preserves_matching_selection_and_drops_vanished_album();
+                refresh_preserves_matching_selection_through_upsert();
+                refresh_drops_vanished_album_and_keeps_surviving_artist();
                 full_sync_reset_clears_every_axis_and_the_entry();
                 pending_search_debounce_never_fires_after_source_replacement();
             },
