@@ -1789,6 +1789,64 @@ mod tests {
         .expect("valid test session")
     }
 
+    /// Spawns an application owner over a migrated in-memory database, a
+    /// stored vault session, the pending transport, the fixed clock, and the
+    /// given live policy, with the source registry left running for the
+    /// caller to shut down: the shared fixture for the disconnect/successor
+    /// and runtime-control compositions below.
+    async fn spawn_owner_with_stored_session_and_database_attached(
+        live: &LastFmLivePolicy,
+    ) -> (
+        LastFmApplicationHandle,
+        LastFmApplicationShutdown,
+        Arc<FixedCredentials>,
+        SourceRegistry,
+        LastFmPlaybackCoordinatorOwner,
+    ) {
+        let database = migrated_database().await;
+        let credentials = Arc::new(FixedCredentials::new(stored_session()));
+        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
+        let coordinator = coordinator_owner
+            .bind_window(source_registry.clone())
+            .expect("window binding");
+        let (handle, shutdown) = spawn_with_dependencies(
+            coordinator,
+            tokio::runtime::Handle::current(),
+            credentials.clone(),
+            Some(Arc::new(PendingTransport)),
+            Arc::new(FixedClock),
+            live.clone(),
+        );
+        handle
+            .try_attach_database(database)
+            .expect("database admitted")
+            .wait()
+            .await
+            .expect("database attached");
+        (
+            handle,
+            shutdown,
+            credentials,
+            source_registry,
+            coordinator_owner,
+        )
+    }
+
+    /// Asserts a forwarded runtime control resolved to the typed `NotActive`
+    /// refusal a dormant owner must surface instead of executing.
+    fn assert_not_active_refusal<T: std::fmt::Debug>(
+        result: Result<T, LastFmRuntimeAdmissionError>,
+        unexpected: &str,
+        refusal: &str,
+    ) {
+        match result {
+            Err(LastFmRuntimeAdmissionError::NotActive) => {}
+            Err(admission) => panic!("{unexpected}: {admission:?}"),
+            Ok(_) => panic!("{refusal}"),
+        }
+    }
+
     #[tokio::test]
     async fn unavailable_build_rejects_database_without_touching_runtime_dependencies() {
         let (_coordinator_owner, coordinator) = binding();
@@ -2112,36 +2170,15 @@ mod tests {
     }
 
     /// LF2 composition: a real generation activates with the typed runtime
-    /// snapshot relayed into the application status, a completed
+    /// snapshot relayed into the application status, and a completed
     /// disconnect-and-purge drains that generation in the bridge-before-
     /// runtime order back to AwaitingConsent with the relayed snapshot
-    /// cleared, and a successor activation — after the reconnect flow has
-    /// restored a vault session the runtime purge deleted — re-activates a
-    /// fresh runtime generation under the same live policy generation.
+    /// cleared.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnect_drains_generation_and_a_successor_activation_reactivates() {
+    async fn disconnect_drains_generation_and_clears_the_relayed_runtime() {
         let live = live_policy_for_test();
-        let database = migrated_database().await;
-        let credentials = Arc::new(FixedCredentials::new(stored_session()));
-        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
-        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
-        let coordinator = coordinator_owner
-            .bind_window(source_registry.clone())
-            .expect("window binding");
-        let (handle, shutdown) = spawn_with_dependencies(
-            coordinator,
-            tokio::runtime::Handle::current(),
-            credentials.clone(),
-            Some(Arc::new(PendingTransport)),
-            Arc::new(FixedClock),
-            live.clone(),
-        );
-        handle
-            .try_attach_database(database)
-            .expect("database admitted")
-            .wait()
-            .await
-            .expect("database attached");
+        let (handle, shutdown, credentials, source_registry, mut coordinator_owner) =
+            spawn_owner_with_stored_session_and_database_attached(&live).await;
 
         // First generation activates and the relay publishes its runtime
         // snapshot inside the Active status before completion resolves.
@@ -2178,6 +2215,43 @@ mod tests {
         let status = *handle.subscribe_status().borrow();
         assert_eq!(status.phase, LastFmApplicationPhase::AwaitingConsent);
         assert_eq!(status.runtime, None);
+        // Two vault loads: the first runtime start and the disconnect purge
+        // reading the exact record it deletes.
+        assert_eq!(credentials.loads.load(Ordering::SeqCst), 2);
+
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
+        source_registry.shutdown().wait().await;
+    }
+
+    /// LF2 composition: after a disconnect-and-purge drains the generation,
+    /// a successor activation — once the reconnect flow has restored the
+    /// vault session the runtime purge deleted — re-activates a fresh
+    /// runtime generation under the same live policy generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successor_activation_reactivates_after_disconnect_drains() {
+        let live = live_policy_for_test();
+        let (handle, shutdown, credentials, source_registry, mut coordinator_owner) =
+            spawn_owner_with_stored_session_and_database_attached(&live).await;
+
+        // The first generation runs and is then drained by the completed
+        // disconnect-and-purge, whose deadline is respected.
+        let generation = live.snapshot();
+        handle
+            .try_activate(
+                LastFmApplicationActivation::issue_from_policy_generation(&generation)
+                    .expect("generation 1 grants activation authority"),
+            )
+            .expect("activation admitted")
+            .wait()
+            .await
+            .expect("first generation activates");
+        let disconnect = handle
+            .try_disconnect_and_purge()
+            .expect("disconnect admitted");
+        tokio::time::timeout(Duration::from_secs(2), disconnect.wait())
+            .await
+            .expect("disconnect deadline")
+            .expect("disconnect purged and drained");
 
         // The runtime purge deleted the vault record, so the reconnect flow
         // stores a fresh session before the successor runtime can start.
@@ -2208,33 +2282,15 @@ mod tests {
         source_registry.shutdown().wait().await;
     }
 
-    /// LF2 composition: the runtime controls forward to the exact active
-    /// generation and surface its typed refusals, while a dormant owner with
-    /// a database attached refuses the same commands without a runtime.
+    /// LF2 composition: a dormant owner with a database attached refuses
+    /// every runtime control without touching a runtime — disconnect with
+    /// the typed GenerationInactive, and reauthorization, recovery capture,
+    /// and resume with the runtime NotActive refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_controls_forward_to_the_active_generation_and_refuse_without_one() {
+    async fn runtime_controls_refuse_on_a_dormant_owner_without_a_runtime() {
         let live = live_policy_for_test();
-        let database = migrated_database().await;
-        let credentials = Arc::new(FixedCredentials::new(stored_session()));
-        let source_registry = SourceRegistry::new(tokio::runtime::Handle::current());
-        let mut coordinator_owner = LastFmPlaybackCoordinatorOwner::isolated_for_test();
-        let coordinator = coordinator_owner
-            .bind_window(source_registry.clone())
-            .expect("window binding");
-        let (handle, shutdown) = spawn_with_dependencies(
-            coordinator,
-            tokio::runtime::Handle::current(),
-            credentials.clone(),
-            Some(Arc::new(PendingTransport)),
-            Arc::new(FixedClock),
-            live.clone(),
-        );
-        handle
-            .try_attach_database(database)
-            .expect("database admitted")
-            .wait()
-            .await
-            .expect("database attached");
+        let (handle, shutdown, _credentials, source_registry, mut coordinator_owner) =
+            spawn_owner_with_stored_session_and_database_attached(&live).await;
 
         // Dormant owner: every control refuses without touching a runtime.
         let disconnect = handle
@@ -2250,29 +2306,42 @@ mod tests {
                 ProtectedString::new("fedcba9876543210fedcba9876543210"),
             )
             .expect("reauthorization admitted");
-        match reauthorization.wait().await.expect("forward admitted") {
-            Err(LastFmRuntimeAdmissionError::NotActive) => {}
-            Err(admission) => panic!("unexpected reauthorization refusal: {admission:?}"),
-            Ok(_) => panic!("reauthorization must be refused while dormant"),
-        }
+        assert_not_active_refusal(
+            reauthorization.wait().await.expect("forward admitted"),
+            "unexpected reauthorization refusal",
+            "reauthorization must be refused while dormant",
+        );
         let recovery = handle
             .try_issue_manual_pause_recovery()
             .expect("recovery capture admitted");
-        match recovery.wait().await.expect("forward admitted") {
-            Err(LastFmRuntimeAdmissionError::NotActive) => {}
-            Err(admission) => panic!("unexpected recovery refusal: {admission:?}"),
-            Ok(_) => panic!("recovery capture must be refused while dormant"),
-        }
+        assert_not_active_refusal(
+            recovery.wait().await.expect("forward admitted"),
+            "unexpected recovery refusal",
+            "recovery capture must be refused while dormant",
+        );
         let resume = handle
             .try_resume_after_manual_recovery(LastFmManualPauseRecovery::dangling_for_test(
                 stored_session().account_binding(),
             ))
             .expect("resume admitted");
-        match resume.wait().await.expect("forward admitted") {
-            Err(LastFmRuntimeAdmissionError::NotActive) => {}
-            Err(admission) => panic!("unexpected resume refusal: {admission:?}"),
-            Ok(_) => panic!("resume must be refused while dormant"),
-        }
+        assert_not_active_refusal(
+            resume.wait().await.expect("forward admitted"),
+            "unexpected resume refusal",
+            "resume must be refused while dormant",
+        );
+
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
+        source_registry.shutdown().wait().await;
+    }
+
+    /// LF2 composition: the runtime controls forward to the exact active
+    /// generation and surface its own typed refusals for the not-ready
+    /// states.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_controls_forward_to_the_active_generation_and_surface_its_typed_refusals() {
+        let live = live_policy_for_test();
+        let (handle, shutdown, _credentials, source_registry, mut coordinator_owner) =
+            spawn_owner_with_stored_session_and_database_attached(&live).await;
 
         // Active generation: the controls forward to the exact runtime and
         // surface its own typed refusals for the not-ready states.
