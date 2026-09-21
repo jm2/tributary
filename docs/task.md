@@ -186,6 +186,11 @@ full acceptance is binding; the checklist below indexes it. No new record has a 
   define safe rejection/diagnostics instead of silently storing false playback authority.
   Acknowledged historical limitation, now actively tracked; coordinate R1 without blocking unrelated
   Last.fm work.
+  Design contract recorded in
+  [`docs/native-path-authority-design.md`](native-path-authority-design.md) (tr-ldhwt): the
+  versioned reversible native-path key plus the explicit refusal boundary and quarantine rules.
+  This record stays open until the representation, its tests, the user documentation, and the
+  changelog all land; the design record itself changes no behavior.
 
 ## P1 — Correctness and shared feature foundations
 
