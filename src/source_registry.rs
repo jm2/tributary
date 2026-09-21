@@ -245,6 +245,41 @@ pub enum PlaybackAttributionCapability {
     External,
 }
 
+/// Whether one managed adapter resolves accepted-track streams to retained
+/// local file media rather than remote HTTP.
+///
+/// The album pane must choose between the retained-file artwork route and the
+/// lease-isolated remote artwork route without inspecting a row's raw locator
+/// (production registry rows are pathless) and without minting a remote stream
+/// credential merely to infer the source kind. This capability is that
+/// authoritative signal. It is deliberately independent from
+/// [`PlaybackAttributionCapability`]: being file-backed and being eligible for
+/// structured listening-history attribution are separate properties, and the
+/// default keeps every existing and future adapter on the remote route until
+/// its stream resolution is reviewed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RetainedFileStreamCapability {
+    #[default]
+    Unsupported,
+    Supported,
+}
+
+/// Which consumer is requesting one retained-file stream resolution.
+///
+/// The album pane resolves artwork speculatively for every bound row, while
+/// playback is user-paced and must never wait behind that speculative work.
+/// Adapters whose resolution performs a blocking mounted probe draw on
+/// independent capacity per class (mirroring the local-library
+/// [`crate::local::resolver::ProbeClass`] gates) so a saturated pane lane
+/// cannot delay a playback resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamResolutionClass {
+    /// Speculative work (album-pane artwork resolution).
+    Speculative,
+    /// Playback-critical resolution.
+    Playback,
+}
+
 /// Exact bounded structured metadata which one live adapter authorizes for a
 /// single track's listening-history attribution.
 ///
@@ -1261,8 +1296,37 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
         })
     }
 
+    /// Resolve one stream with an explicit consumer class.
+    ///
+    /// Adapters whose exact-session resolution performs a blocking mounted
+    /// probe override this to bound speculative album-pane work separately
+    /// from playback, moving the class permit into the blocking closure so an
+    /// aborted speculative caller cannot release capacity while the probe
+    /// still runs. The default forwards to [`Self::resolve_stream`], so every
+    /// existing adapter keeps its current behavior.
+    fn resolve_stream_classified(
+        self: Arc<Self>,
+        track_id: TrackId,
+        _class: StreamResolutionClass,
+    ) -> StreamFuture {
+        self.resolve_stream(track_id)
+    }
+
     fn resolve_artwork(self: Arc<Self>, _track_id: TrackId) -> ArtworkFuture {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Explicit, reviewed opt-in for retained-file stream resolution: the
+    /// adapter's [`Self::resolve_stream`] returns [`AdapterStream::File`] for
+    /// every accepted track identity it admits.
+    ///
+    /// The album pane consults this capability to route a pathless registry
+    /// row to the retained-file artwork extractor instead of the remote
+    /// artwork resolver, so it neither reopens a raw row locator nor mints a
+    /// remote stream credential to discover the source kind. The default keeps
+    /// every existing and future adapter on the remote route until reviewed.
+    fn retained_file_stream_capability(&self) -> RetainedFileStreamCapability {
+        RetainedFileStreamCapability::Unsupported
     }
 
     /// Resolve a typed retained mutation authority for one exact accepted
@@ -2820,6 +2884,28 @@ impl SourceRegistry {
         expected_session_epoch: u64,
         track_id: TrackId,
     ) -> BackendResult<ResolvedSourceStream> {
+        self.resolve_stream_classified(
+            source_id,
+            expected_session_epoch,
+            track_id,
+            StreamResolutionClass::Playback,
+        )
+        .await
+    }
+
+    /// Resolve one stream with an explicit [`StreamResolutionClass`].
+    ///
+    /// Playback callers use [`Self::resolve_stream`], which draws on the
+    /// reserved playback capacity. The album pane calls this with
+    /// [`StreamResolutionClass::Speculative`] so its mounted probes are
+    /// bounded and isolated from playback (2026-09-14 review finding).
+    pub async fn resolve_stream_classified(
+        &self,
+        source_id: SourceId,
+        expected_session_epoch: u64,
+        track_id: TrackId,
+        class: StreamResolutionClass,
+    ) -> BackendResult<ResolvedSourceStream> {
         if let Some(resolved) = self.inner.lifecycle.resolve_latest_accepted_view(
             source_id,
             expected_session_epoch,
@@ -2840,15 +2926,17 @@ impl SourceRegistry {
             )));
         }
 
-        let stream = self
-            .inner
-            .lifecycle
-            .resolve_stream(
-                source_id,
-                expected_session_epoch,
-                move |adapter| async move { adapter.resolve_stream(track_id).await },
-            )
-            .await?;
+        let stream =
+            self.inner
+                .lifecycle
+                .resolve_stream(
+                    source_id,
+                    expected_session_epoch,
+                    move |adapter| async move {
+                        adapter.resolve_stream_classified(track_id, class).await
+                    },
+                )
+                .await?;
         Ok(match stream {
             AdapterStream::ProtectedHttp(request) => {
                 ResolvedSourceStream::Http(MediaRequest::ProtectedHttp(request))
@@ -2871,6 +2959,27 @@ impl SourceRegistry {
                 move |adapter| async move { adapter.resolve_artwork(track_id).await },
             )
             .await
+    }
+
+    /// Whether the exact active session for `source_id` resolves accepted
+    /// tracks to retained file media.
+    ///
+    /// Cheap and synchronous: it inspects the live adapter under one lifecycle
+    /// lock, never blocks, and never mints a stream credential. Returns false
+    /// when the session is absent, superseded, or not retained-file capable,
+    /// so the album pane leaves the pathless row on the lease-isolated remote
+    /// artwork route (or the placeholder) rather than probing a mount it has
+    /// no authority to read.
+    pub fn retains_file_streams(&self, source_id: SourceId, expected_session_epoch: u64) -> bool {
+        self.inner
+            .lifecycle
+            .inspect_active_session(source_id, |adapter| {
+                adapter.retained_file_stream_capability()
+            })
+            .is_some_and(|(session_epoch, capability)| {
+                session_epoch == expected_session_epoch
+                    && capability == RetainedFileStreamCapability::Supported
+            })
     }
 
     /// Resolve a typed retained mutation authority for one exact accepted
@@ -9030,6 +9139,50 @@ mod tests {
         assert!(registry.release_provenance(source_id, claim));
         wait_until_pruned(&registry, source_id).await;
         assert!(!resolved.is_active());
+        registry.shutdown().wait().await;
+    }
+
+    /// The album pane chooses the retained-file route from this authoritative
+    /// capability, never from a row's raw locator. It must report true only
+    /// for the exact live session epoch of a retained-file-capable adapter,
+    /// and false for a superseded epoch, an absent source, or a retired
+    /// session — so a pathless row never probes a mount it has no authority
+    /// to read and never mints a stream credential to infer the source kind
+    /// (2026-09-14 review finding).
+    #[tokio::test]
+    async fn retains_file_streams_is_true_only_for_the_exact_live_removable_session() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let path = mount.path().join("accepted.wav");
+        std::fs::write(&path, minimal_wav_bytes(0x80)).expect("write accepted removable WAV");
+        let source_id = SourceId::removable("registry:test:retained-capability")
+            .expect("removable source identity");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+
+        assert!(registry.retains_file_streams(source_id, session_epoch));
+        assert!(
+            !registry.retains_file_streams(source_id, session_epoch + 1),
+            "a superseded epoch is not the live retained-file session"
+        );
+        let absent = SourceId::removable("registry:test:absent-capability")
+            .expect("absent removable source identity");
+        assert!(
+            !registry.retains_file_streams(absent, 1),
+            "a source with no adopted session is not retained-file capable"
+        );
+
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
+        assert!(
+            !registry.retains_file_streams(source_id, session_epoch),
+            "a retired session no longer carries retained-file authority"
+        );
         registry.shutdown().wait().await;
     }
 

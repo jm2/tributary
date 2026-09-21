@@ -24,6 +24,86 @@ pub use super::root_authority::{MountedMutationTarget, MountedRootAuthority};
 /// same outer budget for the point-in-time file probe.
 const FILE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum number of **speculative** retained-authority filesystem probes
+/// (album-pane artwork lookups) that may run at once.
+const MAX_CONCURRENT_AUTHORITY_PROBES: usize = 8;
+
+/// Reserved capacity for **playback-critical** retained-authority probes.
+///
+/// Playback resolution must never be starved by speculative pane work, so it
+/// draws on a gate of its own instead of sharing [`SPECULATIVE_PROBE_GATE`]
+/// (2026-09-14 N5 review finding).
+const RESERVED_PLAYBACK_PROBES: usize = 8;
+
+/// Which consumer is acquiring retained-authority probe capacity.
+///
+/// The two classes draw on independent gates so that a saturated album-pane
+/// lane cannot delay a playback resolution waiting for capacity
+/// (2026-09-14 N5 review finding).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeClass {
+    /// Speculative work (album-pane thumbnails). Bounded by
+    /// [`SPECULATIVE_PROBE_GATE`] so recycled rows cannot accumulate
+    /// blocking probes.
+    Speculative,
+    /// Playback-critical resolution from `play_current`. Draws on the
+    /// reserved [`PLAYBACK_PROBE_GATE`] so pane saturation cannot starve it.
+    Playback,
+}
+
+/// Bounds concurrent **speculative** retained-authority filesystem probes.
+///
+/// [`resolve_track`] submits its pre-extraction probe with
+/// `tokio::task::spawn_blocking`. A blocking closure cannot be unwound once
+/// it starts, and dropping its `JoinHandle` detaches rather than cancels it,
+/// so a caller that cancels a pending resolution (the album pane's
+/// `run_until_revoked`) would otherwise let recycled rows accumulate
+/// expensive probes without bound on Tokio's shared blocking pool
+/// (2026-09-14 review finding). The permit is acquired *before* the probe is
+/// submitted and moved INTO the blocking closure, so it is released only
+/// when the probe actually completes — never early on task abort — and at
+/// most [`MAX_CONCURRENT_AUTHORITY_PROBES`] speculative probes can ever be in
+/// flight.
+static SPECULATIVE_PROBE_GATE: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_AUTHORITY_PROBES);
+
+/// Reserved gate for playback-critical retained-authority probes.
+///
+/// Kept separate from [`SPECULATIVE_PROBE_GATE`] so that eight stuck
+/// album-pane probes can never consume the capacity a playback resolution
+/// needs (2026-09-14 N5 review finding). Playback is user-paced and
+/// superseded one track at a time, so this bound is a safety cap on
+/// blocking-pool growth rather than a scheduling choke point.
+static PLAYBACK_PROBE_GATE: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(RESERVED_PLAYBACK_PROBES);
+
+/// Select the retained-authority probe gate for `class`.
+fn probe_gate(class: ProbeClass) -> &'static tokio::sync::Semaphore {
+    match class {
+        ProbeClass::Speculative => &SPECULATIVE_PROBE_GATE,
+        ProbeClass::Playback => &PLAYBACK_PROBE_GATE,
+    }
+}
+
+/// Acquire one retained-authority probe permit for an adapter that performs
+/// its own blocking mounted probe (retained removable media).
+///
+/// Mirrors [`acquire_authority_probe`]'s discipline: the caller must move the
+/// returned permit into the blocking closure so aborting the async caller
+/// cannot release capacity while the probe still runs, and speculative
+/// album-pane work draws on a different gate than playback so a saturated
+/// pane lane cannot delay a playback resolution. `None` means the gate could
+/// not be acquired within [`FILE_PROBE_TIMEOUT`]; the caller fails closed.
+pub async fn acquire_retained_probe_permit(
+    class: ProbeClass,
+) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let deadline = tokio::time::Instant::now() + FILE_PROBE_TIMEOUT;
+    tokio::time::timeout_at(deadline, probe_gate(class).acquire())
+        .await
+        .ok()?
+        .ok()
+}
+
 /// A closed, path-free local resolution failure safe for application logs.
 #[derive(Debug, Error)]
 pub enum LocalMediaResolutionError {
@@ -336,71 +416,38 @@ pub async fn resolve_track(
     track_id: &str,
     configured_roots: &[String],
 ) -> Result<ResolvedLocalMedia, LocalMediaResolutionError> {
+    resolve_track_with_class(ProbeClass::Speculative, db, track_id, configured_roots).await
+}
+
+/// Resolve one local track using an explicit [`ProbeClass`].
+///
+/// [`resolve_track`] is the speculative convenience wrapper used by
+/// album-pane artwork. Playback-critical callers pass
+/// [`ProbeClass::Playback`] so their probe capacity is reserved and cannot be
+/// starved by pane work (2026-09-14 N5 review finding).
+pub async fn resolve_track_with_class(
+    class: ProbeClass,
+    db: &DatabaseConnection,
+    track_id: &str,
+    configured_roots: &[String],
+) -> Result<ResolvedLocalMedia, LocalMediaResolutionError> {
     if track_id.is_empty() {
         return Err(LocalMediaResolutionError::InvalidTrackId);
     }
 
-    let model = track::Entity::find_by_id(track_id.to_string())
-        .one(db)
-        .await
-        .map_err(|source| LocalMediaResolutionError::Database { source })?
-        .ok_or(LocalMediaResolutionError::Missing)?;
-
-    let states = library_root::Entity::find()
-        .all(db)
-        .await
-        .map_err(|source| LocalMediaResolutionError::Database { source })?;
+    let model = load_track(db, track_id).await?;
+    let AuthorizedRoot {
+        expected,
+        root,
+        marker,
+    } = select_authorized_root(db, &model.file_path, configured_roots).await?;
     let path = PathBuf::from(&model.file_path);
-    let Some((state, root)) = configured_root_states(&states, configured_roots)
-        .into_iter()
-        .find(|(_, root)| path.starts_with(root))
-    else {
-        return Err(LocalMediaResolutionError::NoConfiguredRoot);
-    };
-    if !state.identity_confirmed || !state.is_available || !state.last_scan_complete {
-        return Err(LocalMediaResolutionError::RootUnavailable);
-    }
-    let expected_marker = state
-        .device_id
-        .clone()
-        .ok_or(LocalMediaResolutionError::RootUnavailable)?;
-    let expected_root_state = ExpectedRootAuthorityState::from_model(state);
-    let authority_path = path.clone();
-    let authority_root = root.clone();
-    let acquired = tokio::time::timeout(
-        FILE_PROBE_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            let authority = Arc::new(RootAuthorityLease::acquire(
-                &authority_root,
-                &expected_marker,
-            )?);
-            let file = authority.open_regular_file(&authority_path)?;
-            Ok::<_, std::io::Error>((authority, file))
-        }),
-    )
-    .await
-    .map_err(|_| LocalMediaResolutionError::AuthorityCheckTimedOut)?
-    .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable {
-        source: std::io::Error::other(format!("local authority task failed: {source}")),
-    })?
-    .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable { source })?;
+    let acquired = acquire_authority_probe(class, track_id, &root, &path, &marker).await?;
 
     // The blocking handle acquisition is intentionally outside SQLite. Re-read
     // both bindings afterward so a concurrent reconciliation/root demotion
     // cannot publish authority acquired for an obsolete database snapshot.
-    let current_model = track::Entity::find_by_id(track_id.to_string())
-        .one(db)
-        .await
-        .map_err(|source| LocalMediaResolutionError::Database { source })?
-        .ok_or(LocalMediaResolutionError::Missing)?;
-    let current_state = library_root::Entity::find_by_id(expected_root_state.path.clone())
-        .one(db)
-        .await
-        .map_err(|source| LocalMediaResolutionError::Database { source })?
-        .ok_or(LocalMediaResolutionError::ChangedDuringResolution)?;
-    if current_model.file_path != model.file_path || !expected_root_state.matches(&current_state) {
-        return Err(LocalMediaResolutionError::ChangedDuringResolution);
-    }
+    verify_unchanged(db, track_id, &model.file_path, &expected).await?;
 
     let extension = path
         .extension()
@@ -419,6 +466,346 @@ pub async fn resolve_track(
         }),
         lease: None,
     })
+}
+
+/// The configured root that currently owns a track, captured together with the
+/// exact authority identity a probe must revalidate.
+struct AuthorizedRoot {
+    expected: ExpectedRootAuthorityState,
+    root: PathBuf,
+    marker: String,
+}
+
+/// Load the exact track row or report it as missing.
+async fn load_track(
+    db: &DatabaseConnection,
+    track_id: &str,
+) -> Result<track::Model, LocalMediaResolutionError> {
+    track::Entity::find_by_id(track_id.to_string())
+        .one(db)
+        .await
+        .map_err(|source| LocalMediaResolutionError::Database { source })?
+        .ok_or(LocalMediaResolutionError::Missing)
+}
+
+/// Select the authoritative configured root containing `file_path`.
+///
+/// Fails closed when no configured root contains the path, when the owning
+/// root is not currently authoritative, or when its identity marker is
+/// absent. The returned [`ExpectedRootAuthorityState`] captures the row so a
+/// later re-read can detect a concurrent demotion.
+async fn select_authorized_root(
+    db: &DatabaseConnection,
+    file_path: &str,
+    configured_roots: &[String],
+) -> Result<AuthorizedRoot, LocalMediaResolutionError> {
+    let states = library_root::Entity::find()
+        .all(db)
+        .await
+        .map_err(|source| LocalMediaResolutionError::Database { source })?;
+    let path = PathBuf::from(file_path);
+    let Some((state, root)) = configured_root_states(&states, configured_roots)
+        .into_iter()
+        .find(|(_, root)| path.starts_with(root))
+    else {
+        return Err(LocalMediaResolutionError::NoConfiguredRoot);
+    };
+    if !state.identity_confirmed || !state.is_available || !state.last_scan_complete {
+        return Err(LocalMediaResolutionError::RootUnavailable);
+    }
+    let marker = state
+        .device_id
+        .clone()
+        .ok_or(LocalMediaResolutionError::RootUnavailable)?;
+    Ok(AuthorizedRoot {
+        expected: ExpectedRootAuthorityState::from_model(state),
+        root,
+        marker,
+    })
+}
+
+/// Acquire retained filesystem authority for `path` under `root`.
+///
+/// Bound the probe before submitting it. A cancelled caller must not be able
+/// to free gate capacity while its detached blocking closure still runs, so
+/// the permit is moved into the closure below. The existing five-second budget
+/// covers both waiting for capacity and running the probe: a saturated gate
+/// can delay a resolution but never stretch it past `FILE_PROBE_TIMEOUT`, and
+/// a callback whose row was recycled while it queued is dropped before it ever
+/// submits a blocking probe.
+///
+/// Speculative (album-pane) and playback-critical callers acquire from
+/// independent gates, so a panes-only saturation cannot delay a playback
+/// resolution here (2026-09-14 N5 review finding).
+#[cfg_attr(not(test), allow(unused_variables))]
+async fn acquire_authority_probe(
+    class: ProbeClass,
+    track_id: &str,
+    root: &std::path::Path,
+    path: &std::path::Path,
+    marker: &str,
+) -> Result<(Arc<RootAuthorityLease>, BoundFile), LocalMediaResolutionError> {
+    let deadline = tokio::time::Instant::now() + FILE_PROBE_TIMEOUT;
+    let probe_permit = tokio::time::timeout_at(deadline, probe_gate(class).acquire())
+        .await
+        .map_err(|_| LocalMediaResolutionError::AuthorityCheckTimedOut)?
+        .map_err(|_| LocalMediaResolutionError::AuthorityUnavailable {
+            source: std::io::Error::other("local authority probe gate unavailable"),
+        })?;
+    let authority_path = path.to_path_buf();
+    let authority_root = root.to_path_buf();
+    let expected_marker = marker.to_owned();
+    #[cfg(test)]
+    let probe_track_id = track_id.to_string();
+    tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            // Hold the gate permit for the entire blocking closure so an
+            // aborted async caller cannot release it while this probe is
+            // still queued or running (2026-09-14 review finding).
+            let _probe_permit = probe_permit;
+            #[cfg(test)]
+            let probe_park_guard = probe_park::enter_if_watched(&probe_track_id);
+            #[cfg(test)]
+            if let Some(park) = probe_park_guard.as_ref() {
+                park.wait_for_release();
+            }
+            let authority = Arc::new(RootAuthorityLease::acquire(
+                &authority_root,
+                &expected_marker,
+            )?);
+            let file = authority.open_regular_file(&authority_path)?;
+            Ok::<_, std::io::Error>((authority, file))
+        }),
+    )
+    .await
+    .map_err(|_| LocalMediaResolutionError::AuthorityCheckTimedOut)?
+    .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable {
+        source: std::io::Error::other(format!("local authority task failed: {source}")),
+    })?
+    .map_err(|source| LocalMediaResolutionError::AuthorityUnavailable { source })
+}
+
+/// Re-read the track and owning root after the blocking probe.
+///
+/// The blocking handle acquisition is intentionally outside SQLite. Re-reading
+/// both bindings afterward ensures a concurrent reconciliation/root demotion
+/// cannot publish authority acquired for an obsolete database snapshot.
+async fn verify_unchanged(
+    db: &DatabaseConnection,
+    track_id: &str,
+    file_path: &str,
+    expected: &ExpectedRootAuthorityState,
+) -> Result<(), LocalMediaResolutionError> {
+    let current_model = track::Entity::find_by_id(track_id.to_string())
+        .one(db)
+        .await
+        .map_err(|source| LocalMediaResolutionError::Database { source })?
+        .ok_or(LocalMediaResolutionError::Missing)?;
+    let current_state = library_root::Entity::find_by_id(expected.path.clone())
+        .one(db)
+        .await
+        .map_err(|source| LocalMediaResolutionError::Database { source })?
+        .ok_or(LocalMediaResolutionError::ChangedDuringResolution)?;
+    if current_model.file_path != file_path || !expected.matches(&current_state) {
+        return Err(LocalMediaResolutionError::ChangedDuringResolution);
+    }
+    Ok(())
+}
+
+/// Test-only instrumentation for the retained-authority probe gates.
+///
+/// Records how many watched probe closures are concurrently executing and
+/// parks them behind a condvar, so a regression can observe the bound
+/// deterministically through the real [`resolve_track`] seam. Production
+/// builds compile this module away entirely.
+#[cfg(test)]
+mod probe_park {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    struct Park {
+        enabled: AtomicBool,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        watcher: Mutex<Option<String>>,
+        waiting: Mutex<()>,
+        release: Condvar,
+        /// Deterministic lost-wakeup regression control: when armed, the
+        /// first waiter that reads `enabled == true` under `waiting` pauses
+        /// inside that window -- still holding `waiting` -- until poked,
+        /// simulating preemption between the predicate read and the condvar
+        /// registration where an unsynchronized [`release`](fn.release)
+        /// used to be lost (2026-09-17 audit rejection).
+        gap: Mutex<Gap>,
+        gap_signal: Condvar,
+    }
+
+    /// State of the predicate-to-wait interleaving window.
+    #[derive(Default)]
+    struct Gap {
+        /// Arm the window for the next waiter.
+        armed: bool,
+        /// A waiter currently sits in the window, holding `waiting`.
+        occupied: bool,
+        /// The tester poked: the waiter must leave the window.
+        poke: bool,
+    }
+
+    fn park() -> &'static Park {
+        static PARK: OnceLock<Park> = OnceLock::new();
+        PARK.get_or_init(|| Park {
+            enabled: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            watcher: Mutex::new(None),
+            waiting: Mutex::new(()),
+            release: Condvar::new(),
+            gap: Mutex::new(Gap::default()),
+            gap_signal: Condvar::new(),
+        })
+    }
+
+    /// Watch exactly `track_id` and park its probe closures until released.
+    pub(super) fn watch(track_id: &str) {
+        let state = park();
+        *state.watcher.lock().expect("probe park watcher") = Some(track_id.to_string());
+        state.in_flight.store(0, Ordering::SeqCst);
+        state.peak.store(0, Ordering::SeqCst);
+        // Arm under the same mutex `release` disarms under, so the two
+        // transitions can never interleave with a waiter's predicate loop.
+        let wait_lock = state.waiting.lock().expect("probe park watch");
+        state.enabled.store(true, Ordering::SeqCst);
+        drop(wait_lock);
+    }
+
+    /// Disarm the park and wake every parked closure.
+    pub(super) fn release() {
+        let state = park();
+        // Flip `enabled` while holding the waiter mutex. A waiter that has
+        // read `enabled == true` under that mutex either sees the flip when
+        // it re-checks, or has already registered on the condvar (its
+        // `wait` released the mutex to us), so the trailing notification
+        // can never be lost. Without this lock the flip lands between the
+        // waiter's last true predicate read and its wait registration: the
+        // parked probe never wakes, and the test runtime waiting on it
+        // hangs forever (2026-09-17 audit rejection).
+        let wait_lock = state.waiting.lock().expect("probe park release");
+        state.enabled.store(false, Ordering::SeqCst);
+        drop(wait_lock);
+        state.release.notify_all();
+    }
+
+    /// Arm the predicate-to-wait window for the next waiter (regression
+    /// control; inert for every other test).
+    pub(super) fn arm_gap() {
+        let state = park();
+        *state.gap.lock().expect("probe park gap") = Gap {
+            armed: true,
+            occupied: false,
+            poke: false,
+        };
+    }
+
+    /// Wait (bounded) until a waiter sits inside the predicate-to-wait
+    /// window. Returns `false` when the deadline passes without occupation.
+    pub(super) fn wait_for_gap_occupation(budget: Duration) -> bool {
+        let state = park();
+        let deadline = Instant::now() + budget;
+        loop {
+            if state.gap.lock().expect("probe park gap").occupied {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Free whichever waiter occupies the window and disarm it. Safe to
+    /// call when the window was never entered.
+    pub(super) fn poke_gap() {
+        let state = park();
+        let mut gap = state.gap.lock().expect("probe park gap");
+        gap.poke = true;
+        state.gap_signal.notify_all();
+    }
+
+    pub(super) fn in_flight() -> usize {
+        park().in_flight.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn peak() -> usize {
+        park().peak.load(Ordering::SeqCst)
+    }
+
+    fn is_watched(track_id: &str) -> bool {
+        park()
+            .watcher
+            .lock()
+            .map(|watcher| watcher.as_deref() == Some(track_id))
+            .unwrap_or(false)
+    }
+
+    /// Enter one watched probe, returning a guard that keeps the in-flight
+    /// count and parks the closure until [`release`]. Unwatched probes get
+    /// `None` and pay nothing.
+    pub(super) fn enter_if_watched(track_id: &str) -> Option<Guard> {
+        if !is_watched(track_id) {
+            return None;
+        }
+        let state = park();
+        let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        state.peak.fetch_max(now, Ordering::SeqCst);
+        Some(Guard { state })
+    }
+
+    pub(super) struct Guard {
+        state: &'static Park,
+    }
+
+    impl Guard {
+        pub(super) fn wait_for_release(&self) {
+            if !self.state.enabled.load(Ordering::SeqCst) {
+                return;
+            }
+            let mut guard = self.state.waiting.lock().expect("probe park wait");
+            while self.state.enabled.load(Ordering::SeqCst) {
+                self.state.stall_in_gap_window();
+                guard = self
+                    .state
+                    .release
+                    .wait(guard)
+                    .expect("probe park wait poisoned");
+            }
+        }
+    }
+
+    impl Park {
+        /// Pause inside the predicate-to-wait window -- `waiting` is held
+        /// for the whole call -- until the tester pokes the window. No-op
+        /// unless the window was armed for this waiter.
+        fn stall_in_gap_window(&self) {
+            let mut gap = self.gap.lock().expect("probe park gap");
+            if !gap.armed {
+                return;
+            }
+            gap.occupied = true;
+            self.gap_signal.notify_all();
+            while !gap.poke {
+                gap = self.gap_signal.wait(gap).expect("probe park gap poisoned");
+            }
+            *gap = Gap::default();
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -833,5 +1220,260 @@ mod tests {
             resolve_track(&db, "escaped", &configured(root.path())).await,
             Err(LocalMediaResolutionError::AuthorityUnavailable { .. })
         ));
+    }
+
+    /// Release the process-global probe park even when an assertion unwinds.
+    struct ParkGuard;
+
+    impl Drop for ParkGuard {
+        fn drop(&mut self) {
+            probe_park::release();
+        }
+    }
+
+    /// Free a waiter held inside the `probe_park` predicate-to-wait gap even
+    /// when an assertion unwinds, so a failing test can never strand
+    /// `release()` behind a held wait mutex.
+    struct GapPokeGuard;
+
+    impl Drop for GapPokeGuard {
+        fn drop(&mut self) {
+            probe_park::poke_gap();
+        }
+    }
+
+    /// Serializes tests that drive the process-global `probe_park`
+    /// instrumentation: only one watcher can be armed at a time, and sibling
+    /// tests run in parallel.
+    static PROBE_PARK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Spawn `attempt_count` real `resolve_track` calls for `track`, returning
+    /// their handles so the caller can simulate recycled rows by aborting them.
+    fn spawn_resolution_attempts(
+        db: &Arc<DatabaseConnection>,
+        roots: &[String],
+        track: &str,
+        attempt_count: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<ResolvedLocalMedia, LocalMediaResolutionError>>> {
+        (0..attempt_count)
+            .map(|_| {
+                let db = Arc::clone(db);
+                let roots = roots.to_vec();
+                let track = track.to_string();
+                tokio::spawn(async move { resolve_track(&db, &track, &roots).await })
+            })
+            .collect()
+    }
+
+    /// Wait until the watched probe count reaches `target`, panicking with
+    /// `message` if it does not within the two-second budget.
+    async fn wait_for_probe_count(target: usize, message: &'static str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while probe_park::in_flight() != target {
+            assert!(tokio::time::Instant::now() < deadline, "{message}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recycled_rows_cannot_grow_the_authority_probe_backlog_past_the_bound() {
+        let _serial = PROBE_PARK_TEST_LOCK.lock().await;
+        let db = database().await;
+        let root = tempfile::tempdir().expect("library root");
+        authorize_root(&db, root.path()).await;
+        let roots = configured(root.path());
+        let path = root.path().join("track.flac");
+        std::fs::write(&path, b"authorized").expect("write authorized file");
+        // `probe_park` is process-global, so watch a private id: sibling
+        // tests run in parallel and resolve their own tracks.
+        const TRACK: &str = "bounded-probe-track";
+        model(TRACK, &path).insert(&db).await.expect("insert track");
+
+        let db = Arc::new(db);
+        probe_park::watch(TRACK);
+        let _park = ParkGuard;
+
+        // Submit several times the permitted concurrency, then let the
+        // resolutions reach the point where their blocking probes run.
+        let attempts =
+            spawn_resolution_attempts(&db, &roots, TRACK, MAX_CONCURRENT_AUTHORITY_PROBES * 3);
+
+        // The gate is the only thing that can keep the rest of the probes
+        // out; wait until every permit is held by a parked probe.
+        wait_for_probe_count(
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "fewer than the bound of probes entered the gate",
+        )
+        .await;
+        assert_eq!(
+            probe_park::peak(),
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "the gate must cap concurrent authority probes at the declared bound"
+        );
+
+        // Recycled rows abandon their resolution (the album pane's
+        // `run_until_revoked` drops the pending future). The probe already
+        // running is detached and keeps its permit, so cancelling the async
+        // callers must not hand that capacity to a new probe.
+        for attempt in &attempts {
+            attempt.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            probe_park::in_flight(),
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "a cancelled caller must not release capacity held by a running probe"
+        );
+
+        probe_park::release();
+        wait_for_probe_count(0, "parked probes did not finish after release").await;
+        assert_eq!(
+            probe_park::peak(),
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "the backlog never exceeded the bound"
+        );
+    }
+
+    /// The speculative pane lane and the playback lane must draw on separate
+    /// capacity: a fully saturated album-pane lane must not delay a playback
+    /// resolution for an unrelated healthy root (2026-09-14 N5 review
+    /// finding).
+    #[tokio::test]
+    async fn saturated_pane_probes_do_not_block_a_playback_resolution() {
+        let _serial = PROBE_PARK_TEST_LOCK.lock().await;
+        let db = database().await;
+        let root = tempfile::tempdir().expect("library root");
+        authorize_root(&db, root.path()).await;
+        let roots = configured(root.path());
+        let pane_path = root.path().join("pane.flac");
+        std::fs::write(&pane_path, b"pane").expect("write pane file");
+        let playback_path = root.path().join("playback.flac");
+        std::fs::write(&playback_path, b"playback").expect("write playback file");
+        // `probe_park` is process-global, so watch a private id; the playback
+        // track is deliberately a different id so its probe is not parked.
+        const PANE_TRACK: &str = "saturated-pane-track";
+        const PLAYBACK_TRACK: &str = "starving-playback-track";
+        model(PANE_TRACK, &pane_path)
+            .insert(&db)
+            .await
+            .expect("insert pane track");
+        model(PLAYBACK_TRACK, &playback_path)
+            .insert(&db)
+            .await
+            .expect("insert playback track");
+
+        let db = Arc::new(db);
+        probe_park::watch(PANE_TRACK);
+        let _park = ParkGuard;
+
+        // Saturate the speculative lane: every permit is held by a parked
+        // pane probe, each of which is detached from its async caller.
+        let pane_attempts =
+            spawn_resolution_attempts(&db, &roots, PANE_TRACK, MAX_CONCURRENT_AUTHORITY_PROBES);
+        wait_for_probe_count(
+            MAX_CONCURRENT_AUTHORITY_PROBES,
+            "the pane lane did not saturate",
+        )
+        .await;
+
+        // A playback resolution for a different healthy track must still
+        // reach the filesystem promptly rather than waiting out the probe
+        // budget for a permit held by pane work.
+        let playback = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolve_track_with_class(ProbeClass::Playback, &db, PLAYBACK_TRACK, &roots),
+        )
+        .await
+        .expect("a playback resolution must not be starved by saturated pane probes");
+        assert!(
+            playback.is_ok(),
+            "playback resolution should succeed: {playback:?}"
+        );
+
+        probe_park::release();
+        for attempt in pane_attempts {
+            let resolved = attempt.await.expect("parked pane probe joined");
+            assert!(
+                resolved.is_ok(),
+                "saturated pane probe should succeed: {resolved:?}"
+            );
+        }
+        wait_for_probe_count(0, "parked pane probes did not finish after release").await;
+    }
+
+    /// The 2026-09-17 audit rejection: `release()` used to flip `enabled`
+    /// and notify without acquiring the waiter mutex, so a release landing
+    /// between the waiter's last true predicate read and its
+    /// `Condvar::wait` registration was lost and the parked probe -- plus
+    /// the test runtime joining it -- hung forever. Force that exact
+    /// interleaving deterministically: the waiter pauses inside the
+    /// predicate-to-wait window while holding the wait mutex, and release
+    /// must block behind it, complete once the waiter registers, and wake
+    /// it. Bounded even on failure: the poke guard drops before the park
+    /// guard, so a failing assertion can never strand `release()` behind a
+    /// held wait mutex.
+    #[tokio::test]
+    async fn release_landing_in_the_predicate_to_wait_gap_wakes_the_parked_probe() {
+        let _serial = PROBE_PARK_TEST_LOCK.lock().await;
+        const TRACK: &str = "probe-park-lost-wakeup-track";
+        probe_park::watch(TRACK);
+        let _park = ParkGuard;
+        // Declared after `_park` so it drops first and frees the waiter
+        // from the gap window even when an assertion below panics.
+        let _poke = GapPokeGuard;
+
+        probe_park::arm_gap();
+        let (waiter_done_tx, waiter_done_rx) = mpsc::channel();
+        // The join handle is deliberately unused: completion is observed
+        // through the bounded channel below so a stuck waiter fails the
+        // test instead of hanging `join`.
+        let _waiter = thread::spawn(move || {
+            if let Some(guard) = probe_park::enter_if_watched(TRACK) {
+                guard.wait_for_release();
+            }
+            waiter_done_tx.send(()).expect("report waiter completion");
+        });
+
+        // The waiter is now parked inside the predicate-to-wait window,
+        // holding the wait mutex.
+        assert!(
+            probe_park::wait_for_gap_occupation(Duration::from_secs(2)),
+            "the armed waiter never reached the predicate-to-wait window"
+        );
+
+        // Release from a separate thread. With the synchronization fix it
+        // may only complete after the waiter has registered on the condvar.
+        let (releaser_entered_tx, releaser_entered_rx) = mpsc::channel();
+        let (releaser_done_tx, releaser_done_rx) = mpsc::channel();
+        let releaser = thread::spawn(move || {
+            releaser_entered_tx.send(()).expect("report release entry");
+            probe_park::release();
+            releaser_done_tx
+                .send(())
+                .expect("report release completion");
+        });
+        releaser_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the releaser never reached release()");
+        assert!(
+            releaser_done_rx.try_recv().is_err(),
+            "release() completed while a waiter still held the predicate-to-wait window"
+        );
+
+        // Let the waiter leave the window and register on the condvar. The
+        // blocked release must then complete and wake the parked probe.
+        probe_park::poke_gap();
+        waiter_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parked probe must wake after the gap release");
+        releaser_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocked release never completed after the waiter registered");
+        releaser.join().expect("releaser thread panicked");
+        assert_eq!(
+            probe_park::in_flight(),
+            0,
+            "the released probe must leave the gate"
+        );
     }
 }
