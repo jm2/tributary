@@ -14,7 +14,7 @@ use crate::architecture::models::{Rating, RatingCapability, TrackRating};
 use crate::architecture::{SourceId, TrackId};
 use crate::local::engine::LibraryCommand;
 
-use super::library_commands::LibraryCommandAdmission;
+use super::library_commands::{CommandAdmissionOutcome, LibraryCommandAdmission};
 use super::objects::{PlaylistOccurrenceState, TrackObject};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -975,7 +975,17 @@ fn queue_rating_command(
     let Some(track_id) = local_rating_track_id(&track) else {
         return false;
     };
-    commands.try_send(LibraryCommand::SetTrackRating { track_id, rating })
+    match commands.try_send(LibraryCommand::SetTrackRating { track_id, rating }) {
+        CommandAdmissionOutcome::Accepted => true,
+        CommandAdmissionOutcome::Overloaded => {
+            // R9: the bounded FIFO refused the edit rather than growing the
+            // backlog. Keep the popover open so the user can retry once the
+            // engine has caught up.
+            tracing::warn!("Library command FIFO is full; rating update was not admitted");
+            false
+        }
+        CommandAdmissionOutcome::Closed => false,
+    }
 }
 
 fn local_rating_track_id(track: &TrackObject) -> Option<TrackId> {

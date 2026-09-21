@@ -18,8 +18,7 @@ use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
 use crate::desktop_integration::MediaAction;
 use crate::local::engine::{
-    LibraryCommand, LibraryEngine, LibraryEvent, RootReauthorizationOutcome,
-    RootReauthorizationRequest,
+    LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
 };
 use crate::local::playlist_sidebar::{
     PlaylistSidebarEntry, PlaylistSidebarRevision, PlaylistSidebarSnapshot, PlaylistSidebarState,
@@ -36,10 +35,10 @@ use super::persistence::{
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{
-    advance_track, advance_track_from_user, format_ms, play_or_start, play_track_at,
-    previous_or_restart_from_user, refresh_projected_library_uris, replay_current, stop_playback,
-    toggle_or_start, BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh,
-    PLAYLIST_SOURCE_PREFIX,
+    admit_history_credit, advance_track, advance_track_from_user, format_ms, play_or_start,
+    play_track_at, previous_or_restart_from_user, refresh_projected_library_uris, replay_current,
+    retry_pending_history_credit_before_transition, stop_playback, toggle_or_start,
+    BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
@@ -1659,6 +1658,11 @@ pub(crate) fn build_window(
     // normal shutdown wait for every earlier admitted command to finish.
     let (library_commands, library_command_rx) =
         super::library_commands::LibraryCommandAdmission::channel();
+    // Cancelled synchronously by `close_and_flush` below so the engine's
+    // initial scan stops admitting mutations instead of delaying the reserved
+    // Flush drain. The token is `Send + Sync`, unlike the `Rc` admission gate,
+    // so it can cross into the library runtime task.
+    let engine_scan_cancellation = library_commands.scan_cancellation();
     let (playlist_sidebar_refresh, playlist_sidebar_refresh_rx) =
         crate::local::playlist_sidebar::playlist_sidebar_refresh_channel();
     let playlist_sidebar_replacing = Rc::new(Cell::new(false));
@@ -2167,8 +2171,12 @@ pub(crate) fn build_window(
                     engine_tx_clone,
                     library_command_rx,
                     services,
+                    engine_scan_cancellation,
                 );
-                engine.run().await;
+                // Boxed: the engine's startup future carries the whole
+                // scan/command state machine and exceeds clippy's
+                // `large_futures` threshold for the GTK task stack frame.
+                Box::pin(engine.run()).await;
             }
             Err(e) => {
                 if let Err(error) = server_playlist_coordinator_shutdown.shutdown().await {
@@ -3148,24 +3156,24 @@ pub(crate) fn build_window(
                 }
 
                 // Account before EOS repeat/advance or error recovery mutates
-                // the occurrence. The session latches exactly once and the
-                // unbounded FIFO accepts synchronously, so no detached send
-                // task can outlive the normal-shutdown drain marker.
-                let history_track_id = observe_player_event_before_history(
+                // the occurrence. The session returns a qualified credit
+                // candidate; the one-shot latch commits only when the bounded
+                // FIFO admits the durable command. An overload retains the
+                // credit inside the session so the next qualifying sample
+                // re-earns it; an explicit shutdown close drops it quietly
+                // because the FIFO has already been drained.
+                let history_credit = observe_player_event_before_history(
                     || {
                         let _ = playback_lastfm.observe_event(&event);
                     },
                     || playback_session.borrow_mut().observe_history_event(&event),
                 );
-                if let Some(track_id) = history_track_id {
-                    let counted_at_ms = Utc::now().timestamp_millis();
-                    if !playback_history_commands.try_send(LibraryCommand::RecordPlaybackHistory {
-                        track_id,
-                        counted_at_ms,
-                    }) {
-                        warn!("Playback history command admission is closed");
-                    }
-                }
+                admit_history_credit(
+                    &playback_history_commands,
+                    &playback_session,
+                    history_credit,
+                    Utc::now().timestamp_millis(),
+                );
                 match event {
                     PlayerEvent::StateChanged { state, .. } => {
                         match state {
@@ -3267,6 +3275,16 @@ pub(crate) fn build_window(
                         buffering_tracker.invalidate();
                         play_btn.set_child(Option::<&gtk::Widget>::None);
                         let mode = repeat_mode.get();
+
+                        // Last delivery chance before the transition retires
+                        // the occurrence: a play qualified at EOS and refused
+                        // during overload has no later sample to re-earn
+                        // through once this branch replays, advances, or
+                        // clears (PR #286 round-4 finding j9j83).
+                        retry_pending_history_credit_before_transition(
+                            &playback_history_commands,
+                            &playback_session,
+                        );
 
                         // Repeat-one: replay the same track.
                         if mode == RepeatMode::One

@@ -331,18 +331,18 @@ impl RootTrustPromptController {
                 }
 
                 if action == ResponseAction::Confirm {
-                    if self
+                    let outcome = self
                         .inner
                         .command_admission
-                        .try_send(LibraryCommand::ConfirmRootTrust(request))
-                    {
+                        .try_send(LibraryCommand::ConfirmRootTrust(request));
+                    if outcome.is_accepted() {
                         self.add_toast(rust_i18n::t!("library_root_trust.pending_toast").as_ref());
                     } else {
                         // The request was not delivered, so do not turn
                         // lifetime deduplication into a permanent denial
                         // of the user's ability to retry.
                         self.inner.queue.borrow_mut().allow_retry(&prompt_id);
-                        tracing::warn!("Library root trust command admission is closed");
+                        tracing::warn!(?outcome, "Library root trust command was not admitted");
                         self.add_toast(rust_i18n::t!("library_root_trust.failed_toast").as_ref());
                     }
                 }
