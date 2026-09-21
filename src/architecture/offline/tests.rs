@@ -229,7 +229,10 @@ fn entity_validator_bounds_redaction_and_serde() {
     assert!(serde_json::from_str::<EntityValidator>("{\"etag\":\"\"}").is_err());
     let oversized = serde_json::json!({ "etag": "x".repeat(MAX_OFFLINE_METADATA_BYTES + 1) });
     assert!(serde_json::from_value::<EntityValidator>(oversized).is_err());
+}
 
+#[test]
+fn validator_payload_bounds_redaction_and_serde() {
     // The payload newtype enforces the same bound on its own: bound,
     // bound + 1, empty, serde round-trip and serde reject, redacted
     // debug.
