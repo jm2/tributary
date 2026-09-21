@@ -8750,12 +8750,16 @@ mod tests {
     ///
     /// `RecommendedWatcher::new` claims one inotify instance, and
     /// `fs.inotify.max_user_instances` is a per-user kernel cap. On a shared
-    /// host other tenants can hold every instance, so construction fails with
-    /// EMFILE no matter what the code under test does — host capacity, not a
-    /// watcher-contract regression. The deterministic assertions these tests
-    /// make are unchanged on a healthy host. Any non-capacity construction
-    /// error (backend, configuration, or platform regression) panics so the
-    /// test fails loudly; the skip is scoped by
+    /// host other tenants can hold every instance, so construction can fail
+    /// with EMFILE no matter what the code under test does — host capacity,
+    /// not a watcher-contract regression. EMFILE alone is ambiguous (the
+    /// same errno also reports per-process descriptor exhaustion), so the
+    /// skip only fires when the process's own descriptor table demonstrably
+    /// has headroom — see `is_inotify_capacity_errno`. The deterministic
+    /// assertions these tests make are unchanged on a healthy host. Any
+    /// non-capacity construction error — including EMFILE caused by real
+    /// descriptor exhaustion, which a descriptor-leak regression would
+    /// produce — panics so the test fails loudly; the skip is scoped by
     /// `is_watcher_backend_capacity_error`, unit-tested below.
     fn idle_watcher_backend_or_skip() -> Option<RecommendedWatcher> {
         match RecommendedWatcher::new(
@@ -8772,9 +8776,12 @@ mod tests {
     }
 
     /// Linux errno values for the inotify capacity failures, kept as raw
-    /// numbers to avoid a libc dev-dependency: EMFILE (24) means
-    /// `fs.inotify.max_user_instances` is exhausted, ENOSPC (28) means
-    /// `fs.inotify.max_user_watches` is exhausted. Gated to Linux because
+    /// numbers to avoid a libc dev-dependency: ENOSPC (28) unambiguously
+    /// means `fs.inotify.max_user_watches` is exhausted, while EMFILE (24)
+    /// is ambiguous — inotify_init(2) reports it both when
+    /// `fs.inotify.max_user_instances` is exhausted and when the process's
+    /// open-descriptor limit is reached — so it needs independent evidence
+    /// before it may read as capacity. Gated to Linux because
     /// `raw_os_error()` is only meaningful in the target OS's namespace —
     /// see `is_inotify_capacity_errno`.
     #[cfg(target_os = "linux")]
@@ -8798,8 +8805,9 @@ mod tests {
 
     /// True only when `error` is the documented shared-host capacity
     /// condition: the kernel refused inotify state because a per-user limit
-    /// is exhausted — EMFILE (instances) or ENOSPC (watch descriptors) on
-    /// Linux, or notify's explicit portable `MaxFilesWatch`. Every other
+    /// is exhausted — ENOSPC (watch descriptors) on Linux, EMFILE (instances)
+    /// on Linux only with independent descriptor-headroom evidence, or
+    /// notify's explicit portable `MaxFilesWatch`. Every other
     /// error — a backend initialization, configuration, or platform
     /// regression such as EPERM — must fail the test instead of skipping
     /// it, so this predicate is deliberately narrow and unit-tested in both
@@ -8812,11 +8820,68 @@ mod tests {
         }
     }
 
-    /// Linux errno namespace: 24 and 28 are the inotify per-user capacity
-    /// limits, so they alone identify host saturation here.
+    /// Linux errno namespace: 28 (ENOSPC) is unambiguously the inotify
+    /// max_user_watches capacity limit. 24 (EMFILE) is ambiguous between
+    /// that per-user saturation and ordinary per-process descriptor
+    /// exhaustion, so it classifies as capacity only when the process's own
+    /// descriptor table demonstrably has headroom, which rules out
+    /// descriptor exhaustion — see `process_fd_table_has_headroom`.
     #[cfg(target_os = "linux")]
     fn is_inotify_capacity_errno(raw_os_error: Option<i32>) -> bool {
-        matches!(raw_os_error, Some(EMFILE | ENOSPC))
+        match raw_os_error {
+            Some(ENOSPC) => true,
+            Some(EMFILE) => emfile_is_inotify_capacity(process_fd_table_has_headroom()),
+            _ => false,
+        }
+    }
+
+    /// Decision core for the ambiguous Linux EMFILE, parameterized on the
+    /// independent descriptor-table evidence so both directions stay
+    /// unit-testable without mutating host descriptor state: with headroom,
+    /// EMFILE means `fs.inotify.max_user_instances` exhaustion (capacity,
+    /// skip); without it, EMFILE is descriptor exhaustion in this process —
+    /// precisely the leak class these watcher tests exist to catch — and
+    /// must fail the test instead of skipping it.
+    #[cfg(target_os = "linux")]
+    fn emfile_is_inotify_capacity(fd_table_has_headroom: bool) -> bool {
+        fd_table_has_headroom
+    }
+
+    /// Independent EMFILE discriminator: true only when the process's open
+    /// descriptor count is demonstrably below its `RLIMIT_NOFILE` soft
+    /// limit. Undeterminable state (`/proc` unreadable or unparsable)
+    /// returns false — no evidence, no skip; a skip needs positive proof
+    /// the errno cannot be an ordinary descriptor failure.
+    #[cfg(target_os = "linux")]
+    fn process_fd_table_has_headroom() -> bool {
+        match (open_fd_count(), soft_fd_limit()) {
+            (Some(used), Some(limit)) => used < limit,
+            _ => false,
+        }
+    }
+
+    /// Number of open descriptors, counted from `/proc/self/fd` (includes
+    /// the descriptor `read_dir` itself holds while listing).
+    #[cfg(target_os = "linux")]
+    fn open_fd_count() -> Option<u64> {
+        let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+        Some(entries.filter_map(Result::ok).count() as u64)
+    }
+
+    /// Soft `RLIMIT_NOFILE` parsed from `/proc/self/limits`; `u64::MAX`
+    /// stands in for an `unlimited` soft limit.
+    #[cfg(target_os = "linux")]
+    fn soft_fd_limit() -> Option<u64> {
+        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+        for line in limits.lines() {
+            if let Some(rest) = line.strip_prefix("Max open files") {
+                return match rest.split_whitespace().next()? {
+                    "unlimited" => Some(u64::MAX),
+                    soft => soft.parse().ok(),
+                };
+            }
+        }
+        None
     }
 
     /// Non-Linux errno namespaces: `raw_os_error()` reports the host OS's
@@ -8850,30 +8915,50 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn watcher_backend_capacity_decision_skips_linux_capacity_errnos() {
-        // Positive control: each documented Linux host-capacity errno maps
-        // to skip. Raw errno values are only the inotify capacity set on
-        // Linux, so this control is target-gated like the predicate arm it
-        // exercises.
-        let capacity_errors = [
-            (
-                "EMFILE (max_user_instances)",
-                notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
-                    EMFILE,
-                ))),
-            ),
-            (
-                "ENOSPC (max_user_watches)",
-                notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
-                    ENOSPC,
-                ))),
-            ),
-        ];
-        for (name, error) in capacity_errors {
-            assert!(
-                is_watcher_backend_capacity_error(&error),
-                "{name} is host capacity and must skip"
-            );
-        }
+        // Positive control: ENOSPC is unambiguously the inotify
+        // max_user_watches host-capacity errno and maps to skip through the
+        // full predicate. Raw errno values are only the inotify capacity set
+        // on Linux, so this control is target-gated like the predicate arm
+        // it exercises.
+        let enospc = notify::Error::new(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(
+            ENOSPC,
+        )));
+        assert!(
+            is_watcher_backend_capacity_error(&enospc),
+            "ENOSPC (max_user_watches) is host capacity and must skip"
+        );
+        // EMFILE needs independent descriptor-headroom evidence before it
+        // may read as max_user_instances capacity, so the positive
+        // assertion runs through the evidence-parameterized decision core
+        // the live arm delegates to; the inverse direction is pinned in
+        // `watcher_backend_capacity_decision_fails_emfile_without_fd_headroom`.
+        assert!(
+            emfile_is_inotify_capacity(true),
+            "EMFILE with descriptor-table headroom (max_user_instances) is host capacity and must skip"
+        );
+        // Wiring check: the live predicate's EMFILE arm must consult
+        // exactly this evidence, so its verdict tracks the measured
+        // descriptor state of this process.
+        assert_eq!(
+            is_inotify_capacity_errno(Some(EMFILE)),
+            process_fd_table_has_headroom(),
+            "live EMFILE classification must track descriptor-headroom evidence"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_backend_capacity_decision_fails_emfile_without_fd_headroom() {
+        // Discriminating inverse control for the ambiguous EMFILE arm:
+        // without descriptor-headroom evidence, EMFILE must NOT read as
+        // inotify capacity. inotify_init(2) also returns EMFILE when the
+        // process's own descriptor table is exhausted — exactly what a
+        // descriptor-leak regression produces — and that failure must fail
+        // the watcher tests loudly instead of silently skipping them.
+        assert!(
+            !emfile_is_inotify_capacity(false),
+            "EMFILE without descriptor headroom is process fd exhaustion, not host capacity; it must fail the test"
+        );
     }
 
     #[test]
