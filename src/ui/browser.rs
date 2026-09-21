@@ -1306,6 +1306,13 @@ fn repopulate_panes(
 /// while the pre-reset selections silently rode along in the filter
 /// callback).
 ///
+/// The folder pane joins the reset: clearing `folder_prefix` alone left
+/// `folder_location`, the folder store, and the folder selection on the
+/// pre-reset directory, so the pane kept displaying a stale directory
+/// inconsistent with the now-empty composed filter (issue #250 rework
+/// finding — hit by the album-artist toggle and every reset path that
+/// does not explicitly clear or re-attach the folder model).
+///
 /// Does NOT emit: callers that replace the source splice the full,
 /// unfiltered track set themselves (see `window.rs` `display_tracks`),
 /// and the reset state composes to exactly that.
@@ -1337,6 +1344,14 @@ pub fn reset_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: 
             entry.set_text("");
         }
     }
+
+    // Reset the folder pane to the roots level so its displayed
+    // directory, store rows, and selection agree with the cleared
+    // folder_prefix. Runs before the pane extraction below so the
+    // folder state resets even when the widget tree is unreachable
+    // (idempotent with the explicit clear/attach calls the display
+    // paths make right after this function).
+    reset_folder_navigation(state);
 
     let Some(panes) = browser_panes(browser_box) else {
         return;
@@ -1792,7 +1807,7 @@ mod tests {
         let pane_stores = q4_browser_pane_stores(&browser_box);
         // populate_genres prepends the "All" row: 1 + the 4 synthetic genres.
         assert_eq!(
-            pane_stores.first().map(gio::ListStore::n_items),
+            pane_stores.first().map(|store| store.n_items()),
             Some(5),
             "publication must repopulate the genre pane from the snapshot"
         );
@@ -2541,6 +2556,207 @@ mod tests {
         );
     }
 
+    /// Unique scratch tree for the folder-navigation contracts: two real
+    /// browsable roots (`ga`, `gb`), each holding `sub/01.flac`, so the
+    /// production `from_configured`/`place_tracks` pipeline sees two
+    /// available roots with a navigable child directory. Scratch lives
+    /// under `${TMPDIR:-/var/tmp}` (never /tmp) and is removed on drop.
+    struct FolderScratch {
+        base: std::path::PathBuf,
+    }
+
+    impl FolderScratch {
+        fn new(tag: &str) -> Self {
+            let base = std::env::var_os("TMPDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp"))
+                .join(format!("tr-2xstt-folder-{tag}-{}", std::process::id()));
+            for root_name in ["ga", "gb"] {
+                let dir = base.join(root_name).join("sub");
+                std::fs::create_dir_all(&dir).expect("create scratch root dir");
+                std::fs::write(dir.join("01.flac"), b"").expect("create scratch track file");
+            }
+            Self { base }
+        }
+
+        fn root_path(&self, name: &str) -> std::path::PathBuf {
+            self.base.join(name)
+        }
+    }
+
+    impl Drop for FolderScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// One source track rooted in the scratch tree: genre/artist/album
+    /// are grouping fixtures; the URI points at the real scratch file so
+    /// the production placement pipeline can bucket it.
+    fn folder_scratch_track(scratch: &FolderScratch, root: &str, title: &str) -> TrackObject {
+        let uri = url::Url::from_file_path(scratch.root_path(root).join("sub/01.flac"))
+            .expect("valid file uri")
+            .to_string();
+        TrackObject::new(
+            1, title, 60, "Alpha", "Album A", "Jazz", "", 0, "", 0, 0, 0, "flac", &uri,
+        )
+    }
+
+    /// Attach the production folder model the way `display_local_tracks`
+    /// does: two real configured roots, real track placement, a real
+    /// `FolderBrowser`.
+    fn attach_two_root_folder_model(state: &BrowserState, scratch: &FolderScratch) {
+        let roots = vec![
+            crate::ui::folder_browser::BrowsableRoot::from_configured(
+                scratch.root_path("ga").to_str().expect("utf8 root path"),
+                None,
+            ),
+            crate::ui::folder_browser::BrowsableRoot::from_configured(
+                scratch.root_path("gb").to_str().expect("utf8 root path"),
+                None,
+            ),
+        ];
+        let inputs = vec![
+            crate::ui::folder_browser::TrackPathInput {
+                source_label: "local".to_string(),
+                path: Some(scratch.root_path("ga").join("sub/01.flac")),
+            },
+            crate::ui::folder_browser::TrackPathInput {
+                source_label: "local".to_string(),
+                path: Some(scratch.root_path("gb").join("sub/01.flac")),
+            },
+        ];
+        let (placed, _report) = crate::ui::folder_browser::place_tracks(&roots, &inputs);
+        attach_folder_model(
+            state,
+            crate::ui::folder_browser::FolderBrowser::new(roots, placed),
+        );
+    }
+
+    /// Navigate into the second root through the production selection
+    /// handler (selection sits on row 0 after the attach reset, so this
+    /// is a real 0→1 change) and assert the navigation took hold.
+    fn navigate_into_second_root(
+        state: &BrowserState,
+        folder_pane: &gtk::Box,
+        folder_sel: &gtk::SingleSelection,
+    ) {
+        folder_sel.set_selected(1);
+        assert!(
+            matches!(
+                &*state.folder_location.borrow(),
+                FolderLocation::Inside { .. }
+            ),
+            "precondition: navigation must be inside a root before the reset"
+        );
+        assert!(
+            state.folder_prefix.borrow().is_some(),
+            "precondition: navigation must apply a folder prefix before the reset"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane).map(|store| store.n_items()),
+            Some(2),
+            "precondition: the pane must display the inside-directory rows (up + sub)"
+        );
+    }
+
+    /// After the reset, the folder pane must display the roots level:
+    /// navigation state, prefix, store rows, and selection all agree
+    /// with the cleared composed filter.
+    fn assert_folder_pane_reset_to_roots(
+        state: &BrowserState,
+        folder_pane: &gtk::Box,
+        folder_sel: &gtk::SingleSelection,
+    ) {
+        assert!(
+            matches!(&*state.folder_location.borrow(), FolderLocation::Roots),
+            "folder navigation must return to the roots level on source replacement"
+        );
+        assert!(
+            state.folder_prefix.borrow().is_none(),
+            "the folder prefix axis must stay cleared after the reset"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane).map(|store| store.n_items()),
+            Some(2),
+            "the folder pane must display the two roots again, not the stale directory"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane)
+                .and_then(|store| store.item(0))
+                .and_downcast::<BrowserItem>()
+                .map(|item| item.label()),
+            Some("ga".to_string()),
+            "the folder pane's first row must be the first root, not the stale up-row"
+        );
+        assert_eq!(
+            folder_sel
+                .selected_item()
+                .and_downcast::<BrowserItem>()
+                .map(|item| item.label()),
+            Some("ga".to_string()),
+            "the folder selection must sit on the first root, consistent with the cleared filter"
+        );
+    }
+
+    /// Evaluated agreement: a post-reset selection composes folder=None —
+    /// the displayed roots and the composed filter say the same thing.
+    fn assert_post_reset_composition_agrees(panes: &[gtk::Box], log: &EmitLog) {
+        get_selection(&panes[0]).set_selected(1);
+        let (genre, artist, album, folder, search) = composed(log);
+        assert_eq!(
+            (
+                genre.as_deref(),
+                artist.as_deref(),
+                album.as_deref(),
+                folder.as_deref(),
+                search.as_str()
+            ),
+            (Some("Folk"), None, None, None, ""),
+            "post-reset interaction must compose from fully cleared axes including folder"
+        );
+    }
+
+    /// Source replacement must reset the folder pane along with every
+    /// other axis: `folder_location` returns to the roots level and the
+    /// folder store/selection display the roots — not the stale
+    /// inside-directory rows — so the pane agrees with the now-empty
+    /// composed filter (issue #250 rework finding: clearing
+    /// `folder_prefix` alone left the pane showing the pre-reset
+    /// directory, the very display/filter disagreement the reset path
+    /// exists to prevent).
+    fn source_replacement_resets_folder_navigation() {
+        let scratch = FolderScratch::new("reset");
+        let source_a = vec![
+            folder_scratch_track(&scratch, "ga", "T1"),
+            folder_scratch_track(&scratch, "gb", "T2"),
+        ];
+        let (log, cb) = recorder();
+        let (browser_box, state) = build_browser(&source_a, false, false, 48, cb);
+        let panes = collect_browser_panes(&browser_box);
+        let folder_pane = &panes[3];
+
+        attach_two_root_folder_model(&state, &scratch);
+
+        // Navigate into the second root through the production
+        // selection handler, then clear the log so only post-reset
+        // emits are observed.
+        let folder_sel = get_selection(folder_pane);
+        navigate_into_second_root(&state, folder_pane, &folder_sel);
+        log.borrow_mut().clear();
+
+        // Source replacement: every axis AND the folder pane must reset.
+        let source_b = vec![fixture_track("Folk", "Beta", "New", "U1")];
+        reset_browser_data(&browser_box, &state, &source_b);
+
+        assert!(
+            log.borrow().is_empty(),
+            "the reset itself must not emit (the caller splices the full set)"
+        );
+        assert_folder_pane_reset_to_roots(&state, folder_pane, &folder_sel);
+        assert_post_reset_composition_agrees(&panes, &log);
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -2559,8 +2775,10 @@ mod tests {
     /// - browser data lifecycle: album selection must survive search
     ///   typing and clearing, source replacement must reset every axis
     ///   so panes and composed filter agree, same-source refresh must
-    ///   preserve still-valid selections and drop vanished axes, and a
-    ///   pending search debounce must die with a replaced source
+    ///   preserve still-valid selections and drop vanished axes, a
+    ///   pending search debounce must die with a replaced source, and
+    ///   source replacement must reset the folder pane to its roots so
+    ///   the displayed directory agrees with the cleared folder filter
     ///   (issue #250);
     /// - tracklist drags must start only from the data row area (folded
     ///   into the popover contract);
@@ -2649,6 +2867,7 @@ mod tests {
                 refresh_drops_vanished_album_and_keeps_surviving_artist();
                 full_sync_reset_clears_every_axis_and_the_entry();
                 pending_search_debounce_never_fires_after_source_replacement();
+                source_replacement_resets_folder_navigation();
             },
         ) else {
             return;
