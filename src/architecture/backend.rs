@@ -159,18 +159,27 @@ pub trait MediaBackend: Send + Sync {
 
     /// Default-deny offline snapshot capability declaration.
     ///
-    /// The contract at `docs/offline-media.md:134-142` requires every
-    /// backend to declare its offline position explicitly through
-    /// `offline_snapshot() -> Result<Option<OfflineSnapshot>, OfflineError>`:
-    /// `Ok(None)` means the source has not declared and is therefore
-    /// not eligible for the cache; `Err(OfflineError::UnsupportedSource)`
-    /// means it explicitly refuses; `Ok(Some(snapshot))` admits
-    /// downloads bounded by the snapshot's per-source byte cap. The
-    /// same set of backends that opt into live `ServerPlaylist`-style
-    /// read authority (Subsonic, Jellyfin, Plex, DAAP) may opt in here;
-    /// Radio-Browser, removable, external-file, and the built-in local
-    /// source must not opt in because they are not credentialed, are
-    /// already local, or are lifecycle-bound without a credential lane.
+    /// The contract requires every backend to declare its offline position
+    /// explicitly through
+    /// `offline_snapshot() -> Result<Option<OfflineSnapshot>, OfflineError>`
+    /// (`docs/offline-media.md:137-140`, "Each source owns its offline
+    /// decision"). `Ok(None)` and `Err(..)` are distinct: `Ok(None)` means
+    /// the source has not declared a position; `Err(OfflineError::Denied)`
+    /// means it explicitly refuses; `Ok(Some(snapshot))` admits downloads
+    /// bounded by the snapshot's per-source byte cap.
+    ///
+    /// The reviewed opt-in set is the four credentialed remote adapters —
+    /// Subsonic, Jellyfin, Plex, and DAAP
+    /// (`docs/offline-media.md:146-149`); any other adapter must return
+    /// `Ok(None)` until its own ADR adds a reviewed capability-matrix row.
+    /// Removable, external-file, and the built-in local source must return
+    /// `Ok(None)` — already local, lifecycle-bound without a credential
+    /// lane, or one-shot (`docs/offline-media.md:150-153`). Radio-Browser
+    /// must return `Err(OfflineError::Denied)`: its streams are public and
+    /// not licensable for offline by default, so it opts out explicitly
+    /// instead of leaving the capability undeclared
+    /// (`docs/offline-media.md:153-156`; capability-matrix row
+    /// `docs/offline-media.md:1085`).
     fn offline_snapshot(&self) -> Result<Option<OfflineSnapshot>, OfflineError> {
         Ok(None)
     }

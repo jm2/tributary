@@ -146,6 +146,55 @@ impl FromStr for SourceId {
     }
 }
 
+/// Durable, non-secret identity of one source incarnation.
+///
+/// Replacing a saved source mints a fresh incarnation and supersedes every
+/// capability decision recorded for the predecessor, while a process
+/// restart only resets the transient session/operation counters and leaves
+/// this value — and an in-flight job's restart authorization — unchanged
+/// (`docs/offline-media.md:157-168`, "Each source owns its offline
+/// decision" item 3; `docs/offline-media.md:325-342` for the
+/// restart-authorization rule). Persisted on the registry's saved-source
+/// record and on every offline job and committed row; it is distinct from
+/// [`SourceId`] (which a replacement preserves) and never carries a
+/// credential, locator, or route.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SourceIncarnationId(Uuid);
+
+impl SourceIncarnationId {
+    /// Adopt an already-persisted incarnation identity.
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    /// Mint the incarnation identity of a newly saved or replaced source.
+    /// Random assignment is always explicit at the registry.
+    pub fn random() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for SourceIncarnationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for SourceIncarnationId {
+    type Err = IdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|_| IdentityError::Source)
+    }
+}
+
 /// Exact non-empty identifier assigned by one source adapter.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -663,6 +712,27 @@ mod tests {
         let first = MediaKey::new(SourceId::local(), track_id.clone());
         let second = MediaKey::new(SourceId::radio_browser(), track_id);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn source_incarnation_ids_are_opaque_bounded_and_replacement_fresh() {
+        let first = SourceIncarnationId::random();
+        let second = SourceIncarnationId::random();
+        assert_ne!(first, second, "each replacement mints a fresh incarnation");
+
+        let parsed: SourceIncarnationId = first.to_string().parse().expect("FromStr");
+        assert_eq!(parsed, first);
+        assert!("not-a-uuid".parse::<SourceIncarnationId>().is_err());
+
+        let json = serde_json::to_string(&first).expect("serialize");
+        let back: SourceIncarnationId = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, first);
+        assert!(serde_json::from_str::<SourceIncarnationId>(r#""""#).is_err());
+
+        // Distinct from SourceId even at the same UUID: a replacement
+        // preserves the SourceId but mints a new incarnation.
+        let as_source = SourceId::from_uuid(first.as_uuid());
+        assert_eq!(as_source.as_uuid(), first.as_uuid());
     }
 
     #[test]

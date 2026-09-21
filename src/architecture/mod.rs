@@ -13,22 +13,27 @@ pub mod offline;
 pub mod server_playlist;
 
 pub use backend::{load_track_catalog, MediaBackend};
-pub use identity::{MediaKey, NativePlaylistId, SourceId, TrackId, ViewOrigin};
+// Same bin-target rationale as the offline block below: the re-export is
+// lib surface until the engine slice (tr-4q8) wires it.
+#[allow(unused_imports)]
+pub use identity::{
+    MediaKey, NativePlaylistId, SourceId, SourceIncarnationId, TrackId, ViewOrigin,
+};
 pub use media::{
     AdvertisedHttpRoute, MediaRepresentation, MediaStreamKind, RemoteMediaResolver,
     ResolvedHttpRequest,
 };
-// The offline re-exports below are intentional public surface for the
-// bounded download/cache engine, the offline catalogue resolver, and the
-// GTK storage panel. The follow-up slices that consume them land as
-// separate implementation records; the binary is not yet wired to them, so
-// silence the unused-import lint at the bin root while keeping the
-// lib-level surface unchanged.
+// The offline re-export below is intentional public surface for exactly
+// two follow-up slices: the bounded download/cache engine (tr-4q8) and
+// the GTK offline storage panel (tr-8h4). This binary is not yet wired
+// to it — the surface is lib-only until those slices land — so the
+// unused-import lint is silenced at the bin root while the lib-level
+// surface stays complete.
 #[allow(unused_imports)]
 pub use offline::{
-    licence_labels, CommittedSnapshot, DigestProvenance, EntityValidator, JobRecord, JobState,
-    LeaseId, OfflineCatalogueEntry, OfflineError, OfflineSnapshot, OperationalLicence,
-    MAX_OFFLINE_BYTE_HINT, MAX_OFFLINE_SNAPSHOT_PATH_BYTES,
+    check_declared_total, CommittedSnapshot, DigestProvenance, EntityValidator, JobRecord,
+    JobState, LeaseId, OfflineCatalogueEntry, OfflineError, OfflineSnapshot, OperationalLicence,
+    MAX_OFFLINE_METADATA_BYTES, MAX_OFFLINE_SNAPSHOT_PATH_BYTES,
 };
 pub use server_playlist::{
     ServerPlaylistSnapshot, ServerPlaylistSummary, MAX_SERVER_PLAYLISTS_PER_LIST,
