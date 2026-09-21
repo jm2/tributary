@@ -6037,6 +6037,21 @@ mod tests {
         }
     }
 
+    /// Explicit bound for waits whose predicate can only turn true after a
+    /// failed mutation's full settle-or-restart unwind. That unwind spans the
+    /// adapter's own bounded deadlines — the 2s `API_TIMEOUT` of the failed
+    /// request, quiescence (`SIGTERM` grace 5s, endpoint release 5s, restart
+    /// 15s — the `QUIESCE_*` deadlines) and restoration inside the 30s
+    /// serialized-recovery deadline — so the generic 10s [`wait_until`] bound
+    /// is smaller than the phase it waits on (tr-9utsm: its one intermittent
+    /// suite-concurrency expiry identified this predicate by deadline-budget
+    /// analysis). These waits use this bound instead; the adapter deadlines
+    /// themselves are never raised, and every behavioral assertion is kept.
+    /// The subsequent lock-free wait resolves in the same unwind tail (route
+    /// release and lock drop are adjacent), so it keeps the default bound,
+    /// exactly like the retained-recovery fixture's 90s route wait above.
+    const SETTLE_UNWIND_BOUND: Duration = Duration::from_secs(90);
+
     /// V2: after the spawn budget is exhausted the production path keeps an
     /// executable retry owner on its own. Once the spawn facility recovers, the
     /// queued job is serviced and its resources are released — with no manual
@@ -11379,7 +11394,9 @@ fn serve(stream: std::net::TcpStream) {
         }
         // No Stop, replacement, controller drop, or event-driven UI cleanup.
         // The timeout case never releases the request: quiescence must kill it.
-        wait_until(|| ticket.route_count() == 0);
+        // The route is released only at the end of the unwind (quiescence,
+        // restart and restoration), so it waits within SETTLE_UNWIND_BOUND.
+        wait_until_within(SETTLE_UNWIND_BOUND, || ticket.route_count() == 0);
         wait_until(|| {
             rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
         });
@@ -11559,7 +11576,9 @@ fn serve(stream: std::net::TcpStream) {
         // Failure cases have no Stop, replacement, drop or UI cleanup.
         // Cancellation cases separately verify Stop-first silence.
         // The timeout case never releases the request: quiescence must kill it.
-        wait_until(|| ticket.route_count() == 0);
+        // The route is released only at the end of the unwind (quiescence,
+        // restart and restoration), so it waits within SETTLE_UNWIND_BOUND.
+        wait_until_within(SETTLE_UNWIND_BOUND, || ticket.route_count() == 0);
         wait_until(|| {
             rustix::fs::flock(&competing, FlockOperation::NonBlockingLockExclusive).is_ok()
         });
