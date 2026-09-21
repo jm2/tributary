@@ -1847,6 +1847,19 @@ mod tests {
         }
     }
 
+    fn assert_forwarded_refusal<T: std::fmt::Debug>(
+        result: Result<T, LastFmRuntimeAdmissionError>,
+        expected: LastFmRuntimeAdmissionError,
+        unexpected: &str,
+        refusal: &str,
+    ) {
+        match result {
+            Err(admission) if admission == expected => {}
+            Err(admission) => panic!("{unexpected}: {admission:?}"),
+            Ok(_) => panic!("{refusal}"),
+        }
+    }
+
     #[tokio::test]
     async fn unavailable_build_rejects_database_without_touching_runtime_dependencies() {
         let (_coordinator_owner, coordinator) = binding();
@@ -2334,17 +2347,12 @@ mod tests {
         source_registry.shutdown().wait().await;
     }
 
-    /// LF2 composition: the runtime controls forward to the exact active
-    /// generation and surface its own typed refusals for the not-ready
-    /// states.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_controls_forward_to_the_active_generation_and_surface_its_typed_refusals() {
-        let live = live_policy_for_test();
-        let (handle, shutdown, _credentials, source_registry, mut coordinator_owner) =
-            spawn_owner_with_stored_session_and_database_attached(&live).await;
-
-        // Active generation: the controls forward to the exact runtime and
-        // surface its own typed refusals for the not-ready states.
+    /// LF2 composition: activate the owner's first published policy
+    /// generation through the public activation path.
+    async fn activate_first_policy_generation(
+        handle: &LastFmApplicationHandle,
+        live: &LastFmLivePolicy,
+    ) {
         let generation = live.snapshot();
         handle
             .try_activate(
@@ -2355,47 +2363,75 @@ mod tests {
             .wait()
             .await
             .expect("generation activates");
+    }
+
+    /// LF2 composition: with an active generation, reauthorization and
+    /// manual-pause recovery capture forward to the exact runtime and
+    /// surface its own typed refusals for the not-ready states.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reauthorization_and_recovery_forward_to_the_active_generation_and_surface_its_typed_refusals(
+    ) {
+        let live = live_policy_for_test();
+        let (handle, shutdown, _credentials, source_registry, mut coordinator_owner) =
+            spawn_owner_with_stored_session_and_database_attached(&live).await;
+        activate_first_policy_generation(&handle, &live).await;
+
         let reauthorization = handle
             .try_reauthorize_same_account(
                 "reauthorization-listener".to_string(),
                 ProtectedString::new("fedcba9876543210fedcba9876543210"),
             )
             .expect("reauthorization admitted");
-        match reauthorization
-            .wait()
-            .await
-            .expect("forwarded to the active runtime")
-        {
-            Err(LastFmRuntimeAdmissionError::NotReadyForReauthorization) => {}
-            Err(admission) => panic!("unexpected reauthorization refusal: {admission:?}"),
-            Ok(_) => panic!("reauthorization requires a code-9 paused runtime"),
-        }
+        assert_forwarded_refusal(
+            reauthorization
+                .wait()
+                .await
+                .expect("forwarded to the active runtime"),
+            LastFmRuntimeAdmissionError::NotReadyForReauthorization,
+            "unexpected reauthorization refusal",
+            "reauthorization requires a code-9 paused runtime",
+        );
         let recovery = handle
             .try_issue_manual_pause_recovery()
             .expect("recovery capture admitted");
-        match recovery
-            .wait()
-            .await
-            .expect("forwarded to the active runtime")
-        {
-            Err(LastFmRuntimeAdmissionError::NotReadyForManualRecovery) => {}
-            Err(admission) => panic!("unexpected recovery refusal: {admission:?}"),
-            Ok(_) => panic!("recovery capture requires a paused runtime"),
-        }
+        assert_forwarded_refusal(
+            recovery
+                .wait()
+                .await
+                .expect("forwarded to the active runtime"),
+            LastFmRuntimeAdmissionError::NotReadyForManualRecovery,
+            "unexpected recovery refusal",
+            "recovery capture requires a paused runtime",
+        );
+
+        assert_owner_drains(shutdown, &mut coordinator_owner).await;
+        source_registry.shutdown().wait().await;
+    }
+
+    /// LF2 composition: with an active generation, resume-after-recovery
+    /// forwards to the exact runtime, which refuses a foreign recovery
+    /// authority with its typed refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_forward_to_the_active_generation_and_refuses_foreign_recovery_authority() {
+        let live = live_policy_for_test();
+        let (handle, shutdown, _credentials, source_registry, mut coordinator_owner) =
+            spawn_owner_with_stored_session_and_database_attached(&live).await;
+        activate_first_policy_generation(&handle, &live).await;
+
         let resume = handle
             .try_resume_after_manual_recovery(LastFmManualPauseRecovery::dangling_for_test(
                 stored_session().account_binding(),
             ))
             .expect("resume admitted");
-        match resume
-            .wait()
-            .await
-            .expect("forwarded to the active runtime")
-        {
-            Err(LastFmRuntimeAdmissionError::NotReadyForManualRecovery) => {}
-            Err(admission) => panic!("unexpected resume refusal: {admission:?}"),
-            Ok(_) => panic!("resume must refuse a foreign recovery authority"),
-        }
+        assert_forwarded_refusal(
+            resume
+                .wait()
+                .await
+                .expect("forwarded to the active runtime"),
+            LastFmRuntimeAdmissionError::NotReadyForManualRecovery,
+            "unexpected resume refusal",
+            "resume must refuse a foreign recovery authority",
+        );
 
         assert_owner_drains(shutdown, &mut coordinator_owner).await;
         source_registry.shutdown().wait().await;
