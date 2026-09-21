@@ -33,7 +33,8 @@ pub use media::{
 pub use offline::{
     check_declared_total, CommittedSnapshot, DigestProvenance, EntityValidator, JobRecord,
     JobState, LeaseId, OfflineCatalogueEntry, OfflineError, OfflineSnapshot, OperationalLicence,
-    MAX_OFFLINE_METADATA_BYTES, MAX_OFFLINE_SNAPSHOT_PATH_BYTES,
+    SnapshotIdentity, ValidatorPayload, MAX_OFFLINE_METADATA_BYTES,
+    MAX_OFFLINE_SNAPSHOT_PATH_BYTES,
 };
 pub use server_playlist::{
     ServerPlaylistSnapshot, ServerPlaylistSummary, MAX_SERVER_PLAYLISTS_PER_LIST,

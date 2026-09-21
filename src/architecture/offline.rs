@@ -70,7 +70,7 @@ pub const MAX_OFFLINE_SNAPSHOT_PATH_BYTES: usize = 4 * 1024;
 /// Reject a declared download total above the per-track payload cap.
 ///
 /// At admission, a job whose declared total (`Content-Length` when known)
-/// that exceeds the per-track payload cap fails
+/// exceeds the per-track payload cap fails
 /// [`OfflineError::QuotaExceeded`] *before any network work*
 /// (`doc:1264-1266`, section "Global quota and the per-track byte cap").
 /// A response whose payload size exactly equals the cap is not a quota
@@ -111,7 +111,7 @@ pub const fn validate_snapshot_path_bytes(byte_len: usize) -> Result<(), Offline
 /// label (e.g. `subsonic-streaming-self`). It is never a free-form text
 /// field, never the full licence text, and never the URL of a licence
 /// page: the catalogue carries the licence label for every offline row
-/// but never the text (`doc:53`, "Licensing" row; `doc:1151`, the
+/// but never the text (`doc:58`, "Licensing" row; `doc:1151`, the
 /// `SourceDeclared` row of the licence table). The application never
 /// invents labels — it only carries the ones the adapter publishes.
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -346,6 +346,52 @@ impl fmt::Display for OfflineError {
     }
 }
 
+/// Bounded server-controlled payload carried by an [`EntityValidator`]
+/// (`ETag` / `Last-Modified` value). The inner string is private:
+/// every construction path goes through [`ValidatorPayload::new`], so
+/// no validator value outside [`MAX_OFFLINE_METADATA_BYTES`] can exist
+/// in the type system — the same discipline as [`LicenceLabel`].
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ValidatorPayload(String);
+
+impl ValidatorPayload {
+    /// Validate a captured server value against
+    /// [`MAX_OFFLINE_METADATA_BYTES`], rejecting empty and over-bound
+    /// values (`None` means discard — the job falls back to the
+    /// no-validator restart-only rule, `doc:205`).
+    pub fn new(value: impl Into<String>) -> Option<Self> {
+        bounded_validator(value.into()).map(Self)
+    }
+
+    /// The bounded server-controlled payload, for the engine's `If-Range`
+    /// request construction only. Never logged, never exposed through GTK.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ValidatorPayload {
+    /// Redacted: byte length only; the server-controlled value never
+    /// reaches logs (`offline.rs` redaction contract, `doc:276-287`).
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatorPayload")
+            .field("byte_len", &self.0.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatorPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| de_error("entity validator"))
+    }
+}
+
 /// Entity validator captured from the first successful response of a
 /// download job (`doc:205`, job-model table). A strong `ETag` is
 /// preferred; `Last-Modified` is the fallback when no strong entity tag
@@ -354,11 +400,12 @@ impl fmt::Display for OfflineError {
 /// carrying the captured value; `None` disables resume and restricts
 /// the job to a full restart (`doc:237-242`, resumption rule).
 ///
-/// The payload is a server-controlled string, so it is private and
-/// bounded: the checked constructors reject empty and over-bound values
-/// against [`MAX_OFFLINE_METADATA_BYTES`] (sharing the
+/// The payload is a server-controlled string, so it is bounded by
+/// construction: variants carry the private-field [`ValidatorPayload`]
+/// (bounded at [`MAX_OFFLINE_METADATA_BYTES`], sharing the
 /// `MAX_REMOTE_TRACK_ID_BYTES` rationale), deserialisation goes through
-/// the constructors, and `Debug` renders the kind plus byte length only.
+/// the checked constructors, and `Debug` renders the kind plus byte
+/// length only.
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EntityValidator {
@@ -366,9 +413,9 @@ pub enum EntityValidator {
     /// The persisted label is the conventional `etag` (mechanical
     /// kebab-case of `ETag` would be `e-tag`); `Display` matches.
     #[serde(rename = "etag")]
-    ETag(String),
+    ETag(ValidatorPayload),
     /// `Last-Modified` timestamp captured when no strong ETag exists.
-    LastModified(String),
+    LastModified(ValidatorPayload),
 }
 
 impl EntityValidator {
@@ -376,14 +423,14 @@ impl EntityValidator {
     /// `None` means discard: the job falls back to the no-validator
     /// restart-only rule (`doc:205`).
     pub fn etag(value: impl Into<String>) -> Option<Self> {
-        bounded_validator(value.into()).map(Self::ETag)
+        Some(Self::ETag(ValidatorPayload::new(value)?))
     }
 
     /// Capture a `Last-Modified` timestamp, rejecting empty and
     /// over-bound payloads. `None` means discard: the job falls back to
     /// the no-validator restart-only rule (`doc:205`).
     pub fn last_modified(value: impl Into<String>) -> Option<Self> {
-        bounded_validator(value.into()).map(Self::LastModified)
+        Some(Self::LastModified(ValidatorPayload::new(value)?))
     }
 
     /// Whether this validator is a strong entity tag. A strong `ETag`
@@ -405,7 +452,7 @@ impl EntityValidator {
     /// request construction only. Never logged, never exposed through GTK.
     pub fn value(&self) -> &str {
         match self {
-            Self::ETag(value) | Self::LastModified(value) => value,
+            Self::ETag(payload) | Self::LastModified(payload) => payload.as_str(),
         }
     }
 
@@ -496,6 +543,40 @@ impl fmt::Display for DigestProvenance {
     }
 }
 
+/// The identity triple of one offline job or committed row
+/// (`doc:199-211`, job-model table; `doc:288-293`, "One job per
+/// `(media_key, source_incarnation)`", rule 5). Grouped because the
+/// contract treats the triple as one identity: restart authorization
+/// compares the durable `(media_key, source_incarnation)` pair and
+/// never the epoch, while `capability_epoch` only orders supersession
+/// within one process run (`doc:325-342`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotIdentity {
+    /// The live `(SourceId, TrackId)` media identity.
+    pub media_key: MediaKey,
+    /// Durable, non-secret identity of the owning source incarnation
+    /// (`doc:202`). Never a transient generation number.
+    pub source_incarnation: SourceIncarnationId,
+    /// The source registry's accepted generation, process-local
+    /// ordering only (`doc:203`); never restart-stable (`doc:292-293`).
+    pub capability_epoch: u64,
+}
+
+impl SnapshotIdentity {
+    /// Assemble the identity triple of one job or committed row.
+    pub const fn new(
+        media_key: MediaKey,
+        source_incarnation: SourceIncarnationId,
+        capability_epoch: u64,
+    ) -> Self {
+        Self {
+            media_key,
+            source_incarnation,
+            capability_epoch,
+        }
+    }
+}
+
 /// One immutable result of one admitted download job at one version.
 ///
 /// Refresh does not mutate; it siblings. A new snapshot for the same
@@ -508,15 +589,9 @@ impl fmt::Display for DigestProvenance {
 /// persisted row has a real call site.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedSnapshot {
-    media_key: MediaKey,
-    /// The durable source incarnation this snapshot was admitted against
-    /// (`doc:202`, job-model table; `doc:157-168`, "Each source owns its
-    /// offline decision" item 3). A source replacement supersedes the
-    /// row's identity even though `SourceId` is preserved.
-    source_incarnation: SourceIncarnationId,
-    /// The accepted generation this snapshot was admitted against;
-    /// process-local ordering only (`doc:203`, `doc:292-293`).
-    capability_epoch: u64,
+    /// The identity triple this snapshot was admitted under
+    /// ([`SnapshotIdentity`]).
+    identity: SnapshotIdentity,
     /// Total committed byte count. Equal to the post-write `current_bytes`
     /// when the job reached `Committed`.
     byte_size: u64,
@@ -546,11 +621,8 @@ impl CommittedSnapshot {
     /// [`validate_snapshot_path_bytes`]) and takes the digest in its
     /// canonical `[u8; 32]` shape, so a committed row cannot exist with
     /// an unbounded path or a non-digest value.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        media_key: MediaKey,
-        source_incarnation: SourceIncarnationId,
-        capability_epoch: u64,
+        identity: SnapshotIdentity,
         byte_size: u64,
         sha256: [u8; 32],
         digest_provenance: DigestProvenance,
@@ -560,9 +632,7 @@ impl CommittedSnapshot {
     ) -> Result<Self, OfflineError> {
         validate_snapshot_path_bytes(cache_path.len())?;
         Ok(Self {
-            media_key,
-            source_incarnation,
-            capability_epoch,
+            identity,
             byte_size,
             sha256,
             digest_provenance,
@@ -572,16 +642,21 @@ impl CommittedSnapshot {
         })
     }
 
+    /// The identity triple this snapshot was admitted under.
+    pub fn identity(&self) -> &SnapshotIdentity {
+        &self.identity
+    }
+
     pub fn media_key(&self) -> &MediaKey {
-        &self.media_key
+        &self.identity.media_key
     }
 
     pub fn source_incarnation(&self) -> SourceIncarnationId {
-        self.source_incarnation
+        self.identity.source_incarnation
     }
 
     pub fn capability_epoch(&self) -> u64 {
-        self.capability_epoch
+        self.identity.capability_epoch
     }
 
     pub fn byte_size(&self) -> u64 {
@@ -733,405 +808,4 @@ pub enum OfflineCatalogueEntry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::architecture::{SourceId, TrackId};
-    use uuid::Uuid;
-
-    fn fixture_media_key() -> MediaKey {
-        MediaKey::new(SourceId::local(), TrackId::new("track-1").unwrap())
-    }
-
-    fn fixture_incarnation() -> SourceIncarnationId {
-        SourceIncarnationId::from_uuid(Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0))
-    }
-
-    fn fixture_snapshot(cache_path: String) -> Result<CommittedSnapshot, OfflineError> {
-        CommittedSnapshot::new(
-            fixture_media_key(),
-            fixture_incarnation(),
-            1,
-            4096,
-            [0xab; 32],
-            DigestProvenance::DoubleFetch,
-            cache_path,
-            OperationalLicence::SourceDeclared(
-                LicenceLabel::new("subsonic-streaming-self").unwrap(),
-            ),
-            1_700_000_000,
-        )
-    }
-
-    #[test]
-    fn operational_licence_defaults_to_denied() {
-        assert_eq!(OperationalLicence::default(), OperationalLicence::Denied);
-    }
-
-    #[test]
-    fn job_state_is_terminal_only_for_committed_failed_cancelled() {
-        for state in [
-            JobState::Queued,
-            JobState::Connecting,
-            JobState::Receiving,
-            JobState::Verifying,
-            JobState::Committing,
-        ] {
-            assert!(!state.is_terminal(), "{state:?} must not be terminal");
-        }
-        for state in [JobState::Committed, JobState::Failed, JobState::Cancelled] {
-            assert!(state.is_terminal(), "{state:?} must be terminal");
-        }
-    }
-
-    #[test]
-    fn offline_error_display_is_redacted() {
-        // No variant name should leak a URL, status, header, body, or
-        // credential — every display impl is the variant label only.
-        let labels = [
-            (OfflineError::Network, "network"),
-            (OfflineError::AuthExpired, "auth-expired"),
-            (OfflineError::LeaseRevoked, "lease-revoked"),
-            (OfflineError::Denied, "denied"),
-            (OfflineError::IntegrityMismatch, "integrity-mismatch"),
-            (
-                OfflineError::IntegrityUnverifiable,
-                "integrity-unverifiable",
-            ),
-            (OfflineError::LicenceDenied, "licence-denied"),
-            (OfflineError::QuotaExceeded, "quota-exceeded"),
-            (
-                OfflineError::PublishRetriesExhausted,
-                "publish-retries-exhausted",
-            ),
-            (OfflineError::StorageUnavailable, "storage-unavailable"),
-            (OfflineError::UnsupportedSource, "unsupported-source"),
-        ];
-        for (variant, label) in labels {
-            let rendered = variant.to_string();
-            assert_eq!(rendered, label, "{variant:?} label drifted");
-            for forbidden in ["http://", "https://", "token=", "password=", "Bearer "] {
-                assert!(
-                    !rendered.contains(forbidden),
-                    "{variant:?} leaked {forbidden:?} in display"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn offline_error_serde_round_trips_kebab_labels() {
-        for (variant, label) in [
-            (OfflineError::Network, "\"network\""),
-            (OfflineError::AuthExpired, "\"auth-expired\""),
-            (OfflineError::LeaseRevoked, "\"lease-revoked\""),
-            (OfflineError::Denied, "\"denied\""),
-            (OfflineError::IntegrityMismatch, "\"integrity-mismatch\""),
-            (
-                OfflineError::IntegrityUnverifiable,
-                "\"integrity-unverifiable\"",
-            ),
-            (OfflineError::LicenceDenied, "\"licence-denied\""),
-            (OfflineError::QuotaExceeded, "\"quota-exceeded\""),
-            (
-                OfflineError::PublishRetriesExhausted,
-                "\"publish-retries-exhausted\"",
-            ),
-            (OfflineError::StorageUnavailable, "\"storage-unavailable\""),
-            (OfflineError::UnsupportedSource, "\"unsupported-source\""),
-        ] {
-            let json = serde_json::to_string(&variant).expect("serialize");
-            assert_eq!(json, label);
-            let back: OfflineError = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(back, variant);
-        }
-    }
-
-    #[test]
-    fn declared_total_above_payload_cap_fails_quota_exceeded() {
-        // Real audio payloads are megabytes; they must never be rejected
-        // for being themselves.
-        let cap: u64 = 256 * 1024 * 1024;
-        assert_eq!(check_declared_total(5 * 1024 * 1024, cap), Ok(()));
-        assert_eq!(check_declared_total(200 * 1024 * 1024, cap), Ok(()));
-        // Equality passes: an exact-cap payload is not a quota failure.
-        assert_eq!(check_declared_total(cap, cap), Ok(()));
-        // Strictly above the cap fails QuotaExceeded before any network
-        // work, including the u64::MAX pathological header.
-        assert_eq!(
-            check_declared_total(cap + 1, cap),
-            Err(OfflineError::QuotaExceeded)
-        );
-        assert_eq!(
-            check_declared_total(u64::MAX, cap),
-            Err(OfflineError::QuotaExceeded)
-        );
-    }
-
-    #[test]
-    fn job_identity_is_media_key_and_source_incarnation() {
-        let key = fixture_media_key();
-        let first = JobRecord::new(key.clone(), fixture_incarnation(), 1);
-        let second = JobRecord::new(
-            key.clone(),
-            SourceIncarnationId::from_uuid(Uuid::from_u128(
-                0x9876_5432_10fe_dcba_9876_5432_10fe_dcba,
-            )),
-            1,
-        );
-        // Same media_key and capability_epoch, different durable
-        // incarnation: the identity differs, exactly as the contract's
-        // identity rule requires.
-        assert_ne!(first.source_incarnation, second.source_incarnation);
-        assert_eq!(first.capability_epoch, second.capability_epoch);
-        assert_eq!(first.media_key, second.media_key);
-        assert_ne!(first, second);
-        // Defaults from the job-model table.
-        assert_eq!(first.journal_bytes, 0);
-        assert!(first.requested_bytes.is_none());
-        assert!(first.resume_validator.is_none());
-        assert!(first.current_sha256.is_none());
-        assert!(first.last_lease.is_none());
-        assert!(first.failure.is_none());
-        assert_eq!(first.state, JobState::Queued);
-    }
-
-    #[test]
-    fn media_key_round_trip_via_source_and_track_ids() {
-        let key = MediaKey::new(SourceId::local(), TrackId::new("track-1").unwrap());
-        let record = JobRecord::new(key.clone(), fixture_incarnation(), 1);
-        assert_eq!(record.media_key, key);
-        assert_eq!(record.state, JobState::Queued);
-        assert_eq!(record.capability_epoch, 1);
-        assert_eq!(record.source_incarnation, fixture_incarnation());
-        assert!(record.failure.is_none());
-        assert_eq!(record.current_bytes, 0);
-        assert_eq!(record.journal_bytes, 0);
-        assert!(record.requested_bytes.is_none());
-        assert!(record.resume_validator.is_none());
-        assert!(record.current_sha256.is_none());
-        assert!(record.last_lease.is_none());
-    }
-
-    #[test]
-    fn source_incarnation_id_is_opaque_serialisable_and_checked() {
-        let id = fixture_incarnation();
-        assert_eq!(id.as_uuid(), id.to_string().parse::<Uuid>().unwrap());
-        let parsed: SourceIncarnationId = id.to_string().parse().expect("FromStr");
-        assert_eq!(parsed, id);
-        assert_ne!(SourceIncarnationId::random(), SourceIncarnationId::random());
-        let json = serde_json::to_string(&id).expect("serialize");
-        let back: SourceIncarnationId = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, id);
-        assert!("not-a-uuid".parse::<SourceIncarnationId>().is_err());
-    }
-
-    #[test]
-    fn entity_validator_bounds_redaction_and_serde() {
-        // Bound, bound + 1, empty.
-        let at_bound = EntityValidator::etag("x".repeat(MAX_OFFLINE_METADATA_BYTES))
-            .expect("validator at bound");
-        assert!(
-            EntityValidator::etag("x".repeat(MAX_OFFLINE_METADATA_BYTES + 1)).is_none(),
-            "over-bound validator must be discarded"
-        );
-        assert!(
-            EntityValidator::etag("").is_none(),
-            "empty must be discarded"
-        );
-        assert!(
-            EntityValidator::last_modified("y".repeat(MAX_OFFLINE_METADATA_BYTES + 1)).is_none()
-        );
-
-        assert!(at_bound.is_strong());
-        let last_modified =
-            EntityValidator::last_modified("Wed, 21 Oct 2015 07:28:00 GMT").expect("validator");
-        assert!(!last_modified.is_strong());
-        assert_eq!(last_modified.kind(), "last-modified");
-        assert_eq!(last_modified.value(), "Wed, 21 Oct 2015 07:28:00 GMT");
-
-        // Redacted debug: kind + byte length, never the payload.
-        let debug = format!("{at_bound:?}");
-        assert!(debug.contains("etag"), "{debug}");
-        assert!(debug.contains("byte_len"), "{debug}");
-        assert!(!debug.contains("xxxx"), "{debug}");
-
-        // Display label == serde variant label.
-        assert_eq!(at_bound.to_string(), "etag");
-        assert_eq!(last_modified.to_string(), "last-modified");
-        let small = EntityValidator::etag("abc").expect("validator");
-        assert_eq!(
-            serde_json::to_string(&small).expect("serialize"),
-            "{\"etag\":\"abc\"}"
-        );
-        let back: EntityValidator =
-            serde_json::from_str("{\"etag\":\"abc\"}").expect("deserialize");
-        assert_eq!(back, small);
-        let back_lm: EntityValidator =
-            serde_json::from_str("{\"last-modified\":\"Tue, 01 Sep 2026 00:00:00 GMT\"}")
-                .expect("deserialize");
-        assert_eq!(back_lm.kind(), "last-modified");
-        // Serde rejection goes through the checked constructor.
-        assert!(serde_json::from_str::<EntityValidator>("{\"etag\":\"\"}").is_err());
-        let oversized = serde_json::json!({ "etag": "x".repeat(MAX_OFFLINE_METADATA_BYTES + 1) });
-        assert!(serde_json::from_value::<EntityValidator>(oversized).is_err());
-    }
-
-    #[test]
-    fn licence_label_bounds_redaction_and_serde() {
-        let at_bound =
-            LicenceLabel::new("x".repeat(MAX_OFFLINE_METADATA_BYTES)).expect("label at bound");
-        assert_eq!(at_bound.as_str().len(), MAX_OFFLINE_METADATA_BYTES);
-        assert!(LicenceLabel::new("x".repeat(MAX_OFFLINE_METADATA_BYTES + 1)).is_none());
-        assert!(LicenceLabel::new("").is_none());
-
-        let label = LicenceLabel::new("subsonic-streaming-self").expect("label");
-        assert_eq!(label.as_str(), "subsonic-streaming-self");
-        assert_eq!(label.to_string(), "subsonic-streaming-self");
-        let debug = format!("{label:?}");
-        assert!(debug.contains("byte_len"), "{debug}");
-        assert!(!debug.contains("subsonic"), "{debug}");
-
-        let json = serde_json::to_string(&label).expect("serialize");
-        assert_eq!(json, "\"subsonic-streaming-self\"");
-        let back: LicenceLabel = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, label);
-        assert!(serde_json::from_str::<LicenceLabel>("\"\"").is_err());
-        let oversized = serde_json::Value::String("x".repeat(MAX_OFFLINE_METADATA_BYTES + 1));
-        assert!(serde_json::from_value::<LicenceLabel>(oversized).is_err());
-    }
-
-    #[test]
-    fn operational_licence_serde_and_display() {
-        let declared = OperationalLicence::SourceDeclared(
-            LicenceLabel::new("jellyfin-streaming-self").unwrap(),
-        );
-        assert_eq!(
-            serde_json::to_string(&OperationalLicence::Denied).unwrap(),
-            "\"denied\""
-        );
-        assert_eq!(
-            serde_json::to_string(&declared).unwrap(),
-            "{\"source-declared\":\"jellyfin-streaming-self\"}"
-        );
-        assert_eq!(
-            serde_json::to_string(&OperationalLicence::Revoked).unwrap(),
-            "\"revoked\""
-        );
-        let back: OperationalLicence =
-            serde_json::from_str("{\"source-declared\":\"plex-streaming-self\"}")
-                .expect("deserialize");
-        assert_eq!(
-            back,
-            OperationalLicence::SourceDeclared(LicenceLabel::new("plex-streaming-self").unwrap())
-        );
-        // Display renders the persisted label for SourceDeclared.
-        assert_eq!(back.to_string(), "plex-streaming-self");
-        assert_eq!(OperationalLicence::Denied.to_string(), "denied");
-        assert_eq!(OperationalLicence::Revoked.to_string(), "revoked");
-    }
-
-    #[test]
-    fn job_state_serde_matches_display() {
-        for (state, label) in [
-            (JobState::Queued, "queued"),
-            (JobState::Connecting, "connecting"),
-            (JobState::Receiving, "receiving"),
-            (JobState::Verifying, "verifying"),
-            (JobState::Committing, "committing"),
-            (JobState::Committed, "committed"),
-            (JobState::Failed, "failed"),
-            (JobState::Cancelled, "cancelled"),
-        ] {
-            assert_eq!(state.to_string(), label);
-            let json = serde_json::to_string(&state).expect("serialize");
-            assert_eq!(json, format!("\"{label}\""));
-            let back: JobState = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(back, state);
-        }
-    }
-
-    #[test]
-    fn digest_provenance_serde_matches_display() {
-        for (provenance, label) in [
-            (DigestProvenance::Advertised, "advertised"),
-            (DigestProvenance::DoubleFetch, "double-fetch"),
-        ] {
-            assert_eq!(provenance.to_string(), label);
-            let json = serde_json::to_string(&provenance).expect("serialize");
-            assert_eq!(json, format!("\"{label}\""));
-            let back: DigestProvenance = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(back, provenance);
-        }
-    }
-
-    #[test]
-    fn committed_snapshot_checked_constructor_enforces_path_bound() {
-        let max_path = "c/".to_string() + &"a".repeat(MAX_OFFLINE_SNAPSHOT_PATH_BYTES - 2);
-        assert_eq!(max_path.len(), MAX_OFFLINE_SNAPSHOT_PATH_BYTES);
-        let at_bound = fixture_snapshot(max_path).expect("snapshot at path bound");
-        assert_eq!(at_bound.media_key(), &fixture_media_key());
-        assert_eq!(at_bound.source_incarnation(), fixture_incarnation());
-        assert_eq!(at_bound.capability_epoch(), 1);
-        assert_eq!(at_bound.byte_size(), 4096);
-        assert_eq!(at_bound.sha256(), &[0xab; 32]);
-        assert_eq!(at_bound.sha256_hex(), "ab".repeat(32));
-        assert_eq!(at_bound.digest_provenance(), DigestProvenance::DoubleFetch);
-        assert_eq!(at_bound.committed_at_epoch_secs(), 1_700_000_000);
-        match at_bound.licence() {
-            OperationalLicence::SourceDeclared(label) => {
-                assert_eq!(label.as_str(), "subsonic-streaming-self");
-            }
-            other => panic!("unexpected licence {other:?}"),
-        }
-
-        let over_bound = "c/".to_string() + &"a".repeat(MAX_OFFLINE_SNAPSHOT_PATH_BYTES - 1);
-        assert!(over_bound.len() > MAX_OFFLINE_SNAPSHOT_PATH_BYTES);
-        assert_eq!(
-            fixture_snapshot(over_bound),
-            Err(OfflineError::StorageUnavailable)
-        );
-        // Direct validator contract (used by the constructor).
-        assert_eq!(
-            validate_snapshot_path_bytes(MAX_OFFLINE_SNAPSHOT_PATH_BYTES),
-            Ok(())
-        );
-        assert_eq!(
-            validate_snapshot_path_bytes(MAX_OFFLINE_SNAPSHOT_PATH_BYTES + 1),
-            Err(OfflineError::StorageUnavailable)
-        );
-    }
-
-    #[test]
-    fn offline_catalogue_entries_construct_all_variants() {
-        let live = OfflineCatalogueEntry::LiveOnly;
-        let snapshot = fixture_snapshot("snapshots/ab".to_string()).expect("snapshot");
-        let cached = OfflineCatalogueEntry::Cached(snapshot.clone());
-        let revoked = OfflineCatalogueEntry::Revoked(snapshot);
-        assert_eq!(live, OfflineCatalogueEntry::LiveOnly);
-        match cached {
-            OfflineCatalogueEntry::Cached(inner) => {
-                assert_eq!(inner.sha256(), &[0xab; 32]);
-            }
-            other => panic!("unexpected entry {other:?}"),
-        }
-        match revoked {
-            OfflineCatalogueEntry::Revoked(inner) => {
-                assert_eq!(inner.cache_path(), "snapshots/ab");
-            }
-            other => panic!("unexpected entry {other:?}"),
-        }
-        // The capability holder keeps its constructor exercised too.
-        let capability = OfflineSnapshot::new(64 * 1024 * 1024);
-        assert_eq!(capability.source_byte_cap, 64 * 1024 * 1024);
-    }
-
-    #[test]
-    fn lease_id_is_opaque_and_compares_by_raw() {
-        let a = LeaseId::from_raw(7);
-        let b = LeaseId::from_raw(7);
-        let c = LeaseId::from_raw(8);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(a.raw(), 7);
-    }
-}
+mod tests;
