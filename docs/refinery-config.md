@@ -6,38 +6,58 @@ Coverage job and the cross-compiled aarch64 matrix tail; the fast end of a
 clean run is ~20 minutes (measured 1211s on a typical green PR, run
 30173146972). Anything under 1200s to a readable verdict is the lower bound.
 
-The upstream refinery pack (`mol-refinery-patrol`) defaults the hosted-CI
-gate deadline `ci_timeout_seconds` to 900s (15 minutes). Honoring that
-literally rejects branches whose checks are still running — by the deadline
-the `Coverage` and cross-compile jobs are routinely in-flight, so a green
-branch reads as "pending at deadline" and is rejected for the wrong reason.
-On a red branch, the eventual verdict would have been a rejection anyway, but
-the timer would have blamed the wrong check.
+## Hosted-CI gate history and the live deadline-free gate
 
-## What this rig overrides
+The upstream refinery pack (`mol-refinery-patrol`) once defaulted a hosted-CI
+gate deadline, `ci_timeout_seconds`, to 900s (15 minutes). Honoring that
+literally rejected branches whose checks were still running — by the deadline
+the `Coverage` and cross-compile jobs were routinely in-flight, so a green
+branch read as "pending at deadline" and was rejected for the wrong reason
+(bead tr-3h7). This rig first raised the deadline to 3600s under
+`[rigs.formula_vars]` in the city config; the 2026-09-08 rendered-workflow
+snapshot still records that override, alongside `ci_poll_seconds = "30"` and
+an eleven-entry `hosted_required_checks_json` allowlist.
 
-Configured under `[rigs.formula_vars]` in the city config (the rig-side
-clone does not own this value — `city.toml` does):
+**That mechanism is retired.** None of those `ci_*` variables exists in any
+live layer today — not in `city.toml`, not in the rig-local refinery formula
+override (2026-09-03), not in the pinned upstream pack — and the upstream
+keys they tuned were removed from the pack as well. The live completion gate
+is the guarded reconciler `.gc/operations/reconcile.py`, run every five
+minutes by the `tributary-reconcile` order. It polls GitHub's
+`statusCheckRollup` per open PR head and is **deadline-free and fail-closed**:
+any failure-class conclusion on any observed check routes the bead back to
+the polecat pool as rework, and an empty rollup never reads as green. The
+gate also compares the check names it observes against the complete gating
+set — the main-branch ruleset's required contexts plus the two city gates
+(`Codacy Static Code Analysis`, `Coverage (Linux x86_64)`) — and parks the
+bead as pending, naming the absent contexts, whenever an expected gating
+check never materialized as a run at all: a rollup that simply lacks an
+expected check is not a passing one. Checks still running park the bead as
+pending — but only when the unfinished check is a *gating* one.
+Hold-class dispositions are evaluated ahead of any CI state and are never
+converted into pending by it: a draft PR (or unknown draft status), an
+unresolved review hold, or an operator audit reject at the head parks the
+bead as `hold` for human disposition. The one exception is the explicit
+per-source `review.corrections_while_held = "true"` opt-in: an open held or
+draft bead inside corrective review whose current-head review evidence is
+missing, incomplete, or stale parks as `pending` until that evidence
+exists, and a new unresolved finding routes to the refinery as `review` —
+the hold itself remains in force throughout and is never cleared by that
+routing.
+Queued advisory jobs such as `SHA256 Checksums` — which GitHub's
+per-account Actions concurrency cap can hold for an hour or more — do not
+delay review or an operator landing that the ruleset itself would allow.
+There is no deadline at which a pending branch can be wrongly rejected.
+This gate is **not** the full machine enforcement of the all-green operator
+policy below: that 2026-09-03 policy remains in force for the operator, and
+what the live gate enforces of it is an enforcement gap, not a retirement —
+the gate is name-sensitive in exactly one place (the required ∪ city gating
+set) and reworks on any failure anywhere, while advisory checks and bot
+reviews still rest on review discipline ("Enforcement status" below).
 
-```toml
-ci_timeout_seconds = "3600"   # 1 hour, comfortable margin over the tail
-```
-
-Everything else stays at the upstream defaults:
-
-- `ci_gate` — `true` — "pending is never green" — fail-closed when checks are
-  still running. **Preserved.**
-- `ci_poll_seconds` — `60` — Poll GitHub for check-runs every minute.
-  **Preserved.**
-- `ci_zero_check_grace_seconds` — `300` — Allow the workflow runs to
-  materialize before declaring zero-on-this-branch. **Preserved.**
-- `ci_timeout_seconds` — `3600` — **Raised from 900**: covers the observed
-  ~20-53 min tail with margin.
-
-The change is the deadline alone; the fail-closed policy is intentionally
-left intact. A bead (tr-3h7) opened the issue and another polecat can land
-the city-config edit through the usual refinery handoff if the change
-hasn't already been applied out-of-band.
+Verification against the live rig, including the exact ruleset-required
+check contexts and fresh dry-run decisions, is recorded in
+[ci-gate-verification-2026-09-17.md](ci-gate-verification-2026-09-17.md).
 
 ## Reviewer policy
 
@@ -64,10 +84,15 @@ Audit, Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64),
 Flatpak (Linux), and MSRV — and no reviews. Coverage, CodeQL, Codacy Static
 Code Analysis, CodeRabbit, Windows (aarch64), and every bot review are
 advisory as far as the repository is concerned: GitHub will merge without
-them. Until the ruleset is widened, the all-green rule is enforced by the
-refinery's own fail-closed check polling (which observes every check on the
-head, required or not) and by review discipline — not by the repository
-refusing the merge.
+them. Until the ruleset is widened, the gap between the policy and the
+machine gate persists: the live reconciler (verified 2026-09-17; absence
+parking added 2026-09-18) scans every check on the head for failure
+conclusions, but its pending set is only the ruleset-required contexts plus
+the two city gates, with an expected gating context absent from the rollup
+parked as well — an unfinished advisory
+check (CodeRabbit, Windows (aarch64), Desktop Metadata, `SHA256 Checksums`)
+no longer delays it, and the all-green rule above remains operator policy
+enforced by review discipline, not by the repository refusing the merge.
 
 **Routine auto-merge stays off until the live gate matches the policy.** The
 `dependabot-automerge` workflow enables GitHub native auto-merge on clean
