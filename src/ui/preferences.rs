@@ -701,6 +701,9 @@ pub fn save_config(config: &AppConfig) -> bool {
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
 /// * `active_output` — the shared audio output handle backing the equalizer panel
+// One argument per live pane widget and change callback the builder wires;
+// bundling them in a struct would only relocate the list, not the coupling.
+#[allow(clippy::too_many_arguments)]
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     column_view: &gtk::ColumnView,
