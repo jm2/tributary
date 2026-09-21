@@ -43,6 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without the exclusive confirmation fails closed to `Unconfirmed`. The Add Output dialog
   saves supervision only together with the exclusive confirmation, paired with a localized
   warning/confirmation message in every supported catalog (13 locales).
+- **Backlog consistency check** — Add a read-only `scripts/check_backlog_consistency.py`
+  (run in the CI `audit` job) that verifies unique record IDs, the literal completion
+  counters — including a mechanical recount of the archived remediation counter from its
+  archived source document — and internal links/anchors in the tracked Markdown, and can
+  optionally report missing issue/bead/PR mappings (with explicit `"pr": null` meaning
+  "not yet published"), merged-but-unreconciled records, and stale review heads from a
+  ledger snapshot. It never edits the index, closes a parent record, or assigns a
+  worker. The checker reports a top-level checkbox without a stable ID instead of
+  silently skipping it, resolves angle-bracket link destinations that contain spaces
+  (inline links and reference definitions), tracks fenced code blocks by delimiter
+  character and run length (closing fences may carry trailing tabs), requires link
+  targets to stay inside the repository root (including through symlinks), and
+  enumerates only tracked Markdown files in a Git checkout (falling back to a
+  recursive walk outside Git); exit `2` for a missing task index or ledger snapshot
+  is documented.
 
 ### Changed
 
