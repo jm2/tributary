@@ -1636,7 +1636,8 @@ mod tests {
     /// GTK session (see the consolidated test below).
     fn q4_publication_contract_and_bench() {
         let objects = q4_bench_track_objects(60);
-        let (browser_box, browser_state) = build_browser(&[], false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let (browser_box, browser_state) =
+            build_browser(&[], false, false, 48, Box::new(|_, _, _, _, _| {}));
         let track_store = gio::ListStore::new::<TrackObject>();
         // The production tracklist drives a ColumnView over a selection
         // model wrapping the store; mirror that so `display_tracks`'s
@@ -1787,7 +1788,8 @@ mod tests {
     /// (`display_only_ms`, `rebuild_ms`).
     fn q4_measure_display_only(rows: usize) -> (f64, f64) {
         let objects = q4_bench_track_objects(rows);
-        let (display_box, display_state) = build_browser(&[], false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let (display_box, display_state) =
+            build_browser(&[], false, false, 48, Box::new(|_, _, _, _, _| {}));
         let display_store = gio::ListStore::new::<TrackObject>();
         let display_selection = gtk::SingleSelection::new(Some(display_store.clone()));
         let display_view = gtk::ColumnView::new(Some(display_selection));
