@@ -2530,6 +2530,8 @@ pub mod tests {
     /// Headless CI (cargo test in the Fedora container with no X/Wayland socket)
     /// cannot initialize GTK, so the contract skips with a printed reason when
     /// no display session is available or GTK cannot acquire a display.
+    /// The dedicated `gtk-display-gate` CI job runs it under Xvfb with
+    /// `TRIBUTARY_GTK_GATE=require`, where that skip becomes a hard failure.
     /// macOS is excluded because GTK's Quartz backend panics when
     /// initialized from the test harness worker thread. The contract still
     /// holds on any machine with a display — it is therefore
@@ -2543,8 +2545,8 @@ pub mod tests {
     /// initializing thread, tripping gtk-rs main-thread checks
     /// (2026-09-09 review rejection, PR #179). It is instead invoked from
     /// the crate's single consolidated GTK test in `browser.rs`, whose
-    /// `acquire` call owns the display gate, the single `gtk::init`, and
-    /// the serialization lock across this body.
+    /// `with_session` call owns the display gate, the single `gtk::init`,
+    /// and the serialization lock across this body.
     #[cfg(not(target_os = "macos"))]
     pub fn popover_from_menu_model_attaches_a_visible_child_widget() {
         assert_track_drags_start_only_from_the_data_row_area();

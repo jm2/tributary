@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Display-backed GTK test gate** — A dedicated CI job runs the crate's production
+  widget contracts under a real X (Xvfb) display on one GTK-owning thread with
+  `TRIBUTARY_GTK_GATE=require`, so a widget test that cannot reach a display fails the
+  job instead of skipping silently. The widget session now refuses to reuse an
+  initialized GTK from a different thread, and recognizes Broadway as a display server
+  for local headless runs.
 - **Folder browsing** — Browse the local library by configured root and folder, with
   distinct identities for multiple roots, lazy navigation, and visible reasons when a root
   is unavailable or has changed identity.

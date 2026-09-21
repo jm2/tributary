@@ -1515,6 +1515,15 @@ mod tests {
     /// Asserts on the `GtkListItem:accessible-label` property (GTK 4.12),
     /// which GTK uses as the row's accessible name — the widget-level
     /// equivalent of an Orca row-announcement smoke test.
+    ///
+    /// Q1 gate (`tr-sptyt`, issue #274): the CI `gtk-display-gate` job runs
+    /// this test under Xvfb with `TRIBUTARY_GTK_GATE=require`, so a display
+    /// that never comes up — or a future refactor that lets this body skip —
+    /// fails the job instead of passing vacuously. The corrected R3/R4
+    /// selection-restoration, per-row drag/drop destination, settings and
+    /// close contracts join THIS body as their implementations land
+    /// (`tr-2xstt`, `tr-y72e3`, `tr-hdgwh`); they must not become competing
+    /// GTK `#[test]`s.
     #[test]
     fn gtk_widget_contracts_hold_on_one_session() {
         // Run every widget construction and assertion below — including
@@ -1526,6 +1535,21 @@ mod tests {
         let Some(()) = crate::ui::widget_test_session::with_session(
             "gtk widget contracts test",
             || {
+                // Fail-on-skip proof: with the session live GTK must be
+                // initialized and the gate must have recorded the
+                // establishment. Under `TRIBUTARY_GTK_GATE=require` (the CI
+                // display gate) `with_session` would already have panicked
+                // instead of returning `None`, so reaching this body means
+                // the contracts below really ran.
+                assert!(
+                    crate::ui::widget_test_session::was_established(),
+                    "the widget session must record an established session before contracts run"
+                );
+                assert!(
+                    gtk::is_initialized(),
+                    "the widget session must have initialized GTK before contracts run"
+                );
+
                 let (list_item, row) = make_setup_list_item();
                 assert_row_roles_presentational(&row);
                 assert_combined_bind_contract(&list_item, &row);
