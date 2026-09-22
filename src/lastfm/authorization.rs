@@ -2,14 +2,14 @@
 //!
 //! The owner retains the request token and staged session behind a bounded,
 //! serialized command lane. Presentation receives only a redacted challenge:
-//! the token-bearing browser URL remains entirely owner-private, while opaque
-//! finish authority is consumed atomically before `auth.getSession` is first
+//! the token-bearing browser URL remains owner-private while opaque finish
+//! authority is consumed atomically before `auth.getSession` is first
 //! awaited.
 //!
-//! This module is intentionally an injected internal core. Production consent,
-//! a concrete browser handoff, global single-owner coordination, and vault
-//! installation remain deferred; no build-credential factory wires this owner
-//! into the application.
+//! This module is intentionally an injected internal core. The account
+//! composition layer (`crate::lastfm::account`) owns production consent, the
+//! consent-gated browser handoff, global single-owner coordination, and
+//! vault installation on top of this owner.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -180,10 +180,11 @@ struct ChallengeInner {
 
 /// Opaque challenge for one exact in-memory request token.
 ///
-/// The token-bearing browser URL remains solely inside the owner and has no
-/// production accessor or handoff. Successful finish, cancel, supersession,
-/// expiry, terminal failure, or shutdown revokes that internal allocation and
-/// every clone's finish authority.
+/// The token-bearing browser URL remains solely inside the owner; only the
+/// account composition layer's consent-gated handoff extracts it for the
+/// system-browser launch. Successful finish, cancel, supersession, expiry,
+/// terminal failure, or shutdown revokes that internal allocation and every
+/// clone's finish authority.
 #[derive(Clone)]
 pub struct LastFmAuthorizationChallenge(Arc<ChallengeInner>);
 
