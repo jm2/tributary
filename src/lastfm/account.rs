@@ -22,7 +22,11 @@ use super::client::{AppCredentials, LastFmClient, LastFmClientError};
 use super::credentials::{
     CredentialError, LastFmAccountBinding, SessionCredentialStore, StoredSession,
 };
-use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
+use super::lifecycle::{
+    acquire_vault_lifecycle, recover_quarantined_lastfm_queue, LastFmQuarantinedQueueRecoveryError,
+    LastFmVaultLifecycleLease,
+};
+use super::storage::purge_account;
 
 /// One process-lifetime authorization owner; a second construction is a bug.
 static AUTHORIZATION_OWNER_CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -255,6 +259,88 @@ pub async fn install_same_account_reauthorization(
     };
     save_under_lease(credentials, lease, session).await?;
     Ok(account)
+}
+
+/// Content-free different-account replacement failures.
+///
+/// No variant carries either username, the queue length, or native
+/// credential-store context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LastFmAccountReplacementError {
+    #[error("Last.fm protected credential store is unavailable")]
+    CredentialStoreUnavailable,
+    #[error("staged Last.fm authorization is invalid for vault installation")]
+    InvalidStagedSession,
+    #[error("the replaced Last.fm account vanished before the replacement")]
+    VaultMissing,
+    #[error("the old account's pending scrobbles could not be discarded")]
+    QueuePurgeRefused,
+    #[error("the old protected account record could not be deleted")]
+    CredentialCleanupRequired,
+}
+
+/// Replace the stored account with a different account after explicit
+/// consent in the settings surface.
+///
+/// The lifecycle lease is held across the whole ordered transition:
+/// transactionally purge the old account's pending scrobbles (they can
+/// never transfer across accounts), delete the exact old protected record,
+/// and only then install the brand-new identity. A failure leaves the
+/// already-valid old record in place; the purge is idempotent, so a retry
+/// converges.
+pub async fn install_replacement_account(
+    credentials: Arc<dyn SessionCredentialStore>,
+    db: sea_orm::DatabaseConnection,
+    staged: LastFmAuthorizationGrant,
+) -> Result<InstalledAccount, LastFmAccountReplacementError> {
+    use LastFmAccountReplacementError as Error;
+
+    let lease = acquire_vault_lifecycle().await;
+    let (staged_username, key) = staged.into_authorized_session().into_parts();
+    let session = StoredSession::new(staged_username.as_str(), key)
+        .map_err(|_| Error::InvalidStagedSession)?;
+    let (lease, existing) = load_under_lease(Arc::clone(&credentials), lease)
+        .await
+        .map_err(|_| Error::CredentialStoreUnavailable)?;
+    let existing = existing.ok_or(Error::VaultMissing)?;
+
+    purge_account(&db, existing.account_binding())
+        .await
+        .map_err(|_| Error::QueuePurgeRefused)?;
+
+    let deleter = Arc::clone(&credentials);
+    let (lease, deleted) = tokio::task::spawn_blocking(move || {
+        let deleted = deleter.delete();
+        (lease, deleted)
+    })
+    .await
+    .map_err(|_| Error::CredentialCleanupRequired)?;
+    deleted.map_err(|_| Error::CredentialCleanupRequired)?;
+
+    let account = InstalledAccount {
+        username: session.username().to_owned(),
+        account_binding: session.account_binding(),
+    };
+    save_under_lease(credentials, lease, session)
+        .await
+        .map_err(|_| Error::CredentialStoreUnavailable)?;
+    Ok(account)
+}
+
+/// Explicitly discard a quarantined queue which cannot be associated with a
+/// loadable account record.
+///
+/// Thin product wrapper over the lifecycle recovery: it refuses while a
+/// valid account exists and otherwise purges the orphaned private rows
+/// under the same lifecycle lease as every destructive vault operation.
+pub async fn discard_quarantined_queue(
+    credentials: Arc<dyn SessionCredentialStore>,
+    db: sea_orm::DatabaseConnection,
+) -> Result<u64, LastFmQuarantinedQueueRecoveryError> {
+    match recover_quarantined_lastfm_queue(db, credentials).await {
+        Ok(recovery) => Ok(recovery.purged_scrobbles()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
