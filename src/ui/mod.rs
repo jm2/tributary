@@ -10,6 +10,7 @@ pub mod discovery_handler;
 pub mod dummy_data;
 pub mod folder_browser;
 pub mod header_bar;
+pub mod lastfm_settings;
 mod library_commands;
 pub mod objects;
 pub mod open_files;
