@@ -3243,6 +3243,13 @@ pub mod tests {
     /// transport the dispatch uses, decides with the same completion core
     /// the dialog opening depends on, and pumps until the decision has run
     /// on the main context.
+    ///
+    /// Callers pass a dedicated [`glib::MainContext::new`] context, never
+    /// the process-global default: `spawn_local` and every `iteration` of
+    /// the pump below acquire the context, and the full parallel suite runs
+    /// this module's tests concurrently with the widget session's GTK init,
+    /// so two tests contending for the shared default context fail
+    /// intermittently with "already acquired by another thread" (tr-i6rhbx).
     fn deliver_admission_and_resolve_completion(
         context: &glib::MainContext,
         evidence: PropertiesSelectionEvidence,
@@ -3288,13 +3295,26 @@ pub mod tests {
         // dispatch's spawn_blocking worker can, and while it is parked the
         // main context the UI runs on must keep dispatching — that is the
         // responsiveness the off-thread admission buys.
+        //
+        // The probe schedules on a dedicated main context through the same
+        // `spawn_local` transport the production dispatch uses. It must
+        // never route through `glib::idle_add_local_once`: that helper
+        // hardwires the process-global default context (`idle_add_local`
+        // does `MainContext::default().acquire()` and panics with "default
+        // main context already acquired by another thread" whenever another
+        // test holds that shared context), which is exactly the intermittent
+        // full-suite failure this test used to hit (tr-i6rhbx). A fresh
+        // context always acquires: nothing else owns it, so the spawn and
+        // the dispatching loop below never contend with another test.
         let pending_path = PathBuf::from("/definitely/not/here.flac");
         let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
 
         let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
-        let dispatched_for_idle = dispatched.clone();
-        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
-        let context = glib::MainContext::default();
+        let dispatched_for_task = dispatched.clone();
+        let context = glib::MainContext::new();
+        context.spawn_local(async move {
+            dispatched_for_task.set(true);
+        });
         pump_main_context_until(
             &context,
             || dispatched.get(),
@@ -3324,8 +3344,10 @@ pub mod tests {
             positions: vec![0],
             media_keys: vec![device_media_key(&device_a)],
         };
+        // Dedicated context, never the process-global default: the parallel
+        // suite acquires that shared context concurrently (tr-i6rhbx).
         let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
+            &glib::MainContext::new(),
             evidence,
             move |position| (position == 0).then(|| device_media_key(&device_b)),
             admitted_by_path(&pending_path),
@@ -3354,8 +3376,10 @@ pub mod tests {
         };
         let admission = admitted_by_path(&pending_path);
         assert_eq!(admission.locals.len(), 1, "admission must admit by path");
+        // Dedicated context, never the process-global default: the parallel
+        // suite acquires that shared context concurrently (tr-i6rhbx).
         let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
+            &glib::MainContext::new(),
             evidence,
             move |position| (position == 0).then(|| device_media_key(&device_a)),
             admission,
