@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, MediaRepresentation, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
@@ -288,16 +288,20 @@ impl PlexClient {
     ///
     /// The `part_key` is a relative path like `/library/parts/12345/file.flac`.
     /// Authentication is retained as a sensitive header, never appended to
-    /// the URL copied into generic models.
+    /// the URL copied into generic models. `representation` is the validated
+    /// descriptor of the media the part returns (see `MediaRepresentation`).
     pub(crate) fn resolved_stream_request(
         &self,
         part_key: &str,
+        representation: MediaRepresentation,
     ) -> BackendResult<ResolvedHttpRequest> {
         let url = self.media_url(part_key)?;
-        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
-            HeaderName::from_static("x-plex-token"),
-            plex_auth_header(&self.auth_token)?,
-        )?;
+        let request = ResolvedHttpRequest::new(url)?
+            .with_representation(representation)
+            .with_sensitive_header(
+                HeaderName::from_static("x-plex-token"),
+                plex_auth_header(&self.auth_token)?,
+            )?;
         match &self.advertised_route {
             Some(route) => request.with_advertised_route(route.clone()),
             None => Ok(request),
@@ -548,7 +552,10 @@ mod tests {
 
         for request in [
             client
-                .resolved_stream_request("/library/parts/1/file.flac")
+                .resolved_stream_request(
+                    "/library/parts/1/file.flac",
+                    MediaRepresentation::buffered_unknown(),
+                )
                 .unwrap(),
             client
                 .resolved_artwork_request("/library/metadata/1/thumb/2")
@@ -586,7 +593,10 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .resolved_stream_request("/library/parts/file%2Fname.flac")
+                    .resolved_stream_request(
+                        "/library/parts/file%2Fname.flac",
+                        MediaRepresentation::buffered_unknown()
+                    )
                     .expect("stream request")
                     .endpoint()
                     .as_str(),
@@ -614,7 +624,7 @@ mod tests {
             ".%2e/outside-prefix",
         ] {
             let error = client
-                .resolved_stream_request(path)
+                .resolved_stream_request(path, MediaRepresentation::buffered_unknown())
                 .err()
                 .expect("plain or encoded dot segments must not escape the configured prefix");
             assert!(matches!(error, BackendError::ConnectionFailed { .. }));
@@ -660,7 +670,10 @@ mod tests {
 
         for request in [
             client
-                .resolved_stream_request("/library/parts/1/file.flac")
+                .resolved_stream_request(
+                    "/library/parts/1/file.flac",
+                    MediaRepresentation::buffered_unknown(),
+                )
                 .unwrap(),
             client
                 .resolved_artwork_request("/library/metadata/1/thumb/2")
@@ -672,7 +685,10 @@ mod tests {
 
         let ordinary = PlexClient::new(origin, "token").expect("ordinary client");
         assert!(ordinary
-            .resolved_stream_request("/library/parts/1/file.flac")
+            .resolved_stream_request(
+                "/library/parts/1/file.flac",
+                MediaRepresentation::buffered_unknown()
+            )
             .unwrap()
             .advertised_route()
             .is_none());

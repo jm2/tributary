@@ -19,7 +19,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
-use crate::architecture::{AdvertisedHttpRoute, ResolvedHttpRequest};
+use crate::architecture::{AdvertisedHttpRoute, MediaRepresentation, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
@@ -86,9 +86,32 @@ impl DaapCatalogueScope {
     pub(crate) const fn database_id(self) -> u32 {
         self.database_id
     }
+
+    /// Fixed catalogue coordinates for sibling adapter tests (no network).
+    #[cfg(test)]
+    pub(super) const fn for_adapter_tests() -> Self {
+        Self {
+            revision: 2,
+            database_id: 1,
+        }
+    }
 }
 
 impl DaapClient {
+    /// Offline client for sibling adapter tests: a real HTTP client stack
+    /// against a documentation-only base URL. Resolution-site methods only
+    /// build requests, so no network is touched.
+    #[cfg(test)]
+    pub(super) fn for_adapter_tests(server_url: &str) -> Self {
+        let base_url = Url::parse(server_url).expect("DAAP base URL");
+        Self {
+            base_url: base_url.clone(),
+            session_id: 42,
+            http: build_http_client(&base_url, None).expect("DAAP client"),
+            advertised_route: None,
+        }
+    }
+
     /// Execute the bounded server-info/login phase and return immediately
     /// after parsing the server-owned session ID.
     ///
@@ -432,20 +455,36 @@ impl DaapClient {
     ///
     /// The untrusted format is encoded as part of one path segment, and the
     /// bearer `session-id` stays isolated until the app-owned fetch boundary.
+    /// The same format also builds the validated representation: DAAP serves
+    /// the track in the format named by the server's own `asfm` metadata, so
+    /// a declared format is authoritative; a format outside the allowlist
+    /// maps to the explicit unknown (see `MediaRepresentation`).
+    ///
+    /// A server that never declared `asfm` stays explicitly unknown too: the
+    /// descriptor is built from the raw `Option`, never from a defaulted
+    /// string, so an undeclared track cannot masquerade as `audio/mpeg`
+    /// (issue #255). Only the legacy URL item hint keeps the historical
+    /// `.mp3` default — the DAAP server serves the item it owns regardless.
     pub(super) fn stream_request(
         &self,
         scope: DaapCatalogueScope,
         song_id: u32,
-        format: &str,
+        format: Option<&str>,
     ) -> BackendResult<ResolvedHttpRequest> {
         let mut endpoint = self.base_url.clone();
-        let item = format!("{song_id}.{format}");
+        let item = format!("{song_id}.{}", format.unwrap_or("mp3"));
         let database_id = scope.database_id.to_string();
         append_base_path_segments(
             &mut endpoint,
             ["databases", database_id.as_str(), "items", item.as_str()],
         );
-        self.resolved_media_request(endpoint)
+        let representation = match format {
+            Some(format) => MediaRepresentation::buffered_from_suffix(format),
+            None => MediaRepresentation::buffered_unknown(),
+        };
+        Ok(self
+            .resolved_media_request(endpoint)?
+            .with_representation(representation))
     }
 
     fn resolved_media_request(&self, endpoint: Url) -> BackendResult<ResolvedHttpRequest> {
@@ -729,6 +768,7 @@ fn unique_dmap_status(children: &[DmapNode]) -> BackendResult<Option<u32>> {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
+    use crate::architecture::media::MediaContainer;
     use crate::audio::test_support::{
         assert_protected_stream_cases_play_to_eos, ProtectedStreamCase,
     };
@@ -796,6 +836,59 @@ mod tests {
     }
 
     #[test]
+    fn declared_allowlisted_asfm_resolves_to_the_matching_descriptor() {
+        let request = client("http://198.51.100.10:3689/")
+            .stream_request(scope(), 7, Some("flac"))
+            .expect("DAAP stream request");
+
+        let representation = request.representation();
+        assert_eq!(representation.container(), Some(MediaContainer::Flac));
+        assert_eq!(representation.content_type(), Some("audio/flac"));
+        assert_eq!(representation.ticket_suffix(), Some("flac"));
+        assert!(request
+            .endpoint()
+            .path()
+            .ends_with("/databases/1/items/7.flac"));
+    }
+
+    #[test]
+    fn non_allowlisted_declared_asfm_resolves_to_explicit_unknown() {
+        let request = client("http://198.51.100.10:3689/")
+            .stream_request(scope(), 7, Some("shn"))
+            .expect("DAAP stream request");
+
+        let representation = request.representation();
+        assert_eq!(representation.container(), None);
+        assert_eq!(representation.content_type(), None);
+        assert_eq!(representation.ticket_suffix(), None);
+        // The URL item hint still names the server-declared format; only the
+        // descriptor is withheld.
+        assert!(request
+            .endpoint()
+            .path()
+            .ends_with("/databases/1/items/7.shn"));
+    }
+
+    #[test]
+    fn absent_asfm_resolves_to_explicit_unknown_without_an_mp3_guess() {
+        let request = client("http://198.51.100.10:3689/")
+            .stream_request(scope(), 7, None)
+            .expect("DAAP stream request");
+
+        let representation = request.representation();
+        assert_eq!(representation, MediaRepresentation::buffered_unknown());
+        assert_eq!(representation.content_type(), None);
+        // No `.mp3` MIME or ticket suffix may be inherited from the URL
+        // default: the descriptor stays explicitly unknown (issue #255).
+        assert_eq!(representation.ticket_suffix(), None);
+        // The legacy URL item hint is unchanged.
+        assert!(request
+            .endpoint()
+            .path()
+            .ends_with("/databases/1/items/7.mp3"));
+    }
+
+    #[test]
     fn protected_daap_and_subsonic_streams_play_to_eos() {
         const EXACT_TEST_NAME: &str =
             "daap::client::tests::protected_daap_and_subsonic_streams_play_to_eos";
@@ -805,7 +898,7 @@ mod tests {
             server_url.set_path("/share/");
 
             let daap_request = client(server_url.as_str())
-                .stream_request(scope(), 7, "flac")
+                .stream_request(scope(), 7, Some("flac"))
                 .expect("DAAP stream request");
             assert_eq!(
                 daap_request.private_query_pairs(),
@@ -844,7 +937,7 @@ mod tests {
             let subsonic_client = SubsonicClient::new(server_url.as_str(), &username, &password)
                 .expect("Subsonic client");
             let subsonic_request = subsonic_client
-                .resolved_stream_request(&song_id)
+                .resolved_stream_request(&song_id, MediaRepresentation::buffered_unknown())
                 .expect("Subsonic stream request");
 
             let private_value = |key: &str| {
@@ -927,7 +1020,7 @@ mod tests {
         ] {
             let client = client(base);
             let stream = client
-                .stream_request(scope(), 7, "flac")
+                .stream_request(scope(), 7, Some("flac"))
                 .expect("stream request");
             assert_eq!(
                 stream.endpoint().as_str(),
@@ -949,7 +1042,7 @@ mod tests {
             assert_eq!(artwork.required_headers(), daap_required_headers());
 
             let malicious = client
-                .stream_request(scope(), 7, "flac/../../logout")
+                .stream_request(scope(), 7, Some("flac/../../logout"))
                 .expect("untrusted format is one segment");
             assert_eq!(
                 malicious.endpoint().as_str(),
@@ -1003,7 +1096,7 @@ mod tests {
         };
 
         let stream = client
-            .stream_request(scope(), 7, "flac/../../logout")
+            .stream_request(scope(), 7, Some("flac/../../logout"))
             .expect("stream request");
         assert_eq!(stream.endpoint().host_str(), Some("mini.local"));
         assert_eq!(stream.endpoint().port(), Some(3689));

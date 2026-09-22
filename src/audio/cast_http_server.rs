@@ -610,15 +610,24 @@ impl CastHttpServer {
     }
 
     fn register_upstream_request(&self, request: UpstreamRequest) -> String {
-        // Carry the upstream's media extension onto the ticket. The Cast
-        // `content_type` is guessed from the URL it is handed, so an
-        // extensionless ticket would advertise a proxied FLAC or Opus stream as
-        // the default `audio/mpeg` and the receiver would refuse or misplay it.
-        //
-        // Only a known audio extension is copied: the ticket path must stay
-        // opaque, and nothing from the upstream URL beyond this fixed set is
-        // allowed to shape it.
-        let ticket = match upstream_media_extension(request.endpoint()) {
+        // Ticket-shaping authority. A typed resolved request carries a
+        // validated `MediaRepresentation`, and its container suffix is
+        // authoritative for the ticket path: extensionless endpoints such as
+        // Subsonic `stream.view` and Jellyfin `Audio/{id}/stream` would
+        // otherwise leave the receiver nothing but its default and mislabel a
+        // proxied FLAC or Opus stream as `audio/mpeg`. URL sniffing stays
+        // exclusively in the legacy branch: a deliberately-unknown resolved
+        // descriptor must survive ticket creation, so an endpoint whose URL
+        // happens to end in a recognized extension gets an extensionless
+        // ticket instead of a guess. Only the legacy branch copies a
+        // recognized URL extension, and only a known audio extension is ever
+        // copied, so the ticket path stays opaque and nothing beyond this
+        // fixed set may shape it.
+        let extension = match &request {
+            UpstreamRequest::Resolved(resolved) => resolved.representation().ticket_suffix(),
+            UpstreamRequest::Legacy(url) => upstream_media_extension(url),
+        };
+        let ticket = match extension {
             Some(extension) => format!("{}.{extension}", Uuid::new_v4()),
             None => Uuid::new_v4().to_string(),
         };
@@ -688,7 +697,9 @@ impl Drop for CastHttpServer {
 ///
 /// A Plex part key ends in `/file.flac`; a Subsonic `stream.view` has no
 /// extension at all, in which case the receiver falls back to its default and
-/// there is nothing more we can say from the URL alone.
+/// there is nothing more we can say from the URL alone. This is only a
+/// fallback: a typed resolved request's validated `MediaRepresentation`
+/// takes precedence over URL sniffing.
 ///
 /// The allow-list is deliberate: the ticket path is otherwise a bare UUID, and
 /// only these fixed strings may ever be appended to it.
@@ -865,6 +876,18 @@ async fn proxy_upstream(
     ] {
         if let Some(value) = upstream.headers().get(&name) {
             response = response.header(name, value.clone());
+        }
+    }
+    // Content-Type authority: the upstream response header is the wire truth
+    // and is passed through untouched when present. When the upstream omits
+    // it (some extensionless endpoints do), the validated descriptor from
+    // media resolution fills the gap so the receiver never has to guess; an
+    // unknown container stays unlabeled rather than mislabeled.
+    if !upstream.headers().contains_key(&header::CONTENT_TYPE) {
+        if let UpstreamRequest::Resolved(resolved) = upstream_request {
+            if let Some(content_type) = resolved.representation().content_type() {
+                response = response.header(header::CONTENT_TYPE, content_type);
+            }
         }
     }
 
@@ -1207,7 +1230,7 @@ mod tests {
         USER_AGENT,
     };
 
-    use crate::architecture::media::MediaLease;
+    use crate::architecture::media::{MediaContainer, MediaLease, MediaRepresentation};
 
     use super::*;
 
@@ -1823,6 +1846,35 @@ mod tests {
             .expect("capture response")
     }
 
+    /// Upstream that intentionally omits Content-Type, like some
+    /// extensionless protected-media endpoints do.
+    async fn capture_untyped_request(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<(Uri, HeaderMap)>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Response {
+        let _ = tx.send((uri, headers));
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("media"))
+            .expect("untyped capture response")
+    }
+
+    /// Upstream that reports a Content-Type that differs from what URL
+    /// sniffing would claim.
+    async fn capture_typed_flac_request(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<(Uri, HeaderMap)>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Response {
+        let _ = tx.send((uri, headers));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "audio/flac")
+            .body(Body::from("media"))
+            .expect("typed capture response")
+    }
+
     const GZIP_MEDIA_BODY: &[u8] = &[
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x4d, 0x4d, 0xc9, 0x4c,
         0x04, 0x00, 0x0c, 0xa1, 0x2c, 0x6a, 0x05, 0x00, 0x00, 0x00,
@@ -1855,6 +1907,8 @@ mod tests {
             .route("/reverse-proxy/library/stream", get(capture_request))
             .route("/explicit-proxy/stream", get(capture_request))
             .route("/compressed/stream", get(capture_compressed_range))
+            .route("/untyped/stream", get(capture_untyped_request))
+            .route("/typed/stream", get(capture_typed_flac_request))
             .with_state(tx);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2211,6 +2265,244 @@ mod tests {
         assert!(server.register_resolved(request).is_none());
         let response = reqwest::get(ticket).await.expect("retired ticket fetch");
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resolved_descriptor_titles_the_proxy_ticket_extension() {
+        let server = CastHttpServer::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("proxy server");
+        // Extensionless endpoint: the URL gives the ticket generator nothing,
+        // so the descriptor is the only container authority.
+        let ticket_for = |representation| {
+            let request = ResolvedHttpRequest::new(
+                Url::parse("https://music.test/stream").expect("extensionless endpoint"),
+            )
+            .expect("resolved request")
+            .with_lease(MediaLease::new())
+            .with_representation(representation);
+            server
+                .register_resolved(request)
+                .expect("active resolved ticket")
+        };
+
+        let flac_ticket = ticket_for(MediaRepresentation::buffered(MediaContainer::Flac));
+        let ticket_extension = |ticket: &str| {
+            Url::parse(ticket)
+                .expect("parse ticket URL")
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .and_then(|segment| {
+                    segment
+                        .rsplit_once('.')
+                        .map(|(_, extension)| extension.to_owned())
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            ticket_extension(&flac_ticket),
+            "flac",
+            "flac ticket: {flac_ticket}"
+        );
+        let aac_ticket = ticket_for(MediaRepresentation::buffered(MediaContainer::Aac));
+        assert_eq!(
+            ticket_extension(&aac_ticket),
+            "aac",
+            "aac ticket: {aac_ticket}"
+        );
+
+        // Explicit unknown stays unlabeled rather than claiming a container.
+        let unknown_ticket = ticket_for(MediaRepresentation::buffered_unknown());
+        let unknown_path = Url::parse(&unknown_ticket)
+            .expect("parse unknown ticket")
+            .path()
+            .to_string();
+        assert!(
+            !unknown_path.contains('.'),
+            "explicit unknown ticket must have no extension: {unknown_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_resolved_representation_keeps_the_endpoint_extension_out_of_the_ticket() {
+        let server = CastHttpServer::start_on(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("proxy server");
+        // The endpoint ends in a recognized audio extension, but the
+        // representation is deliberately unknown: URL sniffing must not
+        // promote that extension into the ticket path, or the unknown state
+        // would not survive ticket creation.
+        let request = ResolvedHttpRequest::new(
+            Url::parse("https://music.test/items/7.mp3").expect("extensioned endpoint"),
+        )
+        .expect("resolved request")
+        .with_lease(MediaLease::new())
+        .with_representation(MediaRepresentation::buffered_unknown());
+        let ticket = server
+            .register_resolved(request)
+            .expect("active resolved ticket");
+
+        let ticket_path = Url::parse(&ticket)
+            .expect("parse unknown ticket")
+            .path()
+            .to_string();
+        assert!(
+            !ticket_path.contains('.'),
+            "an unknown resolved request must get an extensionless ticket, \
+             not the endpoint's .mp3: {ticket_path}"
+        );
+    }
+
+    struct AdvertisedCapture {
+        client: UpstreamMediaClient,
+        captures: tokio::sync::mpsc::UnboundedReceiver<(Uri, HeaderMap)>,
+        upstream_abort: tokio::task::AbortHandle,
+        advertised_endpoint: Url,
+        route_origin: Url,
+        upstream_addr: SocketAddr,
+    }
+
+    async fn start_advertised_capture(
+        advertised_host: &'static str,
+        upstream_path: &str,
+    ) -> AdvertisedCapture {
+        let (upstream_addr, captures, upstream_abort) = start_capture_server().await;
+        let client = test_upstream_client(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let advertised_endpoint = Url::parse(&format!(
+            "http://{advertised_host}:{}{upstream_path}",
+            upstream_addr.port()
+        ))
+        .expect("extensionless advertised endpoint");
+        let route_origin = Url::parse(&format!(
+            "http://{advertised_host}:{}/",
+            upstream_addr.port()
+        ))
+        .expect("advertised origin");
+        AdvertisedCapture {
+            client,
+            captures,
+            upstream_abort,
+            advertised_endpoint,
+            route_origin,
+            upstream_addr,
+        }
+    }
+
+    fn resolved_advertised_request(
+        capture: &AdvertisedCapture,
+        representation: MediaRepresentation,
+    ) -> ResolvedHttpRequest {
+        ResolvedHttpRequest::new(capture.advertised_endpoint.clone())
+            .expect("resolved untyped request")
+            .with_advertised_route(
+                AdvertisedHttpRoute::new(&capture.route_origin, [capture.upstream_addr])
+                    .expect("exact-origin advertised route"),
+            )
+            .expect("matching advertised route")
+            .with_representation(representation)
+    }
+
+    #[tokio::test]
+    async fn untyped_upstream_content_type_is_filled_from_the_descriptor() {
+        let mut capture = start_advertised_capture("cast-untyped.invalid", "/untyped/stream").await;
+
+        // Known container: the descriptor labels the response the receiver sees.
+        let mut receiver_headers = HeaderMap::new();
+        receiver_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+        let request = resolved_advertised_request(
+            &capture,
+            MediaRepresentation::buffered(MediaContainer::Flac),
+        );
+        let response = proxy_upstream(
+            &capture.client,
+            &UpstreamRequest::Resolved(Box::new(request)),
+            &receiver_headers,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("audio/flac")),
+            "an untyped upstream must be labeled from the validated descriptor"
+        );
+        let (_, captured_headers) =
+            tokio::time::timeout(Duration::from_secs(2), capture.captures.recv())
+                .await
+                .expect("capture timeout")
+                .expect("captured request");
+        assert_eq!(
+            captured_headers.get(header::RANGE),
+            Some(&HeaderValue::from_static("bytes=2-5")),
+            "the receiver's Range request must still reach the upstream"
+        );
+
+        // Explicit unknown container: no invented label.
+        let request =
+            resolved_advertised_request(&capture, MediaRepresentation::buffered_unknown());
+        let response = proxy_upstream(
+            &capture.client,
+            &UpstreamRequest::Resolved(Box::new(request)),
+            &HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(header::CONTENT_TYPE),
+            "an unknown container must stay unlabeled, not mislabeled"
+        );
+
+        capture.upstream_abort.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_content_type_passthrough_beats_the_descriptor() {
+        const ADVERTISED_HOST: &str = "cast-typed.invalid";
+
+        let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
+        let client = test_upstream_client(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let advertised_endpoint = Url::parse(&format!(
+            "http://{ADVERTISED_HOST}:{}/typed/stream",
+            upstream_addr.port()
+        ))
+        .expect("typed advertised endpoint");
+        let route_origin = Url::parse(&format!(
+            "http://{ADVERTISED_HOST}:{}/",
+            upstream_addr.port()
+        ))
+        .expect("advertised origin");
+        let resolved = ResolvedHttpRequest::new(advertised_endpoint)
+            .expect("resolved typed request")
+            .with_advertised_route(
+                AdvertisedHttpRoute::new(&route_origin, [upstream_addr])
+                    .expect("exact-origin advertised route"),
+            )
+            .expect("matching advertised route")
+            // Deliberately contradicts the upstream header: if URL sniffing
+            // won anywhere, a wrong mp3 label could leak into the response.
+            .with_representation(MediaRepresentation::buffered(MediaContainer::Mp3));
+        let response = proxy_upstream(
+            &client,
+            &UpstreamRequest::Resolved(Box::new(resolved)),
+            &HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("audio/flac")),
+            "the upstream Content-Type is the wire truth and must pass through untouched"
+        );
+        let _ = captures.recv().await.expect("captured request");
+        upstream_abort.abort();
     }
 
     fn test_upstream_client(

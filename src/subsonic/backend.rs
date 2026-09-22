@@ -17,9 +17,9 @@ use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
 use crate::architecture::{
-    AdvertisedHttpRoute, NativePlaylistId, RemoteMediaResolver, ResolvedHttpRequest,
-    ServerPlaylistSnapshot, ServerPlaylistSummary, TrackId, MAX_SERVER_PLAYLISTS_PER_LIST,
-    MAX_SERVER_PLAYLIST_ENTRIES,
+    AdvertisedHttpRoute, MediaRepresentation, NativePlaylistId, RemoteMediaResolver,
+    ResolvedHttpRequest, ServerPlaylistSnapshot, ServerPlaylistSummary, TrackId,
+    MAX_SERVER_PLAYLISTS_PER_LIST, MAX_SERVER_PLAYLIST_ENTRIES,
 };
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
@@ -60,6 +60,9 @@ struct LibraryCache {
     /// lifetime, so these entries are capped separately and can never evict
     /// a refreshed catalogue profile.
     search_attribution_profiles: BoundedSearchAttributionProfiles,
+    /// Exact Subsonic song ID → validated stream representation. Tracks whose
+    /// suffix is absent or outside the allowlist map to the explicit unknown.
+    representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
 }
 
 impl LibraryCache {
@@ -72,6 +75,7 @@ impl LibraryCache {
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
             search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
+            representation_by_track_id: HashMap::new(),
         }
     }
 }
@@ -405,6 +409,7 @@ impl SubsonicBackend {
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
         let mut attribution_profiles = HashMap::new();
+        let mut representation_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
@@ -439,6 +444,12 @@ impl SubsonicBackend {
                     );
 
                     stream_locator_by_track_id.insert(track_id.clone(), song.id.clone());
+                    representation_by_track_id.insert(
+                        track_id.clone(),
+                        MediaRepresentation::buffered_from_suffix(
+                            song.suffix.as_deref().unwrap_or(""),
+                        ),
+                    );
                     if let Some(cover_art_id) = &song.cover_art {
                         track_artwork_locator_by_track_id
                             .insert(track_id.clone(), cover_art_id.clone());
@@ -496,6 +507,7 @@ impl SubsonicBackend {
             // A full refresh supersedes every search-only retention from the
             // previous catalogue generation.
             search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
+            representation_by_track_id,
         };
 
         Ok(())
@@ -624,6 +636,27 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
             cache
                 .stream_locator_by_track_id
                 .insert(track_id.clone(), song.id.clone());
+            // Same authority as the full sync: the song's suffix from
+            // library metadata labels the stream, so a search-discovered
+            // track resolves to the same representation it would have after
+            // a sync. A present suffix replaces the cached representation;
+            // an absent one must not overwrite a known descriptor with
+            // unknown — only a search-only track gets the explicit unknown
+            // seeded.
+            match song.suffix.as_deref().filter(|suffix| !suffix.is_empty()) {
+                Some(suffix) => {
+                    cache.representation_by_track_id.insert(
+                        track_id.clone(),
+                        MediaRepresentation::buffered_from_suffix(suffix),
+                    );
+                }
+                None => {
+                    cache
+                        .representation_by_track_id
+                        .entry(track_id.clone())
+                        .or_insert_with(MediaRepresentation::buffered_unknown);
+                }
+            }
             if let Some(cover_art_id) = &song.cover_art {
                 cache
                     .track_artwork_locator_by_track_id
@@ -725,10 +758,8 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
 #[async_trait]
 impl RemoteMediaResolver for SubsonicBackend {
     async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-        let song_id = self
-            .cache
-            .read()
-            .await
+        let cache = self.cache.read().await;
+        let song_id = cache
             .stream_locator_by_track_id
             .get(track_id)
             .cloned()
@@ -736,7 +767,18 @@ impl RemoteMediaResolver for SubsonicBackend {
                 entity_type: "track".into(),
                 id: deterministic_uuid(track_id.as_str()),
             })?;
-        self.client.resolved_stream_request(&song_id)
+        // Authority: `stream.view` is issued without transcoding parameters, so
+        // the source container from library metadata is the representation the
+        // server is asked to return. A suffix outside the allowlist resolves to
+        // the explicit unknown rather than a guess.
+        let representation = cache
+            .representation_by_track_id
+            .get(track_id)
+            .copied()
+            .unwrap_or_else(MediaRepresentation::buffered_unknown);
+        drop(cache);
+        self.client
+            .resolved_stream_request(&song_id, representation)
     }
 
     async fn resolve_artwork(
@@ -825,6 +867,7 @@ mod tests {
     use axum::http::StatusCode;
     use md5::{Digest as _, Md5};
 
+    use crate::architecture::media::MediaContainer;
     use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
     use crate::source_registry::MAX_SEARCH_ATTRIBUTION_PROFILES;
@@ -1375,6 +1418,210 @@ mod tests {
         .await;
 
         service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_stream_carries_the_library_container_descriptor() {
+        let service = MockHttpService::start(descriptor_catalogue_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            "user",
+            &password,
+        )
+        .await
+        .expect("descriptor fixture catalogue");
+
+        let cache = backend.cache.read().await;
+        let native_ids: Vec<(TrackId, String)> = cache
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                track
+                    .native_track_id
+                    .as_ref()
+                    .map(|native| (native.clone(), track.title.clone()))
+            })
+            .collect();
+        drop(cache);
+        assert_eq!(native_ids.len(), 2);
+
+        for (track_id, title) in native_ids {
+            let resolved = backend
+                .resolve_stream(&track_id)
+                .await
+                .expect("descriptor resolution");
+            assert_resolved_descriptor_matches_library(&resolved, &title);
+        }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn search_results_carry_the_library_container_descriptor() {
+        let service = MockHttpService::start(descriptor_search_catalogue_routes()).await;
+        let password = Uuid::new_v4().to_string();
+        let backend = SubsonicBackend::connect(
+            "fixture",
+            &format!("{}/gateway/", service.base_url()),
+            "user",
+            &password,
+        )
+        .await
+        .expect("descriptor fixture catalogue");
+
+        // These tracks exist only in the search response — never synced — so
+        // their representations must come from the search path itself. The
+        // third result ("Lossless") is the already-synced flac-track with its
+        // suffix omitted by the search payload.
+        let results = backend.search("Search", 10).await.expect("search fixture");
+        assert_eq!(results.tracks.len(), 3);
+        for track in &results.tracks {
+            let track_id = track
+                .native_track_id
+                .clone()
+                .expect("search result retains its native ID");
+            let resolved = backend
+                .resolve_stream(&track_id)
+                .await
+                .expect("resolve search result");
+            match track.title.as_str() {
+                "Search Lossless" => assert_eq!(
+                    resolved.representation(),
+                    MediaRepresentation::buffered(MediaContainer::Flac),
+                    "search suffix flac must label the resolved stream"
+                ),
+                "Lossless" => assert_eq!(
+                    resolved.representation(),
+                    MediaRepresentation::buffered(MediaContainer::Flac),
+                    "an absent search suffix must preserve the synced flac descriptor"
+                ),
+                _ => {
+                    assert_eq!(track.title, "Search Opaque");
+                    assert_eq!(
+                        resolved.representation(),
+                        MediaRepresentation::buffered_unknown(),
+                        "an unrecognized search suffix must stay explicitly unknown"
+                    );
+                }
+            }
+        }
+        service.finish().await;
+    }
+
+    fn descriptor_catalogue_routes() -> Vec<MockRoute> {
+        let mut routes = vec![
+            MockRoute::get("/gateway/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/gateway/rest/getArtists.view").reply(MockResponse::json(
+                serde_json::json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "artists": {"index": [{"artist": [
+                            {"id": "descriptor-artist", "name": "Descriptor Artist"}
+                        ]}]}
+                    }
+                }),
+            )),
+        ];
+        routes.push(descriptor_artist_route());
+        routes.push(descriptor_album_route());
+        routes
+    }
+
+    fn descriptor_artist_route() -> MockRoute {
+        MockRoute::get("/gateway/rest/getArtist.view")
+            .with_query("id", "descriptor-artist")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artist": {
+                        "id": "descriptor-artist",
+                        "name": "Descriptor Artist",
+                        "album": [
+                            {"id": "descriptor-album", "name": "Descriptor Album"}
+                        ]
+                    }
+                }
+            })))
+    }
+
+    fn descriptor_album_route() -> MockRoute {
+        MockRoute::get("/gateway/rest/getAlbum.view")
+            .with_query("id", "descriptor-album")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {
+                        "id": "descriptor-album",
+                        "name": "Descriptor Album",
+                        "song": [
+                            {
+                                "id": "flac-track",
+                                "title": "Lossless",
+                                "suffix": "flac"
+                            },
+                            {
+                                "id": "opaque-track",
+                                "title": "Opaque",
+                                "suffix": "ape"
+                            }
+                        ]
+                    }
+                }
+            })))
+    }
+
+    fn descriptor_search_route() -> MockRoute {
+        MockRoute::get("/gateway/rest/search3.view")
+            .with_query("query", "Search")
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "searchResult3": {
+                        "song": [
+                            {
+                                "id": "search-flac-track",
+                                "title": "Search Lossless",
+                                "suffix": "flac"
+                            },
+                            {
+                                "id": "search-ape-track",
+                                "title": "Search Opaque",
+                                "suffix": "ape"
+                            },
+                            {
+                                "id": "flac-track",
+                                "title": "Lossless"
+                            }
+                        ]
+                    }
+                }
+            })))
+    }
+
+    fn descriptor_search_catalogue_routes() -> Vec<MockRoute> {
+        let mut routes = descriptor_catalogue_routes();
+        routes.push(descriptor_search_route());
+        routes
+    }
+
+    fn assert_resolved_descriptor_matches_library(resolved: &ResolvedHttpRequest, title: &str) {
+        if title == "Lossless" {
+            assert_eq!(
+                resolved.representation(),
+                MediaRepresentation::buffered(MediaContainer::Flac),
+                "library suffix flac must label the resolved stream"
+            );
+        } else {
+            assert_eq!(title, "Opaque");
+            assert_eq!(
+                resolved.representation(),
+                MediaRepresentation::buffered_unknown(),
+                "an unrecognized suffix must stay explicitly unknown"
+            );
+        }
     }
 
     #[tokio::test]

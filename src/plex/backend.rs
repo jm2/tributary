@@ -14,11 +14,13 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
+use crate::architecture::{
+    AdvertisedHttpRoute, MediaRepresentation, RemoteMediaResolver, ResolvedHttpRequest, TrackId,
+};
 
 use super::api::{
     PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
-    PlexMedia, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
+    PlexMedia, PlexPart, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
 use crate::source_registry::PlaybackAttributionProfile;
@@ -49,12 +51,22 @@ pub struct MusicLibrary {
 
 // ── In-memory cache ─────────────────────────────────────────────────────
 
+/// The selected stream source for a track: the part key the server expects,
+/// plus the container Plex's library metadata declares for it. The container
+/// backs the stream representation when the part key itself carries no usable
+/// extension (part first, media as fallback).
+#[derive(Clone, Debug)]
+struct PlexStreamSource {
+    part_key: String,
+    container: Option<String>,
+}
+
 struct LibraryCache {
     tracks: Vec<Track>,
     albums: Vec<Album>,
     artists: Vec<Artist>,
-    /// Exact Plex rating key → media part key.
-    stream_locator_by_track_id: HashMap<TrackId, String>,
+    /// Exact Plex rating key → selected stream source.
+    stream_source_by_track_id: HashMap<TrackId, PlexStreamSource>,
     /// Exact Plex rating key → thumbnail path.
     track_artwork_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Plex rating key → Last.fm attribution profile derived from the
@@ -68,7 +80,7 @@ impl LibraryCache {
             tracks: Vec::new(),
             albums: Vec::new(),
             artists: Vec::new(),
-            stream_locator_by_track_id: HashMap::new(),
+            stream_source_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
         }
@@ -179,7 +191,7 @@ impl PlexBackend {
         let mut all_albums = Vec::new();
         let mut all_artists = Vec::new();
         let mut skipped_unplayable_tracks = 0usize;
-        let mut stream_locator_by_track_id = HashMap::new();
+        let mut stream_source_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
         let mut attribution_profiles = HashMap::new();
 
@@ -252,14 +264,14 @@ impl PlexBackend {
 
             // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
-                let Some((track_id, track, part_key, attribution_profile)) =
+                let Some((track_id, track, source, attribution_profile)) =
                     cacheable_plex_track(plex_track)
                 else {
                     skipped_unplayable_tracks += 1;
                     continue;
                 };
 
-                stream_locator_by_track_id.insert(track_id.clone(), part_key);
+                stream_source_by_track_id.insert(track_id.clone(), source);
                 if let Some(thumb_path) = &plex_track.thumb {
                     track_artwork_locator_by_track_id.insert(track_id.clone(), thumb_path.clone());
                 }
@@ -329,7 +341,7 @@ impl PlexBackend {
             tracks: all_tracks,
             albums: all_albums,
             artists: all_artists,
-            stream_locator_by_track_id,
+            stream_source_by_track_id,
             track_artwork_locator_by_track_id,
             attribution_profiles,
         };
@@ -564,18 +576,21 @@ impl crate::architecture::MediaBackend for PlexBackend {
 #[async_trait]
 impl RemoteMediaResolver for PlexBackend {
     async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-        let part_key = self
+        let source = self
             .cache
             .read()
             .await
-            .stream_locator_by_track_id
+            .stream_source_by_track_id
             .get(track_id)
             .cloned()
             .ok_or_else(|| BackendError::NotFound {
                 entity_type: "track".into(),
                 id: deterministic_uuid(track_id.as_str()),
             })?;
-        self.client.resolved_stream_request(&part_key)
+        let representation =
+            plex_stream_representation(&source.part_key, source.container.as_deref());
+        self.client
+            .resolved_stream_request(&source.part_key, representation)
     }
 
     async fn resolve_artwork(
@@ -604,16 +619,42 @@ fn deterministic_uuid(plex_id: &str) -> Uuid {
 }
 
 fn plex_stream_locator(plex: &PlexTrack) -> Option<&str> {
-    plex_stream_source(plex).map(|(_, locator)| locator)
+    plex_stream_source(plex).map(|(_, _, locator)| locator)
 }
 
-fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &str)> {
+/// The validated representation of a Plex stream request.
+///
+/// Authority order: the part key ends in the server's file name, so the
+/// extension after the final dot is library metadata — but only when it is
+/// genuinely a final path segment (no `/` may follow it). When the key yields
+/// no usable extension, the container Plex's library metadata declares for
+/// the selected part (falling back to its media) is the recorded format, and
+/// it flows through the same `from_suffix` allowlist: a known container
+/// labels the stream, anything unrecognized or absent resolves to the
+/// explicit unknown rather than a guess. So an extensionless part key with
+/// `container="flac"` advertises FLAC instead of inheriting the receiver's
+/// audio/mpeg default.
+fn plex_stream_representation(part_key: &str, container: Option<&str>) -> MediaRepresentation {
+    let key_suffix = part_key
+        .rsplit_once('.')
+        .map(|(_, suffix)| suffix)
+        .filter(|suffix| !suffix.is_empty() && !suffix.contains('/'));
+    let suffix = key_suffix.unwrap_or_else(|| container.unwrap_or(""));
+    MediaRepresentation::buffered_from_suffix(suffix)
+}
+
+fn plex_stream_source(plex: &PlexTrack) -> Option<(&PlexMedia, &PlexPart, &str)> {
     plex.media.iter().find_map(|media| {
         media
             .part
             .iter()
-            .find_map(|part| part.key.as_deref().filter(|key| !key.trim().is_empty()))
-            .map(|locator| (media, locator))
+            .find_map(|part| {
+                part.key
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(|locator| (part, locator))
+            })
+            .map(|(part, locator)| (media, part, locator))
     })
 }
 
@@ -622,10 +663,10 @@ fn cacheable_plex_track(
 ) -> Option<(
     TrackId,
     Track,
-    String,
+    PlexStreamSource,
     Option<crate::source_registry::PlaybackAttributionProfile>,
 )> {
-    let (media, stream_locator) = plex_stream_source(plex)?;
+    let (media, part, stream_locator) = plex_stream_source(plex)?;
     let track_id = TrackId::remote(plex.rating_key.clone()).ok()?;
     let track_uuid = deterministic_uuid(&plex.rating_key);
     let artist_id = plex
@@ -652,12 +693,13 @@ fn cacheable_plex_track(
         plex.index,
         plex.duration.map(|d| d / 1000),
     );
-    Some((
-        track_id,
-        track,
-        stream_locator.to_string(),
-        attribution_profile,
-    ))
+    let source = PlexStreamSource {
+        part_key: stream_locator.to_string(),
+        // The part's own container describes the file it points at; fall
+        // back to the media's container when the part omits it.
+        container: part.container.clone().or_else(|| media.container.clone()),
+    };
+    Some((track_id, track, source, attribution_profile))
 }
 
 fn plex_track_to_track(
@@ -712,6 +754,7 @@ fn plex_track_to_track(
 mod tests {
     use axum::http::StatusCode;
 
+    use crate::architecture::media::MediaContainer;
     use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
 
@@ -774,6 +817,7 @@ mod tests {
                 },
                 {
                     "bitrate": 1411,
+                    "container": "flac",
                     "audioCodec": "flac",
                     "Part": [{"key": "/library/parts/2/file.flac"}]
                 },
@@ -785,19 +829,75 @@ mod tests {
             plex_stream_locator(&track),
             Some("/library/parts/2/file.flac")
         );
-        let (track_id, published, stream_locator, attribution_profile) =
+        let (track_id, published, source, attribution_profile) =
             cacheable_plex_track(&track).expect("track should be published");
         assert_eq!(track_id.as_str(), "track-id");
         assert_eq!(published.id, deterministic_uuid("track-id"));
         assert_eq!(published.native_track_id.as_ref(), Some(&track_id));
         assert_eq!(published.bitrate_kbps, Some(1411));
         assert_eq!(published.format.as_deref(), Some("flac"));
-        assert_eq!(stream_locator, "/library/parts/2/file.flac");
+        assert_eq!(source.part_key, "/library/parts/2/file.flac");
+        // The selected part carries no container of its own; the media's
+        // container is the recorded fallback for representation shaping.
+        assert_eq!(source.container.as_deref(), Some("flac"));
         // The accepted row omits the required title, so no attribution
         // authority may exist even though the display Track synthesizes
         // an "Unknown" title fallback.
         assert_eq!(published.title, "Unknown");
         assert!(attribution_profile.is_none());
+    }
+
+    #[test]
+    fn extensionless_part_key_falls_back_to_the_declared_container() {
+        // A usable key extension wins over the metadata container.
+        assert_eq!(
+            plex_stream_representation("/library/parts/2/file.mp3", Some("flac")),
+            MediaRepresentation::buffered(MediaContainer::Mp3)
+        );
+        // No usable extension: the declared container labels the stream.
+        assert_eq!(
+            plex_stream_representation("/library/parts/2/track", Some("flac")),
+            MediaRepresentation::buffered(MediaContainer::Flac)
+        );
+        // The key's extension must be a final path segment to count.
+        assert_eq!(
+            plex_stream_representation("/library/parts/2/file.flac/x", Some("opus")),
+            MediaRepresentation::buffered(MediaContainer::Opus)
+        );
+        // Unknown or absent containers stay explicitly unknown.
+        assert_eq!(
+            plex_stream_representation("/library/parts/2/track", Some("ape")),
+            MediaRepresentation::buffered_unknown()
+        );
+        assert_eq!(
+            plex_stream_representation("/library/parts/2/track", None),
+            MediaRepresentation::buffered_unknown()
+        );
+    }
+
+    #[test]
+    fn selected_part_container_is_preferred_over_its_media_container() {
+        let track: PlexTrack = serde_json::from_value(serde_json::json!({
+            "ratingKey": "track-id",
+            "Media": [{
+                "container": "mp4",
+                "audioCodec": "aac",
+                "Part": [{
+                    "key": "/library/parts/1/opaque",
+                    "container": "aac"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let (_, _, source, _) = cacheable_plex_track(&track).expect("track should be published");
+        assert_eq!(source.part_key, "/library/parts/1/opaque");
+        assert_eq!(source.container.as_deref(), Some("aac"));
+        assert_eq!(
+            plex_stream_representation(&source.part_key, source.container.as_deref()),
+            MediaRepresentation::buffered(MediaContainer::Aac),
+            "raw AAC must advertise audio/aac, never audio/mp4"
+        );
     }
 
     #[tokio::test]
