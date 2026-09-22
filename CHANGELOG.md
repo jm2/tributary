@@ -125,17 +125,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live in one shared state object with a single composition rule — every
   selection, search, and refresh emits the same composed filter that both the
   visible list splice and the status count derive from. Source replacement
-  (`reset_browser_data`) clears every axis, the entry text, and pending
-  search debounces, emitting nothing (the caller splices the full set);
+  (`reset_browser_data`) clears every axis, the entry text, the folder pane
+  (navigation returns to the roots level so the displayed directory agrees
+  with the cleared folder filter), and pending search debounces, emitting
+  nothing (the caller splices the full set);
   same-source refresh (`refresh_browser_data`, used by debounced upsert and
   delete) preserves still-valid selections, drops vanished axes as if the
   user had cleared them (most specific first: album → artist → genre), and
   always recomposes. Upserts under an active filter recompose instead of
   appending; unfiltered upserts keep the direct single-row store update.
   The search debounce timer now arms on the browser's thread-default main
-  context rather than the global default. Five production-widget contracts
+  context rather than the global default. Six production-widget contracts
   (selection vs. search, source replacement, refresh preserve/drop, full-sync
-  reset, pending-debounce invalidation) run in the consolidated GTK session.
+  reset, pending-debounce invalidation, folder-pane reset on source
+  replacement) run in the consolidated GTK session.
   (#250)
 
 - **Initial scan no longer delays commands or window close** (`src/local/engine.rs`,
