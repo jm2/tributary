@@ -141,6 +141,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement) run in the consolidated GTK session.
   (#250)
 
+- **Folder rows navigate on activation, not selection** (`src/ui/browser.rs`,
+  `src/ui/objects/browser_item.rs`) —
+  Activating the folder row that was already selected could never
+  navigate: the pane's selection model auto-selects the first row, and
+  the old navigation fired only on selection changes, so re-activating
+  the sole/first root — or the Up row, which is the ONLY row inside an
+  empty leaf — was a no-op and left browsing stuck. Navigation now fires
+  on explicit row activation (double-click, or Enter on the focused row)
+  through the production `ListView::activate` signal, independent of
+  selection. Folder rows also carry typed identities (root / directory /
+  up / status) instead of being interpreted from their display labels: a
+  genuine directory named `…` now descends where the label comparison
+  treated it as Up, root rows resolve positionally against the attached
+  model, and status rows (detached-model notice, empty-roots notice,
+  unavailable or renamed markers) refuse activation. Three
+  production-widget contracts (typed activation end-to-end, status-row
+  refusal, same-source refresh preserving the folder axis) run in the
+  consolidated GTK session. (#251)
+
 - **Initial scan no longer delays commands or window close** (`src/local/engine.rs`,
   `src/ui/library_commands.rs`, `src/ui/tracklist.rs`, `src/ui/root_trust.rs`,
   `src/ui/rhythmbox_migration.rs`, `src/ui/window.rs`) — The engine awaited the

@@ -528,6 +528,8 @@ docs/                        # Design contracts, roadmap, and the active backlog
 On first launch, Tributary scans your XDG music directory (for example `~/Music`; configurable
 in Preferences) and displays all discovered tracks in the main tracklist. Use the **browser
 panes** above the tracklist to filter by Genre → Artist → Album, or browse the library by folder.
+In the folder pane, double-click a root or directory to descend (Enter works on the focused row
+too), and use the `…` row to go back up one level.
 Click any column header to sort; click again to reverse; click a third time to clear the sort.
 
 ### Browsing Removable Media
