@@ -2910,32 +2910,51 @@ mod tests {
         assert_post_reset_composition_agrees(&panes, &log);
     }
 
-    /// The R4 activation contracts (issue #251): folder navigation fires
-    /// on row ACTIVATION through the production `ListView::activate`
-    /// signal, independent of selection changes, and keys off typed row
-    /// identities rather than display labels. Exercised end-to-end:
-    ///
-    /// - the already-selected sole root activates again (the reported
-    ///   bug: selection-changed never fires for a row the model already
-    ///   selected);
-    /// - a genuine directory named `…` DESCENDS while the Up row — same
-    ///   label, different typed identity — ASCENDS (the old code
-    ///   compared labels and could not tell them apart);
-    /// - an empty leaf leaves the auto-selected Up row as the pane's
-    ///   only row and it still navigates back up;
-    /// - three consecutive activations of the already-selected Up row
-    ///   climb three levels back to the roots.
-    fn folder_activation_drives_typed_navigation() {
-        let scratch = FolderScratch::new_ellipsis_tree("activate");
-        let source = vec![
-            folder_scratch_track_at(&scratch, "sole/…/deep/01.flac", "T1"),
-            folder_scratch_track_at(&scratch, "sole/leafonly/01.flac", "T2"),
-        ];
-        let (log, cb) = recorder();
-        let (browser_box, state) = build_browser(&source, false, false, 48, cb);
-        let panes = collect_browser_panes(&browser_box);
-        let folder_pane = &panes[3];
-        attach_sole_root_ellipsis_model(&state, &scratch);
+    /// A fresh browser over the sole-root `…` scratch tree, attached and
+    /// showing the roots level: the fixture every folder-activation
+    /// contract drives (issue #251). `scratch` is held to the end of the
+    /// fixture's life so the URIs the model was built from stay backed by
+    /// real files for the whole test; distinct `tag`s keep parallel
+    /// scratch trees apart within one process.
+    struct FolderActivationFixture {
+        browser_box: gtk::Box,
+        state: BrowserState,
+        panes: Vec<gtk::Box>,
+        source: Vec<TrackObject>,
+        log: EmitLog,
+        _scratch: FolderScratch,
+    }
+
+    impl FolderActivationFixture {
+        fn new(tag: &str) -> Self {
+            let scratch = FolderScratch::new_ellipsis_tree(tag);
+            let source = vec![
+                folder_scratch_track_at(&scratch, "sole/…/deep/01.flac", "T1"),
+                folder_scratch_track_at(&scratch, "sole/leafonly/01.flac", "T2"),
+            ];
+            let (log, cb) = recorder();
+            let (browser_box, state) = build_browser(&source, false, false, 48, cb);
+            let panes = collect_browser_panes(&browser_box);
+            attach_sole_root_ellipsis_model(&state, &scratch);
+            Self {
+                browser_box,
+                state,
+                panes,
+                source,
+                log,
+                _scratch: scratch,
+            }
+        }
+    }
+
+    /// The first reported bug (issue #251): the sole root is
+    /// auto-selected, so a selection-changed listener never fires when
+    /// the user activates it again — activating the ALREADY-SELECTED row
+    /// must still navigate into the root through the production
+    /// `ListView::activate` signal, emitting the root's folder prefix.
+    fn sole_root_activation_navigates_when_already_selected() {
+        let fx = FolderActivationFixture::new("activate-sole-root");
+        let folder_pane = &fx.panes[3];
         let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
         let folder_sel = get_selection(folder_pane);
 
@@ -2943,18 +2962,18 @@ mod tests {
         // the ALREADY-SELECTED row must navigate (the reported bug).
         assert_folder_row(folder_pane, 0, FolderRowKind::Root, Some("sole"));
         assert!(
-            matches!(&*state.folder_location.borrow(), FolderLocation::Roots),
+            matches!(&*fx.state.folder_location.borrow(), FolderLocation::Roots),
             "precondition: navigation must start at the roots level"
         );
-        log.borrow_mut().clear();
+        fx.log.borrow_mut().clear();
         emit_folder_activation(&list_view, 0);
         assert_eq!(
-            composed(&log).3,
-            state.folder_prefix.borrow().clone(),
+            composed(&fx.log).3,
+            fx.state.folder_prefix.borrow().clone(),
             "activation inside the sole root must emit with the folder prefix"
         );
         assert!(
-            state.folder_prefix.borrow().is_some(),
+            fx.state.folder_prefix.borrow().is_some(),
             "activating the sole root must apply the root's folder prefix"
         );
         assert_eq!(
@@ -2962,19 +2981,30 @@ mod tests {
             0,
             "after navigation the selection must sit on the pane's first row"
         );
+    }
 
-        // Inside the root: [Up("…"), Directory("leafonly"), Directory("…")].
-        // Two rows share the label `…` with DIFFERENT typed identities —
-        // the Up row at position 0 and the genuine directory at the end.
+    /// A genuine directory named `…` and the Up row share a label but
+    /// not a typed identity: the directory row must DESCEND on
+    /// activation while the same-labelled Up row ASCENDS — the old
+    /// label-comparing code could not tell them apart (issue #251).
+    fn ellipsis_labelled_rows_keep_typed_identities() {
+        let fx = FolderActivationFixture::new("activate-ellipsis");
+        let folder_pane = &fx.panes[3];
+        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
+
+        // Into the sole root: [Up("…"), Directory("leafonly"),
+        // Directory("…")]. Two rows share the label `…` with DIFFERENT
+        // typed identities — the Up row at position 0 and the genuine
+        // directory at the end.
+        emit_folder_activation(&list_view, 0);
         assert_folder_row(folder_pane, 0, FolderRowKind::Up, Some("…"));
         assert_folder_row(folder_pane, 1, FolderRowKind::Directory, Some("leafonly"));
         assert_folder_row(folder_pane, 2, FolderRowKind::Directory, Some("…"));
 
         // Activating the `…` DIRECTORY must descend, not ascend: the
         // label-based code compared labels and treated it as Up.
-        log.borrow_mut().clear();
         emit_folder_activation(&list_view, 2);
-        let inside_dir = match &*state.folder_location.borrow() {
+        let inside_dir = match &*fx.state.folder_location.borrow() {
             FolderLocation::Inside { dir, .. } => Some(dir.clone()),
             FolderLocation::Roots => None,
         };
@@ -2985,9 +3015,30 @@ mod tests {
         );
         assert_folder_row(folder_pane, 1, FolderRowKind::Directory, Some("deep"));
 
-        // Into `deep` — an empty leaf: its only row is the Up row.
+        // The same-labelled Up row at position 0 must ASCEND.
+        emit_folder_activation(&list_view, 0);
+        assert!(
+            matches!(&*fx.state.folder_location.borrow(), FolderLocation::Roots),
+            "activating the same-labelled Up row must ascend to the roots level"
+        );
+    }
+
+    /// Inside an empty leaf the folder pane's ONLY row is the
+    /// auto-selected Up row — and activating that ALREADY-SELECTED row
+    /// must still navigate back up (the second reported bug:
+    /// selection-changed never fires for a row the model already
+    /// selected) (issue #251).
+    fn empty_leaf_up_row_is_only_row_and_still_navigates() {
+        let fx = FolderActivationFixture::new("activate-empty-leaf");
+        let folder_pane = &fx.panes[3];
+        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
+
+        // Descend sole → `…` → deep, an empty leaf: a track directly
+        // inside and no subdirectories.
+        emit_folder_activation(&list_view, 0);
+        emit_folder_activation(&list_view, 2);
         emit_folder_activation(&list_view, 1);
-        let inside_dir = match &*state.folder_location.borrow() {
+        let inside_dir = match &*fx.state.folder_location.borrow() {
             FolderLocation::Inside { dir, .. } => Some(dir.clone()),
             FolderLocation::Roots => None,
         };
@@ -3000,18 +3051,46 @@ mod tests {
 
         // The empty-leaf Up row is auto-selected at position 0 —
         // activating the ALREADY-SELECTED row must still ascend (the
+        // other reported bug).
+        emit_folder_activation(&list_view, 0);
+        let reached = match &*fx.state.folder_location.borrow() {
+            FolderLocation::Inside { dir, .. } => Some(dir.clone()),
+            FolderLocation::Roots => None,
+        };
+        assert_eq!(
+            reached.as_deref(),
+            Some("…"),
+            "the empty leaf's auto-selected Up row must still navigate back up"
+        );
+    }
+
+    /// Three consecutive activations of the already-selected Up row must
+    /// climb three levels — deep → `…` → the root — back to the roots
+    /// level, each emitting the recomposed filter (issue #251).
+    fn repeated_up_activations_climb_three_levels_to_roots() {
+        let fx = FolderActivationFixture::new("activate-repeated-up");
+        let folder_pane = &fx.panes[3];
+        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
+
+        // Descend sole → `…` → deep so three Up activations are needed.
+        emit_folder_activation(&list_view, 0);
+        emit_folder_activation(&list_view, 2);
+        emit_folder_activation(&list_view, 1);
+
+        // The empty-leaf Up row is auto-selected at position 0 —
+        // activating the ALREADY-SELECTED row must still ascend (the
         // other reported bug). Three consecutive activations of the
         // auto-selected row 0 climb deep → `…` → root → roots.
         for expected in ["…", "", "ROOTS"] {
-            log.borrow_mut().clear();
+            fx.log.borrow_mut().clear();
             emit_folder_activation(&list_view, 0);
             if expected == "ROOTS" {
                 assert!(
-                    matches!(&*state.folder_location.borrow(), FolderLocation::Roots),
+                    matches!(&*fx.state.folder_location.borrow(), FolderLocation::Roots),
                     "third Up activation must reach the roots level"
                 );
             } else {
-                let reached = match &*state.folder_location.borrow() {
+                let reached = match &*fx.state.folder_location.borrow() {
                     FolderLocation::Inside { dir, .. } => Some(dir.clone()),
                     FolderLocation::Roots => None,
                 };
@@ -3022,12 +3101,12 @@ mod tests {
                 );
             }
             assert!(
-                !log.borrow().is_empty(),
+                !fx.log.borrow().is_empty(),
                 "every Up activation must emit the recomposed filter"
             );
         }
         assert!(
-            state.folder_prefix.borrow().is_none(),
+            fx.state.folder_prefix.borrow().is_none(),
             "back at the roots level the folder prefix must be cleared"
         );
         assert_folder_row(folder_pane, 0, FolderRowKind::Root, Some("sole"));
@@ -3086,34 +3165,11 @@ mod tests {
         );
     }
 
-    /// A same-source refresh must preserve the folder axis (location and
-    /// pane rows) and leave activation driving navigation afterwards —
-    /// the refresh path must not strand the activation handler (issue
-    /// #251; the lifecycle groundwork for R6).
-    fn folder_navigation_survives_same_source_refresh() {
-        let scratch = FolderScratch::new_ellipsis_tree("refresh");
-        let source = vec![
-            folder_scratch_track_at(&scratch, "sole/…/deep/01.flac", "T1"),
-            folder_scratch_track_at(&scratch, "sole/leafonly/01.flac", "T2"),
-        ];
-        let (log, cb) = recorder();
-        let (browser_box, state) = build_browser(&source, false, false, 48, cb);
-        let panes = collect_browser_panes(&browser_box);
-        let folder_pane = &panes[3];
-        attach_sole_root_ellipsis_model(&state, &scratch);
-        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
-
-        emit_folder_activation(&list_view, 0);
-        assert!(state.folder_prefix.borrow().is_some());
-        assert_eq!(
-            get_store_from_pane(folder_pane).map(|store| store.n_items()),
-            Some(3),
-            "precondition: inside the root the pane shows Up + the two directories"
-        );
-
-        // Same-source refresh: the folder axis must survive untouched.
-        refresh_browser_data(&browser_box, &state, &source);
-        let inside_dir = match &*state.folder_location.borrow() {
+    /// After a same-source refresh the folder location, prefix, and the
+    /// pane's displayed level and rows must all have survived untouched
+    /// (issue #251).
+    fn assert_refresh_preserves_folder_axis(fx: &FolderActivationFixture, folder_pane: &gtk::Box) {
+        let inside_dir = match &*fx.state.folder_location.borrow() {
             FolderLocation::Inside { dir, .. } => Some(dir.clone()),
             FolderLocation::Roots => None,
         };
@@ -3123,7 +3179,7 @@ mod tests {
             "a same-source refresh must preserve the folder location"
         );
         assert!(
-            state.folder_prefix.borrow().is_some(),
+            fx.state.folder_prefix.borrow().is_some(),
             "a same-source refresh must preserve the folder prefix"
         );
         assert_eq!(
@@ -3132,20 +3188,42 @@ mod tests {
             "the refresh must not disturb the folder pane's displayed level"
         );
         assert_folder_row(folder_pane, 0, FolderRowKind::Up, Some("…"));
+    }
+
+    /// A same-source refresh must preserve the folder axis (location and
+    /// pane rows) and leave activation driving navigation afterwards —
+    /// the refresh path must not strand the activation handler (issue
+    /// #251; the lifecycle groundwork for R6).
+    fn folder_navigation_survives_same_source_refresh() {
+        let fx = FolderActivationFixture::new("refresh");
+        let folder_pane = &fx.panes[3];
+        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
+
+        emit_folder_activation(&list_view, 0);
+        assert!(fx.state.folder_prefix.borrow().is_some());
+        assert_eq!(
+            get_store_from_pane(folder_pane).map(|store| store.n_items()),
+            Some(3),
+            "precondition: inside the root the pane shows Up + the two directories"
+        );
+
+        // Same-source refresh: the folder axis must survive untouched.
+        refresh_browser_data(&fx.browser_box, &fx.state, &fx.source);
+        assert_refresh_preserves_folder_axis(&fx, folder_pane);
 
         // Activation must still navigate after the refresh.
-        log.borrow_mut().clear();
+        fx.log.borrow_mut().clear();
         emit_folder_activation(&list_view, 0);
         assert!(
-            matches!(&*state.folder_location.borrow(), FolderLocation::Roots),
+            matches!(&*fx.state.folder_location.borrow(), FolderLocation::Roots),
             "activating Up after a refresh must return to the roots level"
         );
         assert!(
-            state.folder_prefix.borrow().is_none(),
+            fx.state.folder_prefix.borrow().is_none(),
             "returning to the roots must clear the folder prefix"
         );
         assert!(
-            !log.borrow().is_empty(),
+            !fx.log.borrow().is_empty(),
             "post-refresh activation must emit the recomposed filter"
         );
     }
@@ -3270,8 +3348,15 @@ mod tests {
                 pending_search_debounce_never_fires_after_source_replacement();
                 source_replacement_resets_folder_navigation();
 
-                // Folder activation contracts (issue #251).
-                folder_activation_drives_typed_navigation();
+                // Folder activation contracts (issue #251). The
+                // R4 activation contract is split into focused
+                // tests (Codacy method-size rework round); every
+                // split form still runs in this consolidated
+                // session block.
+                sole_root_activation_navigates_when_already_selected();
+                ellipsis_labelled_rows_keep_typed_identities();
+                empty_leaf_up_row_is_only_row_and_still_navigates();
+                repeated_up_activations_climb_three_levels_to_roots();
                 folder_status_rows_never_navigate();
                 folder_navigation_survives_same_source_refresh();
             },
