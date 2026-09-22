@@ -3243,6 +3243,14 @@ pub mod tests {
     /// transport the dispatch uses, decides with the same completion core
     /// the dialog opening depends on, and pumps until the decision has run
     /// on the main context.
+    ///
+    /// `context` must be private to the calling test, not the process-global
+    /// default: the `spawn_local` below implicitly acquires the context and
+    /// panics when another thread owns it, and the global default context is
+    /// transiently acquired by the widget-test session's contract chain
+    /// (production code schedules on `MainContext::default()`) under libtest
+    /// parallelism (tr-n5ataf). A fresh per-test context has exactly one
+    /// contender — this thread — so delivery is timing-independent.
     fn deliver_admission_and_resolve_completion(
         context: &glib::MainContext,
         evidence: PropertiesSelectionEvidence,
@@ -3288,13 +3296,27 @@ pub mod tests {
         // dispatch's spawn_blocking worker can, and while it is parked the
         // main context the UI runs on must keep dispatching — that is the
         // responsiveness the off-thread admission buys.
+        //
+        // The context is private to this test rather than the process-global
+        // default, for the two races the default carries under libtest's
+        // parallel worker threads: glib's local-spawn APIs
+        // `acquire().expect(...)` their target context and panic when
+        // another thread transiently owns it (the widget-test session's
+        // contract chain acquires the default through production code's
+        // `MainContext::default()` scheduling — tr-n5ataf), and pumping the
+        // default can dispatch the foreign thread-affine sources other
+        // tests leave pending there (tr-8wtab). A per-test context has
+        // exactly one contender — this thread — so the dispatch proof is
+        // timing-independent.
         let pending_path = PathBuf::from("/definitely/not/here.flac");
         let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
 
+        let context = glib::MainContext::new();
         let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
-        let dispatched_for_idle = dispatched.clone();
-        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
-        let context = glib::MainContext::default();
+        let dispatched_for_task = dispatched.clone();
+        context.spawn_local(async move {
+            dispatched_for_task.set(true);
+        });
         pump_main_context_until(
             &context,
             || dispatched.get(),
@@ -3324,8 +3346,13 @@ pub mod tests {
             positions: vec![0],
             media_keys: vec![device_media_key(&device_a)],
         };
+        // Private context per the delivery helper's contract: the global
+        // default is transiently acquired by the widget-test session's
+        // contract chain, and `spawn_local` panics on that lost acquire
+        // race under libtest parallelism (tr-n5ataf).
+        let context = glib::MainContext::new();
         let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
+            &context,
             evidence,
             move |position| (position == 0).then(|| device_media_key(&device_b)),
             admitted_by_path(&pending_path),
@@ -3354,8 +3381,13 @@ pub mod tests {
         };
         let admission = admitted_by_path(&pending_path);
         assert_eq!(admission.locals.len(), 1, "admission must admit by path");
+        // Private context per the delivery helper's contract: the global
+        // default is transiently acquired by the widget-test session's
+        // contract chain, and `spawn_local` panics on that lost acquire
+        // race under libtest parallelism (tr-n5ataf).
+        let context = glib::MainContext::new();
         let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
+            &context,
             evidence,
             move |position| (position == 0).then(|| device_media_key(&device_a)),
             admission,
