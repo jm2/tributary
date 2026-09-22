@@ -254,6 +254,18 @@ impl LastFmAuthorizationGrant {
     pub(in crate::lastfm) fn into_authorized_session(self) -> DesktopAuthorizedSession {
         self.0
     }
+
+    pub(in crate::lastfm) fn username(&self) -> &str {
+        self.0.username()
+    }
+
+    /// Recompose an already-admitted authorization result.
+    ///
+    /// The finish authority of the originating challenge is already consumed;
+    /// this wraps the validated identity for the serialized vault installer.
+    pub(in crate::lastfm) fn from_authorized_session(session: DesktopAuthorizedSession) -> Self {
+        Self(session)
+    }
 }
 
 impl fmt::Debug for LastFmAuthorizationGrant {

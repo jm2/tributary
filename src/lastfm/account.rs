@@ -15,10 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::authorization::{
-    LastFmAuthorizationClock, LastFmAuthorizationHandle, LastFmAuthorizationShutdown,
-    LastFmAuthorizationTransport, SystemLastFmAuthorizationClock,
+    LastFmAuthorizationClock, LastFmAuthorizationGrant, LastFmAuthorizationHandle,
+    LastFmAuthorizationShutdown, LastFmAuthorizationTransport, SystemLastFmAuthorizationClock,
 };
 use super::client::{AppCredentials, LastFmClient, LastFmClientError};
+use super::credentials::{
+    CredentialError, LastFmAccountBinding, SessionCredentialStore, StoredSession,
+};
+use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
 
 /// One process-lifetime authorization owner; a second construction is a bug.
 static AUTHORIZATION_OWNER_CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -68,6 +72,189 @@ pub(in crate::lastfm) fn spawn_lastfm_authorization_owner_with(
     Ok(super::authorization::spawn_lastfm_authorization(
         transport, clock,
     ))
+}
+
+/// Presence classification of the current valid vault record.
+///
+/// The username is an explicitly returned display value for the settings
+/// surface; no key material or diagnostics context is exposed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastFmVaultAccountSnapshot {
+    username: Option<String>,
+}
+
+impl LastFmVaultAccountSnapshot {
+    /// Snapshot of a vault without a valid account record.
+    pub const MISSING: Self = Self { username: None };
+
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+}
+
+/// Load the current valid account record for the settings surface.
+///
+/// This is a display read and does not hold the destructive vault lifecycle
+/// lease; the single-record credential save keeps concurrent readers on
+/// either the old or the new valid value.
+pub async fn load_vault_account(
+    credentials: Arc<dyn SessionCredentialStore>,
+) -> Result<LastFmVaultAccountSnapshot, CredentialError> {
+    tokio::task::spawn_blocking(move || credentials.load())
+        .await
+        .map_err(|_| CredentialError::Unavailable)?
+        .map(|session| LastFmVaultAccountSnapshot {
+            username: session.map(|session| session.username().to_owned()),
+        })
+}
+
+/// Exact transition policy between a staged grant and the current record.
+///
+/// `FreshInstall` mints a brand-new opaque account identity. Reauthorization
+/// preserves the exact stored identity only for byte-identical usernames;
+/// anything else is a different-account replacement which the settings
+/// surface must confirm with an explicit purge-and-install flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LastFmAccountInstallDecision {
+    FreshInstall,
+    SameAccountReauthorization,
+    DifferentAccount { existing_username: String },
+}
+
+/// Classify how a staged authorization would land in the current vault.
+pub async fn stage_account_install_decision(
+    credentials: Arc<dyn SessionCredentialStore>,
+    staged: &LastFmAuthorizationGrant,
+) -> Result<LastFmAccountInstallDecision, CredentialError> {
+    let snapshot = load_vault_account(credentials).await?;
+    match snapshot.username {
+        None => Ok(LastFmAccountInstallDecision::FreshInstall),
+        Some(existing) if existing == staged.username() => {
+            Ok(LastFmAccountInstallDecision::SameAccountReauthorization)
+        }
+        Some(existing) => Ok(LastFmAccountInstallDecision::DifferentAccount {
+            existing_username: existing,
+        }),
+    }
+}
+
+/// Content-free vault installation failures.
+///
+/// No variant carries the staged username, the stored username, or native
+/// credential-store context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LastFmAccountInstallError {
+    #[error("protected credential store is unavailable")]
+    CredentialStoreUnavailable,
+    #[error("staged Last.fm authorization is invalid for vault installation")]
+    InvalidStagedSession,
+    #[error("a valid Last.fm account appeared before installation")]
+    VaultAlreadyBound,
+    #[error("the Last.fm account vanished before reauthorization")]
+    VaultMissing,
+    #[error("the new Last.fm authorization belongs to a different account")]
+    ExactAccountRefused,
+}
+
+/// A durably installed account, safe to surface in settings.
+#[derive(Clone, Debug)]
+pub struct InstalledAccount {
+    username: String,
+    account_binding: LastFmAccountBinding,
+}
+
+impl InstalledAccount {
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub const fn account_binding(&self) -> LastFmAccountBinding {
+        self.account_binding
+    }
+}
+
+/// Load the vault record while provably holding the lifecycle lease.
+///
+/// The lease moves through each blocking task, so cancelling this future
+/// cannot release the lease between inspection and a subsequent destructive
+/// step.
+async fn load_under_lease(
+    credentials: Arc<dyn SessionCredentialStore>,
+    lease: LastFmVaultLifecycleLease,
+) -> Result<(LastFmVaultLifecycleLease, Option<StoredSession>), LastFmAccountInstallError> {
+    let (lease, loaded) = tokio::task::spawn_blocking(move || {
+        let loaded = credentials.load();
+        (lease, loaded)
+    })
+    .await
+    .map_err(|_| LastFmAccountInstallError::CredentialStoreUnavailable)?;
+    let loaded = loaded.map_err(|_| LastFmAccountInstallError::CredentialStoreUnavailable)?;
+    Ok((lease, loaded))
+}
+
+/// Save a vault record while provably holding the lifecycle lease.
+async fn save_under_lease(
+    credentials: Arc<dyn SessionCredentialStore>,
+    lease: LastFmVaultLifecycleLease,
+    session: StoredSession,
+) -> Result<(), LastFmAccountInstallError> {
+    let (_lease, saved) = tokio::task::spawn_blocking(move || {
+        let saved = credentials.save(&session);
+        (lease, saved)
+    })
+    .await
+    .map_err(|_| LastFmAccountInstallError::CredentialStoreUnavailable)?;
+    saved.map_err(|_| LastFmAccountInstallError::CredentialStoreUnavailable)
+}
+
+/// Install a staged grant as a brand-new account identity.
+///
+/// The lifecycle lease is held across the race re-verification and the
+/// durable save, so a runtime successor cannot adopt the vault in between.
+/// A valid record observed under the lease refuses the install untouched.
+pub async fn install_fresh_account(
+    credentials: Arc<dyn SessionCredentialStore>,
+    staged: LastFmAuthorizationGrant,
+) -> Result<InstalledAccount, LastFmAccountInstallError> {
+    let lease = acquire_vault_lifecycle().await;
+    let (staged_username, key) = staged.into_authorized_session().into_parts();
+    let session = StoredSession::new(staged_username.as_str(), key)
+        .map_err(|_| LastFmAccountInstallError::InvalidStagedSession)?;
+    let (lease, current) = load_under_lease(Arc::clone(&credentials), lease).await?;
+    if current.is_some() {
+        return Err(LastFmAccountInstallError::VaultAlreadyBound);
+    }
+    let account = InstalledAccount {
+        username: session.username().to_owned(),
+        account_binding: session.account_binding(),
+    };
+    save_under_lease(credentials, lease, session).await?;
+    Ok(account)
+}
+
+/// Reauthorize the exact stored account with a fresh session key.
+///
+/// The staged grant must carry the byte-identical stored username; the
+/// exact-account guard inside [`StoredSession::reauthorized`] is the
+/// authoritative check and preserves the stored opaque identity, so the
+/// scrobble queue and all durable bindings stay valid.
+pub async fn install_same_account_reauthorization(
+    credentials: Arc<dyn SessionCredentialStore>,
+    staged: LastFmAuthorizationGrant,
+) -> Result<InstalledAccount, LastFmAccountInstallError> {
+    let lease = acquire_vault_lifecycle().await;
+    let (staged_username, key) = staged.into_authorized_session().into_parts();
+    let (lease, existing) = load_under_lease(Arc::clone(&credentials), lease).await?;
+    let existing = existing.ok_or(LastFmAccountInstallError::VaultMissing)?;
+    let session = existing
+        .reauthorized(staged_username.as_str(), key)
+        .map_err(|_| LastFmAccountInstallError::ExactAccountRefused)?;
+    let account = InstalledAccount {
+        username: session.username().to_owned(),
+        account_binding: session.account_binding(),
+    };
+    save_under_lease(credentials, lease, session).await?;
+    Ok(account)
 }
 
 #[cfg(test)]
