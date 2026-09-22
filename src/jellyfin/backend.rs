@@ -15,7 +15,9 @@ use uuid::Uuid;
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
 use crate::architecture::models::*;
-use crate::architecture::{AdvertisedHttpRoute, RemoteMediaResolver, ResolvedHttpRequest, TrackId};
+use crate::architecture::{
+    AdvertisedHttpRoute, MediaRepresentation, RemoteMediaResolver, ResolvedHttpRequest, TrackId,
+};
 
 use super::api::{JellyfinItem, JellyfinItemsResponse, JellyfinViewsResponse};
 use super::client::JellyfinClient;
@@ -62,6 +64,10 @@ struct LibraryCache {
     /// lifetime, so these entries are capped separately and can never evict
     /// a refreshed catalogue profile.
     search_attribution_profiles: BoundedSearchAttributionProfiles,
+    /// Exact Jellyfin audio item ID → validated stream representation. Items
+    /// whose container is absent or outside the allowlist map to the explicit
+    /// unknown.
+    representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
 }
 
 impl LibraryCache {
@@ -74,6 +80,7 @@ impl LibraryCache {
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
             search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
+            representation_by_track_id: HashMap::new(),
         }
     }
 }
@@ -213,6 +220,7 @@ impl JellyfinBackend {
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
         let mut attribution_profiles = HashMap::new();
+        let mut representation_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
 
         for lib in music_libraries {
@@ -246,6 +254,12 @@ impl JellyfinBackend {
                     jellyfin_item_to_track(item, track_id.clone(), track_uuid, artist_id, album_id);
 
                 stream_locator_by_track_id.insert(track_id.clone(), item.id.clone());
+                representation_by_track_id.insert(
+                    track_id.clone(),
+                    MediaRepresentation::buffered_from_suffix(
+                        item.container.as_deref().unwrap_or(""),
+                    ),
+                );
                 if let Some(album_id) = &item.album_id {
                     track_artwork_locator_by_track_id.insert(track_id.clone(), album_id.clone());
                 }
@@ -328,6 +342,7 @@ impl JellyfinBackend {
             // A full refresh supersedes every search-only retention from the
             // previous catalogue generation.
             search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
+            representation_by_track_id,
         };
 
         Ok(())
@@ -473,6 +488,7 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
         let mut albums = Vec::new();
         let mut artists = Vec::new();
         let mut stream_locators = Vec::new();
+        let mut representations = Vec::new();
         let mut track_artwork_locators = Vec::new();
         let mut attribution_profiles: Vec<(TrackId, Option<PlaybackAttributionProfile>)> =
             Vec::new();
@@ -487,6 +503,16 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
                     let artist_id = item.artist_items.first().map(|a| deterministic_uuid(&a.id));
                     let album_id = item.album_id.as_deref().map(deterministic_uuid);
                     stream_locators.push((track_id.clone(), item.id.clone()));
+                    // Same authority as the full sync: the item's container
+                    // from library metadata labels the stream, so a
+                    // search-discovered track resolves to the same
+                    // representation it would have after a sync. The raw
+                    // descriptor is carried to the cache write: a present
+                    // container replaces the cached representation, while an
+                    // absent one must not overwrite a known descriptor with
+                    // unknown — only a search-only track gets the explicit
+                    // unknown seeded.
+                    representations.push((track_id.clone(), item.container.clone()));
                     track_artwork_locators.push((track_id.clone(), item.album_id.clone()));
                     // Retained rows outside the refreshed catalogue still need
                     // Last.fm attribution authority: freeze the profile from
@@ -543,6 +569,25 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
 
         let mut cache = self.cache.write().await;
         cache.stream_locator_by_track_id.extend(stream_locators);
+        for (track_id, container) in representations {
+            match container
+                .as_deref()
+                .filter(|container| !container.is_empty())
+            {
+                Some(container) => {
+                    cache.representation_by_track_id.insert(
+                        track_id,
+                        MediaRepresentation::buffered_from_suffix(container),
+                    );
+                }
+                None => {
+                    cache
+                        .representation_by_track_id
+                        .entry(track_id)
+                        .or_insert_with(MediaRepresentation::buffered_unknown);
+                }
+            }
+        }
         for (track_id, artwork_item_id) in track_artwork_locators {
             if let Some(artwork_item_id) = artwork_item_id {
                 cache
@@ -641,10 +686,8 @@ impl crate::architecture::MediaBackend for JellyfinBackend {
 #[async_trait]
 impl RemoteMediaResolver for JellyfinBackend {
     async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-        let item_id = self
-            .cache
-            .read()
-            .await
+        let cache = self.cache.read().await;
+        let item_id = cache
             .stream_locator_by_track_id
             .get(track_id)
             .cloned()
@@ -652,7 +695,18 @@ impl RemoteMediaResolver for JellyfinBackend {
                 entity_type: "track".into(),
                 id: deterministic_uuid(track_id.as_str()),
             })?;
-        self.client.resolved_stream_request(&item_id)
+        // Authority: `static=true` asks for the original bytes with no
+        // transcoding, so the item's container from library metadata is the
+        // representation the server is asked to return. A container outside
+        // the allowlist resolves to the explicit unknown rather than a guess.
+        let representation = cache
+            .representation_by_track_id
+            .get(track_id)
+            .copied()
+            .unwrap_or_else(MediaRepresentation::buffered_unknown);
+        drop(cache);
+        self.client
+            .resolved_stream_request(&item_id, representation)
     }
 
     async fn resolve_artwork(
@@ -855,11 +909,21 @@ mod tests {
                         "Id": "search-track",
                         "Name": "Fixture Search Song",
                         "Type": "Audio",
+                        "Container": "flac",
                         "Album": "Fixture Album",
                         "AlbumId": "album-1",
                         "AlbumArtist": "Fixture Artist",
                         "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}],
                         "UserData": {"Rating": 4.26}
+                    },
+                    {
+                        "Id": "track-1",
+                        "Name": "Fixture Song",
+                        "Type": "Audio",
+                        "Album": "Fixture Album",
+                        "AlbumId": "album-1",
+                        "AlbumArtist": "Fixture Artist",
+                        "ArtistItems": [{"Id": "artist-1", "Name": "Fixture Artist"}]
                     }],
                     "TotalRecordCount": 1
                 }))),
@@ -898,10 +962,42 @@ mod tests {
         assert_eq!(profile.title(), "Fixture Song");
 
         let search = backend.search("Fixture", 10).await.expect("search fixture");
-        assert_eq!(search.tracks.len(), 1);
+        assert_eq!(search.tracks.len(), 2);
         assert_eq!(
             search.tracks[0].rating,
             TrackRating::read_only(Some(Rating::new(43).unwrap()))
+        );
+        // A search-discovered track carries the same container authority as
+        // a synced one: its Container labels the resolved representation.
+        let searched_id = search.tracks[0]
+            .native_track_id
+            .clone()
+            .expect("searched track native ID");
+        let resolved = backend
+            .resolve_stream(&searched_id)
+            .await
+            .expect("resolve searched track");
+        assert_eq!(
+            resolved.representation(),
+            MediaRepresentation::buffered_from_suffix("flac"),
+            "search result Container=flac must label the resolved stream"
+        );
+        // The second search result is the already-synced track-1 with its
+        // Container omitted: an absent search descriptor must not overwrite
+        // the synced flac representation with the explicit unknown.
+        let synced_id = search.tracks[1]
+            .native_track_id
+            .clone()
+            .expect("synced track native ID");
+        assert_eq!(synced_id.as_str(), "track-1");
+        let resolved = backend
+            .resolve_stream(&synced_id)
+            .await
+            .expect("resolve synced track");
+        assert_eq!(
+            resolved.representation(),
+            MediaRepresentation::buffered_from_suffix("flac"),
+            "an absent search Container must preserve the synced flac descriptor"
         );
 
         let requests = service.requests();
