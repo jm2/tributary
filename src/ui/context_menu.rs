@@ -3243,8 +3243,18 @@ pub mod tests {
     /// transport the dispatch uses, decides with the same completion core
     /// the dialog opening depends on, and pumps until the decision has run
     /// on the main context.
+    ///
+    /// The context is a private one this test thread owns for the whole
+    /// delivery, never the process-global default: parallel tests leave
+    /// thread-affine local futures pending on the default context (the
+    /// production dispatch schedules there and tests never run a main
+    /// loop), and pumping the default from a libtest worker thread makes
+    /// glib's main_context_futures executor poll a future created on
+    /// another thread, whose ThreadGuard panics (tr-r5qtjg). A fresh
+    /// context only ever holds the local future this same thread just
+    /// spawned, and the held acquire keeps every other thread from
+    /// acquiring and dispatching it mid-flight.
     fn deliver_admission_and_resolve_completion(
-        context: &glib::MainContext,
         evidence: PropertiesSelectionEvidence,
         media_key_at: impl Fn(u32) -> Option<MediaKey> + 'static,
         admission: PropertiesAdmission,
@@ -3258,6 +3268,10 @@ pub mod tests {
                 path: pending_path.to_path_buf(),
             },
         ))];
+        let context = glib::MainContext::new();
+        let _ownership = context
+            .acquire()
+            .expect("a fresh main context must be unowned");
         let (tx, rx) = async_channel::bounded::<PropertiesAdmission>(1);
         tx.send_blocking(admission)
             .expect("deliver the admitted set");
@@ -3275,7 +3289,7 @@ pub mod tests {
             ));
         });
         pump_main_context_until(
-            context,
+            &context,
             || outcome.borrow().is_some(),
             "the completion never ran on the main context",
         );
@@ -3291,10 +3305,22 @@ pub mod tests {
         let pending_path = PathBuf::from("/definitely/not/here.flac");
         let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
 
+        // Same private-context discipline as
+        // `deliver_admission_and_resolve_completion`: schedule on a context
+        // this thread owns, not the process-global default parallel tests
+        // leave thread-affine sources on (tr-r5qtjg). `glib::idle_add_local_once`
+        // cannot be redirected — it always attaches to the global default —
+        // so the proof schedules a local future instead, the same
+        // spawn_local transport the dispatch pipeline itself uses.
+        let context = glib::MainContext::new();
+        let _ownership = context
+            .acquire()
+            .expect("a fresh main context must be unowned");
         let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
-        let dispatched_for_idle = dispatched.clone();
-        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
-        let context = glib::MainContext::default();
+        let dispatched_for_task = dispatched.clone();
+        context.spawn_local(async move {
+            dispatched_for_task.set(true);
+        });
         pump_main_context_until(
             &context,
             || dispatched.get(),
@@ -3325,7 +3351,6 @@ pub mod tests {
             media_keys: vec![device_media_key(&device_a)],
         };
         let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
             evidence,
             move |position| (position == 0).then(|| device_media_key(&device_b)),
             admitted_by_path(&pending_path),
@@ -3355,7 +3380,6 @@ pub mod tests {
         let admission = admitted_by_path(&pending_path);
         assert_eq!(admission.locals.len(), 1, "admission must admit by path");
         let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
             evidence,
             move |position| (position == 0).then(|| device_media_key(&device_a)),
             admission,
