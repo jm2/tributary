@@ -142,12 +142,12 @@ pub mod widget_test_session {
     /// installs `gtk4-devel` + `libadwaita-devel` but no icon-theme
     /// package) and stripped-down developer machines have no usable
     /// `hicolor`/`Adwaita` theme, so the resolution guarantee needs its
-    /// own theme. This writes a minimal `hicolor`-named theme under the
-    /// process temp dir — named `hicolor` because that is the theme GTK's
-    /// fallback chain always consults — carrying one tiny PNG under the
-    /// placeholder's name, and adds it to the default icon theme's search
-    /// path. It exists only for the test session; the application never
-    /// ships or registers it.
+    /// own theme. This writes a minimal `hicolor`-named theme under a
+    /// process-unique `tempfile` sandbox — named `hicolor` because that is
+    /// the theme GTK's fallback chain always consults — carrying one tiny
+    /// PNG under the placeholder's name, and adds it to the default icon
+    /// theme's search path. It exists only for the test session; the
+    /// application never ships or registers it.
     ///
     /// Idempotent: `with_session` runs once per consolidated contract
     /// call, and the theme installs on the first GTK-ready session only.
@@ -159,7 +159,19 @@ pub mod widget_test_session {
             return;
         }
 
-        let theme_dir = std::env::temp_dir().join("tributary-widget-test-icons");
+        // A process-unique `tempfile::TempDir` sandbox, the same pattern
+        // the suite's other temp state uses (test_support.rs, media
+        // fixtures): securely permissioned, no fixed name shared across
+        // runs, and no raw `std::env::temp_dir()` use (Codacy flags that
+        // for security-sensitive writes). `TempDir` is `Send + Sync`, so
+        // it lives in the `OnceLock` for the process lifetime and the
+        // registered path stays valid for every session.
+        static THEME_SANDBOX: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let sandbox = THEME_SANDBOX.get_or_init(|| {
+            tempfile::TempDir::with_prefix("tributary-widget-test-icons")
+                .expect("create hermetic icon theme sandbox")
+        });
+        let theme_dir = sandbox.path().to_path_buf();
         let icon_dir = theme_dir.join("hicolor/scalable/apps");
         std::fs::create_dir_all(&icon_dir).expect("create hermetic icon theme dirs");
         std::fs::write(
