@@ -705,6 +705,9 @@ pub fn save_config(config: &AppConfig) -> bool {
 ///   build has no packaged application credentials)
 /// * `lastfm_policy` — the shared policy generation slot the Last.fm group
 ///   reads consent state from
+// The two Last.fm params join an existing seven-parameter surface; a params
+// struct would churn every caller for one optional integration group.
+#[allow(clippy::too_many_arguments)]
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     column_view: &gtk::ColumnView,
@@ -714,9 +717,7 @@ pub fn show_preferences(
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
     lastfm: &crate::ui::lastfm_settings::LastFmSettingsContext,
-    lastfm_policy: &std::sync::Arc<
-        std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>,
-    >,
+    lastfm_policy: &std::sync::Arc<std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>>,
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())

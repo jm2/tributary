@@ -15,6 +15,7 @@
 //! - The connected username comes from the credential vault, never from
 //!   plaintext configuration.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
@@ -139,29 +140,51 @@ pub async fn begin_connect(
 /// The URL is handed to the platform's URI handler exactly once through
 /// `gtk::UriLauncher`; the copyable-field fallback only presents when no
 /// handler consumed the URL. The URL never reaches logs or diagnostics.
-pub async fn launch_browser(parent: &adw::ApplicationWindow, url: &str) {
-    let launcher = gtk::UriLauncher::new(url);
-    let (tx, rx) = async_channel::bounded::<Result<(), glib::Error>>(1);
-    launcher.launch(Some(parent), None::<&gtk::gio::Cancellable>, move |result| {
-        let _ = tx.send(result);
-    });
-    let opened = matches!(rx.recv().await, Ok(Ok(())));
-    if !opened {
-        let fallback = adw::AlertDialog::builder()
-            .heading(rust_i18n::t!("lastfm.disclosure_title").as_ref())
-            .body(rust_i18n::t!("lastfm.browser_fallback_body").as_ref())
-            .close_response("close")
-            .build();
-        fallback.add_response("close", rust_i18n::t!("lastfm.close").as_ref());
-        let entry = gtk::Entry::builder()
-            .text(url)
-            .editable(false)
-            .width_chars(72)
-            .margin_top(8)
-            .margin_bottom(8)
-            .build();
-        fallback.set_extra_child(Some(&entry));
-        fallback.present(Some(parent));
+///
+/// Plain `fn` returning the future (not an `async fn`) per the crate's
+/// `future_not_send` convention: the future owns `!Send` GTK widgets and is
+/// only ever awaited inside a `spawn_local` block on the main context.
+// The returned future owns !Send GTK widgets by construction; every await
+// site in this module runs on the main context (spawn_local / test
+// block_on), never a multithreaded executor (see album_art.rs's note).
+#[allow(clippy::future_not_send)]
+pub fn launch_browser_future(
+    parent: &adw::ApplicationWindow,
+    url: &str,
+) -> impl Future<Output = ()> + 'static {
+    let parent = parent.clone();
+    let url = url.to_owned();
+    async move {
+        let launcher = gtk::UriLauncher::new(&url);
+        let (tx, rx) = async_channel::bounded::<Result<(), glib::Error>>(1);
+        launcher.launch(
+            Some(&parent),
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                // try_send, not send: the callback is sync and `send` here is
+                // an async fn — an unawaited future would deliver nothing and
+                // leave the flow awaiting forever.
+                let _ = tx.try_send(result);
+            },
+        );
+        let opened = matches!(rx.recv().await, Ok(Ok(())));
+        if !opened {
+            let fallback = adw::AlertDialog::builder()
+                .heading(rust_i18n::t!("lastfm.disclosure_title").as_ref())
+                .body(rust_i18n::t!("lastfm.browser_fallback_body").as_ref())
+                .close_response("close")
+                .build();
+            fallback.add_response("close", rust_i18n::t!("lastfm.close").as_ref());
+            let entry = gtk::Entry::builder()
+                .text(&url)
+                .editable(false)
+                .width_chars(72)
+                .margin_top(8)
+                .margin_bottom(8)
+                .build();
+            fallback.set_extra_child(Some(&entry));
+            fallback.present(Some(&parent));
+        }
     }
 }
 
@@ -297,39 +320,53 @@ struct SurfaceWidgets {
 /// vault record offers Connect; a connected record offers Disconnect; an
 /// unreadable vault disables everything. No plaintext ever leaves the vault
 /// into configuration — the username is display-only.
-async fn refresh_surface(widgets: &SurfaceWidgets, context: &LastFmSettingsContext) {
-    let Some(state) = context.snapshot() else {
-        widgets
-            .row
-            .set_title(rust_i18n::t!("lastfm.status_unavailable").as_ref());
-        widgets.connect_btn.set_sensitive(false);
-        widgets.disconnect_btn.set_visible(false);
-        return;
-    };
-    match load_vault_account(Arc::clone(&state.credentials)).await {
-        Ok(snapshot) => match snapshot.username() {
-            Some(username) => {
-                widgets
-                    .row
-                    .set_title(rust_i18n::t!("lastfm.connected_as", username = username).as_ref());
-                widgets.connect_btn.set_sensitive(false);
-                widgets.disconnect_btn.set_visible(true);
-                widgets.disconnect_btn.set_sensitive(true);
-            }
-            None => {
-                widgets
-                    .row
-                    .set_title(rust_i18n::t!("lastfm.status_not_connected").as_ref());
-                widgets.connect_btn.set_sensitive(true);
-                widgets.disconnect_btn.set_visible(false);
-            }
-        },
-        Err(_) => {
+///
+/// Plain `fn` returning the future: the future owns `!Send` GTK widgets and
+/// is only ever awaited on the main context (`future_not_send` convention).
+// The returned future owns !Send GTK widgets by construction; every await
+// site in this module runs on the main context (spawn_local / test
+// block_on), never a multithreaded executor (see album_art.rs's note).
+#[allow(clippy::future_not_send)]
+fn refresh_surface_future(
+    widgets: &SurfaceWidgets,
+    context: &LastFmSettingsContext,
+) -> impl Future<Output = ()> + 'static {
+    let widgets = widgets.clone();
+    let context = context.clone();
+    async move {
+        let Some(state) = context.snapshot() else {
             widgets
                 .row
-                .set_title(rust_i18n::t!("lastfm.status_vault_unavailable").as_ref());
+                .set_title(rust_i18n::t!("lastfm.status_unavailable").as_ref());
             widgets.connect_btn.set_sensitive(false);
             widgets.disconnect_btn.set_visible(false);
+            return;
+        };
+        match load_vault_account(Arc::clone(&state.credentials)).await {
+            Ok(snapshot) => match snapshot.username() {
+                Some(username) => {
+                    widgets.row.set_title(
+                        rust_i18n::t!("lastfm.connected_as", username = username).as_ref(),
+                    );
+                    widgets.connect_btn.set_sensitive(false);
+                    widgets.disconnect_btn.set_visible(true);
+                    widgets.disconnect_btn.set_sensitive(true);
+                }
+                None => {
+                    widgets
+                        .row
+                        .set_title(rust_i18n::t!("lastfm.status_not_connected").as_ref());
+                    widgets.connect_btn.set_sensitive(true);
+                    widgets.disconnect_btn.set_visible(false);
+                }
+            },
+            Err(_) => {
+                widgets
+                    .row
+                    .set_title(rust_i18n::t!("lastfm.status_vault_unavailable").as_ref());
+                widgets.connect_btn.set_sensitive(false);
+                widgets.disconnect_btn.set_visible(false);
+            }
         }
     }
 }
@@ -339,19 +376,34 @@ fn set_flow_busy(widgets: &SurfaceWidgets, busy: bool) {
     widgets.disconnect_btn.set_sensitive(!busy);
 }
 
-/// Await an `adw::AlertDialog` response from async context. The dialog
+/// Await an `adw::AlertDialog` response from a main-thread flow. The dialog
 /// presents itself through its builder helpers; this only bridges the
 /// user's choice back into the awaiting flow.
-async fn await_dialog_response(
+///
+/// Plain `fn` returning the future (`future_not_send` convention: the
+/// future owns `!Send` GTK widgets; `try_send` because the GTK callback is
+/// sync and an unawaited `send` future would deliver nothing).
+// The returned future owns !Send GTK widgets by construction; every await
+// site in this module runs on the main context (spawn_local / test
+// block_on), never a multithreaded executor (see album_art.rs's note).
+#[allow(clippy::future_not_send)]
+fn dialog_response_future(
     dialog: &adw::AlertDialog,
     parent: &adw::ApplicationWindow,
-) -> String {
-    let (tx, rx) = async_channel::bounded::<String>(1);
+) -> impl Future<Output = String> + 'static {
     let dialog = dialog.clone();
-    dialog.choose(Some(parent), None::<&gtk::gio::Cancellable>, move |response| {
-        let _ = tx.send(response.to_string());
-    });
-    rx.recv().await.unwrap_or_default()
+    let parent = parent.clone();
+    async move {
+        let (tx, rx) = async_channel::bounded::<String>(1);
+        dialog.choose(
+            Some(&parent),
+            None::<&gtk::gio::Cancellable>,
+            move |response| {
+                let _ = tx.try_send(response.to_string());
+            },
+        );
+        rx.recv().await.unwrap_or_default()
+    }
 }
 
 /// Run one consent-gated connect attempt to its end.
@@ -361,94 +413,132 @@ async fn await_dialog_response(
 /// final display. Consent precedes the browser flow: when the live policy
 /// generation lacks acceptance, the disclosure is presented first, and
 /// dismissing it stores nothing and re-enables the row without a flow.
-async fn run_connect_flow(
+///
+/// Plain `fn` returning the future (`future_not_send` convention: the flow
+/// owns `!Send` GTK widgets across dialog awaits and runs only on the main
+/// context's `spawn_local`).
+// The returned future owns !Send GTK widgets by construction; every await
+// site in this module runs on the main context (spawn_local / test
+// block_on), never a multithreaded executor (see album_art.rs's note).
+#[allow(clippy::future_not_send)]
+fn connect_flow_future(
     parent: &adw::ApplicationWindow,
     context: &LastFmSettingsContext,
     policy_slot: &Arc<Mutex<LastFmPolicyGeneration>>,
     widgets: &SurfaceWidgets,
-) -> Option<String> {
-    widgets.row.set_title(rust_i18n::t!("lastfm.connecting").as_ref());
-    let Some(state) = context.snapshot() else {
-        return Some(connect_failure_message(ConnectFailure::Unavailable));
-    };
-    match begin_connect(&state, policy_slot).await {
-        Ok((challenge, url)) => finish_via_browser(parent, &state, &challenge, &url).await,
-        Err(ConnectFailure::ConsentRequired) => {
-            let response =
-                await_dialog_response(&present_disclosure_dialog(parent), parent).await;
-            if response != "accept" {
-                // Dismissing stores nothing and leaves the feature off.
-                return Some(rust_i18n::t!("lastfm.status_consent_required").to_string());
+) -> impl Future<Output = Option<String>> + 'static {
+    let parent = parent.clone();
+    let context = context.clone();
+    let policy_slot = Arc::clone(policy_slot);
+    let widgets = widgets.clone();
+    async move {
+        widgets
+            .row
+            .set_title(rust_i18n::t!("lastfm.connecting").as_ref());
+        let Some(state) = context.snapshot() else {
+            return Some(connect_failure_message(ConnectFailure::Unavailable));
+        };
+        match begin_connect(&state, &policy_slot).await {
+            Ok((challenge, url)) => {
+                finish_via_browser_future(&parent, &state, &challenge, &url).await
             }
-            if accept_disclosure(&state, policy_slot, &rust_i18n::locale().to_string())
-                .await
-                .is_err()
-            {
-                return Some(rust_i18n::t!("lastfm.status_store_error").to_string());
-            }
-            match begin_connect(&state, policy_slot).await {
-                Ok((challenge, url)) => {
-                    finish_via_browser(parent, &state, &challenge, &url).await
+            Err(ConnectFailure::ConsentRequired) => {
+                let response =
+                    dialog_response_future(&present_disclosure_dialog(&parent), &parent).await;
+                if response != "accept" {
+                    // Dismissing stores nothing and leaves the feature off.
+                    return Some(rust_i18n::t!("lastfm.status_consent_required").to_string());
                 }
-                Err(failure) => Some(connect_failure_message(failure)),
+                if accept_disclosure(&state, &policy_slot, &rust_i18n::locale())
+                    .await
+                    .is_err()
+                {
+                    return Some(rust_i18n::t!("lastfm.status_store_error").to_string());
+                }
+                match begin_connect(&state, &policy_slot).await {
+                    Ok((challenge, url)) => {
+                        finish_via_browser_future(&parent, &state, &challenge, &url).await
+                    }
+                    Err(failure) => Some(connect_failure_message(failure)),
+                }
             }
+            Err(failure) => Some(connect_failure_message(failure)),
         }
-        Err(failure) => Some(connect_failure_message(failure)),
     }
 }
 
 /// Hand off to the browser and finish on the user's confirmation.
-async fn finish_via_browser(
+///
+/// Plain `fn` returning the future (`future_not_send` convention).
+// The returned future owns !Send GTK widgets by construction; every await
+// site in this module runs on the main context (spawn_local / test
+// block_on), never a multithreaded executor (see album_art.rs's note).
+#[allow(clippy::future_not_send)]
+fn finish_via_browser_future(
     parent: &adw::ApplicationWindow,
     state: &LastFmSettingsState,
     challenge: &LastFmAuthorizationChallenge,
     url: &str,
-) -> Option<String> {
-    launch_browser(parent, url).await;
-    let response = await_dialog_response(&present_finish_dialog(parent), parent).await;
-    if response != "continue" {
-        // Cancelled: the owner revokes the superseded challenge; the
-        // refreshed vault state is the truthful display.
-        return None;
-    }
-    match finish_connect(state, challenge).await {
-        Ok(_) => None,
-        Err(failure) => Some(connect_failure_message(failure)),
+) -> impl Future<Output = Option<String>> + 'static {
+    let parent = parent.clone();
+    let state = state.clone();
+    let challenge = challenge.clone();
+    let url = url.to_owned();
+    async move {
+        launch_browser_future(&parent, &url).await;
+        let response = dialog_response_future(&present_finish_dialog(&parent), &parent).await;
+        if response != "continue" {
+            // Cancelled: the owner revokes the superseded challenge; the
+            // refreshed vault state is the truthful display.
+            return None;
+        }
+        match finish_connect(&state, &challenge).await {
+            Ok(_) => None,
+            Err(failure) => Some(connect_failure_message(failure)),
+        }
     }
 }
 
 /// Run one explicit disconnect-and-purge after its confirmation dialog.
-async fn run_disconnect_flow(
+///
+/// Plain `fn` returning the future (`future_not_send` convention).
+// The returned future owns !Send GTK widgets by construction; every await
+// site in this module runs on the main context (spawn_local / test
+// block_on), never a multithreaded executor (see album_art.rs's note).
+#[allow(clippy::future_not_send)]
+fn disconnect_flow_future(
     parent: &adw::ApplicationWindow,
     context: &LastFmSettingsContext,
-) -> Option<String> {
-    let Some(state) = context.snapshot() else {
-        return Some(connect_failure_message(ConnectFailure::Unavailable));
-    };
-    let dialog = adw::AlertDialog::builder()
-        .heading(rust_i18n::t!("lastfm.disconnect_confirm_title").as_ref())
-        .body(rust_i18n::t!("lastfm.disconnect_confirm_body").as_ref())
-        .close_response("cancel")
-        .default_response("cancel")
-        .build();
-    dialog.add_response("cancel", rust_i18n::t!("lastfm.cancel").as_ref());
-    dialog.add_response(
-        "disconnect",
-        rust_i18n::t!("lastfm.disconnect_confirm_accept").as_ref(),
-    );
-    dialog.set_response_appearance("disconnect", adw::ResponseAppearance::Destructive);
-    dialog.present(Some(parent));
-    if await_dialog_response(&dialog, parent).await != "disconnect" {
-        return None;
-    }
-    match disconnect_and_purge(Arc::clone(&state.credentials), state.db.clone()).await {
-        // A missing vault record is already the truthful refreshed state.
-        Ok(_) | Err(LastFmAccountDisconnectError::VaultMissing) => None,
-        Err(LastFmAccountDisconnectError::QueuePurgeRefused) => {
-            Some(rust_i18n::t!("lastfm.status_purge_refused").to_string())
+) -> impl Future<Output = Option<String>> + 'static {
+    let parent = parent.clone();
+    let context = context.clone();
+    async move {
+        let Some(state) = context.snapshot() else {
+            return Some(connect_failure_message(ConnectFailure::Unavailable));
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading(rust_i18n::t!("lastfm.disconnect_confirm_title").as_ref())
+            .body(rust_i18n::t!("lastfm.disconnect_confirm_body").as_ref())
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+        dialog.add_response("cancel", rust_i18n::t!("lastfm.cancel").as_ref());
+        dialog.add_response(
+            "disconnect",
+            rust_i18n::t!("lastfm.disconnect_confirm_accept").as_ref(),
+        );
+        dialog.set_response_appearance("disconnect", adw::ResponseAppearance::Destructive);
+        dialog.present(Some(&parent));
+        if dialog_response_future(&dialog, &parent).await != "disconnect" {
+            return None;
         }
-        Err(_) => {
-            Some(rust_i18n::t!("lastfm.status_vault_unavailable").to_string())
+        match disconnect_and_purge(Arc::clone(&state.credentials), state.db.clone()).await {
+            // A missing vault record is already the truthful refreshed state.
+            Ok(_) | Err(LastFmAccountDisconnectError::VaultMissing) => None,
+            Err(LastFmAccountDisconnectError::QueuePurgeRefused) => {
+                Some(rust_i18n::t!("lastfm.status_purge_refused").to_string())
+            }
+            Err(_) => Some(rust_i18n::t!("lastfm.status_vault_unavailable").to_string()),
         }
     }
 }
@@ -513,8 +603,8 @@ pub fn build_lastfm_group(
             glib::MainContext::default().spawn_local(async move {
                 set_flow_busy(&widgets, true);
                 let persistent =
-                    run_connect_flow(&parent, &context, &policy_slot, &widgets).await;
-                refresh_surface(&widgets, &context).await;
+                    connect_flow_future(&parent, &context, &policy_slot, &widgets).await;
+                refresh_surface_future(&widgets, &context).await;
                 if let Some(message) = persistent {
                     widgets.row.set_title(message.as_str());
                 }
@@ -534,8 +624,8 @@ pub fn build_lastfm_group(
             let widgets = widgets.clone();
             glib::MainContext::default().spawn_local(async move {
                 set_flow_busy(&widgets, true);
-                let persistent = run_disconnect_flow(&parent, &context).await;
-                refresh_surface(&widgets, &context).await;
+                let persistent = disconnect_flow_future(&parent, &context).await;
+                refresh_surface_future(&widgets, &context).await;
                 if let Some(message) = persistent {
                     widgets.row.set_title(message.as_str());
                 }
@@ -548,14 +638,18 @@ pub fn build_lastfm_group(
         let context = context.clone();
         let widgets = widgets.clone();
         glib::MainContext::default().spawn_local(async move {
-            refresh_surface(&widgets, &context).await;
+            refresh_surface_future(&widgets, &context).await;
         });
     }
 
     group
 }
 
-#[cfg(test)]
+// The sole caller is browser.rs's consolidated GTK test, which shares the
+// crate's one GTK session only off-macOS; an ungated copy of these symbols
+// is dead code there and fails clippy -D warnings. Mirror the caller's gate
+// exactly, as preferences::widget_tests already does.
+#[cfg(all(test, not(target_os = "macos")))]
 pub mod widget_tests {
     use super::*;
 
@@ -575,7 +669,7 @@ pub mod widget_tests {
         // The detached path awaits nothing; block on the thread-default
         // main context the widget test session established.
         glib::MainContext::ref_thread_default().block_on(async {
-            refresh_surface(&widgets, &context).await;
+            refresh_surface_future(&widgets, &context).await;
         });
         assert_eq!(
             widgets.row.title().as_str(),
