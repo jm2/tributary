@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::authorization::{
-    LastFmAuthorizationClock, LastFmAuthorizationGrant, LastFmAuthorizationHandle,
-    LastFmAuthorizationShutdown, LastFmAuthorizationTransport, SystemLastFmAuthorizationClock,
+    LastFmAuthorizationChallenge, LastFmAuthorizationClock, LastFmAuthorizationGrant,
+    LastFmAuthorizationHandle, LastFmAuthorizationShutdown, LastFmAuthorizationTransport,
+    SystemLastFmAuthorizationClock,
 };
 use super::client::{AppCredentials, LastFmClient, LastFmClientError};
 use super::credentials::{
@@ -26,6 +27,7 @@ use super::lifecycle::{
     acquire_vault_lifecycle, recover_quarantined_lastfm_queue, LastFmQuarantinedQueueRecoveryError,
     LastFmVaultLifecycleLease,
 };
+use super::policy::LastFmPolicyGeneration;
 use super::storage::purge_account;
 
 /// One process-lifetime authorization owner; a second construction is a bug.
@@ -341,6 +343,40 @@ pub async fn discard_quarantined_queue(
         Ok(recovery) => Ok(recovery.purged_scrobbles()),
         Err(error) => Err(error),
     }
+}
+
+/// Content-free consent-gated authorization failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LastFmAccountAuthorizationError {
+    #[error("recorded consent is required before Last.fm authorization")]
+    ConsentRequired,
+    #[error("Last.fm authorization is unavailable")]
+    AuthorizationUnavailable,
+}
+
+/// Begin a desktop authorization flow for the consent-gated handoff.
+///
+/// The live policy generation is verified consented and enabled before the
+/// flow starts; without recorded consent this fails closed and no request
+/// token is fetched. Returns the exact challenge plus its browser URL for
+/// the one system-browser launch; the URL never reaches diagnostics.
+pub async fn begin_consent_gated_authorization(
+    authorization: &LastFmAuthorizationHandle,
+    policy: &LastFmPolicyGeneration,
+) -> Result<(LastFmAuthorizationChallenge, String), LastFmAccountAuthorizationError> {
+    if !policy.consented_and_enabled() {
+        return Err(LastFmAccountAuthorizationError::ConsentRequired);
+    }
+    let challenge = authorization
+        .try_begin()
+        .map_err(|_| LastFmAccountAuthorizationError::AuthorizationUnavailable)?
+        .wait()
+        .await
+        .map_err(|_| LastFmAccountAuthorizationError::AuthorizationUnavailable)?;
+    let url = challenge
+        .authorization_url()
+        .map_err(|_| LastFmAccountAuthorizationError::AuthorizationUnavailable)?;
+    Ok((challenge, url))
 }
 
 #[cfg(test)]

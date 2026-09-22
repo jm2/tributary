@@ -320,7 +320,7 @@ fn session() -> DesktopAuthorizedSession {
 fn authorization_url(
     challenge: &LastFmAuthorizationChallenge,
 ) -> Result<String, LastFmAuthorizationAdmissionError> {
-    challenge.authorization_url_for_test()
+    challenge.authorization_url()
 }
 
 fn assert_url_revoked(challenge: &LastFmAuthorizationChallenge) {
@@ -1241,7 +1241,7 @@ async fn poisoned_internal_ingress_fails_the_entire_owner_closed() {
 }
 
 #[test]
-fn production_challenge_source_surface_exposes_only_flow() {
+fn production_challenge_source_surface_stays_module_private() {
     let source = include_str!("authorization.rs").replace("\r\n", "\n");
     let implementation = source
         .split_once("impl LastFmAuthorizationChallenge {")
@@ -1257,9 +1257,15 @@ fn production_challenge_source_surface_exposes_only_flow() {
         .collect::<Vec<_>>();
     assert_eq!(
         public_items,
-        ["pub fn flow(&self) -> LastFmAuthorizationFlow {"]
+        [
+            "pub(in crate::lastfm) fn authorization_url(",
+            "pub fn flow(&self) -> LastFmAuthorizationFlow {",
+        ]
     );
-    assert!(implementation.contains("#[cfg(test)]\n    fn authorization_url_for_test"));
+    // The browser handoff must remain a module-private seam gated on the
+    // composition layer's consent check, never a public API.
+    assert!(implementation.contains("pub(in crate::lastfm) fn authorization_url("));
+    assert!(implementation.contains("Consent-gated browser handoff URL"));
 }
 
 #[tokio::test]

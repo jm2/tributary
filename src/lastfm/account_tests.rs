@@ -1,5 +1,6 @@
 //! Focused regressions for the Last.fm account composition layer.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -13,11 +14,11 @@ use uuid::Uuid;
 use crate::db::entities::lastfm_scrobble;
 use crate::db::migration::Migrator;
 use crate::lastfm::account::{
-    discard_quarantined_queue, install_fresh_account, install_replacement_account,
-    install_same_account_reauthorization, load_vault_account,
+    begin_consent_gated_authorization, discard_quarantined_queue, install_fresh_account,
+    install_replacement_account, install_same_account_reauthorization, load_vault_account,
     spawn_lastfm_authorization_owner_with, stage_account_install_decision,
-    LastFmAccountInstallDecision, LastFmAccountInstallError, LastFmAccountIntegrationError,
-    LastFmAccountReplacementError,
+    LastFmAccountAuthorizationError, LastFmAccountInstallDecision, LastFmAccountInstallError,
+    LastFmAccountIntegrationError, LastFmAccountReplacementError,
 };
 use crate::lastfm::authorization::{
     LastFmAuthorizationClock, LastFmAuthorizationGrant, LastFmAuthorizationPhase,
@@ -30,6 +31,9 @@ use crate::lastfm::credentials::{
     CredentialError, LastFmAccountBinding, ProtectedString, SessionCredentialStore, StoredSession,
 };
 use crate::lastfm::lifecycle::acquire_vault_lifecycle;
+use crate::lastfm::policy::{
+    commit_policy_update, LastFmConsentRecord, LastFmPolicyGeneration, LastFmPolicyUpdate,
+};
 
 const SESSION_KEY: &str = "0123456789abcdef0123456789abcdef";
 const RENEWED_SESSION_KEY: &str = "abcdef0123456789abcdef0123456789";
@@ -80,19 +84,70 @@ impl LastFmAuthorizationClock for FrozenClock {
 }
 
 #[tokio::test]
-async fn process_authorization_owner_claims_exactly_once() {
+async fn process_authorization_owner_gates_second_claim_and_consent() {
     let (handle, shutdown) =
         spawn_lastfm_authorization_owner_with(Arc::new(ApprovingTransport), Arc::new(FrozenClock))
             .expect("the first process claim must succeed");
 
     assert_eq!(
-        handle.subscribe_status().borrow().phase,
-        LastFmAuthorizationPhase::Idle
-    );
-    assert_eq!(
         spawn_lastfm_authorization_owner_with(Arc::new(ApprovingTransport), Arc::new(FrozenClock),)
             .unwrap_err(),
         LastFmAccountIntegrationError::OwnerClaimed
+    );
+
+    // The closed default generation must refuse the handoff before any flow
+    // starts: no request token is fetched, and the phase stays Idle.
+    assert_eq!(
+        begin_consent_gated_authorization(&handle, &LastFmPolicyGeneration::default())
+            .await
+            .unwrap_err(),
+        LastFmAccountAuthorizationError::ConsentRequired
+    );
+    assert_eq!(
+        handle.subscribe_status().borrow().phase,
+        LastFmAuthorizationPhase::Idle
+    );
+
+    let db = account_database().await;
+    let consented = commit_policy_update(
+        &db,
+        0,
+        LastFmPolicyUpdate {
+            consent: Some(LastFmConsentRecord::try_new("en", 1).expect("valid consent record")),
+            enabled: true,
+            enabled_remote_sources: HashSet::new(),
+        },
+    )
+    .await
+    .expect("consented policy commits");
+    assert!(consented.consented_and_enabled());
+
+    let (challenge, url) = begin_consent_gated_authorization(&handle, &consented)
+        .await
+        .expect("consented authorization begins");
+    assert!(url.starts_with("https://www.last.fm/api/auth/"));
+    assert!(url.contains("api_key="));
+    assert!(url.contains("token="));
+
+    // The owner publishes the URL once the request token resolves.
+    let mut url_published = None;
+    for _ in 0..200 {
+        match challenge.authorization_url() {
+            Ok(published) => {
+                url_published = Some(published);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+    assert_eq!(
+        url_published.as_deref(),
+        Some(url.as_str()),
+        "the handoff URL must be the exact current challenge's URL"
+    );
+    assert_eq!(
+        handle.subscribe_status().borrow().phase,
+        LastFmAuthorizationPhase::AwaitingApproval
     );
 
     drop(shutdown);

@@ -13,7 +13,6 @@
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-#[cfg(test)]
 use std::sync::Weak;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -174,7 +173,8 @@ struct ChallengeInner {
     generation: u64,
     flow: LastFmAuthorizationFlow,
     finish: LastFmAuthorizationFinish,
-    #[cfg(test)]
+    // Weak on purpose: a retained challenge must never keep the owner
+    // handle (and with it the URL authority) alive after shutdown.
     handle: Weak<HandleInner>,
 }
 
@@ -189,8 +189,16 @@ struct ChallengeInner {
 pub struct LastFmAuthorizationChallenge(Arc<ChallengeInner>);
 
 impl LastFmAuthorizationChallenge {
-    #[cfg(test)]
-    fn authorization_url_for_test(&self) -> Result<String, LastFmAuthorizationAdmissionError> {
+    /// Consent-gated browser handoff URL for this exact challenge.
+    ///
+    /// Only the account composition layer may call this, immediately before
+    /// the system-browser launch and only once the live policy generation is
+    /// consented and enabled. The URL stays private to the module in every
+    /// other direction; revocation (cancel, supersession, expiry, shutdown)
+    /// fails the extraction closed.
+    pub(in crate::lastfm) fn authorization_url(
+        &self,
+    ) -> Result<String, LastFmAuthorizationAdmissionError> {
         let handle = self
             .0
             .handle
@@ -845,7 +853,8 @@ enum OwnerEvent {
 struct AuthorizationOwner {
     commands: async_channel::Receiver<Command>,
     ingress: Arc<Mutex<IngressGate>>,
-    #[cfg(test)]
+    // Weak backref for the challenge's consent-gated URL extraction; a
+    // retained challenge must never keep the owner handle alive.
     handle: Weak<HandleInner>,
     transport: Arc<dyn LastFmAuthorizationTransport>,
     clock: Arc<dyn LastFmAuthorizationClock>,
@@ -1197,7 +1206,6 @@ impl AuthorizationOwner {
             generation,
             flow: flow.clone(),
             finish: finish.clone(),
-            #[cfg(test)]
             handle: self.handle.clone(),
         }));
         let ingress = Arc::clone(&self.ingress);
@@ -1839,7 +1847,6 @@ fn spawn_lastfm_authorization_with_options(
     let mut owner = AuthorizationOwner {
         commands: receiver,
         ingress,
-        #[cfg(test)]
         handle: Arc::downgrade(&inner),
         transport,
         clock,
