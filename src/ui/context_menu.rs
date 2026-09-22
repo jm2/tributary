@@ -3224,6 +3224,32 @@ pub mod tests {
         }
     }
 
+    /// Runs `body` with a fresh main context pushed as the calling thread's
+    /// thread default, handing it to `body` for spawning and pumping.
+    ///
+    /// These delivery tests must never touch the process-global default
+    /// main context: a context is single-owner, and in a full
+    /// display-backed suite run the consolidated widget test session can
+    /// hold the global default (directly or via its own gtk init work)
+    /// while this suite's tests run concurrently on another libtest
+    /// worker thread. `spawn_local` on a context another thread owns
+    /// panics ("Failed to acquire ownership of main context, already
+    /// acquired by another thread"), and `idle_add_local_once` acquires
+    /// the global default the same way — both observed in the full
+    /// gtk4-broadwayd run (tr-e032lg), invisible in headless runs where
+    /// the widget session never initializes. These tests construct no
+    /// widgets, so they need nothing from a GTK session: a private
+    /// context always acquires (nothing else owns it yet), and pumping
+    /// only ever dispatches sources this same thread scheduled on it —
+    /// the exact discipline `widget_test_session::with_session` applies
+    /// to widget tests.
+    fn on_private_main_context<R>(body: impl FnOnce(&glib::MainContext) -> R) -> R {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| body(&context))
+            .expect("fresh main context always acquires: nothing else owns it yet")
+    }
+
     /// Builds the single-path admitted set the completion stitches. This is
     /// deliberately not `capture_pending_locals`: that fn parks while
     /// another test holds the admission gate, and this suite's tests run
@@ -3287,28 +3313,34 @@ pub mod tests {
         // The worker parks inside the admission gate exactly as the
         // dispatch's spawn_blocking worker can, and while it is parked the
         // main context the UI runs on must keep dispatching — that is the
-        // responsiveness the off-thread admission buys.
-        let pending_path = PathBuf::from("/definitely/not/here.flac");
-        let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
+        // responsiveness the off-thread admission buys. The context is the
+        // suite's own private one: the global default is a cross-thread
+        // ownership race with the widget test session (tr-e032lg), and
+        // idle_add_local_once would acquire that global default here.
+        on_private_main_context(|context| {
+            let pending_path = PathBuf::from("/definitely/not/here.flac");
+            let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
 
-        let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
-        let dispatched_for_idle = dispatched.clone();
-        glib::idle_add_local_once(move || dispatched_for_idle.set(true));
-        let context = glib::MainContext::default();
-        pump_main_context_until(
-            &context,
-            || dispatched.get(),
-            "the main context stopped dispatching while the admission worker was parked",
-        );
-        assert!(
-            !worker.is_finished(),
-            "the responsiveness proof must run while the worker is still parked"
-        );
+            let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+            let dispatched_for_task = dispatched.clone();
+            context.spawn_local(async move {
+                dispatched_for_task.set(true);
+            });
+            pump_main_context_until(
+                context,
+                || dispatched.get(),
+                "the main context stopped dispatching while the admission worker was parked",
+            );
+            assert!(
+                !worker.is_finished(),
+                "the responsiveness proof must run while the worker is still parked"
+            );
 
-        release.send(()).expect("release admission gate");
-        let admitted = worker.join().expect("admission worker");
-        assert_eq!(admitted.len(), 1, "admission must admit by path");
-        *HELD_ADMISSION_GATE.lock().expect("gate lock") = None;
+            release.send(()).expect("release admission gate");
+            let admitted = worker.join().expect("admission worker");
+            assert_eq!(admitted.len(), 1, "admission must admit by path");
+            *HELD_ADMISSION_GATE.lock().expect("gate lock") = None;
+        });
     }
 
     #[test]
@@ -3324,13 +3356,15 @@ pub mod tests {
             positions: vec![0],
             media_keys: vec![device_media_key(&device_a)],
         };
-        let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
-            evidence,
-            move |position| (position == 0).then(|| device_media_key(&device_b)),
-            admitted_by_path(&pending_path),
-            &pending_path,
-        );
+        let outcome = on_private_main_context(|context| {
+            deliver_admission_and_resolve_completion(
+                context,
+                evidence,
+                move |position| (position == 0).then(|| device_media_key(&device_b)),
+                admitted_by_path(&pending_path),
+                &pending_path,
+            )
+        });
         assert!(
             matches!(
                 outcome.borrow().as_ref(),
@@ -3354,13 +3388,15 @@ pub mod tests {
         };
         let admission = admitted_by_path(&pending_path);
         assert_eq!(admission.locals.len(), 1, "admission must admit by path");
-        let outcome = deliver_admission_and_resolve_completion(
-            &glib::MainContext::default(),
-            evidence,
-            move |position| (position == 0).then(|| device_media_key(&device_a)),
-            admission,
-            &pending_path,
-        );
+        let outcome = on_private_main_context(|context| {
+            deliver_admission_and_resolve_completion(
+                context,
+                evidence,
+                move |position| (position == 0).then(|| device_media_key(&device_a)),
+                admission,
+                &pending_path,
+            )
+        });
         match outcome.borrow().as_ref() {
             Some(PropertiesCompletion::Open(opened)) => {
                 assert!(matches!(opened[0].target, SaveTarget::Local(_)));
