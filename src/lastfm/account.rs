@@ -432,3 +432,15 @@ pub async fn begin_consent_gated_authorization(
 #[cfg(test)]
 #[path = "account_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "account_install_tests.rs"]
+mod install_tests;
+
+#[cfg(test)]
+#[path = "account_queue_tests.rs"]
+mod queue_tests;
+
+#[cfg(test)]
+#[path = "account_test_support.rs"]
+mod test_support;
