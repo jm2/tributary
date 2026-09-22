@@ -114,18 +114,32 @@ pub const fn validate_snapshot_path_bytes(byte_len: usize) -> Result<(), Offline
 /// but never the text (`doc:58`, "Licensing" row; `doc:1151`, the
 /// `SourceDeclared` row of the licence table). The application never
 /// invents labels — it only carries the ones the adapter publishes.
+///
+/// The value is an ASCII identifier: non-empty, at most
+/// [`MAX_OFFLINE_METADATA_BYTES`] bytes, and every byte an ASCII
+/// alphanumeric, `-`, or `_`. Anything else (spaces, punctuation,
+/// non-ASCII) is rejected at construction and on deserialisation, so a
+/// hostile adapter cannot smuggle prose, markup, or multi-byte sequences
+/// into the persisted row.
 #[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct LicenceLabel(String);
 
 impl LicenceLabel {
-    /// Validate an adapter-published label against
-    /// [`MAX_OFFLINE_METADATA_BYTES`], rejecting empty and over-bound
-    /// values (`None` means discard — there is no licence state to
-    /// persist).
+    /// Validate an adapter-published label: non-empty, at most
+    /// [`MAX_OFFLINE_METADATA_BYTES`] bytes, and an ASCII identifier
+    /// charset (ASCII alphanumeric, `-`, `_`) — rejecting empty,
+    /// over-bound, and out-of-charset values (`None` means discard —
+    /// there is no licence state to persist).
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         if value.is_empty() || value.len() > MAX_OFFLINE_METADATA_BYTES {
+            return None;
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
             return None;
         }
         Some(Self(value))

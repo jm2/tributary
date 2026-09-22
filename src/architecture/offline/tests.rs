@@ -276,6 +276,27 @@ fn licence_label_bounds_redaction_and_serde() {
 }
 
 #[test]
+fn licence_label_charset_is_ascii_identifier() {
+    // Accepted: ASCII alphanumerics, hyphens, underscores.
+    assert!(LicenceLabel::new("subsonic-streaming-self").is_some());
+    assert!(LicenceLabel::new("jellyfin_streaming_self").is_some());
+    assert!(LicenceLabel::new("PlexStreaming4k").is_some());
+    // Rejected: space, punctuation, non-ASCII, control bytes.
+    assert!(LicenceLabel::new("has space").is_none());
+    assert!(LicenceLabel::new("label.dot").is_none());
+    assert!(LicenceLabel::new("label/slash").is_none());
+    assert!(LicenceLabel::new("étiquette").is_none());
+    assert!(LicenceLabel::new("label\nnewline").is_none());
+    // Serde deserialisation goes through the same checked constructor.
+    assert!(serde_json::from_str::<LicenceLabel>("\"has space\"").is_err());
+    assert!(serde_json::from_str::<LicenceLabel>("\"étiquette\"").is_err());
+    // And through the nested persisted row shape.
+    assert!(
+        serde_json::from_str::<OperationalLicence>("{\"source-declared\":\"has space\"}").is_err()
+    );
+}
+
+#[test]
 fn operational_licence_serde_and_display() {
     let declared =
         OperationalLicence::SourceDeclared(LicenceLabel::new("jellyfin-streaming-self").unwrap());
