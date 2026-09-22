@@ -354,6 +354,56 @@ pub enum LastFmAccountAuthorizationError {
     AuthorizationUnavailable,
 }
 
+/// Content-free explicit disconnect failures.
+///
+/// The variants mirror the destructive-transition ordering: the queue purge
+/// is refused before the protected record is ever deleted, so a refusal
+/// never leaves a purged queue with a live account identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LastFmAccountDisconnectError {
+    #[error("the Last.fm credential store is unavailable")]
+    CredentialStoreUnavailable,
+    #[error("no connected Last.fm account exists")]
+    VaultMissing,
+    #[error("the pending-scrobble purge was refused")]
+    QueuePurgeRefused,
+    #[error("the protected record must be removed but could not be")]
+    CredentialCleanupRequired,
+}
+
+/// Explicit "Disconnect and purge": transactionally purge every pending
+/// scrobble bound to the account, then delete the protected record under
+/// the lifecycle lease.
+///
+/// Returns the number of purged pending scrobbles. A purge refusal leaves
+/// the valid account record and every queue row untouched.
+pub async fn disconnect_and_purge(
+    credentials: Arc<dyn SessionCredentialStore>,
+    db: sea_orm::DatabaseConnection,
+) -> Result<u64, LastFmAccountDisconnectError> {
+    use LastFmAccountDisconnectError as Error;
+
+    let lease = acquire_vault_lifecycle().await;
+    let (lease, existing) = load_under_lease(Arc::clone(&credentials), lease)
+        .await
+        .map_err(|_| Error::CredentialStoreUnavailable)?;
+    let existing = existing.ok_or(Error::VaultMissing)?;
+
+    let purged = purge_account(&db, existing.account_binding())
+        .await
+        .map_err(|_| Error::QueuePurgeRefused)?;
+
+    let deleter = Arc::clone(&credentials);
+    let (_lease, deleted) = tokio::task::spawn_blocking(move || {
+        let deleted = deleter.delete();
+        (lease, deleted)
+    })
+    .await
+    .map_err(|_| Error::CredentialCleanupRequired)?;
+    deleted.map_err(|_| Error::CredentialCleanupRequired)?;
+    Ok(purged)
+}
+
 /// Begin a desktop authorization flow for the consent-gated handoff.
 ///
 /// The live policy generation is verified consented and enabled before the

@@ -567,6 +567,44 @@ async fn quarantine_discard_purges_orphaned_rows_and_refuses_a_valid_account() {
     );
 }
 
+#[tokio::test]
+async fn disconnect_purges_queue_then_deletes_the_exact_record() {
+    let vault = Arc::new(MemoryVault::default());
+    vault.seed("leaving-user", SESSION_KEY);
+    let binding = vault.stored_binding();
+    let db = account_database().await;
+    seed_queue_rows(&db, binding, 4).await;
+
+    let credentials: Arc<dyn SessionCredentialStore> = vault.clone();
+    let purged = crate::lastfm::account::disconnect_and_purge(Arc::clone(&credentials), db.clone())
+        .await
+        .expect("disconnect lands");
+    assert_eq!(purged, 4);
+    assert_eq!(queue_len(&db).await, 0);
+    assert_eq!(vault.stored_username(), None);
+    assert_eq!(
+        crate::lastfm::account::disconnect_and_purge(credentials, db.clone())
+            .await
+            .unwrap_err(),
+        crate::lastfm::account::LastFmAccountDisconnectError::VaultMissing
+    );
+
+    vault.seed("leaving-user", SESSION_KEY);
+    seed_queue_rows(&db, binding, 1).await;
+    let interloper = StoredSession::new("someone-else", ProtectedString::new(SESSION_KEY))
+        .expect("fixture satisfies validation")
+        .account_binding();
+    seed_queue_rows(&db, interloper, 2).await;
+    assert_eq!(
+        crate::lastfm::account::disconnect_and_purge(vault.clone(), db)
+            .await
+            .unwrap_err(),
+        crate::lastfm::account::LastFmAccountDisconnectError::QueuePurgeRefused,
+        "an interloper binding must freeze the disconnect"
+    );
+    assert_eq!(vault.stored_username().as_deref(), Some("leaving-user"));
+}
+
 #[test]
 fn replacement_errors_are_content_free() {
     let diagnostics = format!(
