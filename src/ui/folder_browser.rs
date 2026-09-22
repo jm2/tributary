@@ -838,8 +838,11 @@ mod tests {
 /// Native Windows fixtures (#252). Drive roots, backslash separators,
 /// spaces, Unicode, and prefix-sibling names are only expressible on a
 /// Windows target, so these run in the Windows CI leg
-/// (`cargo test --release --target <windows-target>`).
-#[cfg(windows)]
+/// (`cargo test --release --target <windows-target>`). Gated on `test`
+/// as well: `--all-targets` also compiles the bin without `cfg(test)`,
+/// and in that pass the `#[test]` callers below are stripped, which
+/// would turn every fixture helper here into a `-D dead_code` error.
+#[cfg(all(test, windows))]
 mod windows_fixtures {
     use super::*;
 
