@@ -3603,6 +3603,23 @@ impl fmt::Debug for LastFmManualPauseRecovery {
     }
 }
 
+#[cfg(test)]
+impl LastFmManualPauseRecovery {
+    /// A recovery authority bound to no live runtime. Resume admission must
+    /// refuse it through the same typed mismatch path as a genuine foreign
+    /// authority, so application-level forwarding can be exercised without a
+    /// paused runtime.
+    pub(in crate::lastfm) fn dangling_for_test(account_binding: LastFmAccountBinding) -> Self {
+        Self {
+            runtime: Weak::new(),
+            account_binding,
+            account_epoch: LastFmAccountEpoch::INITIAL,
+            status_revision: 0,
+            pause: storage::LastFmDurablePause::Compatibility,
+        }
+    }
+}
+
 /// Load the exact vault authority and validate every retained row before
 /// exposing an active handle.
 ///
