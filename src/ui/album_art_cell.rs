@@ -334,18 +334,28 @@ pub mod widget_tests {
 
     /// The placeholder reset must leave the missing-art state VISIBLE.
     ///
-    /// The 2026-09-07 review finding: `show_placeholder` followed its
-    /// `set_icon_name` with `set_paintable(None)`, and a `None` paintable
-    /// assignment is GTK4's `gtk_image_clear` — it wiped the freshly
-    /// installed icon (storage back to empty, blank square) instead of
-    /// replacing a recycled cell's texture. The content store observable
-    /// on every GTK 4.x is the storage type: `IconName` while the
-    /// placeholder is installed, `Empty` after a clearing write. (A
-    /// previous draft asserted `paintable().is_some()` here instead;
-    /// that encoded a false premise — `gtk_image_get_paintable` only
-    /// reports paintables installed with `set_paintable`, and GTK 4.22
-    /// returns `None` for a healthy icon-name image, verified first-hand
-    /// on Fedora 44 / gtk4-4.22.5.)
+    /// Three properties together pin that:
+    ///
+    /// 1. the placeholder icon name is wired into the image;
+    /// 2. the image storage stays icon-name — the 2026-09-07 defect was a
+    ///    follow-up `set_paintable(None)` flipping the storage away from
+    ///    icon-name and blanking the image. A `None` paintable assignment
+    ///    is GTK4's `gtk_image_clear`, so the content-store observable on
+    ///    every GTK 4.x is the storage type: `IconName` while the
+    ///    placeholder is installed, `Empty` after a clearing write;
+    /// 3. the icon theme the image consults at snapshot time resolves the
+    ///    name. An unresolvable name renders as a blank square even with
+    ///    correct storage — exactly what the bare CI container exposed
+    ///    (GTK Display Gate, 2026-09-21). GTK 4.22 keeps an icon-name
+    ///    image's paintable `None` until a mapped snapshot populates the
+    ///    icon helper (verified on 4.22.5: `paintable()` stays `None`
+    ///    after `set_icon_name`, after measure, and even after mapping a
+    ///    window and pumping the frame — the getter peeks without
+    ///    loading), so the former `paintable().is_some()` assertion was
+    ///    unreachable for icon-name storage on current GTK. The theme
+    ///    resolution check is the honest stand-in for "renders pixels,
+    ///    not blank": `widget_test_session` installs a hermetic `hicolor`
+    ///    theme so this holds on any host, icon-themed or bare.
     pub fn show_placeholder_keeps_the_missing_art_visible() {
         let cell = AlbumArtCell::new("audio-x-generic-symbolic");
         // Paint a texture first so the reset truly has stale content to
@@ -360,7 +370,21 @@ pub mod widget_tests {
         assert_eq!(
             cell.image.storage_type(),
             gtk::ImageType::IconName,
-            "the placeholder must stay the image's content: a cleared (empty) Image renders blank"
+            "the placeholder must stay icon-name storage: a flipped or \
+             cleared storage renders blank"
+        );
+        assert!(
+            // The DISPLAY-bound theme — not `IconTheme::default()`, which
+            // in gtk4-rs is a throwaway display-less `IconTheme::new()`.
+            // This is the same instance the image consults at snapshot
+            // time. `widget_test_session` registers the hermetic hicolor
+            // theme on it before any widget body runs.
+            gtk::IconTheme::for_display(
+                &gtk::gdk::Display::default().expect("GTK session has a display")
+            )
+            .has_icon("audio-x-generic-symbolic"),
+            "the placeholder icon must resolve in the session icon theme: \
+             an unresolvable name renders as a blank square"
         );
     }
 

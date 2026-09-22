@@ -131,6 +131,64 @@ pub mod widget_test_session {
         &GTK_OWNER
     }
 
+    /// Installs the hermetic placeholder-icon theme for widget-contract
+    /// sessions, once per process.
+    ///
+    /// The album-art placeholder contract asserts that the placeholder
+    /// icon (`audio-x-generic-symbolic`) resolves in the icon theme the
+    /// image consults at snapshot time — an unresolvable name renders as a
+    /// blank square, the exact defect class that contract guards
+    /// (2026-09-07). Bare CI containers (the fedora:44 GTK display gate
+    /// installs `gtk4-devel` + `libadwaita-devel` but no icon-theme
+    /// package) and stripped-down developer machines have no usable
+    /// `hicolor`/`Adwaita` theme, so the resolution guarantee needs its
+    /// own theme. This writes a minimal `hicolor`-named theme under the
+    /// process temp dir — named `hicolor` because that is the theme GTK's
+    /// fallback chain always consults — carrying one tiny PNG under the
+    /// placeholder's name, and adds it to the default icon theme's search
+    /// path. It exists only for the test session; the application never
+    /// ships or registers it.
+    ///
+    /// Idempotent: `with_session` runs once per consolidated contract
+    /// call, and the theme installs on the first GTK-ready session only.
+    fn ensure_hermetic_icon_theme() {
+        use gtk::gdk::prelude::TextureExt as _;
+
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        if INSTALLED.get().is_some() {
+            return;
+        }
+
+        let theme_dir = std::env::temp_dir().join("tributary-widget-test-icons");
+        let icon_dir = theme_dir.join("hicolor/scalable/apps");
+        std::fs::create_dir_all(&icon_dir).expect("create hermetic icon theme dirs");
+        std::fs::write(
+            theme_dir.join("hicolor/index.theme"),
+            "[Icon Theme]\nName=hicolor\nDirectories=scalable/apps\n\n\
+             [scalable/apps]\nContext=Applications\nType=Scalable\nSize=16\n\
+             MinSize=8\nMaxSize=512\n",
+        )
+        .expect("write hermetic index.theme");
+        // 2x2 opaque texture saved as the icon payload; the contracts
+        // assert RESOLUTION, not artwork, so the pixels are irrelevant.
+        let pixels = gtk::glib::Bytes::from(&[
+            255u8, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        ]);
+        let texture =
+            gtk::gdk::MemoryTexture::new(2, 2, gtk::gdk::MemoryFormat::R8g8b8a8, &pixels, 8);
+        texture
+            .save_to_png(icon_dir.join("audio-x-generic-symbolic.png"))
+            .expect("write hermetic placeholder icon");
+        // NOTE: `IconTheme::default()` here would be wrong — in gtk4-rs
+        // that is `Default::default()` = a throwaway `IconTheme::new()`
+        // with no display. Widgets consult the DISPLAY-bound theme, so the
+        // path must be registered on `for_display`.
+        let display = gtk::gdk::Display::default().expect("GTK session has a display");
+        gtk::IconTheme::for_display(&display).add_search_path(&theme_dir);
+
+        INSTALLED.set(()).ok();
+    }
+
     /// Set once a widget session has been established (GTK initialized
     /// under the lock), so the calling test can assert it did not run as a
     /// vacuous no-op.
@@ -321,6 +379,12 @@ pub mod widget_test_session {
                 }
             }
         }
+
+        // The placeholder contracts assert icon resolution through the
+        // default icon theme; bare CI containers ship no icon themes, so
+        // the session installs its own hermetic hicolor theme before any
+        // widget body runs (see the function docs).
+        ensure_hermetic_icon_theme();
 
         // Push the session's dedicated main context as the thread default
         // for exactly the duration of `body` (see the doc comment above
