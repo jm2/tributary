@@ -13,8 +13,9 @@ pub mod offline;
 pub mod server_playlist;
 
 pub use backend::{load_track_catalog, MediaBackend};
-// Same bin-target rationale as the offline block below: the re-export is
-// lib surface until the engine slice (tr-4q8) wires it.
+// Binary-target surface with no in-crate consumer yet: the engine slice
+// (tr-4q8) wires it. The lib target exposes only `architecture::error`
+// (`src/lib.rs`), so this re-export is bin-only until then.
 #[allow(unused_imports)]
 pub use identity::{
     MediaKey, NativePlaylistId, SourceId, SourceIncarnationId, TrackId, ViewOrigin,
@@ -25,10 +26,11 @@ pub use media::{
 };
 // The offline re-export below is intentional public surface for exactly
 // two follow-up slices: the bounded download/cache engine (tr-4q8) and
-// the GTK offline storage panel (tr-8h4). This binary is not yet wired
-// to it — the surface is lib-only until those slices land — so the
-// unused-import lint is silenced at the bin root while the lib-level
-// surface stays complete.
+// the GTK offline storage panel (tr-8h4). Nothing in this crate consumes
+// it yet, and it lives in the binary target only — the lib target
+// exposes just `architecture::error` (`src/lib.rs`) — so the
+// unused-import lint is silenced at the bin root until those slices
+// land and wire it.
 #[allow(unused_imports)]
 pub use offline::{
     check_declared_total, CommittedSnapshot, DigestProvenance, EntityValidator, JobRecord,
