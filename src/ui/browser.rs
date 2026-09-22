@@ -3015,12 +3015,21 @@ mod tests {
         );
         assert_folder_row(folder_pane, 1, FolderRowKind::Directory, Some("deep"));
 
-        // The same-labelled Up row at position 0 must ASCEND.
+        // The same-labelled Up row at position 0 must ASCEND one level —
+        // back to the root's top ([Up("…"), leafonly, …]), the same
+        // ladder the repeated-Up contract climbs — never a
+        // label-interpreted descent that would stay inside `…`.
         emit_folder_activation(&list_view, 0);
-        assert!(
-            matches!(&*fx.state.folder_location.borrow(), FolderLocation::Roots),
-            "activating the same-labelled Up row must ascend to the roots level"
+        let ascended = match &*fx.state.folder_location.borrow() {
+            FolderLocation::Inside { dir, .. } => Some(dir.clone()),
+            FolderLocation::Roots => None,
+        };
+        assert_eq!(
+            ascended.as_deref(),
+            Some(""),
+            "the same-labelled Up row must ascend to the root's top level"
         );
+        assert_folder_row(folder_pane, 1, FolderRowKind::Directory, Some("leafonly"));
     }
 
     /// Inside an empty leaf the folder pane's ONLY row is the
