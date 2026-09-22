@@ -3604,12 +3604,13 @@ pub(crate) fn build_window(
             let bs_for_aa = bs.clone();
             let master_for_aa = master_for_pref.clone();
             let on_aa_change: std::rc::Rc<dyn Fn(bool)> = std::rc::Rc::new(move |enabled: bool| {
-                // Refresh the browser snapshot so the album-artist
+                // Reset the browser snapshot so the album-artist
                 // grouping change takes effect against the latest
                 // library state, not just whatever was loaded when
-                // the browser was first built.
+                // the browser was first built. The grouping change
+                // itself re-emits the composed filter afterwards.
                 let tracks = master_for_aa.borrow().clone();
-                browser::rebuild_browser_data(&bw_for_aa, &bs_for_aa, &tracks);
+                browser::reset_browser_data(&bw_for_aa, &bs_for_aa, &tracks);
                 browser::set_album_artist_grouping(&bw_for_aa, &bs_for_aa, enabled);
             });
             let bw_for_art = bw.clone();
@@ -3716,7 +3717,10 @@ pub fn display_tracks(
     track_store.splice(0, track_store.n_items(), objects);
 
     tracklist::update_status(status_label, objects);
-    browser::rebuild_browser_data(browser_widget, browser_state, objects);
+    // Source replacement: reset every browser filter axis so the panes
+    // and the evaluated filter agree on "All" (issue #250). No emit —
+    // the splice above already installed the full unfiltered set.
+    browser::reset_browser_data(browser_widget, browser_state, objects);
     // A source switch resets the folder pane: only the local library
     // carries browsable filesystem roots (the explicit omission policy).
     // The local-display paths re-attach the model right after this call.
@@ -4153,32 +4157,48 @@ fn setup_library_events(
 
                     // If local is the active source, update the visible tracklist.
                     if *active_source_key.borrow() == "local" {
-                        // Check if already in the store (update) or new (append).
-                        let mut found = false;
-                        for i in 0..track_store.n_items() {
-                            if let Some(existing) =
-                                track_store.item(i).and_downcast_ref::<TrackObject>()
-                            {
-                                if existing.uri() == uri {
-                                    track_store.remove(i);
-                                    track_store.insert(i, &obj);
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if !found {
-                            track_store.append(&obj);
-                        }
-
-                        // Update master tracks immediately.
+                        // Update master tracks FIRST: a browser filter emit
+                        // recomposes the visible list from master, so master
+                        // must already carry the upserted row.
                         let st = source_tracks.borrow();
                         let local_tracks = st.get("local").cloned().unwrap_or_default();
+                        drop(st);
                         *master_tracks.borrow_mut() = local_tracks.clone();
 
-                        // Debounce browser rebuild + status update (500 ms).
+                        if browser_state.is_filter_active() {
+                            // An active browser filter must gate what enters
+                            // the visible list: recompose it from the updated
+                            // master instead of appending an unfiltered row
+                            // (issue #250).
+                            browser_state.emit();
+                        } else {
+                            // No filter active: the appended/updated row IS
+                            // the composed result — update the store directly
+                            // instead of splicing the whole list.
+                            let mut found = false;
+                            for i in 0..track_store.n_items() {
+                                if let Some(existing) =
+                                    track_store.item(i).and_downcast_ref::<TrackObject>()
+                                {
+                                    if existing.uri() == uri {
+                                        track_store.remove(i);
+                                        track_store.insert(i, &obj);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !found {
+                                track_store.append(&obj);
+                            }
+                        }
+
+                        // Debounce browser refresh + status update (500 ms).
                         // The tracklist store is already up-to-date above;
                         // only the 3-pane browser and status bar are deferred.
+                        // Same-source refresh: preserves still-valid browser
+                        // selections instead of resetting them to "All"
+                        // (issue #250).
                         let gen = browser_rebuild_gen.get().wrapping_add(1);
                         browser_rebuild_gen.set(gen);
 
@@ -4186,7 +4206,6 @@ fn setup_library_events(
                         let source_tracks = source_tracks.clone();
                         let browser_widget = browser_widget.clone();
                         let browser_state = browser_state.clone();
-                        let status_label = status_label.clone();
                         let active_source_key = active_source_key.clone();
                         let source_navigation = source_navigation.clone();
                         let navigation_request = source_navigation.borrow().latest_request("local");
@@ -4213,8 +4232,8 @@ fn setup_library_events(
                             }
                             let st = source_tracks.borrow();
                             let local_tracks = st.get("local").cloned().unwrap_or_default();
-                            tracklist::update_status(&status_label, &local_tracks);
-                            browser::rebuild_browser_data(
+                            drop(st);
+                            browser::refresh_browser_data(
                                 &browser_widget,
                                 &browser_state,
                                 &local_tracks,
@@ -4253,9 +4272,17 @@ fn setup_library_events(
                         // Update master tracks immediately.
                         let st = source_tracks.borrow();
                         let local_tracks = st.get("local").cloned().unwrap_or_default();
+                        drop(st);
                         *master_tracks.borrow_mut() = local_tracks.clone();
 
-                        // Debounce browser rebuild + status update (500 ms).
+                        // Debounce browser refresh + status update (500 ms).
+                        // The direct removal above is safe under an active
+                        // filter (a removed row either exists and leaves, or
+                        // was already filtered out). Same-source refresh:
+                        // preserves still-valid browser selections instead of
+                        // resetting them to "All" (issue #250); its emit also
+                        // recomposes the filtered status count, so no manual
+                        // unfiltered update_status here.
                         let gen = browser_rebuild_gen.get().wrapping_add(1);
                         browser_rebuild_gen.set(gen);
 
@@ -4263,7 +4290,6 @@ fn setup_library_events(
                         let source_tracks = source_tracks.clone();
                         let browser_widget = browser_widget.clone();
                         let browser_state = browser_state.clone();
-                        let status_label = status_label.clone();
                         let active_source_key = active_source_key.clone();
                         let source_navigation = source_navigation.clone();
                         let navigation_request = source_navigation.borrow().latest_request("local");
@@ -4290,8 +4316,8 @@ fn setup_library_events(
                             }
                             let st = source_tracks.borrow();
                             let local_tracks = st.get("local").cloned().unwrap_or_default();
-                            tracklist::update_status(&status_label, &local_tracks);
-                            browser::rebuild_browser_data(
+                            drop(st);
+                            browser::refresh_browser_data(
                                 &browser_widget,
                                 &browser_state,
                                 &local_tracks,

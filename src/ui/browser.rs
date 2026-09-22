@@ -28,12 +28,27 @@ pub type FilterCallback =
     Box<dyn Fn(Option<String>, Option<String>, Option<String>, Option<String>, String)>;
 
 /// Opaque handle to the browser's internal track snapshot.
-/// Passed back to [`rebuild_browser_data`] when the library changes.
+/// Passed back to [`reset_browser_data`] / [`refresh_browser_data`]
+/// when the library changes.
 #[derive(Clone)]
 pub struct BrowserState {
     tracks: Rc<RefCell<Vec<TrackSnapshot>>>,
+    /// Shared selection axes — the single source of truth every handler
+    /// mutates and every emit composes from (issue #250). Handlers
+    /// capture clones of the whole state so a mutation and the
+    /// subsequent emit always read and write the same cells.
+    selected_genre: Rc<RefCell<Option<String>>>,
+    selected_artist: Rc<RefCell<Option<String>>>,
+    selected_album: Rc<RefCell<Option<String>>>,
     /// Current search text for the realtime filter.
     search_text: Rc<RefCell<String>>,
+    /// Generation counter invalidating pending search debounces when
+    /// the shared state is reset (source replacement / full sync).
+    search_debounce_gen: Rc<Cell<u32>>,
+    /// THE single composition rule: every filter change emits through
+    /// [`BrowserState::emit`], which reads all five axes from this
+    /// shared state and invokes the callback.
+    on_filter_changed: Rc<FilterCallback>,
     /// When true, the Artist pane groups by album artist (with fallback
     /// to track artist for tracks that don't carry an album-artist tag).
     use_album_artist: Rc<Cell<bool>>,
@@ -89,10 +104,61 @@ enum FolderLocation {
     Inside { root_id: String, dir: String },
 }
 
+impl BrowserState {
+    /// Compose the current filter from the shared axes and invoke the
+    /// filter callback — the ONE composition rule (issue #250). Every
+    /// mutation path — pane selection, debounced search, album-artist
+    /// regrouping, data reset/refresh — emits through here, so the
+    /// evaluated result always matches the state the panes display.
+    pub fn emit(&self) {
+        (self.on_filter_changed)(
+            self.selected_genre.borrow().clone(),
+            self.selected_artist.borrow().clone(),
+            self.selected_album.borrow().clone(),
+            self.folder_prefix.borrow().clone(),
+            self.search_text.borrow().clone(),
+        );
+    }
+
+    /// True when any filter axis is set: the window must recompose the
+    /// visible list through the browser instead of appending raw rows
+    /// (issue #250 — an upsert under an active filter leaked an
+    /// unfiltered row into the track list).
+    pub fn is_filter_active(&self) -> bool {
+        self.selected_genre.borrow().is_some()
+            || self.selected_artist.borrow().is_some()
+            || self.selected_album.borrow().is_some()
+            || self.folder_prefix.borrow().is_some()
+            || !self.search_text.borrow().is_empty()
+    }
+
+    /// Clear every shared filter axis and invalidate a pending search
+    /// debounce. Used when the data the axes point into is replaced
+    /// wholesale (source replacement / full sync).
+    fn reset_selections(&self) {
+        *self.selected_genre.borrow_mut() = None;
+        *self.selected_artist.borrow_mut() = None;
+        *self.selected_album.borrow_mut() = None;
+        *self.search_text.borrow_mut() = String::new();
+        *self.folder_prefix.borrow_mut() = None;
+        // A debounce timer armed before the reset must never fire with
+        // pre-reset text: the generation check inside the timer drops it.
+        self.search_debounce_gen
+            .set(self.search_debounce_gen.get().wrapping_add(1));
+    }
+
+    /// Current search text (window and test introspection).
+    pub fn search_text(&self) -> String {
+        self.search_text.borrow().clone()
+    }
+}
+
 /// Build the 3-pane browser.
 ///
 /// Returns `(gtk::Box, BrowserState)`.  The caller must keep the
-/// `BrowserState` and pass it to [`rebuild_browser_data`] on FullSync.
+/// `BrowserState` and pass it to [`reset_browser_data`] (source
+/// replacement) or [`refresh_browser_data`] (same-source refresh) as
+/// the library changes.
 pub fn build_browser(
     all_tracks: &[TrackObject],
     use_album_artist: bool,
@@ -100,20 +166,11 @@ pub fn build_browser(
     initial_album_pane_artwork_size: i32,
     on_filter_changed: FilterCallback,
 ) -> (gtk::Box, BrowserState) {
-    let use_album_artist: Rc<Cell<bool>> = Rc::new(Cell::new(use_album_artist));
     let album_pane_artwork: Rc<Cell<bool>> = Rc::new(Cell::new(initial_album_pane_artwork));
     let album_pane_artwork_size: Rc<Cell<i32>> =
         Rc::new(Cell::new(initial_album_pane_artwork_size));
-    // Shared filter state
-    let selected_genre: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let selected_artist: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let selected_album: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let search_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-
-    // Re-entrancy guard: when one handler repopulates a sibling store,
-    // the sibling's selection_changed fires.  The guard prevents that
-    // from cascading into further repopulation.
-    let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Wrap callback in Rc for sharing between the state and the handlers
+    let on_filter_changed: Rc<FilterCallback> = Rc::new(on_filter_changed);
 
     // Album-art coordinator: virtualized, accessible, bounded cache for
     // the album pane's per-row thumbnails. The source registry is wired
@@ -127,29 +184,22 @@ pub fn build_browser(
     let album_store = gio::ListStore::new::<BrowserItem>();
     let folder_store = gio::ListStore::new::<BrowserItem>();
 
+    // Shared mutable track snapshot — updated by reset/refresh.
+    let tracks: Rc<RefCell<Vec<TrackSnapshot>>> = Rc::new(RefCell::new(
+        all_tracks.iter().map(TrackSnapshot::from_object).collect(),
+    ));
+
+    // Re-entrancy guard: when one handler repopulates a sibling store,
+    // the sibling's selection_changed fires.  The guard prevents that
+    // from cascading into further repopulation.
+    let updating: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
     // Folder-browsing state. The model is attached later by the window
     // (once the local library is known); until then the pane shows the
     // explicit omission notice.
     let folder_model: Rc<RefCell<Option<FolderBrowser>>> = Rc::new(RefCell::new(None));
     let folder_location: Rc<RefCell<FolderLocation>> = Rc::new(RefCell::new(FolderLocation::Roots));
     let folder_prefix: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-
-    // Shared mutable track snapshot — updated by rebuild_browser_data.
-    let tracks: Rc<RefCell<Vec<TrackSnapshot>>> = Rc::new(RefCell::new(
-        all_tracks.iter().map(TrackSnapshot::from_object).collect(),
-    ));
-
-    // Initial population
-    let use_aa = use_album_artist.get();
-    populate_genres(&genre_store, &tracks.borrow(), &None, &None, use_aa);
-    populate_artists(&artist_store, &tracks.borrow(), &None, &None, use_aa);
-    populate_albums(&album_store, &tracks.borrow(), &None, &None, use_aa);
-    // Folder pane starts detached: the notice row explains the policy
-    // until the window attaches the local-library model.
-    populate_folder_pane(&folder_store, None, &FolderLocation::Roots);
-
-    // Wrap callback in Rc for sharing across closures
-    let on_filter_changed = Rc::new(on_filter_changed);
 
     // ── Search entry ─────────────────────────────────────────────────
     let search_entry = gtk::SearchEntry::builder()
@@ -173,151 +223,155 @@ pub fn build_browser(
     );
     let folder_pane = build_pane("Folder", &folder_store);
 
+    // Initial population — unfiltered, handlers are not connected yet,
+    // so autoselect lands every pane on "All".
+    {
+        let borrowed = tracks.borrow();
+        let flag = use_album_artist;
+        populate_genres(&genre_store, &borrowed, &None, &None, flag);
+        populate_artists(&artist_store, &borrowed, &None, &None, flag);
+        populate_albums(&album_store, &borrowed, &None, &None, flag);
+    }
+    // Folder pane starts detached: the notice row explains the policy
+    // until the window attaches the local-library model.
+    populate_folder_pane(&folder_store, None, &FolderLocation::Roots);
+
+    // The shared browser state: every filter axis, the search debounce
+    // generation, and the composition callback live here — handlers
+    // capture clones of it so a mutation and the subsequent emit always
+    // touch the same cells (issue #250).
+    let state = BrowserState {
+        tracks,
+        selected_genre: Rc::new(RefCell::new(None)),
+        selected_artist: Rc::new(RefCell::new(None)),
+        selected_album: Rc::new(RefCell::new(None)),
+        search_text: Rc::new(RefCell::new(String::new())),
+        search_debounce_gen: Rc::new(Cell::new(0)),
+        on_filter_changed,
+        use_album_artist: Rc::new(Cell::new(use_album_artist)),
+        folder_model,
+        folder_location,
+        folder_prefix,
+        folder_store,
+        folder_selection: get_selection(&folder_pane),
+        updating,
+        album_pane_artwork,
+        album_pane_artwork_size,
+        album_art_cache: Rc::new(album_art_controller.cache().clone()),
+        album_art_controller,
+        album_art_binder: Rc::new(RefCell::new(None)),
+    };
+
     // ── Genre selection ──────────────────────────────────────────────
-    // User picks a genre → repopulate artist + album (downstream).
-    // Do NOT repopulate the genre store itself.
+    // User picks a genre → clear the downstream axes, repopulate the
+    // panes cross-filtered by the new axes, emit the composed filter.
     {
         let sel = get_selection(&genre_pane);
-        let sg = selected_genre.clone();
-        let sa = selected_artist.clone();
-        let sl = selected_album.clone();
-        let artist_store = artist_store.clone();
-        let album_store = album_store.clone();
-        let tracks = tracks.clone();
-        let cb = on_filter_changed.clone();
-        let updating = updating.clone();
-        let search_text = search_text.clone();
-        let use_aa = use_album_artist.clone();
-        let fp = folder_prefix.clone();
+        let state = state.clone();
+        let genre_pane = genre_pane.clone();
+        let artist_pane = artist_pane.clone();
+        let album_pane = album_pane.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
-            if updating.get() {
+            if state.updating.get() {
                 return;
             }
             let genre = get_selected_label(sel);
             debug!("Browser: genre changed");
-            *sg.borrow_mut() = genre.clone();
-            *sa.borrow_mut() = None;
-            *sl.borrow_mut() = None;
+            *state.selected_genre.borrow_mut() = genre.clone();
+            *state.selected_artist.borrow_mut() = None;
+            *state.selected_album.borrow_mut() = None;
 
-            updating.set(true);
-            let borrowed = tracks.borrow();
-            let flag = use_aa.get();
-            populate_artists(&artist_store, &borrowed, &genre, &None, flag);
-            populate_albums(&album_store, &borrowed, &genre, &None, flag);
-            updating.set(false);
-
-            cb(
-                genre,
-                None,
-                None,
-                fp.borrow().clone(),
-                search_text.borrow().clone(),
+            state.updating.set(true);
+            repopulate_panes(
+                &state,
+                &genre_pane,
+                &artist_pane,
+                &album_pane,
+                &genre,
+                &None,
+                &None,
             );
+            state.updating.set(false);
+
+            state.emit();
         });
     }
 
     // ── Artist selection ─────────────────────────────────────────────
-    // User picks an artist → cross-filter genres, repopulate albums.
+    // User picks an artist → clear the album axis, repopulate the panes
+    // cross-filtered by the new axes, emit the composed filter.
     {
         let sel = get_selection(&artist_pane);
-        let sg = selected_genre.clone();
-        let sa = selected_artist.clone();
-        let sl = selected_album.clone();
-        let genre_store = genre_store.clone();
+        let state = state.clone();
         let genre_pane = genre_pane.clone();
-        let artist_store = artist_store.clone();
         let artist_pane = artist_pane.clone();
-        let album_store = album_store.clone();
-        let tracks = tracks.clone();
-        let cb = on_filter_changed.clone();
-        let updating = updating.clone();
-        let search_text = search_text.clone();
-        let use_aa = use_album_artist.clone();
-        let fp = folder_prefix.clone();
+        let album_pane = album_pane.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
-            if updating.get() {
+            if state.updating.get() {
                 return;
             }
             let artist = get_selected_label(sel);
             debug!("Browser: artist changed");
-            *sa.borrow_mut() = artist.clone();
-            *sl.borrow_mut() = None;
-            let genre = sg.borrow().clone();
+            *state.selected_artist.borrow_mut() = artist.clone();
+            *state.selected_album.borrow_mut() = None;
+            let genre = state.selected_genre.borrow().clone();
 
-            updating.set(true);
-            let borrowed = tracks.borrow();
-            let flag = use_aa.get();
-            populate_genres(&genre_store, &borrowed, &artist, &None, flag);
-            restore_selection(&genre_pane, &genre);
-            // When the user clears the artist filter ("All"), a prior album
-            // selection may have narrowed the Artist pane down to a single
-            // artist. Restore the full genre-filtered artist list so the
-            // user can pick a different artist again (issue #30). Only do
-            // this for the artist→All case — a normal artist pick must keep
-            // cross-filtering genres/albums without wiping the artist list.
-            if artist.is_none() {
-                populate_artists(&artist_store, &borrowed, &genre, &None, flag);
-                restore_selection(&artist_pane, &artist);
-            }
-            populate_albums(&album_store, &borrowed, &genre, &artist, flag);
-            updating.set(false);
-
-            cb(
-                genre,
-                artist,
-                None,
-                fp.borrow().clone(),
-                search_text.borrow().clone(),
+            state.updating.set(true);
+            // Repopulating the artist store with the album axis cleared
+            // also restores the full genre-filtered artist list when the
+            // user clears the artist filter ("All", issue #30) — and
+            // after any artist pick, so the pane never keeps a list
+            // narrowed by an album that was just deselected.
+            repopulate_panes(
+                &state,
+                &genre_pane,
+                &artist_pane,
+                &album_pane,
+                &genre,
+                &artist,
+                &None,
             );
+            state.updating.set(false);
+
+            state.emit();
         });
     }
 
     // ── Album selection ──────────────────────────────────────────────
-    // User picks an album → cross-filter genres and artists.
+    // User picks an album → repopulate the panes cross-filtered by the
+    // new axes (album does not narrow itself), emit the composed filter.
     {
         let sel = get_selection(&album_pane);
-        let sg = selected_genre.clone();
-        let sa = selected_artist.clone();
-        let sl = selected_album.clone();
-        let genre_store = genre_store.clone();
+        let state = state.clone();
         let genre_pane = genre_pane.clone();
-        let artist_store = artist_store.clone();
         let artist_pane = artist_pane.clone();
-        let tracks = tracks.clone();
-        let cb = on_filter_changed.clone();
-        let updating = updating.clone();
-        let search_text = search_text.clone();
-        let use_aa = use_album_artist.clone();
-        let fp = folder_prefix.clone();
+        let album_pane = album_pane.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
-            if updating.get() {
+            if state.updating.get() {
                 return;
             }
             let album = get_selected_label(sel);
             debug!("Browser: album changed");
-            *sl.borrow_mut() = album.clone();
-            let genre = sg.borrow().clone();
-            let artist = sa.borrow().clone();
+            *state.selected_album.borrow_mut() = album.clone();
+            let genre = state.selected_genre.borrow().clone();
+            let artist = state.selected_artist.borrow().clone();
 
-            updating.set(true);
-            let borrowed = tracks.borrow();
-            let flag = use_aa.get();
-            populate_genres(&genre_store, &borrowed, &artist, &album, flag);
-            restore_selection(&genre_pane, &genre);
-            populate_artists(&artist_store, &borrowed, &genre, &album, flag);
-            restore_selection(&artist_pane, &artist);
-            updating.set(false);
-
-            cb(
-                genre,
-                artist,
-                album,
-                fp.borrow().clone(),
-                search_text.borrow().clone(),
+            state.updating.set(true);
+            repopulate_panes(
+                &state,
+                &genre_pane,
+                &artist_pane,
+                &album_pane,
+                &genre,
+                &artist,
+                &album,
             );
+            state.updating.set(false);
+
+            state.emit();
         });
     }
 
@@ -328,19 +382,10 @@ pub fn build_browser(
     {
         let sel = get_selection(&folder_pane);
         let selection = sel.clone();
-        let sg = selected_genre.clone();
-        let sa = selected_artist.clone();
-        let sl = selected_album.clone();
-        let model = folder_model.clone();
-        let location = folder_location.clone();
-        let prefix = folder_prefix.clone();
-        let store = folder_store.clone();
-        let cb = on_filter_changed.clone();
-        let updating = updating.clone();
-        let search_text = search_text.clone();
+        let state = state.clone();
 
         sel.connect_selection_changed(move |sel, _, _| {
-            if updating.get() {
+            if state.updating.get() {
                 return;
             }
             let Some(item) = sel.selected_item().and_downcast::<BrowserItem>() else {
@@ -349,10 +394,10 @@ pub fn build_browser(
             let label = item.label();
 
             // Interpret the row by the current location.
-            let current = location.borrow().clone();
+            let current = state.folder_location.borrow().clone();
             let next = match &current {
                 FolderLocation::Roots => {
-                    let model_ref = model.borrow();
+                    let model_ref = state.folder_model.borrow();
                     let Some(browser) = model_ref.as_ref() else {
                         return;
                     };
@@ -399,61 +444,63 @@ pub fn build_browser(
             };
             let Some(next) = next else { return };
 
-            *location.borrow_mut() = next.clone();
-            updating.set(true);
-            let new_prefix =
-                populate_folder_pane(&store, model.borrow().as_ref(), &location.borrow());
-            selection.set_selected(0);
-            updating.set(false);
-            *prefix.borrow_mut() = new_prefix.clone();
-
-            let genre = sg.borrow().clone();
-            let artist = sa.borrow().clone();
-            let album = sl.borrow().clone();
-            cb(
-                genre,
-                artist,
-                album,
-                new_prefix,
-                search_text.borrow().clone(),
+            *state.folder_location.borrow_mut() = next.clone();
+            state.updating.set(true);
+            let new_prefix = populate_folder_pane(
+                &state.folder_store,
+                state.folder_model.borrow().as_ref(),
+                &state.folder_location.borrow(),
             );
+            selection.set_selected(0);
+            state.updating.set(false);
+            *state.folder_prefix.borrow_mut() = new_prefix.clone();
+
+            state.emit();
         });
     }
 
     // ── Search entry handler (debounced 100ms) ───────────────────────
     {
-        let sg = selected_genre.clone();
-        let sa = selected_artist.clone();
-        let search_text = search_text.clone();
-        let fp = folder_prefix.clone();
-        let cb = on_filter_changed;
-        let debounce_gen: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        let entry_state = state.clone();
 
         search_entry.connect_search_changed(move |entry| {
             let text = entry.text().to_string();
+            // Programmatic echo: reset_browser_data cleared the entry
+            // after clearing the shared state, so the text already
+            // matches. Without the guard the late (GTK search-delay)
+            // echo would re-arm a debounce and emit a filter the reset
+            // just cleared.
+            if entry_state.search_text() == text {
+                return;
+            }
             debug!("Browser: search changed");
-            *search_text.borrow_mut() = text.clone();
+            *entry_state.search_text.borrow_mut() = text.clone();
 
-            // Debounce: invalidate any pending timer and schedule a new one.
-            // 100ms is short enough to feel responsive but prevents the
-            // expensive filter callback from firing on every keystroke
-            // during fast typing.
-            let gen = debounce_gen.get().wrapping_add(1);
-            debounce_gen.set(gen);
+            // Debounce: invalidate any pending timer and schedule a new
+            // one. 100ms is short enough to feel responsive but prevents
+            // the expensive filter callback from firing on every
+            // keystroke during fast typing.
+            let gen = entry_state.search_debounce_gen.get().wrapping_add(1);
+            entry_state.search_debounce_gen.set(gen);
 
-            let sg = sg.clone();
-            let sa = sa.clone();
-            let fp = fp.clone();
-            let cb = cb.clone();
-            let gen_rc = debounce_gen.clone();
-
-            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
-                if gen_rc.get() != gen {
-                    return; // Superseded by a newer keystroke.
+            // Arm the timer on the context the browser itself lives on —
+            // the thread-default one. The free `glib::timeout_add_local*`
+            // functions attach to the GLOBAL default context, which the
+            // widget test session deliberately never pumps
+            // (widget_test_session); production runs both as the same
+            // context, so behavior there is unchanged.
+            let debounce_context =
+                glib::MainContext::thread_default().unwrap_or_else(glib::MainContext::default);
+            let timer_state = entry_state.clone();
+            debounce_context.spawn_local(async move {
+                glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                if timer_state.search_debounce_gen.get() != gen {
+                    return; // Superseded by a newer keystroke or a data reset.
                 }
-                let genre = sg.borrow().clone();
-                let artist = sa.borrow().clone();
-                cb(genre, artist, None, fp.borrow().clone(), text);
+                // Compose at fire time from the CURRENT shared axes —
+                // the selected album (and every other axis) must ride
+                // along with the search text (issue #250).
+                timer_state.emit();
             });
         });
     }
@@ -495,22 +542,6 @@ pub fn build_browser(
     browser_box.append(&search_entry);
     browser_box.append(&panes_box);
 
-    let state = BrowserState {
-        tracks,
-        search_text,
-        use_album_artist,
-        folder_model,
-        folder_location,
-        folder_prefix,
-        folder_store,
-        folder_selection: get_selection(&folder_pane),
-        updating,
-        album_pane_artwork,
-        album_pane_artwork_size,
-        album_art_cache: Rc::new(album_art_controller.cache().clone()),
-        album_art_controller,
-        album_art_binder: Rc::new(RefCell::new(None)),
-    };
     (browser_box, state)
 }
 
@@ -573,7 +604,7 @@ pub fn set_album_pane_artwork_size(browser_box: &gtk::Box, state: &BrowserState,
 /// selection-changed callback — silently cleared the user's active
 /// album filter (2026-09-08 PR #171 review). Fresh artwork candidates
 /// are not a layout concern: every library change repopulates the store
-/// through [`rebuild_browser_data`].
+/// through [`reset_browser_data`].
 ///
 /// The cache is cleared because every entry was decoded at the previous
 /// size and would never match a new `(album_key, pixel_size)` lookup
@@ -1210,15 +1241,82 @@ pub fn populate_albums(
 }
 
 // ---------------------------------------------------------------------------
-// Public API for rebuilding browser from FullSync
+// Public API for replacing or refreshing browser data
 // ---------------------------------------------------------------------------
 
-/// Rebuild all three browser pane stores from a new set of tracks.
+/// The three selection panes of a browser box, in display order (genre,
+/// artist, album) — extracted from the widget tree shared by the reset,
+/// refresh, and regrouping paths.
+fn browser_panes(browser_box: &gtk::Box) -> Option<[gtk::Box; 3]> {
+    // The browser_box layout is: SearchEntry, panes_box (horizontal Box).
+    // The panes_box contains the four panes with gutter separators
+    // between them.
+    let panes_box = browser_box.last_child()?.downcast::<gtk::Box>().ok()?;
+    let mut panes = [None, None, None];
+    let mut child = panes_box.first_child();
+    while let Some(widget) = child {
+        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
+            if let Some(slot) = panes.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(pane.clone());
+            }
+        }
+        child = widget.next_sibling();
+    }
+    Some([panes[0].clone()?, panes[1].clone()?, panes[2].clone()?])
+}
+
+/// Repopulate all three selection panes cross-filtered by the given
+/// axes (each pane ignores its own axis, mirroring the selection
+/// handlers) and restore the visual selections. Callers must hold
+/// [`BrowserState::updating`] so the programmatic repopulation does not
+/// cascade into the selection handlers.
+fn repopulate_panes(
+    state: &BrowserState,
+    genre_pane: &gtk::Box,
+    artist_pane: &gtk::Box,
+    album_pane: &gtk::Box,
+    genre: &Option<String>,
+    artist: &Option<String>,
+    album: &Option<String>,
+) {
+    let borrowed = state.tracks.borrow();
+    let use_aa = state.use_album_artist.get();
+    if let Some(store) = get_store_from_pane(genre_pane) {
+        populate_genres(&store, &borrowed, artist, album, use_aa);
+    }
+    if let Some(store) = get_store_from_pane(artist_pane) {
+        populate_artists(&store, &borrowed, genre, album, use_aa);
+    }
+    if let Some(store) = get_store_from_pane(album_pane) {
+        populate_albums(&store, &borrowed, genre, artist, use_aa);
+    }
+    restore_selection(genre_pane, genre);
+    restore_selection(artist_pane, artist);
+    restore_selection(album_pane, album);
+}
+
+/// Replace the browser's data wholesale and reset every filter axis.
 ///
-/// Updates the shared `BrowserState` snapshot so that subsequent
-/// selection changes use fresh data, then repopulates all three stores
-/// with filters reset to "All".
-pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
+/// This is the SOURCE-REPLACEMENT path (a different library became
+/// active, or a full sync replaced the data): the previous selections
+/// point at values that may no longer exist, so every axis — including
+/// the search text and any pending search debounce — resets to "All",
+/// and the panes repopulate unfiltered so the displayed selections
+/// agree with the reset state (issue #250: the panes used to show "All"
+/// while the pre-reset selections silently rode along in the filter
+/// callback).
+///
+/// The folder pane joins the reset: clearing `folder_prefix` alone left
+/// `folder_location`, the folder store, and the folder selection on the
+/// pre-reset directory, so the pane kept displaying a stale directory
+/// inconsistent with the now-empty composed filter (issue #250 rework
+/// finding — hit by the album-artist toggle and every reset path that
+/// does not explicitly clear or re-attach the folder model).
+///
+/// Does NOT emit: callers that replace the source splice the full,
+/// unfiltered track set themselves (see `window.rs` `display_tracks`),
+/// and the reset state composes to exactly that.
+pub fn reset_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
     // The track set just changed (FullSync, source switch, snapshot
     // refresh). Bump the album-art cache's content generation so covers
     // changed by the new data are re-resolved within the SAME source
@@ -1234,55 +1332,104 @@ pub fn rebuild_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
     let snapshots: Vec<TrackSnapshot> = tracks.iter().map(TrackSnapshot::from_object).collect();
     *state.tracks.borrow_mut() = snapshots;
 
-    // Clear search text on data rebuild (new source / full sync).
-    *state.search_text.borrow_mut() = String::new();
+    // Clear every shared axis and kill a pending search debounce before
+    // the entry's (GTK search-delayed) echo can re-arm it.
+    state.reset_selections();
 
-    // Clear the search entry widget if present (first child of browser_box).
+    // Clear the search entry widget if present (first child of
+    // browser_box). The resulting search-changed is a no-op: the guard
+    // sees the text already matches the cleared shared state.
     if let Some(first) = browser_box.first_child() {
         if let Some(entry) = first.downcast_ref::<gtk::SearchEntry>() {
             entry.set_text("");
         }
     }
 
-    let borrowed = state.tracks.borrow();
-    let use_aa = state.use_album_artist.get();
-    populate_all_panes(browser_box, &borrowed, use_aa);
-}
+    // Reset the folder pane to the roots level so its displayed
+    // directory, store rows, and selection agree with the cleared
+    // folder_prefix. Runs before the pane extraction below so the
+    // folder state resets even when the widget tree is unreachable
+    // (idempotent with the explicit clear/attach calls the display
+    // paths make right after this function).
+    reset_folder_navigation(state);
 
-/// Repopulate the genre, artist and album pane stores from the shared
-/// track snapshot with their filters reset to "All".
-///
-/// The browser_box layout is: SearchEntry, panes_box (horizontal Box);
-/// the panes_box contains 4 panes (genre_pane, artist_pane, album_pane,
-/// folder_pane) separated by 1px `.browser-separator` gutters.
-fn populate_all_panes(browser_box: &gtk::Box, tracks: &[TrackSnapshot], use_aa: bool) {
-    let Some(panes_box) = browser_box
-        .last_child()
-        .and_then(|w| w.downcast::<gtk::Box>().ok())
-    else {
+    let Some(panes) = browser_panes(browser_box) else {
         return;
     };
+    state.updating.set(true);
+    repopulate_panes(state, &panes[0], &panes[1], &panes[2], &None, &None, &None);
+    state.updating.set(false);
+}
 
-    let mut child = panes_box.first_child();
-    let mut panes = Vec::new();
-    while let Some(widget) = child {
-        if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
-            panes.push(pane.clone());
-        }
-        child = widget.next_sibling();
-    }
+/// Refresh the browser's data from the SAME source (incremental library
+/// events) while preserving still-valid selections.
+///
+/// Each selection axis is validated against the refreshed snapshot and
+/// the most specific one is dropped first (album → artist → genre): a
+/// value that vanished falls back to "All" exactly as if the user had
+/// cleared it. The panes repopulate cross-filtered by the surviving
+/// axes and the visual selections are restored, then the composed
+/// filter is emitted — recomputing the evaluated result from the shared
+/// state so the track list and status agree with the panes (issue
+/// #250).
+pub fn refresh_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
+    let snapshots: Vec<TrackSnapshot> = tracks.iter().map(TrackSnapshot::from_object).collect();
+    *state.tracks.borrow_mut() = snapshots;
 
-    if panes.len() >= 3 {
-        if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-            populate_genres(&genre_store, tracks, &None, &None, use_aa);
+    // Validate the axes against the refreshed snapshot, dropping the
+    // most specific axis first (album → artist → genre).
+    let mut genre = state.selected_genre.borrow().clone();
+    let mut artist = state.selected_artist.borrow().clone();
+    let mut album = state.selected_album.borrow().clone();
+    {
+        let borrowed = state.tracks.borrow();
+        let use_aa = state.use_album_artist.get();
+        if !snapshot_matches(&borrowed, &genre, &artist, &album, use_aa) {
+            album = None;
         }
-        if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-            populate_artists(&artist_store, tracks, &None, &None, use_aa);
+        if !snapshot_matches(&borrowed, &genre, &artist, &album, use_aa) {
+            artist = None;
         }
-        if let Some(album_store) = get_store_from_pane(&panes[2]) {
-            populate_albums(&album_store, tracks, &None, &None, use_aa);
+        if !snapshot_matches(&borrowed, &genre, &artist, &album, use_aa) {
+            genre = None;
         }
     }
+    *state.selected_genre.borrow_mut() = genre.clone();
+    *state.selected_artist.borrow_mut() = artist.clone();
+    *state.selected_album.borrow_mut() = album.clone();
+
+    let Some(panes) = browser_panes(browser_box) else {
+        // No pane widgets reachable — still recompose the evaluated
+        // result so the track list and status agree with the state.
+        state.emit();
+        return;
+    };
+    state.updating.set(true);
+    repopulate_panes(
+        state, &panes[0], &panes[1], &panes[2], &genre, &artist, &album,
+    );
+    state.updating.set(false);
+
+    state.emit();
+}
+
+/// True when any track in `tracks` matches all three axes at once
+/// (with the browser's album-artist grouping applied to the artist
+/// axis). Mirrors the `populate_*` filters.
+fn snapshot_matches(
+    tracks: &[TrackSnapshot],
+    genre: &Option<String>,
+    artist: &Option<String>,
+    album: &Option<String>,
+    use_album_artist: bool,
+) -> bool {
+    tracks.iter().any(|t| {
+        genre.as_ref().is_none_or(|g| t.genre == *g)
+            && artist
+                .as_ref()
+                .is_none_or(|a| t.browser_artist(use_album_artist) == a)
+            && album.as_ref().is_none_or(|al| t.album == *al)
+    })
 }
 
 /// Label of the pane row that ascends one folder level.
@@ -1390,37 +1537,23 @@ fn join_root_prefix(root: &str, dir: &str) -> String {
 ///
 /// Updates the shared flag, then refreshes all three panes from the
 /// current snapshot.  Selections reset to "All" because the artist
-/// pane's contents are about to change.
+/// pane's contents are about to change; the composed filter is emitted
+/// at the end so the evaluated result follows the reset (issue #250).
 pub fn set_album_artist_grouping(browser_box: &gtk::Box, state: &BrowserState, enabled: bool) {
     state.use_album_artist.set(enabled);
+    *state.selected_genre.borrow_mut() = None;
+    *state.selected_artist.borrow_mut() = None;
+    *state.selected_album.borrow_mut() = None;
 
-    let borrowed = state.tracks.borrow();
-    let panes_box = browser_box
-        .last_child()
-        .and_then(|w| w.downcast::<gtk::Box>().ok());
+    let Some(panes) = browser_panes(browser_box) else {
+        state.emit();
+        return;
+    };
+    state.updating.set(true);
+    repopulate_panes(state, &panes[0], &panes[1], &panes[2], &None, &None, &None);
+    state.updating.set(false);
 
-    if let Some(ref panes_box) = panes_box {
-        let mut child = panes_box.first_child();
-        let mut panes = Vec::new();
-        while let Some(widget) = child {
-            if let Some(pane) = widget.downcast_ref::<gtk::Box>() {
-                panes.push(pane.clone());
-            }
-            child = widget.next_sibling();
-        }
-
-        if panes.len() >= 3 {
-            if let Some(genre_store) = get_store_from_pane(&panes[0]) {
-                populate_genres(&genre_store, &borrowed, &None, &None, enabled);
-            }
-            if let Some(artist_store) = get_store_from_pane(&panes[1]) {
-                populate_artists(&artist_store, &borrowed, &None, &None, enabled);
-            }
-            if let Some(album_store) = get_store_from_pane(&panes[2]) {
-                populate_albums(&album_store, &borrowed, &None, &None, enabled);
-            }
-        }
-    }
+    state.emit();
 }
 
 /// Extract the `gio::ListStore` from a browser pane's widget tree.
@@ -1604,7 +1737,7 @@ mod tests {
     }
 
     /// The genre/artist/album ListStores behind the browser panes, in pane
-    /// order (same traversal contract as `rebuild_browser_data`).
+    /// order (same traversal contract as `reset_browser_data`).
     fn q4_browser_pane_stores(browser_box: &gtk::Box) -> Vec<gio::ListStore> {
         let mut stores = Vec::new();
         let Some(panes_box) = browser_box.last_child().and_downcast::<gtk::Box>() else {
@@ -1674,7 +1807,7 @@ mod tests {
         let pane_stores = q4_browser_pane_stores(&browser_box);
         // populate_genres prepends the "All" row: 1 + the 4 synthetic genres.
         assert_eq!(
-            pane_stores.first().map(gio::ListStore::n_items),
+            pane_stores.first().map(|store| store.n_items()),
             Some(5),
             "publication must repopulate the genre pane from the snapshot"
         );
@@ -1784,7 +1917,7 @@ mod tests {
 
     /// Display-only lower bound at `rows` scale: a second browser built
     /// empty, objects preconverted outside the timer, `display_tracks`
-    /// alone — then `rebuild_browser_data` alone. Returns
+    /// alone — then `reset_browser_data` alone. Returns
     /// (`display_only_ms`, `rebuild_ms`).
     fn q4_measure_display_only(rows: usize) -> (f64, f64) {
         let objects = q4_bench_track_objects(rows);
@@ -1807,7 +1940,7 @@ mod tests {
         );
         let display_only_ms = display_started.elapsed().as_micros() as f64 / 1_000.0;
         let rebuild_started = std::time::Instant::now();
-        rebuild_browser_data(&display_box, &display_state, &objects);
+        reset_browser_data(&display_box, &display_state, &objects);
         let rebuild_ms = rebuild_started.elapsed().as_micros() as f64 / 1_000.0;
         (display_only_ms, rebuild_ms)
     }
@@ -1865,7 +1998,7 @@ mod tests {
 
     /// Compact track fixture for the pane tests (the real constructor
     /// takes 14 arguments; only these five vary here).
-    fn fixture_track(
+    fn art_fixture_track(
         number: u32,
         artist: &str,
         album: &str,
@@ -1880,7 +2013,7 @@ mod tests {
     /// Collect the four pane boxes from the browser widget tree
     /// (browser_box = [SearchEntry, panes_box], panes_box = [genre,
     /// artist, album, folder] with separators between them — mirrors
-    /// `rebuild_browser_data`). The separators are `gtk::Separator`s, so
+    /// `reset_browser_data`). The separators are `gtk::Separator`s, so
     /// filtering to `gtk::Box` children drops them and the album pane
     /// stays at index 2.
     fn collect_browser_panes(browser_box: &gtk::Box) -> Vec<gtk::Box> {
@@ -1930,9 +2063,9 @@ mod tests {
     /// — silently cleared the user's active album filter.
     fn factory_swap_preserves_album_filters_and_selection() {
         let tracks = vec![
-            fixture_track(1, "AR", "A1", "G1", "file:///t1.flac"),
-            fixture_track(2, "AR", "A2", "G1", "file:///t2.flac"),
-            fixture_track(3, "AR2", "A3", "G2", "file:///t3.flac"),
+            art_fixture_track(1, "AR", "A1", "G1", "file:///t1.flac"),
+            art_fixture_track(2, "AR", "A2", "G1", "file:///t2.flac"),
+            art_fixture_track(3, "AR2", "A3", "G2", "file:///t3.flac"),
         ];
         let (browser_box, state) =
             build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
@@ -1965,11 +2098,11 @@ mod tests {
     /// queried afterwards (2026-09-10 review finding — same-session
     /// FullSync used to leave changed covers stale).
     fn rebuild_bumps_album_art_content_generation() {
-        let tracks = vec![fixture_track(1, "AR", "A1", "G1", "file:///t1.flac")];
+        let tracks = vec![art_fixture_track(1, "AR", "A1", "G1", "file:///t1.flac")];
         let (browser_box, state) =
             build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
         let before = state.album_art_controller.cache().content_generation();
-        rebuild_browser_data(&browser_box, &state, &[]);
+        reset_browser_data(&browser_box, &state, &[]);
         assert!(
             state.album_art_controller.cache().content_generation() > before,
             "a full data rebuild must advance the album-art content generation"
@@ -2004,6 +2137,626 @@ mod tests {
         );
     }
 
+    // ── Browser data lifecycle contracts (issue #250) ─────────────────
+    // Search, source replacement, and incremental refresh must keep the
+    // displayed pane selections and the composed filter in sync.
+
+    /// Fixture track with the given grouping fields (no album-artist
+    /// tag, so browser grouping falls back to the track artist).
+    fn fixture_track(genre: &str, artist: &str, album: &str, title: &str) -> TrackObject {
+        TrackObject::new(
+            1,
+            title,
+            60,
+            artist,
+            album,
+            genre,
+            "",
+            0,
+            "",
+            0,
+            0,
+            0,
+            "flac",
+            &format!("file:///lib/{artist}/{album}/{title}.flac"),
+        )
+    }
+
+    /// Log of composed filter emits: (genre, artist, album, folder,
+    /// search).
+    type EmitLog = Rc<
+        RefCell<
+            Vec<(
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            )>,
+        >,
+    >;
+
+    /// A filter callback that records every composed emit.
+    fn recorder() -> (EmitLog, FilterCallback) {
+        let log: EmitLog = Rc::new(RefCell::new(Vec::new()));
+        let sink = log.clone();
+        let cb = Box::new(move |g, a, al, f, s| {
+            sink.borrow_mut().push((g, a, al, f, s));
+        });
+        (log, cb)
+    }
+
+    /// The most recent composed emit.
+    fn composed(
+        log: &EmitLog,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) {
+        log.borrow().last().expect("at least one emit").clone()
+    }
+
+    /// The most recent search text, if anything was emitted yet (a
+    /// reset legitimately emits nothing, so pumps must tolerate an
+    /// empty log).
+    fn last_search(log: &EmitLog) -> Option<String> {
+        log.borrow().last().map(|entry| entry.4.clone())
+    }
+
+    fn search_entry_of(browser_box: &gtk::Box) -> gtk::SearchEntry {
+        browser_box
+            .first_child()
+            .and_downcast::<gtk::SearchEntry>()
+            .expect("search entry is the browser box's first child")
+    }
+
+    /// The browser's composed-filter entry point: type into the search
+    /// entry and deliver `search-changed` directly. GTK's own
+    /// search-delay timer is a C-side source on the GLOBAL default main
+    /// context, which the widget test session deliberately never pumps,
+    /// so real typing would never surface here — fire the signal the
+    /// delay would eventually call, with the entry's new text.
+    fn type_search(browser_box: &gtk::Box, text: &str) {
+        let entry = search_entry_of(browser_box);
+        entry.set_text(text);
+        entry.emit_by_name::<()>("search-changed", &[]);
+    }
+
+    /// Pump the session's thread-default main context until `done` or
+    /// the deadline. Typing surfaces synchronously via
+    /// [`type_search`]; the browser's 100ms debounce then runs on this
+    /// context before an emit can be observed. Polls without blocking
+    /// (a context with no ready sources must not park the test past
+    /// the deadline).
+    fn pump_until(
+        context: &glib::MainContext,
+        deadline: std::time::Instant,
+        done: impl Fn() -> bool,
+    ) {
+        while !done() && std::time::Instant::now() < deadline {
+            if !context.iteration(false) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Pump the session's context for a fixed duration.
+    fn pump_for(context: &glib::MainContext, duration: std::time::Duration) {
+        pump_until(context, std::time::Instant::now() + duration, || false);
+    }
+
+    fn session_context() -> glib::MainContext {
+        glib::MainContext::thread_default().expect("widget session pushed a main context")
+    }
+
+    /// THE reported defect: with an album selected, typing into search
+    /// and clearing it again must keep the album axis — the composed
+    /// filter must carry the album the panes still display (issue
+    /// #250).
+    fn album_selection_survives_typing_and_clearing() {
+        let context = session_context();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let tracks = vec![
+            fixture_track("Jazz", "Alpha", "Album One", "T1"),
+            fixture_track("Jazz", "Alpha", "Album One", "T2"),
+            fixture_track("Jazz", "Alpha", "Album Two", "T3"),
+        ];
+        let (log, cb) = recorder();
+        let (browser_box, _state) = build_browser(&tracks, false, false, 48, cb);
+        let panes = browser_panes(&browser_box).expect("panes");
+
+        // Rows are ["All", "Album One", "Album Two"] ("All" is
+        // prepended, album rows follow in sorted order).
+        get_selection(&panes[2]).set_selected(1);
+        assert_eq!(
+            composed(&log).2.as_deref(),
+            Some("Album One"),
+            "album pick must compose album axis"
+        );
+
+        type_search(&browser_box, "zzz");
+        pump_until(&context, deadline, || composed(&log).4 == "zzz");
+        let (genre, artist, album, folder, search) = composed(&log);
+        assert_eq!(search, "zzz");
+        assert_eq!(
+            album.as_deref(),
+            Some("Album One"),
+            "searching must not drop the album selection (issue #250)"
+        );
+        assert_eq!((genre, artist, folder), (None, None, None));
+
+        type_search(&browser_box, "");
+        pump_until(&context, deadline, || composed(&log).4.is_empty());
+        let (_, _, album, _, _) = composed(&log);
+        assert_eq!(
+            album.as_deref(),
+            Some("Album One"),
+            "clearing the search must not drop the album selection"
+        );
+    }
+
+    /// Source replacement (A → B) resets every axis and the panes agree:
+    /// the panes display "All" AND the composed filter carries no stale
+    /// artist/album — the issue's exact probe (issue #250).
+    fn source_replacement_resets_every_filter_axis() {
+        let context = session_context();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let source_a = vec![
+            fixture_track("Rock", "Alpha", "Old Album", "T1"),
+            fixture_track("Rock", "Alpha", "Old Album", "T2"),
+        ];
+        let source_b = vec![
+            fixture_track("Folk", "Beta", "New Album", "U1"),
+            fixture_track("Folk", "Beta", "New Album", "U2"),
+        ];
+        let (log, cb) = recorder();
+        let (browser_box, state) = build_browser(&source_a, false, false, 48, cb);
+        let panes = browser_panes(&browser_box).expect("panes");
+
+        get_selection(&panes[1]).set_selected(1);
+        assert_eq!(composed(&log).1.as_deref(), Some("Alpha"));
+
+        reset_browser_data(&browser_box, &state, &source_b);
+
+        assert_eq!(
+            search_entry_of(&browser_box).text(),
+            "",
+            "the search entry must clear on source replacement"
+        );
+        assert_eq!(
+            get_selected_label(&get_selection(&panes[1])),
+            None,
+            "artist pane must display All after a source replacement"
+        );
+
+        // Type after the replacement: the composed filter must carry NO
+        // stale artist and the freshly typed text.
+        type_search(&browser_box, "new");
+        pump_until(&context, deadline, || composed(&log).4 == "new");
+        let (genre, artist, album, folder, search) = composed(&log);
+        assert_eq!(search, "new");
+        assert_eq!(
+            (genre, artist, album, folder),
+            (None, None, None, None),
+            "a search after a source replacement must compose from the reset axes"
+        );
+
+        // And a later album pick rides along with the surviving search.
+        get_selection(&panes[2]).set_selected(1);
+        let (genre, artist, album, _, search) = composed(&log);
+        assert_eq!(album.as_deref(), Some("New Album"));
+        assert_eq!(artist, None, "artist axis must stay reset");
+        assert_eq!(genre, None);
+        assert_eq!(search, "new", "search text survives a later selection");
+    }
+
+    /// A production browser arranged for the same-source refresh
+    /// contracts: built on three Jazz/Alpha tracks with artist Alpha
+    /// and album `Album A` selected (album rows are `All`, `Album A`,
+    /// `Album B` — `All` prepended, albums sorted), and the emit log
+    /// cleared so the next `composed` reflects only the refresh under
+    /// test.
+    struct RefreshArrangement {
+        log: EmitLog,
+        browser_box: gtk::Box,
+        state: BrowserState,
+        panes: [gtk::Box; 3],
+    }
+
+    /// Build [`RefreshArrangement`].
+    fn arranged_artist_and_album_selection() -> RefreshArrangement {
+        let initial = vec![
+            fixture_track("Jazz", "Alpha", "Album A", "T1"),
+            fixture_track("Jazz", "Alpha", "Album A", "T2"),
+            fixture_track("Jazz", "Alpha", "Album B", "T3"),
+        ];
+        let (log, cb) = recorder();
+        let (browser_box, state) = build_browser(&initial, false, false, 48, cb);
+        let panes = browser_panes(&browser_box).expect("panes");
+        get_selection(&panes[1]).set_selected(1);
+        get_selection(&panes[2]).set_selected(1);
+        log.borrow_mut().clear();
+        RefreshArrangement {
+            log,
+            browser_box,
+            state,
+            panes,
+        }
+    }
+
+    /// Same-source refresh: a still-valid album selection survives an
+    /// upsert of a non-matching track, and the emit must still carry
+    /// both axes (issue #250).
+    fn refresh_preserves_matching_selection_through_upsert() {
+        let arrangement = arranged_artist_and_album_selection();
+
+        // Upsert a non-matching track: the selections must survive the
+        // refresh and the emit must still carry both axes.
+        let upserted = vec![
+            fixture_track("Jazz", "Alpha", "Album A", "T1"),
+            fixture_track("Jazz", "Alpha", "Album A", "T2"),
+            fixture_track("Jazz", "Alpha", "Album B", "T3"),
+            fixture_track("Jazz", "Alpha", "Album C", "T4"),
+        ];
+        refresh_browser_data(&arrangement.browser_box, &arrangement.state, &upserted);
+        let (_, artist, album, _, _) = composed(&arrangement.log);
+        assert_eq!(
+            artist.as_deref(),
+            Some("Alpha"),
+            "refresh must preserve a valid artist"
+        );
+        assert_eq!(
+            album.as_deref(),
+            Some("Album A"),
+            "refresh must preserve a still-valid album selection"
+        );
+        let album_store = get_store_from_pane(&arrangement.panes[2]).expect("album store");
+        assert_eq!(album_store.n_items(), 4, "All + the three albums");
+        assert_eq!(
+            get_selected_label(&get_selection(&arrangement.panes[2])).as_deref(),
+            Some("Album A"),
+            "the pane must keep displaying the preserved selection"
+        );
+    }
+
+    /// Same-source refresh: deleting every track of the selected album
+    /// drops the album axis to All exactly as if the user had cleared
+    /// it, while the still-valid artist axis and the panes' displayed
+    /// selections keep agreeing (issue #250).
+    fn refresh_drops_vanished_album_and_keeps_surviving_artist() {
+        let arrangement = arranged_artist_and_album_selection();
+
+        // Delete every "Album A" track: the album axis must drop to All
+        // while the still-valid artist axis survives, and the panes must
+        // display the agreement.
+        let after_delete = vec![fixture_track("Jazz", "Alpha", "Album C", "T4")];
+        refresh_browser_data(&arrangement.browser_box, &arrangement.state, &after_delete);
+        let (_, artist, album, _, _) = composed(&arrangement.log);
+        assert_eq!(
+            album, None,
+            "a vanished album must drop the axis to All (issue #250)"
+        );
+        assert_eq!(
+            artist.as_deref(),
+            Some("Alpha"),
+            "a still-valid artist must survive the album's drop"
+        );
+        assert_eq!(
+            get_selected_label(&get_selection(&arrangement.panes[2])),
+            None,
+            "the album pane must display All after its selection vanished"
+        );
+        assert_eq!(
+            get_selected_label(&get_selection(&arrangement.panes[1])).as_deref(),
+            Some("Alpha"),
+            "the artist pane must keep displaying the surviving selection"
+        );
+    }
+
+    /// A full-sync-style replacement clears every axis AND the entry,
+    /// emits nothing itself (the caller splices the full set), and the
+    /// next interaction composes from fully cleared axes (issue #250).
+    fn full_sync_reset_clears_every_axis_and_the_entry() {
+        let context = session_context();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let source_a = vec![fixture_track("Rock", "Alpha", "Old", "T1")];
+        let source_b = vec![fixture_track("Folk", "Beta", "New", "U1")];
+        let (log, cb) = recorder();
+        let (browser_box, state) = build_browser(&source_a, false, false, 48, cb);
+        let panes = browser_panes(&browser_box).expect("panes");
+
+        get_selection(&panes[0]).set_selected(1);
+        get_selection(&panes[1]).set_selected(1);
+        get_selection(&panes[2]).set_selected(1);
+        type_search(&browser_box, "query");
+        pump_until(&context, deadline, || composed(&log).4 == "query");
+        log.borrow_mut().clear();
+
+        reset_browser_data(&browser_box, &state, &source_b);
+
+        assert_eq!(state.search_text(), "", "shared search text must reset");
+        assert_eq!(
+            search_entry_of(&browser_box).text(),
+            "",
+            "entry widget must clear"
+        );
+        assert!(
+            log.borrow().is_empty(),
+            "reset must not emit (display_tracks splices the full set itself)"
+        );
+        for pane in &panes {
+            assert_eq!(
+                get_selected_label(&get_selection(pane)),
+                None,
+                "every pane must display All after a full-sync reset"
+            );
+        }
+
+        get_selection(&panes[0]).set_selected(1);
+        let (genre, artist, album, folder, search) = composed(&log);
+        assert_eq!(
+            (
+                genre.as_deref(),
+                artist.as_deref(),
+                album.as_deref(),
+                folder.as_deref(),
+                search.as_str()
+            ),
+            (Some("Folk"), None, None, None, ""),
+            "post-reset selection must compose from fully cleared axes"
+        );
+    }
+
+    /// THE reported race: a pending search debounce armed before a
+    /// source replacement must never fire with the pre-reset text, and
+    /// the handler must keep working for later typing (issue #250).
+    fn pending_search_debounce_never_fires_after_source_replacement() {
+        let context = session_context();
+        let source_a = vec![fixture_track("Rock", "Alpha", "Old", "T1")];
+        let source_b = vec![fixture_track("Folk", "Beta", "New", "U1")];
+        let (log, cb) = recorder();
+        let (browser_box, state) = build_browser(&source_a, false, false, 48, cb);
+
+        // Type and wait only until GTK's search-delay delivered the
+        // text to the handler — the browser's own 100ms debounce is
+        // still pending.
+        type_search(&browser_box, "stale");
+        pump_until(
+            &context,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+            || state.search_text() == "stale",
+        );
+
+        // Replace the source while the debounce timer is still pending.
+        reset_browser_data(&browser_box, &state, &source_b);
+        assert_eq!(state.search_text(), "");
+
+        // Pump well past the debounce window: no timer may fire.
+        pump_for(&context, std::time::Duration::from_millis(600));
+        assert!(
+            log.borrow().iter().all(|entry| entry.4 != "stale"),
+            "a pending search debounce must die with the replaced source (issue #250)"
+        );
+
+        // The generation invalidation must not brick later typing.
+        type_search(&browser_box, "fresh");
+        pump_until(
+            &context,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+            || last_search(&log).as_deref() == Some("fresh"),
+        );
+        assert_eq!(composed(&log).4, "fresh");
+        assert_eq!(
+            log.borrow().last().unwrap().1,
+            None,
+            "post-reset search must compose from the reset axes"
+        );
+    }
+
+    /// Unique scratch tree for the folder-navigation contracts: two real
+    /// browsable roots (`ga`, `gb`), each holding `sub/01.flac`, so the
+    /// production `from_configured`/`place_tracks` pipeline sees two
+    /// available roots with a navigable child directory. Scratch lives
+    /// under `${TMPDIR:-/var/tmp}` (never /tmp) and is removed on drop.
+    struct FolderScratch {
+        base: std::path::PathBuf,
+    }
+
+    impl FolderScratch {
+        fn new(tag: &str) -> Self {
+            let base = std::env::var_os("TMPDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp"))
+                .join(format!("tr-2xstt-folder-{tag}-{}", std::process::id()));
+            for root_name in ["ga", "gb"] {
+                let dir = base.join(root_name).join("sub");
+                std::fs::create_dir_all(&dir).expect("create scratch root dir");
+                std::fs::write(dir.join("01.flac"), b"").expect("create scratch track file");
+            }
+            Self { base }
+        }
+
+        fn root_path(&self, name: &str) -> std::path::PathBuf {
+            self.base.join(name)
+        }
+    }
+
+    impl Drop for FolderScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// One source track rooted in the scratch tree: genre/artist/album
+    /// are grouping fixtures; the URI points at the real scratch file so
+    /// the production placement pipeline can bucket it.
+    fn folder_scratch_track(scratch: &FolderScratch, root: &str, title: &str) -> TrackObject {
+        let uri = url::Url::from_file_path(scratch.root_path(root).join("sub/01.flac"))
+            .expect("valid file uri")
+            .to_string();
+        TrackObject::new(
+            1, title, 60, "Alpha", "Album A", "Jazz", "", 0, "", 0, 0, 0, "flac", &uri,
+        )
+    }
+
+    /// Attach the production folder model the way `display_local_tracks`
+    /// does: two real configured roots, real track placement, a real
+    /// `FolderBrowser`.
+    fn attach_two_root_folder_model(state: &BrowserState, scratch: &FolderScratch) {
+        let roots = vec![
+            crate::ui::folder_browser::BrowsableRoot::from_configured(
+                scratch.root_path("ga").to_str().expect("utf8 root path"),
+                None,
+            ),
+            crate::ui::folder_browser::BrowsableRoot::from_configured(
+                scratch.root_path("gb").to_str().expect("utf8 root path"),
+                None,
+            ),
+        ];
+        let inputs = vec![
+            crate::ui::folder_browser::TrackPathInput {
+                source_label: "local".to_string(),
+                path: Some(scratch.root_path("ga").join("sub/01.flac")),
+            },
+            crate::ui::folder_browser::TrackPathInput {
+                source_label: "local".to_string(),
+                path: Some(scratch.root_path("gb").join("sub/01.flac")),
+            },
+        ];
+        let (placed, _report) = crate::ui::folder_browser::place_tracks(&roots, &inputs);
+        attach_folder_model(
+            state,
+            crate::ui::folder_browser::FolderBrowser::new(roots, placed),
+        );
+    }
+
+    /// Navigate into the second root through the production selection
+    /// handler (selection sits on row 0 after the attach reset, so this
+    /// is a real 0→1 change) and assert the navigation took hold.
+    fn navigate_into_second_root(
+        state: &BrowserState,
+        folder_pane: &gtk::Box,
+        folder_sel: &gtk::SingleSelection,
+    ) {
+        folder_sel.set_selected(1);
+        assert!(
+            matches!(
+                &*state.folder_location.borrow(),
+                FolderLocation::Inside { .. }
+            ),
+            "precondition: navigation must be inside a root before the reset"
+        );
+        assert!(
+            state.folder_prefix.borrow().is_some(),
+            "precondition: navigation must apply a folder prefix before the reset"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane).map(|store| store.n_items()),
+            Some(2),
+            "precondition: the pane must display the inside-directory rows (up + sub)"
+        );
+    }
+
+    /// After the reset, the folder pane must display the roots level:
+    /// navigation state, prefix, store rows, and selection all agree
+    /// with the cleared composed filter.
+    fn assert_folder_pane_reset_to_roots(
+        state: &BrowserState,
+        folder_pane: &gtk::Box,
+        folder_sel: &gtk::SingleSelection,
+    ) {
+        assert!(
+            matches!(&*state.folder_location.borrow(), FolderLocation::Roots),
+            "folder navigation must return to the roots level on source replacement"
+        );
+        assert!(
+            state.folder_prefix.borrow().is_none(),
+            "the folder prefix axis must stay cleared after the reset"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane).map(|store| store.n_items()),
+            Some(2),
+            "the folder pane must display the two roots again, not the stale directory"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane)
+                .and_then(|store| store.item(0))
+                .and_downcast::<BrowserItem>()
+                .map(|item| item.label()),
+            Some("ga".to_string()),
+            "the folder pane's first row must be the first root, not the stale up-row"
+        );
+        assert_eq!(
+            folder_sel
+                .selected_item()
+                .and_downcast::<BrowserItem>()
+                .map(|item| item.label()),
+            Some("ga".to_string()),
+            "the folder selection must sit on the first root, consistent with the cleared filter"
+        );
+    }
+
+    /// Evaluated agreement: a post-reset selection composes folder=None —
+    /// the displayed roots and the composed filter say the same thing.
+    fn assert_post_reset_composition_agrees(panes: &[gtk::Box], log: &EmitLog) {
+        get_selection(&panes[0]).set_selected(1);
+        let (genre, artist, album, folder, search) = composed(log);
+        assert_eq!(
+            (
+                genre.as_deref(),
+                artist.as_deref(),
+                album.as_deref(),
+                folder.as_deref(),
+                search.as_str()
+            ),
+            (Some("Folk"), None, None, None, ""),
+            "post-reset interaction must compose from fully cleared axes including folder"
+        );
+    }
+
+    /// Source replacement must reset the folder pane along with every
+    /// other axis: `folder_location` returns to the roots level and the
+    /// folder store/selection display the roots — not the stale
+    /// inside-directory rows — so the pane agrees with the now-empty
+    /// composed filter (issue #250 rework finding: clearing
+    /// `folder_prefix` alone left the pane showing the pre-reset
+    /// directory, the very display/filter disagreement the reset path
+    /// exists to prevent).
+    fn source_replacement_resets_folder_navigation() {
+        let scratch = FolderScratch::new("reset");
+        let source_a = vec![
+            folder_scratch_track(&scratch, "ga", "T1"),
+            folder_scratch_track(&scratch, "gb", "T2"),
+        ];
+        let (log, cb) = recorder();
+        let (browser_box, state) = build_browser(&source_a, false, false, 48, cb);
+        let panes = collect_browser_panes(&browser_box);
+        let folder_pane = &panes[3];
+
+        attach_two_root_folder_model(&state, &scratch);
+
+        // Navigate into the second root through the production
+        // selection handler, then clear the log so only post-reset
+        // emits are observed.
+        let folder_sel = get_selection(folder_pane);
+        navigate_into_second_root(&state, folder_pane, &folder_sel);
+        log.borrow_mut().clear();
+
+        // Source replacement: every axis AND the folder pane must reset.
+        let source_b = vec![fixture_track("Folk", "Beta", "New", "U1")];
+        reset_browser_data(&browser_box, &state, &source_b);
+
+        assert!(
+            log.borrow().is_empty(),
+            "the reset itself must not emit (the caller splices the full set)"
+        );
+        assert_folder_pane_reset_to_roots(&state, folder_pane, &folder_sel);
+        assert_post_reset_composition_agrees(&panes, &log);
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -2019,6 +2772,14 @@ mod tests {
     ///   ones — exactly one surviving gutter between panes that straddle
     ///   a disabled pane, no dangling edge gutters
     ///   ([`crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones`]);
+    /// - browser data lifecycle: album selection must survive search
+    ///   typing and clearing, source replacement must reset every axis
+    ///   so panes and composed filter agree, same-source refresh must
+    ///   preserve still-valid selections and drop vanished axes, a
+    ///   pending search debounce must die with a replaced source, and
+    ///   source replacement must reset the folder pane to its roots so
+    ///   the displayed directory agrees with the cleared folder filter
+    ///   (issue #250);
     /// - tracklist drags must start only from the data row area (folded
     ///   into the popover contract);
     /// - a FullSync publication must replace the visible track store, the
@@ -2098,6 +2859,15 @@ mod tests {
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();
                 album_artwork_disabled_keeps_browser_row_contract();
+
+                // Browser data lifecycle contracts (issue #250).
+                album_selection_survives_typing_and_clearing();
+                source_replacement_resets_every_filter_axis();
+                refresh_preserves_matching_selection_through_upsert();
+                refresh_drops_vanished_album_and_keeps_surviving_artist();
+                full_sync_reset_clears_every_axis_and_the_entry();
+                pending_search_debounce_never_fires_after_source_replacement();
+                source_replacement_resets_folder_navigation();
             },
         ) else {
             return;

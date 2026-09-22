@@ -113,6 +113,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
+  Selecting a genre/artist/album or typing in the browser search left the three
+  panes and the track list disagreeing: typing a search dropped the picked album
+  from the composed filter while the album pane still displayed it; a source
+  replacement (rescan, full sync, external change) and the album-artist toggle
+  reset the panes' displayed "All" selections but left the shared filter state
+  (artist/album/search/folder prefix) stale, so the next search re-narrowed by
+  an artist from the replaced source; and an upsert under an active filter
+  appended the new row to the visible list unfiltered. All browser axes now
+  live in one shared state object with a single composition rule — every
+  selection, search, and refresh emits the same composed filter that both the
+  visible list splice and the status count derive from. Source replacement
+  (`reset_browser_data`) clears every axis, the entry text, the folder pane
+  (navigation returns to the roots level so the displayed directory agrees
+  with the cleared folder filter), and pending search debounces, emitting
+  nothing (the caller splices the full set);
+  same-source refresh (`refresh_browser_data`, used by debounced upsert and
+  delete) preserves still-valid selections, drops vanished axes as if the
+  user had cleared them (most specific first: album → artist → genre), and
+  always recomposes. Upserts under an active filter recompose instead of
+  appending; unfiltered upserts keep the direct single-row store update.
+  The search debounce timer now arms on the browser's thread-default main
+  context rather than the global default. Six production-widget contracts
+  (selection vs. search, source replacement, refresh preserve/drop, full-sync
+  reset, pending-debounce invalidation, folder-pane reset on source
+  replacement) run in the consolidated GTK session.
+  (#250)
+
 - **Initial scan no longer delays commands or window close** (`src/local/engine.rs`,
   `src/ui/library_commands.rs`, `src/ui/tracklist.rs`, `src/ui/root_trust.rs`,
   `src/ui/rhythmbox_migration.rs`, `src/ui/window.rs`) — The engine awaited the
