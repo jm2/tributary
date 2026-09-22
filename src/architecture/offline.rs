@@ -558,7 +558,7 @@ impl fmt::Display for DigestProvenance {
 }
 
 /// The identity triple of one offline job or committed row
-/// (`doc:199-211`, job-model table; `doc:288-293`, "One job per
+/// (`doc:199-211`, job-model table; `doc:289-294`, "One job per
 /// `(media_key, source_incarnation)`", rule 5). Grouped because the
 /// contract treats the triple as one identity: restart authorization
 /// compares the durable `(media_key, source_incarnation)` pair and
@@ -572,7 +572,7 @@ pub struct SnapshotIdentity {
     /// (`doc:202`). Never a transient generation number.
     pub source_incarnation: SourceIncarnationId,
     /// The source registry's accepted generation, process-local
-    /// ordering only (`doc:203`); never restart-stable (`doc:292-293`).
+    /// ordering only (`doc:203`); never restart-stable (`doc:326-327`).
     pub capability_epoch: u64,
 }
 
@@ -711,7 +711,7 @@ impl CommittedSnapshot {
 
 /// A live, in-flight download job. The engine owns one `JobRecord` per
 /// `(media_key, source_incarnation)` and never admits a second while the
-/// first is non-terminal (`doc:288-293`, "One job per
+/// first is non-terminal (`doc:289-294`, "One job per
 /// `(media_key, source_incarnation)`", rule 5).
 ///
 /// Restart authorization compares the durable
@@ -730,7 +730,7 @@ pub struct JobRecord {
     /// this durable identity, never a transient generation number.
     pub source_incarnation: SourceIncarnationId,
     /// The source registry's accepted generation, process-local ordering
-    /// only (`doc:203`); never restart-stable (`doc:292-293`).
+    /// only (`doc:203`); never restart-stable (`doc:326-327`).
     pub capability_epoch: u64,
     /// Server-advertised `Content-Length` when the response declares one;
     /// quota input only, never a committed size and never authoritative
