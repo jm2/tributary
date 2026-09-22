@@ -3074,6 +3074,16 @@ mod tests {
             "activating the empty-roots notice row must not navigate"
         );
         assert!(log.borrow().is_empty(), "a status activation must not emit");
+
+        // Regression (issue #251 self-review): the Cell<u8> default a
+        // BrowserItem carries when never given a folder kind must decode
+        // to Status — the never-navigable identity — so a stray
+        // untyped row can never drive folder navigation.
+        assert_eq!(
+            BrowserItem::new("plain untyped row", 0).folder_kind(),
+            FolderRowKind::Status,
+            "an untyped BrowserItem must decode as Status, never as a navigable kind"
+        );
     }
 
     /// A same-source refresh must preserve the folder axis (location and

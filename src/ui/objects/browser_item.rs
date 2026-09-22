@@ -30,21 +30,27 @@ pub enum FolderRowKind {
 }
 
 impl FolderRowKind {
+    /// Encoding invariant: `Status` is zero — the `Cell<u8>` default a
+    /// `BrowserItem` carries when it was never explicitly given a folder
+    /// kind — so ANY row that is not an explicitly typed folder row
+    /// decodes to `Status` and is refused by folder navigation. Every
+    /// other encoding decodes to exactly the kind `to_u8` wrote; unknown
+    /// values fall back to `Status` (refuse, never guess).
     fn from_u8(raw: u8) -> Self {
         match raw {
-            0 => Self::Root,
-            1 => Self::Directory,
-            2 => Self::Up,
+            1 => Self::Root,
+            2 => Self::Directory,
+            3 => Self::Up,
             _ => Self::Status,
         }
     }
 
     fn to_u8(self) -> u8 {
         match self {
-            Self::Root => 0,
-            Self::Directory => 1,
-            Self::Up => 2,
-            Self::Status => 3,
+            Self::Status => 0,
+            Self::Root => 1,
+            Self::Directory => 2,
+            Self::Up => 3,
         }
     }
 }
