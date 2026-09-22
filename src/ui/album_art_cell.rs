@@ -362,6 +362,17 @@ pub mod widget_tests {
             gtk::ImageType::IconName,
             "the placeholder must stay the image's content: a cleared (empty) Image renders blank"
         );
+        // Storage type alone cannot distinguish stored-but-unrenderable
+        // content: an icon name the display's theme does not know still
+        // holds IconName storage yet renders as the missing-image
+        // fallback. Resolve it through THIS display's theme so the
+        // contract proves the placeholder actually paints on the gate's
+        // display (PR #303 round-1 review refinement).
+        assert!(
+            gtk::IconTheme::for_display(&cell.image.display()).has_icon("audio-x-generic-symbolic"),
+            "the display's icon theme must resolve the placeholder icon: \
+             unresolved content renders as the missing-image fallback"
+        );
     }
 
     /// A 1×1 opaque texture stand-in for resolved album art.
