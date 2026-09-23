@@ -18254,9 +18254,10 @@ mod tests {
         }));
     }
 
-    /// A symlink stands in for a case-insensitive filesystem here: the old
-    /// spelling opens the renamed file but is not enumerated as a file of its
-    /// own.
+    /// On a case-insensitive filesystem (the macOS default) the old spelling
+    /// already opens the renamed file; elsewhere a symlink stands in for that:
+    /// the old spelling opens the renamed file but is not enumerated as a file
+    /// of its own.
     #[cfg(unix)]
     #[tokio::test]
     async fn case_only_rename_retargets_the_existing_row() {
@@ -18271,7 +18272,10 @@ mod tests {
         let renamed = root.join("Song.flac");
         let old_spelling = root.join("song.flac");
         std::fs::write(&renamed, SILENCE_FLAC).expect("write renamed audio");
-        std::os::unix::fs::symlink(&renamed, &old_spelling).expect("alias the old spelling");
+        let case_insensitive = old_spelling.exists();
+        if !case_insensitive {
+            std::os::unix::fs::symlink(&renamed, &old_spelling).expect("alias the old spelling");
+        }
         insert_rename_test_track(
             &db,
             "case-rename",
@@ -18282,9 +18286,15 @@ mod tests {
         .await;
 
         // A different file whose old spelling is really gone is not an alias.
+        // A case-insensitive filesystem cannot hold that distinction, so the
+        // vanished row there names a file that exists under no spelling.
         let replaced = root.join("Other.flac");
         std::fs::write(&replaced, SILENCE_FLAC).expect("write unrelated audio");
-        let gone = root.join("other.flac");
+        let gone = if case_insensitive {
+            root.join("vanished.flac")
+        } else {
+            root.join("other.flac")
+        };
         insert_rename_test_track(&db, "gone", gone.to_str().unwrap(), "Gone", 1).await;
 
         let (tx, _rx) = async_channel::unbounded();
