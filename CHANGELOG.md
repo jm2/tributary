@@ -128,6 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Last.fm keeps queued scrobbles** — Scrobbles saved while offline are no longer deleted when
+  Last.fm rejects the app's key or signature or the daily scrobble limit is reached; they wait and
+  are sent later. Brief storage errors and web error pages are retried instead of stopping
+  delivery. Last.fm remains unavailable in current builds.
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.

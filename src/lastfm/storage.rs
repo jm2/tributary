@@ -633,48 +633,88 @@ pub async fn due_batch(
     }
 }
 
-/// Delete one complete accepted/ignored batch if its exact FIFO snapshot is
-/// still current. A stale or partially missing receipt changes no row.
+/// Settle one completely answered batch if its exact FIFO snapshot is still
+/// current: delete every row except those flagged in `deferred`, which keep
+/// their attempt count and become eligible again at `deferred_until_ms`.
+/// An empty `deferred` settles the whole batch. A stale or partially missing
+/// receipt changes no row.
 pub async fn settle_terminal(
     db: &DatabaseConnection,
     receipt: &LastFmBatchReceipt,
+    deferred: &[bool],
+    deferred_until_ms: i64,
 ) -> Result<(), LastFmQueueError> {
+    if !(deferred.is_empty() || deferred.len() == receipt.rows.len())
+        || !(0..=MAX_LASTFM_RETRY_AT_MS).contains(&deferred_until_ms)
+    {
+        return Err(LastFmQueueError::InvalidBatch);
+    }
+    let mut settled_ids = Vec::with_capacity(receipt.rows.len());
+    let mut deferred_ids = Vec::new();
+    for (index, row) in receipt.rows.iter().enumerate() {
+        if deferred.get(index).copied().unwrap_or(false) {
+            deferred_ids.push(row.id);
+        } else {
+            settled_ids.push(row.id);
+        }
+    }
     let transaction = crate::db::begin_write(db)
         .await
         .map_err(|_| LastFmQueueError::Storage)?;
-    if let Err(error) = validate_receipt(&transaction, receipt).await {
-        let _ = transaction.rollback().await;
-        return Err(error);
+    let result = async {
+        validate_receipt(&transaction, receipt).await?;
+        let binding = receipt.account_binding.as_bytes().to_vec();
+        let deleted = execute_for_rows(
+            &transaction,
+            "DELETE FROM lastfm_scrobble_queue WHERE account_binding = ? AND id IN",
+            vec![binding.clone().into()],
+            &settled_ids,
+        )
+        .await?;
+        let postponed = execute_for_rows(
+            &transaction,
+            "UPDATE lastfm_scrobble_queue SET next_attempt_at_ms = ?
+             WHERE account_binding = ? AND id IN",
+            vec![deferred_until_ms.into(), binding.into()],
+            &deferred_ids,
+        )
+        .await?;
+        if deleted + postponed == receipt.rows.len() as u64 {
+            Ok(())
+        } else {
+            Err(LastFmQueueError::StaleBatch)
+        }
     }
+    .await;
+    finish_transaction(transaction, result).await
+}
 
-    let placeholders = std::iter::repeat_n("?", receipt.rows.len())
+/// Run `statement` against the listed row ids and return the number of rows
+/// it changed. An empty list changes nothing.
+async fn execute_for_rows<C>(
+    db: &C,
+    statement: &str,
+    mut values: Vec<sea_orm::Value>,
+    ids: &[i64],
+) -> Result<u64, LastFmQueueError>
+where
+    C: ConnectionTrait,
+{
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(", ");
-    let mut values = Vec::with_capacity(receipt.rows.len() + 1);
-    values.push(receipt.account_binding.as_bytes().to_vec().into());
-    values.extend(receipt.rows.iter().map(|row| row.id.into()));
-    let result = transaction
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            format!(
-                "DELETE FROM lastfm_scrobble_queue
-                 WHERE account_binding = ? AND id IN ({placeholders})"
-            ),
-            values,
-        ))
-        .await;
-    let Ok(result) = result else {
-        let _ = transaction.rollback().await;
-        return Err(LastFmQueueError::Storage);
-    };
-    if result.rows_affected() != receipt.rows.len() as u64 {
-        let _ = transaction.rollback().await;
-        return Err(LastFmQueueError::StaleBatch);
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| LastFmQueueError::Storage)
+    values.extend(ids.iter().map(|&id| id.into()));
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!("{statement} ({placeholders})"),
+        values,
+    ))
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|_| LastFmQueueError::Storage)
 }
 
 /// Retain one complete failed batch and move it to one bounded retry time if
@@ -2030,7 +2070,7 @@ mod tests {
         };
         assert_eq!(ready.len(), 1);
         assert_eq!(ready.rows()[0].id, stored[0].id);
-        settle_terminal(&db, &ready).await.unwrap();
+        settle_terminal(&db, &ready, &[], 0).await.unwrap();
 
         assert!(matches!(
             batch_availability(&db, account, 0, 50).await.unwrap(),
@@ -2063,7 +2103,7 @@ mod tests {
         );
         let first = batch(&db, first_account, 0, 50).await;
         assert_eq!(first.len(), 1);
-        settle_terminal(&db, &first).await.unwrap();
+        settle_terminal(&db, &first, &[], 0).await.unwrap();
         assert_eq!(queue_len(&db).await.unwrap(), 0);
 
         enqueue(&db, &input(first_account, "Private pending row"))
@@ -2462,7 +2502,7 @@ mod tests {
         let first = batch(&db, account, 0, MAX_LASTFM_BATCH_ROWS).await;
         assert_eq!(first.len(), MAX_LASTFM_BATCH_ROWS);
         assert!(first.rows().windows(2).all(|rows| rows[0].id < rows[1].id));
-        settle_terminal(&db, &first).await.unwrap();
+        settle_terminal(&db, &first, &[], 0).await.unwrap();
         let last = batch(&db, account, 0, MAX_LASTFM_BATCH_ROWS).await;
         assert_eq!(last.len(), 1);
     }
@@ -2483,7 +2523,7 @@ mod tests {
                 .unwrap();
 
             let error = if settlement {
-                settle_terminal(&db, &receipt).await.unwrap_err()
+                settle_terminal(&db, &receipt, &[], 0).await.unwrap_err()
             } else {
                 reschedule_batch(&db, &receipt, 500).await.unwrap_err()
             };
@@ -2507,7 +2547,7 @@ mod tests {
 
         let nonprefix = LastFmBatchReceipt::try_new(account, current.rows()[1..].to_vec()).unwrap();
         assert_eq!(
-            settle_terminal(&db, &nonprefix).await.unwrap_err(),
+            settle_terminal(&db, &nonprefix, &[], 0).await.unwrap_err(),
             LastFmQueueError::StaleBatch
         );
         assert_eq!(queue_len(&db).await.unwrap(), 3);
@@ -2529,13 +2569,13 @@ mod tests {
 
         reschedule_batch(&db, &current, 500).await.unwrap();
         assert_eq!(
-            settle_terminal(&db, &current).await.unwrap_err(),
+            settle_terminal(&db, &current, &[], 0).await.unwrap_err(),
             LastFmQueueError::StaleBatch
         );
         assert_eq!(queue_len(&db).await.unwrap(), 3);
         let refreshed = batch(&db, account, 500, 50).await;
         assert!(refreshed.rows().iter().all(|row| row.attempt_count == 1));
-        settle_terminal(&db, &refreshed).await.unwrap();
+        settle_terminal(&db, &refreshed, &[], 0).await.unwrap();
         assert_eq!(queue_len(&db).await.unwrap(), 0);
     }
 

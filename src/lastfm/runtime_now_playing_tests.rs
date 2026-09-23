@@ -558,8 +558,12 @@ async fn terminal_and_transient_results_are_one_shot_and_leave_delivery_status_u
             LastFmNowPlayingOutcome::Ignored,
         ),
         (
-            Err(LastFmClientError::ServiceRejected { code: 13 }),
+            Err(LastFmClientError::ServiceRejected { code: 6 }),
             LastFmNowPlayingOutcome::Rejected,
+        ),
+        (
+            Err(LastFmClientError::ServiceRejected { code: 13 }),
+            LastFmNowPlayingOutcome::CapabilityUnavailable,
         ),
         (
             Err(LastFmClientError::Timeout),
@@ -579,7 +583,7 @@ async fn terminal_and_transient_results_are_one_shot_and_leave_delivery_status_u
         ),
         (
             Err(LastFmClientError::HttpStatus),
-            LastFmNowPlayingOutcome::Incompatible,
+            LastFmNowPlayingOutcome::Unavailable,
         ),
         (
             Err(LastFmClientError::BodyLimit),
