@@ -64,6 +64,23 @@ fn reserved_final_intent_slots(capacity: usize) -> usize {
 const CAST_SENDER_ID: &str = "sender-0";
 const CAST_RECEIVER_ID: &str = "receiver-0";
 
+/// Playback state shared by the worker and the public output.
+#[derive(Clone, Copy)]
+struct CastPlayback {
+    state: PlayerState,
+    /// Last polled position of the current media.
+    position_ms: Option<u64>,
+}
+
+impl CastPlayback {
+    const fn stopped() -> Self {
+        Self {
+            state: PlayerState::Stopped,
+            position_ms: None,
+        }
+    }
+}
+
 /// Chromecast audio output — streams to a Cast V2 device.
 pub struct ChromecastOutput {
     #[allow(dead_code)]
@@ -77,7 +94,7 @@ pub struct ChromecastOutput {
     event_tx: async_channel::Sender<PlayerEvent>,
     event_generation: AtomicU64,
     volume: f64,
-    current_state: Arc<Mutex<PlayerState>>,
+    current_state: Arc<Mutex<CastPlayback>>,
     cast_server: Arc<Mutex<Option<CastHttpServer>>>,
     rt_handle: Option<tokio::runtime::Handle>,
     intent_epoch: Arc<AtomicU64>,
@@ -637,6 +654,8 @@ type CastTlsStream = rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpSt
 type CastIo = BoundedCastStream<CastTlsStream>;
 
 struct RustCastTransport {
+    manager: Rc<rust_cast::message_manager::MessageManager<CastIo>>,
+    buffered_only: Rc<Cell<bool>>,
     connection: rust_cast::channels::connection::ConnectionChannel<'static, CastIo>,
     heartbeat: rust_cast::channels::heartbeat::HeartbeatChannel<'static, CastIo>,
     media: rust_cast::channels::media::MediaChannel<'static, CastIo>,
@@ -756,10 +775,14 @@ struct BoundedCastStream<S> {
     header_delivered: usize,
     payload_remaining: Option<u32>,
     poisoned: bool,
+    /// While set, a read at a frame boundary fails with `WouldBlock` without
+    /// touching the stream, so draining rust_cast's buffer never starts
+    /// reading a new frame.
+    buffered_only: Rc<Cell<bool>>,
 }
 
 impl<S> BoundedCastStream<S> {
-    const fn new(inner: S) -> Self {
+    fn new(inner: S) -> Self {
         Self {
             inner,
             header: [0; 4],
@@ -767,7 +790,12 @@ impl<S> BoundedCastStream<S> {
             header_delivered: 0,
             payload_remaining: None,
             poisoned: false,
+            buffered_only: Rc::new(Cell::new(false)),
         }
+    }
+
+    fn buffered_only(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.buffered_only)
     }
 
     fn reset_for_header(&mut self) {
@@ -833,6 +861,12 @@ impl<S: Read> Read for BoundedCastStream<S> {
                 return Ok(read_count);
             }
 
+            if self.header_filled == 0 && self.buffered_only.get() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "no buffered Cast frame",
+                ));
+            }
             while self.header_filled < self.header.len() {
                 let read = self.inner.read(&mut self.header[self.header_filled..])?;
                 if read == 0 {
@@ -886,11 +920,10 @@ impl CastConnector for RustCastConnector {
             .map_err(|error| opaque_cast_failure("TCP connection", error))?;
         let _ = stream.set_nodelay(true);
 
-        let mut config = rustls::ClientConfig::builder()
+        let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(rust_cast::NoCertificateVerification {}))
             .with_no_client_auth();
-        config.key_log = Arc::new(rustls::KeyLogFile::new());
         let server_name = rustls::pki_types::ServerName::IpAddress(self.address.ip().into());
         let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|error| opaque_cast_failure("TLS connection", error))?;
@@ -912,6 +945,7 @@ impl CastConnector for RustCastConnector {
         // the peer's advertised protobuf length is rejected before rust_cast
         // sees the header and allocates its receive buffer.
         let stream = BoundedCastStream::new(stream);
+        let buffered_only = stream.buffered_only();
         let manager = Rc::new(rust_cast::message_manager::MessageManager::new(stream));
         let connection = rust_cast::channels::connection::ConnectionChannel::new(
             CAST_SENDER_ID,
@@ -927,9 +961,11 @@ impl CastConnector for RustCastConnector {
         let receiver = rust_cast::channels::receiver::ReceiverChannel::new(
             CAST_SENDER_ID,
             CAST_RECEIVER_ID,
-            manager,
+            Rc::clone(&manager),
         );
         Ok(RustCastTransport {
+            manager,
+            buffered_only,
             connection,
             heartbeat,
             media,
@@ -947,8 +983,48 @@ impl RustCastTransport {
         call: impl FnOnce(&Self) -> Result<T, rust_cast::errors::Error>,
     ) -> CastResult<T> {
         let _guard = self.deadline.arm(self.operation_timeout);
-        call(self).map_err(|error| rust_cast_failure(operation, error))
+        let result = call(self).map_err(|error| rust_cast_failure(operation, error));
+        // A stream an unusable failure may have left mid-frame is never
+        // read again.
+        if result
+            .as_ref()
+            .is_err_and(|failure| !failure.connection_usable)
+        {
+            return result;
+        }
+        drain_unread_frames(&self.manager, &self.heartbeat, &self.buffered_only)
+            .map_err(|error| rust_cast_failure(operation, error))?;
+        result
     }
+}
+
+/// Discard the frames rust_cast buffered while waiting for a reply (PONGs and
+/// receiver broadcasts nothing reads) so its buffer cannot grow for the life
+/// of a session, answering receiver PINGs. Never reads from the stream.
+fn drain_unread_frames<S>(
+    manager: &rust_cast::message_manager::MessageManager<S>,
+    heartbeat: &rust_cast::channels::heartbeat::HeartbeatChannel<'_, S>,
+    buffered_only: &Cell<bool>,
+) -> Result<(), rust_cast::errors::Error>
+where
+    S: Read + Write,
+{
+    use rust_cast::channels::heartbeat::HeartbeatResponse;
+
+    buffered_only.set(true);
+    let mut result = Ok(());
+    while let Ok(message) = manager.receive() {
+        if heartbeat.can_handle(&message)
+            && matches!(heartbeat.parse(&message), Ok(HeartbeatResponse::Ping))
+        {
+            result = heartbeat.pong();
+            if result.is_err() {
+                break;
+            }
+        }
+    }
+    buffered_only.set(false);
+    result
 }
 
 impl CastTransport for RustCastTransport {
@@ -1173,7 +1249,7 @@ enum CleanupOutcome {
 fn spawn_cast_worker<C>(
     connector: C,
     intent_epoch: Arc<AtomicU64>,
-    current_state: Arc<Mutex<PlayerState>>,
+    current_state: Arc<Mutex<CastPlayback>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
     initial_volume: f64,
@@ -1205,7 +1281,7 @@ fn run_cast_worker<C>(
     mut connector: C,
     worker_rx: WorkerCommandReceiver,
     intent_epoch: Arc<AtomicU64>,
-    current_state: Arc<Mutex<PlayerState>>,
+    current_state: Arc<Mutex<CastPlayback>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
     initial_volume: f64,
@@ -1384,7 +1460,7 @@ fn handle_load<C>(
     volume: f64,
     applied_volume: &mut f64,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) where
     C: CastConnector,
@@ -1653,7 +1729,7 @@ fn finish_load<T>(
     owner: CommandOwner,
     loaded: CastResult<CastStatusSnapshot>,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) where
     T: CastTransport,
@@ -1752,10 +1828,12 @@ fn finish_load<T>(
         let _ = set_state_and_emit(owner, initial_state, intent_epoch, current_state, event_tx);
     }
     if let Some(position_ms) = loaded.position_ms {
-        emit_if_current(
+        publish_position(
             owner,
-            PlayerEvent::position(owner.event_generation, position_ms, loaded.duration_ms),
+            position_ms,
+            loaded.duration_ms,
             intent_epoch,
+            current_state,
             event_tx,
         );
     }
@@ -1765,7 +1843,7 @@ fn finish_stage<T>(
     result: CastResult<T>,
     owner: CommandOwner,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) -> bool {
     if !is_current(owner, intent_epoch) {
@@ -1785,7 +1863,7 @@ fn cleanup_then_fail<T>(
     owner: CommandOwner,
     failure: CastFailure,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) where
     T: CastTransport,
@@ -1838,7 +1916,7 @@ fn handle_control<T>(
     kind: CommandKind,
     applied_volume: &mut f64,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) where
     T: CastTransport,
@@ -1921,7 +1999,7 @@ fn poll_active<T>(
     active: &mut Option<WorkerSession<T>>,
     force: bool,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
 ) where
@@ -2058,10 +2136,12 @@ fn poll_active<T>(
     }
 
     if let Some(position_ms) = status.position_ms {
-        emit_if_current(
+        publish_position(
             owner,
-            PlayerEvent::position(owner.event_generation, position_ms, status.duration_ms),
+            position_ms,
+            status.duration_ms,
             intent_epoch,
+            current_state,
             event_tx,
         );
     }
@@ -2207,7 +2287,7 @@ fn fail_cast(
     owner: CommandOwner,
     failure: CastFailure,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) {
     fail_message(
@@ -2227,7 +2307,7 @@ fn fail_message(
     owner: CommandOwner,
     message: String,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) {
     if !is_current(owner, intent_epoch) {
@@ -2254,7 +2334,7 @@ fn set_state_and_emit(
     owner: CommandOwner,
     state: PlayerState,
     intent_epoch: &AtomicU64,
-    current_state: &Mutex<PlayerState>,
+    current_state: &Mutex<CastPlayback>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) -> bool {
     if !is_current(owner, intent_epoch) {
@@ -2265,9 +2345,12 @@ fn set_state_and_emit(
         if !is_current(owner, intent_epoch) {
             return false;
         }
-        *current = state;
+        current.state = state;
+        if matches!(state, PlayerState::Stopped | PlayerState::Buffering) {
+            current.position_ms = None;
+        }
         if !is_current(owner, intent_epoch) {
-            *current = PlayerState::Stopped;
+            *current = CastPlayback::stopped();
             return false;
         }
     }
@@ -2278,6 +2361,30 @@ fn set_state_and_emit(
         event_tx,
     );
     true
+}
+
+/// Cache the polled position for `position_ms()` and report it to the UI.
+fn publish_position(
+    owner: CommandOwner,
+    position_ms: u64,
+    duration_ms: u64,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<CastPlayback>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) {
+    {
+        let mut current = current_state.lock().unwrap_or_else(|p| p.into_inner());
+        if !is_current(owner, intent_epoch) {
+            return;
+        }
+        current.position_ms = Some(position_ms);
+    }
+    emit_if_current(
+        owner,
+        PlayerEvent::position(owner.event_generation, position_ms, duration_ms),
+        intent_epoch,
+        event_tx,
+    );
 }
 
 fn emit_if_current(
@@ -2372,7 +2479,7 @@ impl ChromecastOutput {
         initial_volume: f64,
     ) -> Self {
         info!(%address, name = %display_name, "Chromecast output configured");
-        let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
+        let current_state = Arc::new(Mutex::new(CastPlayback::stopped()));
         let intent_epoch = Arc::new(AtomicU64::new(0));
         let initial_volume = initial_volume.clamp(0.0, 1.0);
         let worker_tx = spawn_cast_worker(
@@ -2412,10 +2519,17 @@ impl ChromecastOutput {
     }
 
     fn next_owner(&self) -> CommandOwner {
-        CommandOwner {
+        let owner = CommandOwner {
             epoch: self.intent_epoch.fetch_add(1, Ordering::SeqCst) + 1,
             event_generation: self.event_generation(),
+        };
+        // The previous media's position must not answer for the new intent
+        // (Previous would restart the wrong track). Cleared after the epoch
+        // advance so the worker cannot re-publish the retired position.
+        if let Ok(mut current) = self.current_state.lock() {
+            current.position_ms = None;
         }
+        owner
     }
 
     fn current_owner(&self) -> CommandOwner {
@@ -2705,12 +2819,15 @@ impl AudioOutput for ChromecastOutput {
     fn state(&self) -> PlayerState {
         self.current_state
             .lock()
-            .map(|state| *state)
+            .map(|current| current.state)
             .unwrap_or(PlayerState::Stopped)
     }
 
     fn position_ms(&self) -> Option<u64> {
-        None
+        self.current_state
+            .lock()
+            .map(|current| current.position_ms)
+            .unwrap_or(None)
     }
 }
 
@@ -2861,11 +2978,15 @@ mod tests {
     }
 
     fn encode_cast_frame(payload: CastMessagePayload) -> Vec<u8> {
+        encode_namespaced_frame(TEST_CAST_NAMESPACE, payload)
+    }
+
+    fn encode_namespaced_frame(namespace: &str, payload: CastMessagePayload) -> Vec<u8> {
         let written = Arc::new(Mutex::new(Vec::new()));
         let stream = BoundedCastStream::new(ObservedCastIo::writer(Arc::clone(&written)));
         MessageManager::new(stream)
             .send(CastMessage {
-                namespace: TEST_CAST_NAMESPACE.to_string(),
+                namespace: namespace.to_string(),
                 source: CAST_RECEIVER_ID.to_string(),
                 destination: CAST_SENDER_ID.to_string(),
                 payload,
@@ -2961,6 +3082,54 @@ mod tests {
             rust_cast::errors::Error::Io(error)
                 if error.kind() == io::ErrorKind::UnexpectedEof
         ));
+    }
+
+    #[test]
+    fn draining_answers_receiver_pings_and_empties_the_buffer_without_reading() {
+        let text = |payload: &str| CastMessagePayload::String(payload.to_string());
+        let input = [
+            encode_namespaced_frame(
+                "urn:x-cast:com.google.cast.tp.heartbeat",
+                text(r#"{"type":"PING"}"#),
+            ),
+            encode_cast_frame(text("broadcast")),
+            encode_cast_frame(text("reply")),
+            encode_cast_frame(text("later")),
+        ]
+        .concat();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let io = ObservedCastIo {
+            input: std::io::Cursor::new(input),
+            max_read: usize::MAX,
+            forbid_read_at: None,
+            forbidden_read: Arc::new(AtomicBool::new(false)),
+            written: Arc::clone(&written),
+        };
+        let stream = BoundedCastStream::new(io);
+        let buffered_only = stream.buffered_only();
+        let manager = Rc::new(MessageManager::new(stream));
+        let heartbeat = rust_cast::channels::heartbeat::HeartbeatChannel::new(
+            CAST_SENDER_ID,
+            CAST_RECEIVER_ID,
+            Rc::clone(&manager),
+        );
+
+        // Waiting for "reply" buffers the PING and the broadcast.
+        manager
+            .receive_find_map(|message| Ok((message.payload == text("reply")).then_some(())))
+            .expect("reply frame");
+        drain_unread_frames(&manager, &heartbeat, &buffered_only).expect("drain");
+
+        let written = written.lock().expect("test Cast write lock").clone();
+        assert!(
+            String::from_utf8_lossy(&written).contains("PONG"),
+            "the receiver PING is answered"
+        );
+        assert_eq!(
+            manager.receive().expect("next frame").payload,
+            text("later"),
+            "the buffer is empty and the unread frame is still on the stream"
+        );
     }
 
     #[test]
@@ -3315,7 +3484,7 @@ mod tests {
                     connector,
                     rx,
                     epoch_for_worker,
-                    Arc::new(Mutex::new(PlayerState::Stopped)),
+                    Arc::new(Mutex::new(CastPlayback::stopped())),
                     event_tx,
                     timing,
                     HARNESS_INITIAL_VOLUME,
@@ -4893,6 +5062,28 @@ mod tests {
     }
 
     #[test]
+    fn position_ms_reports_the_last_polled_position_until_the_next_intent() {
+        let shared = FakeShared::new();
+        shared
+            .load_statuses
+            .lock()
+            .expect("load statuses lock")
+            .push_back(CastStatusSnapshot {
+                position_ms: Some(5_000),
+                ..CastStatusSnapshot::loaded(42)
+            });
+        let (event_tx, _events) = async_channel::unbounded();
+        let output = ChromecastOutput::new_with_fake_transport(&shared, event_tx, 0.5);
+        assert_eq!(output.position_ms(), None);
+
+        assert!(output.load_uri("https://radio.test/stream.mp3"));
+        assert!(wait_for(2, || output.position_ms() == Some(5_000)));
+
+        output.stop();
+        assert_eq!(output.position_ms(), None);
+    }
+
+    #[test]
     fn shutdown_cleans_active_media_without_emitting_events() {
         let shared = FakeShared::new();
         let mut harness = Harness::new(Arc::clone(&shared));
@@ -5257,7 +5448,7 @@ mod tests {
             event_tx: async_channel::Sender<PlayerEvent>,
             initial_volume: f64,
         ) -> Self {
-            let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
+            let current_state = Arc::new(Mutex::new(CastPlayback::stopped()));
             let intent_epoch = Arc::new(AtomicU64::new(0));
             let initial_volume = initial_volume.clamp(0.0, 1.0);
             let worker_tx = spawn_cast_worker(
