@@ -2751,7 +2751,8 @@ fn update_now_playing_ui(
 
     // Scroll only when the queue's source and item are present in the current
     // view. Navigation still works when the user is viewing another source or
-    // has filtered the playing item out.
+    // has filtered the playing item out. Scrolling leaves the selection and
+    // keyboard focus alone: they belong to the user.
     let active_source_key = ctx.active_source_key.borrow().clone();
     if let Some((identity, view)) = identity
         .filter(|identity| identity_belongs_to_source(identity, &active_source_key))
@@ -2769,12 +2770,8 @@ fn update_now_playing_ui(
                     .and_then(|track| row_position_identity(&view, &track))
             },
         ) {
-            ctx.column_view.scroll_to(
-                position,
-                None,
-                gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                None,
-            );
+            ctx.column_view
+                .scroll_to(position, None, gtk::ListScrollFlags::NONE, None);
         }
     }
 
