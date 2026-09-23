@@ -1,5 +1,6 @@
 Name:           tributary
-Version:        v0.1.0
+# Packit replaces Version with the release tag minus its "v" (see .packit.yaml).
+Version:        0.6.2
 Release:        1%{?dist}
 Summary:        A high-performance media manager with unified local and remote backends
 
@@ -39,7 +40,7 @@ like Subsonic, Jellyfin, and Plex.
 %autosetup -p1 -n %{name}-%{version}
 
 %build
-cargo build --release
+cargo build --release --locked
 
 %install
 # Install binary
@@ -75,5 +76,8 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/io.github.tributary.Tributary.png
 
 %changelog
-* Fri Apr 03 2026 John-Michael Mulesa <jmulesa@gmail.com> - v0.1.0-1
+* Wed Sep 23 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.6.2-1
+- Version COPR builds without the release tag's "v" prefix.
+
+* Fri Apr 03 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.1.0-1
 - Initial Fedora package.

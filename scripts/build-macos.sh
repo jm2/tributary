@@ -216,7 +216,7 @@ info "macOS app icon sources are complete and parseable."
 # ── Rust Build ───────────────────────────────────────────────────────────────
 info "Building Tributary (release)..."
 
-cargo build --release
+cargo build --release --locked
 info "Binary built: $(pwd)/$BINARY"
 
 # ── .app Bundle ──────────────────────────────────────────────────────────────

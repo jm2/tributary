@@ -153,7 +153,15 @@ winresource = "0.1"
 maintainer = "Tributary Contributors"
 copyright = "2026, Tributary Contributors"
 license-file = ["LICENSE", "0"]
-depends = "libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.6), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav, libdbus-1-3"
+# Without this, cargo-deb uses the whole README as the package description.
+extended-description = """\
+Tributary is a Rhythmbox-style music manager for GNOME, written in Rust with \
+GTK4 and libadwaita. One library view browses and plays local music alongside \
+Subsonic/Navidrome, Jellyfin, and Plex servers, DAAP shares, and internet radio."""
+# $auto derives the linked-library floors (glibc included) from the built
+# binary. The explicit entries are what it cannot see: the GTK/libadwaita API
+# floors the crate enables, and GStreamer plugins loaded at run time.
+depends = "$auto, libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.6), gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav"
 section = "sound"
 assets = [
     ["target/release/tributary", "usr/bin/", "755"],

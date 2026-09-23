@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Linux packages** — Fedora COPR builds now carry plain version numbers, so they update an
+  installed release RPM instead of always ranking below it. The `.deb` has a short description
+  and declares the system libraries, including glibc, that the program needs.
 - **Jellyfin 12 sign-in** — Tributary signs in to, browses, and streams from Jellyfin 12 servers,
   which reject the older sign-in header Tributary used to send. Earlier Jellyfin versions keep
   working.
@@ -122,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Release builds** — Release packages are built from exact, reviewed versions of the build
+  actions, Rust compiler, and packaging tools, and each published file has a GitHub
+  build-provenance attestation that `gh attestation verify` can check.
 - **Discovered Plex servers** — Signing in to a Plex server found on the network no longer sends
   your Plex account token to it. Tributary first confirms through plex.tv that the server is one of
   yours, then connects securely with that server's own access.

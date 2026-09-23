@@ -26,11 +26,11 @@ jobs:
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Cache Cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -39,15 +39,17 @@ jobs:
           key: fuzz-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: fuzz-cargo-
       - name: Cache fuzz corpus
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
       - name: Install Rust nightly (required for cargo-fuzz)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: Fuzz every target (bounded)
         env:
           # The fuzz crate shares the root release profile, whose LTO and
@@ -76,7 +78,7 @@ jobs:
           exit "$failed"
       - name: Upload crash artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
