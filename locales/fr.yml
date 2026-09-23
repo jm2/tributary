@@ -319,6 +319,8 @@ errors:
     decoder_failed: "Le décodeur audio a échoué"
     audio_output_failed: "La sortie audio a échoué"
     playback_failed: "La lecture audio a échoué"
+    track_unavailable: "Impossible d'ouvrir « %{title} »"
+    skip_limit: "Lecture arrêtée : plusieurs morceaux d'affilée n'ont pas pu être lus"
     airplay_raopsink_missing: "La lecture AirPlay 1 n'est pas disponible : cette version ne contient aucun émetteur GStreamer raopsink compatible"
     mpd_exclusive_control_required: "Ajoutez à nouveau cette sortie MPD, confirmez le contrôle exclusif de la partition, puis sélectionnez-la à nouveau avant la lecture"
   database:

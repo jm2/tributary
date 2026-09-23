@@ -35,10 +35,11 @@ use super::persistence::{
     restore_sort_state, save_repeat_mode, save_shuffle, save_sort_state, save_window_geometry,
 };
 use super::playback::{
-    admit_history_credit, advance_track, advance_track_from_user, format_ms, play_or_start,
-    play_track_at, previous_or_restart_from_user, refresh_projected_library_uris, replay_current,
-    retry_pending_history_credit_before_transition, stop_playback, toggle_or_start,
-    BufferingTracker, PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
+    admit_history_credit, advance_track, advance_track_from_user, display_duration_ms,
+    play_or_start, play_track_at, previous_or_restart_from_user, recover_from_failed_load,
+    refresh_projected_library_uris, replay_current, retry_pending_history_credit_before_transition,
+    stop_playback, toggle_or_start, BufferingTracker, LoadFailure, PlaybackContext,
+    PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
@@ -2691,6 +2692,14 @@ pub(crate) fn build_window(
     let media_ctrl: Rc<RefCell<Option<crate::desktop_integration::MediaController>>> =
         Rc::new(RefCell::new(None));
 
+    let playback_progress = super::playback::ProgressDisplay {
+        scale: hb.progress.clone(),
+        position_label: hb.position_label.clone(),
+        duration_label: hb.duration_label.clone(),
+        seeking: seeking.clone(),
+    };
+    let playback_notices = super::playback::PlaybackNotices::new(toast_overlay.clone());
+
     // Every terminal/reset path uses this one operation. Besides resetting the
     // visible controls it invalidates delayed spinner callbacks and both local
     // and remote artwork workers before installing the idle placeholder.
@@ -2699,10 +2708,7 @@ pub(crate) fn build_window(
         let title_label = hb.title_label.clone();
         let artist_label = hb.artist_label.clone();
         let album_art = hb.album_art.clone();
-        let progress_adj = hb.progress_adj.clone();
-        let position_label = hb.position_label.clone();
-        let duration_label = hb.duration_label.clone();
-        let seeking = seeking.clone();
+        let playback_progress = playback_progress.clone();
         let media_ctrl = media_ctrl.clone();
         let buffering_tracker = buffering_tracker.clone();
         Rc::new(move || {
@@ -2714,12 +2720,7 @@ pub(crate) fn build_window(
             artist_label.set_tooltip_text(Option::<&str>::None);
             super::album_art::invalidate();
             album_art.set_icon_name(Some("audio-x-generic-symbolic"));
-            seeking.set(true);
-            progress_adj.set_value(0.0);
-            progress_adj.set_upper(1.0);
-            seeking.set(false);
-            position_label.set_label("0:00");
-            duration_label.set_label("0:00");
+            playback_progress.clear();
             if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                 ctrl.set_stopped();
             }
@@ -2748,6 +2749,8 @@ pub(crate) fn build_window(
             let playback_source_registry = source_registry.clone();
             let playback_lastfm = lastfm_playback.clone();
             let playback_lastfm_policy = lastfm_policy.clone();
+            let playback_progress = playback_progress.clone();
+            let playback_notices = playback_notices.clone();
             let media_playback_admission = library_commands.clone();
 
             glib::MainContext::default().spawn_local(async move {
@@ -2772,6 +2775,8 @@ pub(crate) fn build_window(
                         source_registry: playback_source_registry.clone(),
                         lastfm_playback: playback_lastfm.clone(),
                         lastfm_policy: playback_lastfm_policy.clone(),
+                        progress: playback_progress.clone(),
+                        notices: playback_notices.clone(),
                     };
                     match action {
                         MediaAction::Play => {
@@ -2846,6 +2851,8 @@ pub(crate) fn build_window(
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
         let playback_lastfm_policy = lastfm_policy.clone();
+        let playback_progress = playback_progress.clone();
+        let playback_notices = playback_notices.clone();
         let playback_admission = library_commands.clone();
 
         hb.play_button.connect_clicked(move |_| {
@@ -2868,6 +2875,8 @@ pub(crate) fn build_window(
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
                     lastfm_policy: playback_lastfm_policy.clone(),
+                    progress: playback_progress.clone(),
+                    notices: playback_notices.clone(),
                 },
                 shuffle.is_active(),
             );
@@ -3044,6 +3053,8 @@ pub(crate) fn build_window(
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
         let playback_lastfm_policy = lastfm_policy.clone();
+        let playback_progress = playback_progress.clone();
+        let playback_notices = playback_notices.clone();
         let playback_admission = library_commands.clone();
 
         column_view.connect_activate(move |_view, position| {
@@ -3067,6 +3078,8 @@ pub(crate) fn build_window(
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
                     lastfm_policy: playback_lastfm_policy.clone(),
+                    progress: playback_progress.clone(),
+                    notices: playback_notices.clone(),
                 },
             );
         });
@@ -3090,6 +3103,8 @@ pub(crate) fn build_window(
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
         let playback_lastfm_policy = lastfm_policy.clone();
+        let playback_progress = playback_progress.clone();
+        let playback_notices = playback_notices.clone();
         let playback_admission = library_commands.clone();
 
         hb.next_button.connect_clicked(move |_| {
@@ -3112,6 +3127,8 @@ pub(crate) fn build_window(
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
                     lastfm_policy: playback_lastfm_policy.clone(),
+                    progress: playback_progress.clone(),
+                    notices: playback_notices.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -3137,6 +3154,8 @@ pub(crate) fn build_window(
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
         let playback_lastfm_policy = lastfm_policy.clone();
+        let playback_progress = playback_progress.clone();
+        let playback_notices = playback_notices.clone();
         let playback_admission = library_commands.clone();
 
         hb.prev_button.connect_clicked(move |_| {
@@ -3159,6 +3178,8 @@ pub(crate) fn build_window(
                     source_registry: playback_source_registry.clone(),
                     lastfm_playback: playback_lastfm.clone(),
                     lastfm_policy: playback_lastfm_policy.clone(),
+                    progress: playback_progress.clone(),
+                    notices: playback_notices.clone(),
                 },
                 repeat_mode.get(),
                 shuffle.is_active(),
@@ -3169,31 +3190,37 @@ pub(crate) fn build_window(
     // ── Receive PlayerEvents on GTK main thread ─────────────────────
     {
         let play_btn = hb.play_button.clone();
-        let album_art = hb.album_art.clone();
-        let title_label = hb.title_label.clone();
-        let artist_label = hb.artist_label.clone();
-        let progress_adj = hb.progress_adj.clone();
-        let position_label = hb.position_label.clone();
-        let duration_label = hb.duration_label.clone();
         let repeat_mode = hb.repeat_mode.clone();
         let shuffle = hb.shuffle_button.clone();
-        let seeking = seeking.clone();
         let media_ctrl = media_ctrl.clone();
         let active_output = active_output.clone();
-        let sm = sort_model.clone();
-        let active_source_key = active_source_key.clone();
         let playback_session = playback_session.clone();
-        let cv = column_view.clone();
         let buffering_tracker = buffering_tracker.clone();
         let clear_playback_ui = clear_playback_ui.clone();
-        let toast_overlay = toast_overlay.clone();
-        let playback_rt = rt_handle.clone();
-        let playback_config = app_config.clone();
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
-        let playback_lastfm_policy = lastfm_policy.clone();
+        let playback_progress = playback_progress.clone();
+        let playback_notices = playback_notices.clone();
         let playback_history_commands = library_commands.clone();
         let playback_shutdown_started = shutdown_started.clone();
+        let ctx = PlaybackContext {
+            model: sort_model.clone(),
+            active_source_key: active_source_key.clone(),
+            active_output: active_output.clone(),
+            album_art: hb.album_art.clone(),
+            title_label: hb.title_label.clone(),
+            artist_label: hb.artist_label.clone(),
+            media_ctrl: media_ctrl.clone(),
+            session: playback_session.clone(),
+            app_config: app_config.clone(),
+            rt_handle: rt_handle.clone(),
+            column_view: column_view.clone(),
+            source_registry: playback_source_registry.clone(),
+            lastfm_playback: playback_lastfm.clone(),
+            lastfm_policy: lastfm_policy.clone(),
+            progress: playback_progress.clone(),
+            notices: playback_notices.clone(),
+        };
 
         // Pre-build a spinner widget for the buffering state.
         let buffering_spinner = gtk::Spinner::builder()
@@ -3310,26 +3337,20 @@ pub(crate) fn build_window(
                             }
                         }
 
-                        // Always update the elapsed time label.
-                        position_label.set_label(&format_ms(position_ms));
-
-                        // Only update the progress slider and duration label
-                        // when the stream has a known duration (> 0).
-                        // Live streams (radio) have duration_ms == 0.
-                        seeking.set(true);
-                        if duration_ms > 0 {
-                            progress_adj.set_upper(duration_ms as f64);
-                            progress_adj.set_value(position_ms as f64);
-                            seeking.set(false);
-                            duration_label.set_label(&format_ms(duration_ms));
-                        } else {
-                            // Live stream: keep slider at 0, show "LIVE" or
-                            // blank for the duration label.
-                            progress_adj.set_upper(1.0);
-                            progress_adj.set_value(0.0);
-                            seeking.set(false);
-                            duration_label.set_label("LIVE");
+                        // Moving past the start is proof the item plays, so
+                        // earlier failed loads no longer count toward giving
+                        // up on skipping.
+                        if position_ms > 0 {
+                            playback_session.borrow_mut().reset_load_failures();
                         }
+
+                        // Outputs report 0 when they cannot measure the
+                        // stream (common for transcoded remote streams); the
+                        // catalogue's duration then stands in, and only an
+                        // item with neither is shown as live.
+                        let catalogue_ms = playback_session.borrow().current_duration_ms();
+                        playback_progress
+                            .show(position_ms, display_duration_ms(duration_ms, catalogue_ms));
                     }
 
                     PlayerEvent::TrackEnded { .. } => {
@@ -3348,48 +3369,12 @@ pub(crate) fn build_window(
                         );
 
                         // Repeat-one: replay the same track.
-                        if mode == RepeatMode::One
-                            && replay_current(&PlaybackContext {
-                                model: sm.clone(),
-                                active_source_key: active_source_key.clone(),
-                                active_output: active_output.clone(),
-                                album_art: album_art.clone(),
-                                title_label: title_label.clone(),
-                                artist_label: artist_label.clone(),
-                                media_ctrl: media_ctrl.clone(),
-                                session: playback_session.clone(),
-                                app_config: playback_config.clone(),
-                                rt_handle: playback_rt.clone(),
-                                column_view: cv.clone(),
-                                source_registry: playback_source_registry.clone(),
-                                lastfm_playback: playback_lastfm.clone(),
-                                lastfm_policy: playback_lastfm_policy.clone(),
-                            })
-                        {
+                        if mode == RepeatMode::One && replay_current(&ctx) {
                             continue;
                         }
 
                         // Auto-advance (shuffle-aware).
-                        let advanced = advance_track(
-                            &PlaybackContext {
-                                model: sm.clone(),
-                                active_source_key: active_source_key.clone(),
-                                active_output: active_output.clone(),
-                                album_art: album_art.clone(),
-                                title_label: title_label.clone(),
-                                artist_label: artist_label.clone(),
-                                media_ctrl: media_ctrl.clone(),
-                                session: playback_session.clone(),
-                                app_config: playback_config.clone(),
-                                rt_handle: playback_rt.clone(),
-                                column_view: cv.clone(),
-                                source_registry: playback_source_registry.clone(),
-                                lastfm_playback: playback_lastfm.clone(),
-                                lastfm_policy: playback_lastfm_policy.clone(),
-                            },
-                            mode,
-                            shuffle.is_active(),
-                        );
+                        let advanced = advance_track(&ctx, mode, shuffle.is_active());
 
                         if !advanced {
                             // End of playlist — invalidate the event generation
@@ -3423,13 +3408,11 @@ pub(crate) fn build_window(
 
                     PlayerEvent::Error { message, .. } => {
                         tracing::error!(error = %message, "Player error");
-                        // Show the failure to the user. Outputs reduce every
-                        // failure to a fixed category or fixed actionable
-                        // string before it can reach a player event — never
-                        // server text, a URL, or a credential — so the
-                        // message is safe to display verbatim. Without this,
-                        // a failed load is visible only in the logs.
-                        toast_overlay.add_toast(adw::Toast::new(&message));
+                        // Outputs reduce every failure to a fixed category or
+                        // fixed actionable string before it can reach a
+                        // player event — never server text, a URL, or a
+                        // credential — so the message is safe to display
+                        // verbatim.
                         let external_source = playback_session
                             .borrow()
                             .external_source_for_terminal(event_generation, false);
@@ -3438,6 +3421,7 @@ pub(crate) fn build_window(
                             retirement,
                         } = playback_error_disposition(external_source)
                         {
+                            playback_notices.show(&message);
                             super::open_files::invalidate_admission();
                             retire_terminal_playback_in_order(
                                 || playback_session.borrow_mut().clear(),
@@ -3471,6 +3455,7 @@ pub(crate) fn build_window(
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(false);
                         }
+                        recover_from_failed_load(&ctx, LoadFailure::Output(message));
                     }
                 }
             }
@@ -3551,6 +3536,8 @@ pub(crate) fn build_window(
         let playback_source_registry = source_registry.clone();
         let playback_lastfm = lastfm_playback.clone();
         let playback_lastfm_policy = lastfm_policy.clone();
+        let playback_progress = playback_progress.clone();
+        let playback_notices = playback_notices.clone();
         let playback_admission = library_commands.clone();
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
@@ -3585,6 +3572,8 @@ pub(crate) fn build_window(
             let playback_source_registry = playback_source_registry.clone();
             let playback_lastfm = playback_lastfm.clone();
             let playback_lastfm_policy = playback_lastfm_policy.clone();
+            let playback_progress = playback_progress.clone();
+            let playback_notices = playback_notices.clone();
             let playback_admission = playback_admission.clone();
             glib::MainContext::default().spawn_local(async move {
                 match admission.await {
@@ -3607,6 +3596,8 @@ pub(crate) fn build_window(
                             source_registry: playback_source_registry,
                             lastfm_playback: playback_lastfm,
                             lastfm_policy: playback_lastfm_policy,
+                            progress: playback_progress,
+                            notices: playback_notices,
                         };
                         if super::playback::play_external_session(pending.session(), &ctx) {
                             pending.commit();

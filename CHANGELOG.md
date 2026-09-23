@@ -121,6 +121,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unplayable tracks no longer stop the queue** — When the next track can't be opened (for
+  example, its file was deleted or its drive is unplugged) or can't be decoded, Tributary now
+  says so and skips to the following track. It stops with a message after several failures in
+  a row; a track you pick yourself is reported but not skipped.
+- **Now-playing controls** — The time and scrubber reset as soon as a track changes, streams
+  whose length can't be measured show the library's track length instead of "LIVE", and only
+  live radio disables the scrubber. Track changes no longer replace your selection in the track
+  list, the play button's tooltip says Pause while playing, and Escape clears the search.
 - **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
   12 servers, which by default reject the older authentication header Tributary used to
   send. Earlier Jellyfin versions keep working.
