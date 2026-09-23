@@ -27,7 +27,7 @@ const TOP_CLICK_VIEW_KEY: &str = "top-clicked";
 const TOP_VOTE_VIEW_KEY: &str = "top-voted";
 const NEARME_VIEW_KEY: &str = "near-me";
 
-/// Columns to show when viewing radio stations.
+/// IDs of the columns to show when viewing radio stations.
 const RADIO_VISIBLE_COLUMNS: &[&str] = &["Title", "Artist", "Album", "Genre", "Bitrate", "Format"];
 
 /// Check if a backend type is an exact built-in radio view.
@@ -61,39 +61,32 @@ pub fn radio_source_key(view: &ViewOrigin) -> Option<&'static str> {
 
 /// Switch column visibility for radio mode or restore music mode.
 ///
-/// When `radio = true`: show only radio-relevant columns. When false, restore
-/// all columns; the caller then reapplies the user's visibility preferences.
+/// When `radio = true`: show only radio-relevant columns, with the Artist and
+/// Album columns retitled for a station's country and state/province. When
+/// false, restore every column and its music title; the caller then reapplies
+/// the user's visibility preferences. Column IDs never change, so persisted
+/// visibility, order, and sort stay keyed to the music columns.
 pub fn apply_radio_columns(column_view: &gtk::ColumnView, radio: bool) {
+    let locale = rust_i18n::locale();
     let columns = column_view.columns();
     for i in 0..columns.n_items() {
-        if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
-            if let Some(title) = col.title() {
-                if title.is_empty() {
-                    continue;
-                }
-                let title = title.to_string();
-                if radio {
-                    let is_artist = title == "Artist" || title == "Country";
-                    let is_album = title == "Album" || title == "State/Province";
-                    if is_artist {
-                        col.set_visible(true);
-                        col.set_title(Some("Country"));
-                    } else if is_album {
-                        col.set_visible(true);
-                        col.set_title(Some("State/Province"));
-                    } else {
-                        col.set_visible(RADIO_VISIBLE_COLUMNS.contains(&title.as_str()));
-                    }
-                } else {
-                    col.set_visible(true);
-                    if title == "Country" {
-                        col.set_title(Some("Artist"));
-                    } else if title == "State/Province" {
-                        col.set_title(Some("Album"));
-                    }
-                }
-            }
-        }
+        let Some(col) = columns.item(i).and_downcast::<gtk::ColumnViewColumn>() else {
+            continue;
+        };
+        let Some(id) = col.id() else {
+            continue; // sentinel column
+        };
+        col.set_visible(!radio || RADIO_VISIBLE_COLUMNS.contains(&id.as_str()));
+        col.set_title(Some(&column_title(&id, radio, &locale)));
+    }
+}
+
+/// Display title of column `id` in radio or music mode.
+fn column_title(id: &str, radio: bool, locale: &str) -> String {
+    match (radio, id) {
+        (true, "Artist") => rust_i18n::t!("columns.country", locale = locale).into_owned(),
+        (true, "Album") => rust_i18n::t!("columns.state_province", locale = locale).into_owned(),
+        _ => preferences::column_title(id, locale),
     }
 }
 
@@ -256,7 +249,7 @@ fn clear_exact_consent_prerequisite(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_radio_backend, radio_source_key, radio_view_origin, NEARME_SOURCE_KEY,
+        column_title, is_radio_backend, radio_source_key, radio_view_origin, NEARME_SOURCE_KEY,
         TOP_CLICK_SOURCE_KEY, TOP_VOTE_SOURCE_KEY,
     };
     use crate::architecture::ViewOrigin;
@@ -280,5 +273,14 @@ mod tests {
         }
         assert!(!is_radio_backend("radio-attacker-defined"));
         assert_eq!(radio_view_origin("radio-attacker-defined"), None);
+    }
+
+    #[test]
+    fn radio_mode_retitles_only_artist_and_album_in_the_given_locale() {
+        assert_eq!(column_title("Artist", true, "de"), "Land");
+        assert_eq!(column_title("Album", true, "de"), "Bundesland");
+        assert_eq!(column_title("Rating", true, "de"), "Bewertung");
+        assert_eq!(column_title("Artist", false, "de"), "Künstler");
+        assert_eq!(column_title("Album", false, "fr"), "Album");
     }
 }

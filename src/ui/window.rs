@@ -2975,11 +2975,9 @@ pub(crate) fn build_window(
         let cv = column_view.clone();
         let active_source_key = active_source_key.clone();
         sorter.connect_changed(move |_, _| {
-            // Don't persist sort state while viewing a radio station: in
-            // radio mode the Artist/Album columns are renamed to
-            // Country/State-Province, so the saved title could never be
-            // re-matched against the music-mode columns on the next launch
-            // (issue #38).
+            // Don't persist sort state while viewing a radio station: radio
+            // mode repurposes the Artist/Album columns as Country and
+            // State/Province, so a station sort is not the user's music sort.
             if super::radio::is_radio_backend(&active_source_key.borrow()) {
                 return;
             }
@@ -3476,9 +3474,9 @@ pub(crate) fn build_window(
                 let save_queued = save_queued.clone();
                 glib::idle_add_local_once(move || {
                     save_queued.set(false);
-                    // Skip persistence while in radio mode — the renamed
-                    // Artist→Country / Album→State-Province columns would
-                    // corrupt the saved column order (issue #38).
+                    // Skip persistence while in radio mode, which
+                    // repurposes and hides columns; the saved order is the
+                    // music layout.
                     if super::radio::is_radio_backend(&active_source_key.borrow()) {
                         return;
                     }

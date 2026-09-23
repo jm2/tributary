@@ -58,6 +58,7 @@ columns:
   artist: "Исполнитель"
   album: "Альбом"
   genre: "Жанр"
+  composer: "Композитор"
   year: "Год"
   date_modified: "Дата изменения"
   bitrate: "Битрейт"

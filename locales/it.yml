@@ -58,6 +58,7 @@ columns:
   artist: "Artista"
   album: "Album"
   genre: "Genere"
+  composer: "Compositore"
   year: "Anno"
   date_modified: "Data di modifica"
   bitrate: "Bitrate"

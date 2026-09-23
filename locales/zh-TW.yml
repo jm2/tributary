@@ -58,6 +58,7 @@ columns:
   artist: "演出者"
   album: "專輯"
   genre: "類型"
+  composer: "作曲者"
   year: "年份"
   date_modified: "修改日期"
   bitrate: "位元率"

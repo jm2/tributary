@@ -58,6 +58,7 @@ columns:
   artist: "アーティスト"
   album: "アルバム"
   genre: "ジャンル"
+  composer: "作曲者"
   year: "年"
   date_modified: "更新日"
   bitrate: "ビットレート"
