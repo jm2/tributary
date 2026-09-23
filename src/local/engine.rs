@@ -15939,25 +15939,51 @@ mod tests {
         start: std::time::Instant,
     ) -> Q4StartupTimeline {
         let mut timeline = Q4StartupTimeline::default();
-        loop {
-            tokio::select! {
-                biased;
-                ack = flush_rx.recv() => {
-                    assert!(ack.is_ok(), "Flush barrier must be acknowledged");
-                    timeline.flush_ack_us = Some(start.elapsed().as_micros() as u64);
-                    break;
+        let mut events_open = true;
+        let ack = loop {
+            if events_open {
+                tokio::select! {
+                    biased;
+                    // Event arm FIRST under `biased;`: the engine publishes
+                    // ScanComplete (and any during-scan command's event)
+                    // before it acks the Flush barrier, so when the collector
+                    // is polled with both channels ready the queued events
+                    // must be stamped ahead of the ack. Polling the flush arm
+                    // first let the ack win that race: the loop broke, the
+                    // post-loop drain stamped ScanComplete AFTER flush_ack_us,
+                    // and the bench's `scan_complete_us <= flush_ack_us`
+                    // settlement assert panicked (tr-kcfmsh, reproduced on
+                    // main fc5d0d6a).
+                    event = event_rx.recv() => {
+                        match event {
+                            Ok(event) => {
+                                // Stamp arrival, not wait start: sampling
+                                // before the select! would record every
+                                // event with the previous iteration's time
+                                // and underreport the startup endpoints
+                                // whenever the loop blocked on an empty
+                                // channel.
+                                let elapsed_us = start.elapsed().as_micros() as u64;
+                                timeline.record(&event, elapsed_us, command_track);
+                            }
+                            // Sender dropped: every published event has
+                            // already been consumed (a closed async_channel
+                            // delivers its buffered values before reporting
+                            // close). Stop polling this arm — a closed
+                            // receiver resolves immediately and would
+                            // otherwise preempt the pending ack on every
+                            // poll — and wait on the ack alone.
+                            Err(_) => { events_open = false; }
+                        }
+                    }
+                    ack = flush_rx.recv() => { break ack; }
                 }
-                event = event_rx.recv() => {
-                    let event = event.expect("engine event channel stays open until flush");
-                    // Stamp arrival, not wait start: sampling before the
-                    // select! would record every event with the previous
-                    // iteration's time and underreport the startup endpoints
-                    // whenever the loop blocked on an empty channel.
-                    let elapsed_us = start.elapsed().as_micros() as u64;
-                    timeline.record(&event, elapsed_us, command_track);
-                }
+            } else {
+                break flush_rx.recv().await;
             }
-        }
+        };
+        assert!(ack.is_ok(), "Flush barrier must be acknowledged");
+        timeline.flush_ack_us = Some(start.elapsed().as_micros() as u64);
         // The command event was published before the flush ack, so a
         // bounded non-blocking drain settles any remaining race.
         while let Ok(event) = event_rx.try_recv() {
@@ -16028,14 +16054,84 @@ mod tests {
             "arrival stamps must be strictly monotonic across events"
         );
         // The flush send happens after the second feeder sleep, so its
-        // stamp is floored at the second delay. It may legitimately land
-        // BEFORE the FullSync stamp: under `biased;` the flush arm wins
-        // when both channels are ready and the drain loop then stamps the
-        // already-queued event — still at its own receipt, just later.
+        // stamp is floored at the second delay. The event arm is polled
+        // first under `biased;`, so a queued FullSync is stamped before
+        // the ack even when both channels are ready at the same poll —
+        // the ack never preempts already-published events (tr-kcfmsh).
         let flush_ack_us = timeline.flush_ack_us.expect("flush ack recorded");
         assert!(
             flush_ack_us >= SECOND_DELAY_MS * 1_000,
             "the flush ack must be stamped at its own arrival (>= {SECOND_DELAY_MS} ms), got {flush_ack_us} us"
+        );
+        assert!(
+            flush_ack_us >= fullsync_us,
+            "the flush ack must not preempt an already-queued event (>= {fullsync_us} us), got {flush_ack_us} us"
+        );
+    }
+
+    /// Regression (tr-kcfmsh): the settlement sampler must drain
+    /// already-published events BEFORE selecting the Flush ack. Pre-load
+    /// the event channel with a large queue whose LAST entry is
+    /// ScanComplete, and ack the Flush barrier before the sampler is ever
+    /// polled, so both channels are ready at its first `select!`. Under
+    /// the old flush-first bias the ack won that race immediately and the
+    /// post-loop drain stamped ScanComplete milliseconds AFTER the ack,
+    /// panicking the Q4 bench (`scan_complete_us <= flush_ack_us`). With
+    /// event-first bias every queued event is consumed in-loop and the
+    /// ack is stamped last. The queue is sized so the defective ordering
+    /// fails the assert by a wide, deterministic margin rather than a
+    /// clock-granularity flake. Cheap by construction: no fixture tree,
+    /// no engine, no `#[ignore]`.
+    #[tokio::test]
+    async fn q4_startup_timeline_acks_only_after_queued_events_drain() {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (flush_tx, flush_rx) = async_channel::bounded(1);
+        const QUEUED_PROGRESS_EVENTS: usize = 50_000;
+        // Pre-load both channels BEFORE the sampler runs: unbounded event
+        // sends and the single buffered flush permit complete without a
+        // receiver, so both arms are ready at the sampler's first poll —
+        // the exact interleaving that panicked the bench on main.
+        for i in 0..QUEUED_PROGRESS_EVENTS as u64 {
+            event_tx
+                .send(LibraryEvent::ScanProgress(i, QUEUED_PROGRESS_EVENTS as u64))
+                .await
+                .expect("queue progress event");
+        }
+        event_tx
+            .send(LibraryEvent::ScanComplete)
+            .await
+            .expect("queue ScanComplete last");
+        flush_tx.send(()).await.expect("ack the flush barrier");
+
+        let start = std::time::Instant::now();
+        // Hold the sender open across collection: the harness invariant is
+        // that the event channel stays open until the flush ack, and with
+        // event-first bias a closed event channel would win the poll over
+        // the pending ack.
+        let timeline = {
+            let _keep_open = event_tx;
+            let _keep_open_ack = flush_tx;
+            q4_collect_startup_timeline(
+                &event_rx,
+                flush_rx,
+                "q4-timing-test-no-command-track",
+                start,
+            )
+            .await
+        };
+
+        let scan_complete_us = timeline
+            .scan_complete_us
+            .expect("queued ScanComplete recorded");
+        let flush_ack_us = timeline.flush_ack_us.expect("flush ack recorded");
+        assert_eq!(
+            timeline.scan_progress_events, QUEUED_PROGRESS_EVENTS,
+            "every queued progress event must be consumed before the ack"
+        );
+        assert!(
+            scan_complete_us <= flush_ack_us,
+            "the Flush barrier must not preempt queued events: ScanComplete at \
+             {scan_complete_us} us must not land after the ack at {flush_ack_us} us"
         );
     }
 
