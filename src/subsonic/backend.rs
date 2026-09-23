@@ -2413,55 +2413,19 @@ mod tests {
     }
     /// A `tracing` layer capturing the rendered fields of every WARN- or
     /// ERROR-level event emitted under it.
-    struct DiagnosticSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for DiagnosticSink {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if !matches!(
-                event.metadata().level(),
-                &tracing::Level::WARN | &tracing::Level::ERROR
-            ) {
-                return;
-            }
-            let mut visitor = DiagnosticVisitor { fields: Vec::new() };
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push(format!(
-                "{} {}",
-                event.metadata().level(),
-                visitor.fields.join(" ")
-            ));
-        }
-    }
-
-    struct DiagnosticVisitor {
-        fields: Vec<String>,
-    }
-
-    impl tracing::field::Visit for DiagnosticVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.fields.push(format!("{}={value:?}", field.name()));
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.fields.push(format!("{}={value}", field.name()));
-        }
-    }
-
     fn capture_diagnostics(body: impl FnOnce()) -> Vec<String> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(DiagnosticSink(std::sync::Arc::clone(&sink)));
-        // The default dispatcher is scoped to `body`, which drives the fixture
-        // runtime on this same thread so the captured events belong to it.
-        tracing::subscriber::with_default(subscriber, body);
-        let captured = sink.lock().unwrap().clone();
-        captured
+        crate::test_log_capture::capture_events(body)
+            .into_iter()
+            .filter(|event| matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR))
+            .map(|event| {
+                let fields: Vec<String> = event
+                    .fields
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect();
+                format!("{} {}", event.level, fields.join(" "))
+            })
+            .collect()
     }
 
     /// A catalogue whose single artist reports `songCount` as a string — a

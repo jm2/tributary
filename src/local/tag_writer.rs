@@ -4747,53 +4747,15 @@ mod tests {
         *stolen.lock().unwrap() = Some(stolen_leaf);
     }
 
-    /// A `tracing` layer capturing the message of every ERROR-level event
-    /// emitted under it, so a regression can require the loud signal the
-    /// contested-cleanup refusal must carry.
-    #[cfg(unix)]
-    struct ErrorEventSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    #[cfg(unix)]
-    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ErrorEventSink {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().level() != &tracing::Level::ERROR {
-                return;
-            }
-            event.record(&mut MessageVisitor(std::sync::Arc::clone(&self.0)));
-        }
-    }
-
-    /// A `tracing` field visitor extracting the `message` field of an
-    /// ERROR-level event into the sink.
-    #[cfg(unix)]
-    struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    #[cfg(unix)]
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0.lock().unwrap().push(format!("{value:?}"));
-            }
-        }
-    }
-
     /// Run `body` capturing the message of every ERROR-level tracing event
     /// it emits on this thread.
     #[cfg(unix)]
     fn capture_error_events(body: impl FnOnce()) -> Vec<String> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(ErrorEventSink(std::sync::Arc::clone(&sink)));
-        // The default dispatcher is scoped to `body`; it is restored before
-        // this returns.
-        tracing::subscriber::with_default(subscriber, body);
-        let captured = sink.lock().unwrap().clone();
-        captured
+        crate::test_log_capture::capture_events(body)
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::ERROR)
+            .filter_map(|event| event.message().map(str::to_owned))
+            .collect()
     }
 
     /// Drive the contested rehearsal under the armed verify→unlink window:
