@@ -379,25 +379,8 @@ impl PlaylistManager {
         name: &str,
         rules: &SmartRules,
     ) -> Result<playlist::Model, DbErr> {
-        let storage = smart_rules_storage(rules)?;
-        let now = now_rfc3339();
         let txn = crate::db::begin_write(&self.db).await?;
-        let result = playlist::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
-            name: Set(name.to_string()),
-            is_smart: Set(true),
-            smart_rules_json: Set(Some(storage.json)),
-            limit_enabled: Set(storage.limit_enabled),
-            limit_value: Set(storage.limit_value),
-            limit_unit: Set(storage.limit_unit),
-            limit_sort: Set(storage.limit_sort),
-            match_mode: Set(storage.match_mode),
-            live_updating: Set(true),
-            created_at: Set(now.clone()),
-            updated_at: Set(now),
-        }
-        .insert(&txn)
-        .await?;
+        let result = insert_smart_playlist(&txn, name, rules, now_rfc3339()).await?;
         txn.commit().await?;
         info!(id = %result.id, "Smart playlist created");
         Ok(result)
@@ -1193,55 +1176,40 @@ impl PlaylistManager {
 
     // ── Default smart playlists ──────────────────────────────────────
 
-    /// Seed default smart playlists on first launch.
+    /// Seed the default smart playlists (Recently Added, Recently Played,
+    /// Top 25 Most Played) once per database.
     ///
-    /// Creates: Recently Added, Recently Played, Top 25 Most Played.
-    /// Called from the engine when the playlist table is empty.
+    /// Seeding happens only while the database has never held a playlist, so
+    /// deleting every playlist later does not bring the defaults back. The
+    /// playlist-sidebar revision advances on every playlist insert, update,
+    /// and delete and never decreases, so an empty table at revision zero
+    /// means no playlist was ever stored. The check and the inserts share one
+    /// write transaction.
+    ///
+    /// Returns the created playlists, or none when seeding was not needed.
     pub async fn seed_defaults(&self) -> Result<Vec<playlist::Model>, DbErr> {
-        let mut created = Vec::new();
+        let defaults = [
+            ("Recently Added", recently_added_default_rules()),
+            ("Recently Played", recently_played_default_rules()),
+            ("Top 25 Most Played", top_25_most_played_default_rules()),
+        ];
 
-        // 1. Recently Added — Date Added is in the last 30 days
-        let rules_recently_added = smart_rules::SmartRules {
-            match_mode: smart_rules::MatchMode::All,
-            rules: vec![smart_rules::SmartRule {
-                field: smart_rules::RuleField::DateAdded,
-                operator: smart_rules::RuleOperator::IsInTheLast {
-                    amount: 30,
-                    unit: smart_rules::DateUnit::Days,
-                },
-                value: smart_rules::RuleValue::Number(30),
-            }],
-            limit: None,
-            sort_order: vec![smart_rules::SortCriterion {
-                field: smart_rules::SortField::DateAdded,
-                direction: smart_rules::SortDirection::Descending,
-            }],
-        };
-        let pl = self
-            .create_smart_playlist("Recently Added", &rules_recently_added)
-            .await?;
-        info!(id = %pl.id, "Seeded: Recently Added");
-        created.push(pl);
+        let txn = crate::db::begin_write(&self.db).await?;
+        let never_held_playlists = playlist::Entity::find().one(&txn).await?.is_none()
+            && super::playlist_sidebar::query_revision(&txn).await?.value() == 0;
+        if !never_held_playlists {
+            txn.commit().await?;
+            return Ok(Vec::new());
+        }
 
-        // 2. Recently Played — authoritative playback time in the inclusive
-        // last-14-day window, newest first with stable TrackId ties.
-        let rules_recently_played = recently_played_default_rules();
-        let pl = self
-            .create_smart_playlist("Recently Played", &rules_recently_played)
-            .await?;
-        info!(id = %pl.id, "Seeded: Recently Played");
-        created.push(pl);
-
-        // 3. Top 25 Most Played — positive counts only, then count descending,
-        // playback time descending (unknown last), and stable TrackId ties.
-        let rules_top25 = top_25_most_played_default_rules();
-        let pl = self
-            .create_smart_playlist("Top 25 Most Played", &rules_top25)
-            .await?;
-        info!(id = %pl.id, "Seeded: Top 25 Most Played");
-        created.push(pl);
-
-        info!(count = created.len(), "Default smart playlists seeded");
+        let mut created = Vec::with_capacity(defaults.len());
+        let timestamps = sequential_creation_timestamps(chrono::Utc::now());
+        for ((name, rules), created_at) in defaults.iter().zip(timestamps) {
+            let playlist = insert_smart_playlist(&txn, name, rules, created_at).await?;
+            info!(id = %playlist.id, name, "Seeded default smart playlist");
+            created.push(playlist);
+        }
+        txn.commit().await?;
         Ok(created)
     }
 }
@@ -1333,6 +1301,55 @@ fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
                     .to_owned(),
             ),
         )
+}
+
+/// Insert one fully configured smart playlist. Rules and every compatibility
+/// column are encoded before the row is written.
+async fn insert_smart_playlist<C>(
+    db: &C,
+    name: &str,
+    rules: &SmartRules,
+    created_at: String,
+) -> Result<playlist::Model, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let storage = smart_rules_storage(rules)?;
+    playlist::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        name: Set(name.to_string()),
+        is_smart: Set(true),
+        smart_rules_json: Set(Some(storage.json)),
+        limit_enabled: Set(storage.limit_enabled),
+        limit_value: Set(storage.limit_value),
+        limit_unit: Set(storage.limit_unit),
+        limit_sort: Set(storage.limit_sort),
+        match_mode: Set(storage.match_mode),
+        live_updating: Set(true),
+        created_at: Set(created_at.clone()),
+        updated_at: Set(created_at),
+    }
+    .insert(db)
+    .await
+}
+
+fn recently_added_default_rules() -> smart_rules::SmartRules {
+    smart_rules::SmartRules {
+        match_mode: smart_rules::MatchMode::All,
+        rules: vec![smart_rules::SmartRule {
+            field: smart_rules::RuleField::DateAdded,
+            operator: smart_rules::RuleOperator::IsInTheLast {
+                amount: 30,
+                unit: smart_rules::DateUnit::Days,
+            },
+            value: smart_rules::RuleValue::Number(30),
+        }],
+        limit: None,
+        sort_order: vec![smart_rules::SortCriterion {
+            field: smart_rules::SortField::DateAdded,
+            direction: smart_rules::SortDirection::Descending,
+        }],
+    }
 }
 
 fn recently_played_default_rules() -> smart_rules::SmartRules {
@@ -1604,6 +1621,19 @@ fn valid_track_match_duration(track: &track::Model) -> Option<i32> {
 /// Get current time as RFC3339 string.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Creation timestamps for playlists created together, strictly increasing
+/// from `base` in creation order.
+///
+/// The sidebar orders playlists that have no explicit position by
+/// `created_at` and then by random ID, so playlists created in one
+/// transaction must not share a timestamp. RFC 3339 text with the `+00:00`
+/// offset sorts chronologically even when the fractional-second width varies.
+pub(super) fn sequential_creation_timestamps(
+    base: chrono::DateTime<chrono::Utc>,
+) -> impl Iterator<Item = String> {
+    (0_i64..).map(move |offset| (base + chrono::TimeDelta::microseconds(offset)).to_rfc3339())
 }
 
 #[cfg(test)]
@@ -1995,6 +2025,69 @@ mod tests {
         assert_eq!(top_25.limit_sort.as_deref(), Some(r#""MostPlayed""#));
         assert_eq!(top_25.match_mode, "all");
         assert!(top_25.live_updating);
+    }
+
+    #[tokio::test]
+    async fn defaults_are_seeded_once_in_order_and_stay_deleted() {
+        use crate::local::playlist_sidebar::{
+            load_playlist_sidebar_snapshot, PlaylistSidebarState,
+        };
+
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let seeded = manager.seed_defaults().await.expect("seed fresh database");
+        let expected = ["Recently Added", "Recently Played", "Top 25 Most Played"];
+        let seeded_names: Vec<&str> = seeded
+            .iter()
+            .map(|playlist| playlist.name.as_str())
+            .collect();
+        assert_eq!(seeded_names, expected);
+
+        let snapshot = load_playlist_sidebar_snapshot(&db)
+            .await
+            .expect("load sidebar snapshot");
+        let PlaylistSidebarState::Ready(rows) = snapshot.state() else {
+            panic!("sidebar snapshot must be available");
+        };
+        let sidebar_names: Vec<&str> = rows.iter().map(|row| row.name()).collect();
+        assert_eq!(sidebar_names, expected);
+
+        assert!(manager
+            .seed_defaults()
+            .await
+            .expect("skip seeding a populated database")
+            .is_empty());
+        for playlist in &seeded {
+            manager
+                .delete_playlist(&playlist.id)
+                .await
+                .expect("delete default playlist");
+        }
+        assert!(manager
+            .seed_defaults()
+            .await
+            .expect("skip seeding after the user deleted everything")
+            .is_empty());
+        assert!(manager
+            .list_playlists()
+            .await
+            .expect("list playlists")
+            .is_empty());
+    }
+
+    #[test]
+    fn sequential_creation_timestamps_sort_in_creation_order_across_a_second() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-09-23T10:00:00.999998+00:00")
+            .expect("parse base timestamp")
+            .with_timezone(&chrono::Utc);
+        let timestamps: Vec<String> = super::sequential_creation_timestamps(base)
+            .take(4)
+            .collect();
+
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, timestamps);
     }
 
     #[tokio::test]

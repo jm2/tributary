@@ -52,21 +52,15 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 // LibraryEvent — messages sent to GTK main thread
 // ---------------------------------------------------------------------------
 
-/// Seed an empty playlist table when possible, then always attempt one
-/// versioned publication through the engine-owned publisher.
+/// Seed the default playlists if this database has never held one, then
+/// always attempt one versioned publication through the engine-owned
+/// publisher.
 async fn seed_default_playlists_and_request(
     playlist_manager: &super::playlist_manager::PlaylistManager,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) {
-    match playlist_manager.list_playlists().await {
-        Ok(playlists) if playlists.is_empty() => {
-            info!("No playlists found — seeding defaults");
-            if let Err(error) = playlist_manager.seed_defaults().await {
-                warn!(%error, "Failed to seed default playlists");
-            }
-        }
-        Ok(_) => {}
-        Err(error) => warn!(%error, "Failed to load playlists before default seeding"),
+    if let Err(error) = playlist_manager.seed_defaults().await {
+        warn!(%error, "Failed to seed default playlists");
     }
 
     if matches!(

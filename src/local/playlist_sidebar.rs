@@ -231,7 +231,7 @@ where
     Ok(PlaylistSidebarSnapshot::new(revision, state))
 }
 
-async fn query_revision<C>(db: &C) -> Result<PlaylistSidebarRevision, DbErr>
+pub(super) async fn query_revision<C>(db: &C) -> Result<PlaylistSidebarRevision, DbErr>
 where
     C: ConnectionTrait,
 {
