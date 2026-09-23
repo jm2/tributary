@@ -20,6 +20,7 @@ header:
   main_menu: "메인 메뉴"
   playback_position: "재생 위치"
   volume: "음량"
+  rescan_library: "라이브러리 다시 검색"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "앨범"
   folder: "폴더"
   all: "전체"
+  folder_root_unavailable: "%{name} (사용할 수 없음)"
+  folder_unavailable_notice: "이 폴더는 현재 사용할 수 없습니다"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:

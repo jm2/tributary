@@ -20,6 +20,7 @@ header:
   main_menu: "Menu principale"
   playback_position: "Posizione di riproduzione"
   volume: "Volume"
+  rescan_library: "Ripeti la scansione della libreria"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "Album"
   folder: "Cartella"
   all: "Tutti"
+  folder_root_unavailable: "%{name} (non disponibile)"
+  folder_unavailable_notice: "Questa cartella al momento non è disponibile"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:

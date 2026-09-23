@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+  distinct identities for multiple roots, lazy navigation, and a visible notice when a
+  root is unavailable.
 - **Album artwork in the browser** — The Album pane can show cover art for local and server
   albums. Turn it on under Preferences → Browser Views and choose Small, Medium, or Large.
 - **Folder browsing** — A Folder pane browses the local library by library folder and
@@ -47,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Library folders that come and go** — A library folder on a drive or network share that
+  connects after Tributary starts, or is remounted, is now watched and scanned within about
+  half a minute, and the folder browser shows it as unavailable while it is away and keeps
+  up with added, removed and renamed folders. The main menu also has a Rescan Library item.
+- **Local library edge cases** — Changing only the letter case of a file name no longer
+  duplicates the track, files left hidden by an interrupted tag save are put back, tag
+  editing is reported as unavailable on Windows FAT and exFAT drives instead of failing on
+  save, and a folder that used to be a separate drive is scanned again once it is not.
 - **Settings are no longer lost silently** — An unreadable settings or outputs file is kept aside
   with a notice instead of being replaced, and a failed save or unreachable MPD server when adding
   an output is reported. Preferences changes no longer disturb the radio station layout, closing

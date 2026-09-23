@@ -3632,6 +3632,24 @@ pub(crate) fn build_window(
         window.add_action(&prefs_action);
     }
 
+    // ── Rescan the local library on request ──────────────────────────
+    {
+        let admission = library_commands.clone();
+        let spinner = scan_spinner.clone();
+        let rescan_action = gtk::gio::SimpleAction::new("rescan-library", None);
+        rescan_action.connect_activate(move |_, _| {
+            if admission
+                .try_send(crate::local::engine::LibraryCommand::Rescan)
+                .is_accepted()
+            {
+                // The scan's ScanComplete hides it again.
+                spinner.set_visible(true);
+                spinner.set_spinning(true);
+            }
+        });
+        window.add_action(&rescan_action);
+    }
+
     // ── Ctrl+F: focus browser search entry ───────────────────────────
     {
         let bw = browser_widget.clone();
@@ -3866,7 +3884,7 @@ pub(super) fn apply_full_sync_publication(
     // Local on screen is republished in place: a same-source refresh, not a
     // source switch, so nothing the user set up in the view is reset.
     if *active_source_key.borrow() == "local" {
-        let (folder_model, _) = build_folder_model(app_config, &objects);
+        let (folder_model, _) = build_folder_model(app_config, browser_state, &objects);
         *master_tracks.borrow_mut() = objects.clone();
         browser::resync_browser_data(browser_widget, browser_state, &objects, folder_model);
     }
@@ -3896,7 +3914,7 @@ pub(super) fn display_local_tracks(
         status_label,
         column_view,
     );
-    let (folder_model, _) = build_folder_model(app_config, objects);
+    let (folder_model, _) = build_folder_model(app_config, browser_state, objects);
     browser::attach_folder_model(browser_state, folder_model);
 }
 
@@ -4192,11 +4210,12 @@ pub(super) fn refresh_playlist_play_statistics(
 }
 
 /// Build the folder-browsing model for the local library: configured roots
-/// (with availability/renamed state observed from the filesystem) plus the
+/// with the availability the library engine last reported for them, plus the
 /// placed local catalog. The report is dropped by callers that surface
 /// omissions through the pane's policy rows instead.
 fn build_folder_model(
     app_config: &Rc<RefCell<preferences::AppConfig>>,
+    browser_state: &browser::BrowserState,
     objects: &[TrackObject],
 ) -> (
     folder_browser::FolderBrowser,
@@ -4206,7 +4225,12 @@ fn build_folder_model(
         .borrow()
         .library_paths
         .iter()
-        .map(|path| folder_browser::BrowsableRoot::from_configured(path, None))
+        .map(|path| {
+            folder_browser::BrowsableRoot::new(
+                path,
+                browser_state.root_availability(std::path::Path::new(path)),
+            )
+        })
         .collect();
     let inputs: Vec<folder_browser::TrackPathInput> = objects
         .iter()
@@ -4368,6 +4392,7 @@ fn setup_library_events(
                         let source_tracks = source_tracks.clone();
                         let browser_widget = browser_widget.clone();
                         let browser_state = browser_state.clone();
+                        let app_config = app_config.clone();
                         let active_source_key = active_source_key.clone();
                         let source_navigation = source_navigation.clone();
                         let navigation_request = source_navigation.borrow().latest_request("local");
@@ -4395,10 +4420,13 @@ fn setup_library_events(
                             let st = source_tracks.borrow();
                             let local_tracks = st.get("local").cloned().unwrap_or_default();
                             drop(st);
-                            browser::refresh_browser_data(
+                            let (folder_model, _) =
+                                build_folder_model(&app_config, &browser_state, &local_tracks);
+                            browser::refresh_local_browser_data(
                                 &browser_widget,
                                 &browser_state,
                                 &local_tracks,
+                                folder_model,
                             );
                         });
                     }
@@ -4452,6 +4480,7 @@ fn setup_library_events(
                         let source_tracks = source_tracks.clone();
                         let browser_widget = browser_widget.clone();
                         let browser_state = browser_state.clone();
+                        let app_config = app_config.clone();
                         let active_source_key = active_source_key.clone();
                         let source_navigation = source_navigation.clone();
                         let navigation_request = source_navigation.borrow().latest_request("local");
@@ -4479,10 +4508,13 @@ fn setup_library_events(
                             let st = source_tracks.borrow();
                             let local_tracks = st.get("local").cloned().unwrap_or_default();
                             drop(st);
-                            browser::refresh_browser_data(
+                            let (folder_model, _) =
+                                build_folder_model(&app_config, &browser_state, &local_tracks);
+                            browser::refresh_local_browser_data(
                                 &browser_widget,
                                 &browser_state,
                                 &local_tracks,
+                                folder_model,
                             );
                         });
                     }
@@ -4719,6 +4751,25 @@ fn setup_library_events(
                             _ => rust_i18n::t!("preferences.reauthorization_failed_status"),
                         };
                         status_label.set_text(status.as_ref());
+                    }
+                }
+
+                LibraryEvent::RootStatusChanged(statuses) => {
+                    // A root that went away or came back changes what the
+                    // folder pane may browse; FullSync covers scans, so
+                    // only a change seen on screen needs a refresh here.
+                    if browser_state.set_root_status(statuses)
+                        && *active_source_key.borrow() == "local"
+                    {
+                        let local_tracks = master_tracks.borrow().clone();
+                        let (folder_model, _) =
+                            build_folder_model(&app_config, &browser_state, &local_tracks);
+                        browser::refresh_local_browser_data(
+                            &browser_widget,
+                            &browser_state,
+                            &local_tracks,
+                            folder_model,
+                        );
                     }
                 }
 

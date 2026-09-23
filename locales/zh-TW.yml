@@ -20,6 +20,7 @@ header:
   main_menu: "主選單"
   playback_position: "播放位置"
   volume: "音量"
+  rescan_library: "重新掃描音樂庫"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "專輯"
   folder: "資料夾"
   all: "全部"
+  folder_root_unavailable: "%{name}（無法使用）"
+  folder_unavailable_notice: "此資料夾目前無法使用"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:

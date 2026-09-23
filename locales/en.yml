@@ -20,6 +20,7 @@ header:
   main_menu: "Main Menu"
   playback_position: "Playback position"
   volume: "Volume"
+  rescan_library: "Rescan Library"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "Album"
   folder: "Folder"
   all: "All"
+  folder_root_unavailable: "%{name} (unavailable)"
+  folder_unavailable_notice: "This folder is currently unavailable"
   # Album-pane artwork toggle labels. The browser key set ships in
   # every locale at the `browser:` level; artwork controls live under
   # preferences to match the existing grouping-toggle placement.

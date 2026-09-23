@@ -992,6 +992,20 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
     drop(destination_file);
     destination_result.map_err(|_| TagWritePreflightError::Unavailable)?;
 
+    // Off Unix the commit publishes the staged copy with `std::fs::hard_link`,
+    // which FAT and exFAT volumes do not support. Rehearse it too, so such a
+    // volume reports tag editing unavailable instead of failing every save.
+    #[cfg(not(unix))]
+    {
+        let link = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(staged_sibling_name(path.as_os_str()));
+        std::fs::hard_link(replacement.path(), &link)
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        std::fs::remove_file(&link).map_err(|_| TagWritePreflightError::Unavailable)?;
+    }
+
     replacement
         .persist_to(destination.path())
         .map_err(|_| TagWritePreflightError::Unavailable)?;

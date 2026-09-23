@@ -18,7 +18,8 @@ use super::album_pane_art::{
     AlbumArtBinder, AlbumArtCache, AlbumArtController, FALLBACK_PLACEHOLDER_ICON,
 };
 use super::objects::{AlbumArtCandidate, BrowserItem, FolderRowKind, TrackObject};
-use crate::ui::folder_browser::{join_native, FolderBrowser, RootBrowseError};
+use crate::local::engine::LibraryRootStatus;
+use crate::ui::folder_browser::{join_native, FolderBrowser, RootAvailability, RootBrowseError};
 use tracing::debug;
 
 /// Callback invoked when the browser selection changes.
@@ -57,6 +58,9 @@ pub struct BrowserState {
     /// pathless source is active or no library roots are configured — the
     /// folder pane then shows the explicit omission notice instead.
     folder_model: Rc<RefCell<Option<FolderBrowser>>>,
+    /// The library engine's latest availability verdict per configured
+    /// root, projected into every folder model the window builds.
+    root_status: Rc<RefCell<Vec<LibraryRootStatus>>>,
     /// Where the folder pane currently points.
     folder_location: Rc<RefCell<FolderLocation>>,
     /// The file-path prefix the folder pane currently filters by
@@ -105,6 +109,32 @@ enum FolderLocation {
 }
 
 impl BrowserState {
+    /// Record the engine's latest root availability, returning whether it
+    /// changed.
+    pub fn set_root_status(&self, statuses: Vec<LibraryRootStatus>) -> bool {
+        let mut current = self.root_status.borrow_mut();
+        if *current == statuses {
+            return false;
+        }
+        *current = statuses;
+        true
+    }
+
+    /// The engine's verdict for one configured root. A root the engine has
+    /// not reported on yet is unavailable.
+    pub fn root_availability(&self, root: &std::path::Path) -> RootAvailability {
+        let available = self
+            .root_status
+            .borrow()
+            .iter()
+            .any(|status| status.available && status.path == root);
+        if available {
+            RootAvailability::Available
+        } else {
+            RootAvailability::Unavailable
+        }
+    }
+
     /// Compose the current filter from the shared axes and invoke the
     /// filter callback — the ONE composition rule (issue #250). Every
     /// mutation path — pane selection, debounced search, album-artist
@@ -250,6 +280,7 @@ pub fn build_browser(
         on_filter_changed,
         use_album_artist: Rc::new(Cell::new(use_album_artist)),
         folder_model,
+        root_status: Rc::new(RefCell::new(Vec::new())),
         folder_location,
         folder_prefix,
         folder_store,
@@ -1351,10 +1382,9 @@ pub fn refresh_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
 }
 
 /// Republish the whole snapshot of the library already on screen (a
-/// same-source full sync). As in [`refresh_browser_data`], selections that
-/// still exist and the search text survive. The folder pane keeps its
-/// location while that root is still configured, and album covers are
-/// re-resolved because a full sync can carry changed artwork.
+/// same-source full sync). As in [`refresh_local_browser_data`], selections
+/// and the folder location survive; album covers are also re-resolved
+/// because a full sync can carry changed artwork.
 pub fn resync_browser_data(
     browser_box: &gtk::Box,
     state: &BrowserState,
@@ -1362,27 +1392,70 @@ pub fn resync_browser_data(
     folder_model: FolderBrowser,
 ) {
     state.album_art_controller.cache().bump_content_generation();
-    let keeps_location = match &*state.folder_location.borrow() {
-        FolderLocation::Roots => true,
-        FolderLocation::Inside { root_id, .. } => folder_model
+    refresh_local_browser_data(browser_box, state, tracks, folder_model);
+}
+
+/// Refresh the local library on screen after an incremental change or a root
+/// availability change, replacing the folder model as well as the other
+/// panes' data. Selections that still exist and the search text survive.
+pub fn refresh_local_browser_data(
+    browser_box: &gtk::Box,
+    state: &BrowserState,
+    tracks: &[TrackObject],
+    folder_model: FolderBrowser,
+) {
+    replace_folder_model(state, folder_model);
+    refresh_browser_data(browser_box, state, tracks);
+}
+
+/// Install a rebuilt folder model while keeping the pane's location valid.
+///
+/// The location survives while its root is still configured. Inside an
+/// unavailable root it stays put and the pane says why it is empty; inside
+/// an available root it climbs to the deepest folder that still holds
+/// tracks. A root that is no longer configured returns the pane to the
+/// roots level.
+fn replace_folder_model(state: &BrowserState, folder_model: FolderBrowser) {
+    let next = match state.folder_location.borrow().clone() {
+        FolderLocation::Roots => Some(FolderLocation::Roots),
+        FolderLocation::Inside { root_id, mut dir } => folder_model
             .roots()
             .iter()
-            .any(|root| &root.root_id == root_id),
+            .find(|root| root.root_id == root_id)
+            .map(|root| {
+                if root.browsable() {
+                    while !folder_model.has_directory(&root_id, &dir) {
+                        dir = parent_folder(&dir);
+                    }
+                }
+                FolderLocation::Inside { root_id, dir }
+            }),
     };
     *state.folder_model.borrow_mut() = Some(folder_model);
-    if keeps_location {
-        state.updating.set(true);
-        let prefix = populate_folder_pane(
-            &state.folder_store,
-            state.folder_model.borrow().as_ref(),
-            &state.folder_location.borrow(),
-        );
-        state.updating.set(false);
-        *state.folder_prefix.borrow_mut() = prefix;
-    } else {
+    let Some(next) = next else {
         reset_folder_navigation(state);
+        return;
+    };
+    let moved = next != *state.folder_location.borrow();
+    *state.folder_location.borrow_mut() = next;
+    state.updating.set(true);
+    let prefix = populate_folder_pane(
+        &state.folder_store,
+        state.folder_model.borrow().as_ref(),
+        &state.folder_location.borrow(),
+    );
+    if moved {
+        state.folder_selection.set_selected(0);
     }
-    refresh_browser_data(browser_box, state, tracks);
+    state.updating.set(false);
+    *state.folder_prefix.borrow_mut() = prefix;
+}
+
+/// The portable parent of a root-relative folder (`""` is the root).
+fn parent_folder(dir: &str) -> String {
+    dir.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
 }
 
 /// True when any track in `tracks` matches all three axes at once
@@ -1467,9 +1540,10 @@ fn populate_folder_pane(
         (Some(browser), FolderLocation::Roots) => {
             let labels = browser.disambiguated_root_labels();
             for (root, label) in browser.roots().iter().zip(labels) {
-                let label = match root.availability_suffix() {
-                    Some(suffix) => format!("{label}{suffix}"),
-                    None => label,
+                let label = if root.browsable() {
+                    label
+                } else {
+                    rust_i18n::t!("browser.folder_root_unavailable", name = label).into_owned()
                 };
                 // Root rows are pushed in model order, so the row's
                 // position within the store IS the root's index — the
@@ -1500,12 +1574,9 @@ fn populate_folder_pane(
                         ));
                     }
                 }
-                Err(RootBrowseError::Unavailable { reason }) => {
-                    rows.push((format!("(unavailable: {reason})"), 0, FolderRowKind::Status));
-                }
-                Err(RootBrowseError::Renamed { previous_path }) => {
+                Err(RootBrowseError::Unavailable) => {
                     rows.push((
-                        format!("(renamed from {previous_path})"),
+                        rust_i18n::t!("browser.folder_unavailable_notice").into_owned(),
                         0,
                         FolderRowKind::Status,
                     ));
@@ -1569,7 +1640,7 @@ fn resolve_folder_activation(
     let current = state.folder_location.borrow().clone();
     match (&current, item.folder_kind()) {
         // Informational rows (detached notice, empty-roots notice,
-        // unavailable / renamed markers) never navigate.
+        // unavailable markers) never navigate.
         (_, FolderRowKind::Status) => None,
         (FolderLocation::Roots, FolderRowKind::Root) => {
             let model_ref = state.folder_model.borrow();
@@ -1590,13 +1661,9 @@ fn resolve_folder_activation(
             if dir.is_empty() {
                 Some(FolderLocation::Roots)
             } else {
-                let parent = match dir.rsplit_once('/') {
-                    Some((parent, _)) => parent.to_string(),
-                    None => String::new(),
-                };
                 Some(FolderLocation::Inside {
                     root_id: root_id.clone(),
-                    dir: parent,
+                    dir: parent_folder(dir),
                 })
             }
         }
@@ -2691,7 +2758,7 @@ mod tests {
 
     /// Unique scratch tree for the folder-navigation contracts: two real
     /// browsable roots (`ga`, `gb`), each holding `sub/01.flac`, so the
-    /// production `from_configured`/`place_tracks` pipeline sees two
+    /// production `BrowsableRoot::new`/`place_tracks` pipeline sees two
     /// available roots with a navigable child directory. Scratch lives
     /// under `${TMPDIR:-/var/tmp}` (never /tmp) and is removed on drop.
     struct FolderScratch {
@@ -2775,13 +2842,13 @@ mod tests {
     /// `FolderBrowser`.
     fn attach_two_root_folder_model(state: &BrowserState, scratch: &FolderScratch) {
         let roots = vec![
-            crate::ui::folder_browser::BrowsableRoot::from_configured(
+            crate::ui::folder_browser::BrowsableRoot::new(
                 scratch.root_path("ga").to_str().expect("utf8 root path"),
-                None,
+                RootAvailability::Available,
             ),
-            crate::ui::folder_browser::BrowsableRoot::from_configured(
+            crate::ui::folder_browser::BrowsableRoot::new(
                 scratch.root_path("gb").to_str().expect("utf8 root path"),
-                None,
+                RootAvailability::Available,
             ),
         ];
         let inputs = vec![
@@ -2809,9 +2876,9 @@ mod tests {
     }
 
     fn sole_root_ellipsis_model(scratch: &FolderScratch) -> FolderBrowser {
-        let roots = vec![crate::ui::folder_browser::BrowsableRoot::from_configured(
+        let roots = vec![crate::ui::folder_browser::BrowsableRoot::new(
             scratch.root_path("sole").to_str().expect("utf8 root path"),
-            None,
+            RootAvailability::Available,
         )];
         let inputs = vec![
             crate::ui::folder_browser::TrackPathInput {
@@ -3330,6 +3397,114 @@ mod tests {
         assert!(fx.state.folder_prefix.borrow().is_none());
     }
 
+    /// The folder pane's root-relative directory, or `None` at the roots.
+    fn folder_dir(state: &BrowserState) -> Option<String> {
+        match &*state.folder_location.borrow() {
+            FolderLocation::Inside { dir, .. } => Some(dir.clone()),
+            FolderLocation::Roots => None,
+        }
+    }
+
+    /// A rebuilt folder model under the user's location (issue #253): a
+    /// folder that lost its last track climbs to the nearest folder that
+    /// still holds one, and a root the engine reports unavailable keeps the
+    /// location but says why it is empty, inside it and on its root row.
+    fn folder_pane_follows_library_and_root_availability_changes() {
+        use crate::ui::folder_browser::{place_tracks, BrowsableRoot, TrackPathInput};
+
+        let fx = FolderActivationFixture::new("availability");
+        let folder_pane = &fx.panes[3];
+        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
+        let root = fx.scratch.root_path("sole");
+        let root_text = root.to_str().expect("utf8 root path");
+        let model = |availability, tracks: &[&str]| {
+            let roots = vec![BrowsableRoot::new(root_text, availability)];
+            let inputs: Vec<TrackPathInput> = tracks
+                .iter()
+                .map(|relative| TrackPathInput {
+                    source_label: "local".to_string(),
+                    path: Some(root.join(relative)),
+                })
+                .collect();
+            let (placed, _report) = place_tracks(&roots, &inputs);
+            FolderBrowser::new(roots, placed)
+        };
+
+        // Into the root, then into `leafonly` (rows: Up, leafonly, …).
+        emit_folder_activation(&list_view, 0);
+        let root_prefix = fx.state.folder_prefix.borrow().clone();
+        emit_folder_activation(&list_view, 1);
+        assert_eq!(folder_dir(&fx.state).as_deref(), Some("leafonly"));
+
+        // Its only track goes away: the pane climbs back to the root.
+        let remaining = ["…/deep/01.flac"];
+        refresh_local_browser_data(
+            &fx.browser_box,
+            &fx.state,
+            &fx.source,
+            model(RootAvailability::Available, &remaining),
+        );
+        assert_eq!(folder_dir(&fx.state).as_deref(), Some(""));
+        assert_eq!(
+            *fx.state.folder_prefix.borrow(),
+            root_prefix,
+            "the filter must follow the pane to the root"
+        );
+        assert_eq!(
+            get_store_from_pane(folder_pane).map(|store| store.n_items()),
+            Some(2)
+        );
+        assert_folder_row(folder_pane, 1, FolderRowKind::Directory, Some("…"));
+
+        // The root goes away: the location stays and the pane explains.
+        refresh_local_browser_data(
+            &fx.browser_box,
+            &fx.state,
+            &fx.source,
+            model(RootAvailability::Unavailable, &remaining),
+        );
+        assert_eq!(folder_dir(&fx.state).as_deref(), Some(""));
+        let notice = rust_i18n::t!("browser.folder_unavailable_notice");
+        assert_folder_row(folder_pane, 1, FolderRowKind::Status, Some(notice.as_ref()));
+
+        // At the roots level the root row carries the same verdict and
+        // refuses navigation.
+        emit_folder_activation(&list_view, 0);
+        let label = rust_i18n::t!("browser.folder_root_unavailable", name = "sole");
+        assert_folder_row(folder_pane, 0, FolderRowKind::Root, Some(label.as_ref()));
+        emit_folder_activation(&list_view, 0);
+        assert!(folder_dir(&fx.state).is_none());
+    }
+
+    /// The browser projects the engine's root status; a root it has not
+    /// reported on is unavailable, and only a changed report asks for a
+    /// refresh.
+    fn root_status_projects_the_engine_verdict() {
+        let fx = FolderActivationFixture::new("root-status");
+        let root = std::path::PathBuf::from("/music/a");
+        let report = |available| {
+            vec![LibraryRootStatus {
+                path: root.clone(),
+                available,
+            }]
+        };
+        assert_eq!(
+            fx.state.root_availability(&root),
+            RootAvailability::Unavailable
+        );
+        assert!(fx.state.set_root_status(report(true)));
+        assert_eq!(
+            fx.state.root_availability(&root),
+            RootAvailability::Available
+        );
+        assert!(!fx.state.set_root_status(report(true)));
+        assert!(fx.state.set_root_status(report(false)));
+        assert_eq!(
+            fx.state.root_availability(&root),
+            RootAvailability::Unavailable
+        );
+    }
+
     // ── The view on screen across same-source refreshes (#250, #329) ──
 
     /// The production track list and browser, wired as the window wires
@@ -3802,6 +3977,8 @@ mod tests {
                 // Same-source refreshes keep the view on screen (issues
                 // #250 and #329).
                 folder_location_survives_same_source_full_sync();
+                folder_pane_follows_library_and_root_availability_changes();
+                root_status_projects_the_engine_verdict();
                 playlist_view_keeps_search_and_scroll_across_a_play_count_event();
                 playlist_reload_keeps_search_and_scroll();
                 local_view_keeps_filters_search_and_scroll_across_a_same_source_full_sync();
