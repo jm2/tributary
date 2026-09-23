@@ -149,6 +149,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when Tributary runs in a language other than English, so ratings can be edited again.
   Track list column titles and the Preferences column checkboxes are now translated, and
   saved column visibility, order and sort carry over unchanged.
+- **Confirm before deleting a playlist or removing a server** — Deleting a playlist or
+  removing a saved server from the sidebar now asks for confirmation first, with Cancel
+  as the default, so a misclick no longer discards it immediately.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

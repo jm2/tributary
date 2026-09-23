@@ -471,7 +471,7 @@ fn handle_rename(
     dialog.present(Some(win));
 }
 
-/// Delete a playlist from the DB and remove from sidebar.
+/// Ask for confirmation, then delete a playlist from the DB and the sidebar.
 fn handle_delete(
     win: &adw::ApplicationWindow,
     sidebar_store: &gtk::gio::ListStore,
@@ -479,15 +479,39 @@ fn handle_delete(
     playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
     playlist_id: &str,
 ) {
-    info!(id = %playlist_id, "Deleting playlist");
-    let sidebar_store = sidebar_store.clone();
-    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
-    let win = win.clone();
-    let pid = playlist_id.to_string();
-
-    if !playlist_allows_ordinary_actions(&sidebar_store, &pid) {
+    if !playlist_allows_ordinary_actions(sidebar_store, playlist_id) {
         return;
     }
+    let Some((_, source)) = playlist_source(sidebar_store, playlist_id) else {
+        return;
+    };
+
+    let sidebar_store = sidebar_store.clone();
+    let rt_handle = rt_handle.clone();
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
+    let win_for_delete = win.clone();
+    let pid = playlist_id.to_string();
+    let dialog = super::confirm_dialog::delete_playlist(&source.name(), move || {
+        // A dialog can outlive the row that opened it. Re-resolve the exact
+        // current row so a recycled or newly-linked playlist cannot inherit
+        // this confirmation.
+        if playlist_allows_ordinary_actions(&sidebar_store, &pid) {
+            delete_playlist(&win_for_delete, &rt_handle, &playlist_sidebar_refresh, pid);
+        }
+    });
+    dialog.present(Some(win));
+}
+
+/// Delete a confirmed playlist from the DB and refresh the sidebar.
+fn delete_playlist(
+    win: &adw::ApplicationWindow,
+    rt_handle: &tokio::runtime::Handle,
+    playlist_sidebar_refresh: &crate::local::playlist_sidebar::PlaylistSidebarRefresh,
+    pid: String,
+) {
+    info!(id = %pid, "Deleting playlist");
+    let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
+    let win = win.clone();
 
     let (result_tx, result_rx) = async_channel::bounded::<PlaylistCrudOutcome<()>>(1);
 

@@ -3341,6 +3341,7 @@ mod tests {
                 crate::ui::preferences::widget_tests::column_state_is_keyed_by_id_under_a_non_english_locale();
                 crate::ui::preferences::widget_tests::radio_columns_keep_their_ids();
                 crate::ui::lastfm_settings::widget_tests::render_shows_only_the_offered_actions();
+                crate::ui::confirm_dialog::widget_tests::nothing_is_removed_until_the_destructive_response();
                 crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
                 crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
                 crate::ui::album_pane_art::widget_tests::album_art_row_publishes_combined_accessible_name();
