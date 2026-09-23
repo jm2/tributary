@@ -18,7 +18,7 @@ use super::album_pane_art::{
     AlbumArtBinder, AlbumArtCache, AlbumArtController, FALLBACK_PLACEHOLDER_ICON,
 };
 use super::objects::{AlbumArtCandidate, BrowserItem, FolderRowKind, TrackObject};
-use crate::ui::folder_browser::{FolderBrowser, RootBrowseError};
+use crate::ui::folder_browser::{join_native, FolderBrowser, RootBrowseError};
 use tracing::debug;
 
 /// Callback invoked when the browser selection changes.
@@ -1589,12 +1589,11 @@ fn resolve_folder_activation(
 
 /// Join a root path and a root-relative directory into the filter prefix
 /// (no trailing separator; the window's URI comparison appends one).
+/// `dir` uses the portable `/`-separated representation and is normalized
+/// with the model's no-escape rules before the native join, so a Windows
+/// root mixes no separators and a crafted dir cannot climb above the root.
 fn join_root_prefix(root: &str, dir: &str) -> String {
-    if dir.is_empty() {
-        root.to_string()
-    } else {
-        format!("{root}/{dir}")
-    }
+    join_native(root, dir).to_string_lossy().into_owned()
 }
 
 /// Toggle album-artist grouping and rebuild the browser panes.

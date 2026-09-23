@@ -175,6 +175,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can no longer start a new upsert and its unbounded authority probes, and
   pre-deletion authority probes are bounded too. A cancelled scan still fails
   closed, preserving the incomplete-scan/no-deletion semantics.
+- **Windows folder browsing** (`src/ui/folder_browser.rs`, `src/ui/browser.rs`) — Folder
+  navigation split stored track paths on `/` only, but placement keeps native separators,
+  so on Windows every level below a configured root was lost: no folder children were ever
+  offered below the root. Derivation now compares over native path components, while the
+  navigation `dir` strings keep a deliberately portable `/`-separated form. The folder
+  filter prefix joins through the same native path logic, so filtering can no longer mix
+  separators on Windows either, and `..` clamps at the root (with the platform's native
+  separator refused inside a `dir` component) keeping the no-escape contract. Covered by
+  native-component fixtures on every platform and Windows-only drive-root fixtures
+  (spaces, Unicode, prefix-sibling names, drive roots, URI containment).
 - **Chromecast control saturation** (`src/audio/chromecast_output.rs`) — A slow
   but responsive Cast receiver could previously lose the final seek or volume
   intent when the bounded worker ingress saturated: the oldest transient
