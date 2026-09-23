@@ -189,7 +189,8 @@ fn empty_imported_track() -> ImportedTrack {
     }
 }
 
-fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
+/// Parse XSPF document text: the file-independent core of [`import_xspf`].
+pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
     validate_xml_10_text(content)?;
 
     let mut reader = NsReader::from_str(content.trim_start_matches('\u{feff}'));
