@@ -113,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One device per install** — Each Tributary install now presents its own device identity
+  to Jellyfin and Plex, so signing in on a second computer, or adding the same Jellyfin
+  server twice, no longer signs out your other Tributary sessions.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

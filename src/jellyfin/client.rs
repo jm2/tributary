@@ -17,6 +17,7 @@ use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
     redact_url_secrets, strip_request_url, validate_base_url,
 };
+use crate::install_id::install_id;
 
 use super::api::{JellyfinAuthRequest, JellyfinAuthResponse};
 
@@ -141,7 +142,8 @@ impl JellyfinClient {
 
         // Build a temporary client WITHOUT a token for the auth request.
         let pre_auth_header = format!(
-            r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{CLIENT_NAME}", Version="{CLIENT_VERSION}""#,
+            r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{}", Version="{CLIENT_VERSION}""#,
+            install_id(),
         );
 
         let mut pre_auth_headers = HeaderMap::new();
@@ -560,9 +562,12 @@ async fn best_effort_logout_minted_session(
         .await;
 }
 
+/// `DeviceId` must be unique per install: issuing a token logs out the same
+/// user's other sessions that share it.
 fn jellyfin_auth_header(api_key: &str) -> BackendResult<HeaderValue> {
     let auth_value = format!(
-        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{CLIENT_NAME}", Version="{CLIENT_VERSION}", Token="{api_key}""#,
+        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{}", Version="{CLIENT_VERSION}", Token="{api_key}""#,
+        install_id(),
     );
     let mut value =
         HeaderValue::from_str(&auth_value).map_err(|e| BackendError::ConnectionFailed {

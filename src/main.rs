@@ -79,6 +79,7 @@ pub(crate) mod http_security;
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod http_test_service;
+mod install_id;
 #[allow(dead_code)]
 mod jellyfin;
 #[allow(dead_code)]
