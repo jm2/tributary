@@ -113,6 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Library folders** — A library folder that is itself a symbolic link (for example
+  `~/Music` pointing to another disk) is now indexed instead of showing an empty library.
+  Removing a library folder now forgets its unplayable tracks at the next start, while a
+  folder that is only temporarily unavailable, such as an unmounted drive, keeps them.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album
