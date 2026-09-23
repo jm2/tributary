@@ -5835,6 +5835,13 @@ fn same_audio_extension(from: &Path, to: &Path) -> bool {
             .is_some_and(|(from, to)| from.eq_ignore_ascii_case(to))
 }
 
+/// Tributary's own tag-write siblings: the staged copy and the quarantined
+/// original. They are never library content; the watcher only uses them to
+/// learn that the public path next to them changed.
+fn is_private_write_sibling(path: &Path) -> bool {
+    tag_writer::is_tag_write_temp_file(path) || super::root_authority::is_quarantine_file(path)
+}
+
 async fn prepare_watcher_rename_guard(
     db: &DatabaseConnection,
     roots: &mut WatcherRootCache,
@@ -6174,10 +6181,20 @@ impl WatcherBatch {
                 }
             }
             EventKind::Modify(ModifyKind::Name(_)) => {
-                // FSEvents and kqueue cannot associate the old and new sides.
-                // Never infer identity from metadata; a guarded scan performs
-                // the conservative delete/upsert fallback.
-                self.reconciliation_required = true;
+                // FSEvents and kqueue cannot associate the old and new sides,
+                // so identity is never inferred. An audio path still names one
+                // file: refresh or remove it by path. Any other name may be a
+                // directory, which needs the guarded reconciliation scan.
+                for path in event.paths {
+                    if is_private_write_sibling(&path) {
+                        continue;
+                    }
+                    if tag_parser::is_audio_file(&path) {
+                        self.record_upsert(path);
+                    } else {
+                        self.reconciliation_required = true;
+                    }
+                }
             }
             EventKind::Create(kind) => {
                 let folder = matches!(kind, CreateKind::Folder);
@@ -6200,7 +6217,7 @@ impl WatcherBatch {
     }
 
     fn record_remove(&mut self, path: PathBuf) {
-        if tag_writer::is_tag_write_temp_file(&path) {
+        if is_private_write_sibling(&path) {
             return;
         }
         if self.paired_paths.contains(&path) {
@@ -6217,7 +6234,7 @@ impl WatcherBatch {
     }
 
     fn record_upsert(&mut self, path: PathBuf) {
-        if tag_writer::is_tag_write_temp_file(&path) {
+        if is_private_write_sibling(&path) {
             return;
         }
         let paired = self.paired_paths.contains(&path);
@@ -6251,19 +6268,21 @@ impl WatcherBatch {
 
     fn record_rename_pair(&mut self, from: PathBuf, to: PathBuf) {
         match (
-            tag_writer::is_tag_write_temp_file(&from),
-            tag_writer::is_tag_write_temp_file(&to),
+            is_private_write_sibling(&from),
+            is_private_write_sibling(&to),
         ) {
             (true, true) => return,
+            // A tag write moves the original aside, publishes the staged copy
+            // under its name, and (after a failed commit) moves the original
+            // back. Each step only means the public path changed: refresh it
+            // in place without transferring identity from a private name that
+            // was never indexed.
             (true, false) => {
-                // Atomic tag replacement is a private sibling becoming the
-                // original track. Refresh metadata at the public path without
-                // transferring identity from a path that was never indexed.
                 self.record_upsert(to);
                 return;
             }
             (false, true) => {
-                self.record_remove(from);
+                self.record_upsert(from);
                 return;
             }
             (false, false) => {}
@@ -6271,6 +6290,25 @@ impl WatcherBatch {
 
         let pair = WatcherRenamePair { from, to };
         if pair.from == pair.to {
+            self.record_upsert(pair.to);
+            return;
+        }
+        // Only a same-extension audio file or a directory carries an indexed
+        // identity across a rename. A file renamed across extensions (a sync
+        // tool publishing its hidden download, or a track renamed to a
+        // non-audio name) is a removal of the source plus an upsert of the
+        // destination. A rename keeps the object's type, so the source was a
+        // file as well and its deferred observation is not a directory.
+        if !same_audio_extension(&pair.from, &pair.to)
+            && matches!(
+                watcher_upsert_path_kind(&pair.to),
+                Ok(WatcherUpsertPathKind::RegularFile)
+            )
+        {
+            self.deferred_paths.remove(&pair.from);
+            if tag_parser::is_audio_file(&pair.from) {
+                self.record_remove(pair.from);
+            }
             self.record_upsert(pair.to);
             return;
         }
@@ -9798,6 +9836,262 @@ mod tests {
         assert_eq!(adjacent_split.upsert_paths, HashSet::from([track]));
         assert!(adjacent_split.rename_pairs.is_empty());
         assert!(adjacent_split.deferred_paths.is_empty());
+    }
+
+    const TEST_TAG_STAGING_NAME: &str = ".tributary-tag-00000000-0000-4000-8000-000000000000.flac";
+    const TEST_QUARANTINE_NAME: &str =
+        ".track.flac.tributary-replaced-0123456789abcdef0123456789abcdef";
+
+    fn path_str(path: &Path) -> &str {
+        path.to_str().expect("test paths are UTF-8")
+    }
+
+    /// Rename halves as a backend reports them: inotify tags both halves with
+    /// one cookie and adds a `Both` event; Windows reports adjacent untracked
+    /// halves only.
+    fn rename_halves(from: &Path, to: &Path, tracker: Option<usize>) -> Vec<notify::Event> {
+        use notify::event::RenameMode;
+
+        let mut events = vec![
+            rename_event(RenameMode::From, &[path_str(from)], tracker),
+            rename_event(RenameMode::To, &[path_str(to)], tracker),
+        ];
+        if tracker.is_some() {
+            events.push(rename_event(
+                RenameMode::Both,
+                &[path_str(from), path_str(to)],
+                tracker,
+            ));
+        }
+        events
+    }
+
+    /// The events of one tag save: the staged copy is written, the original
+    /// moves to a quarantine sibling, the staged copy is renamed onto the
+    /// public name, and the quarantine is unlinked.
+    fn tag_commit_events(
+        track: &Path,
+        staged: &Path,
+        quarantine: &Path,
+        trackers: Option<(usize, usize)>,
+    ) -> Vec<notify::Event> {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+        use notify::{Event, EventKind};
+
+        let mut events = vec![
+            Event::new(EventKind::Create(CreateKind::File)).add_path(staged.to_path_buf()),
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                .add_path(staged.to_path_buf()),
+        ];
+        events.extend(rename_halves(
+            track,
+            quarantine,
+            trackers.map(|(first, _)| first),
+        ));
+        events.extend(rename_halves(
+            staged,
+            track,
+            trackers.map(|(_, second)| second),
+        ));
+        events.push(
+            Event::new(EventKind::Remove(RemoveKind::File)).add_path(quarantine.to_path_buf()),
+        );
+        events
+    }
+
+    fn debounced_batch(events: Vec<notify::Event>) -> WatcherBatch {
+        let mut ingress = WatcherDebounceBatch::default();
+        for event in events {
+            ingress.collect(Ok(event));
+        }
+        ingress.finish().expect("ordinary event stream is reliable")
+    }
+
+    #[test]
+    fn watcher_batch_turns_a_quarantine_tag_commit_into_one_public_upsert() {
+        let library = TestDirectory::new("tag-commit-quarantine");
+        let track = library.path().join("track.flac");
+        let staged = library.path().join(TEST_TAG_STAGING_NAME);
+        let quarantine = library.path().join(TEST_QUARANTINE_NAME);
+        // When the debounce window closes only the committed track remains.
+        std::fs::write(&track, b"tagged audio").expect("publish tagged track");
+
+        for trackers in [Some((11, 12)), None] {
+            let batch = debounced_batch(tag_commit_events(&track, &staged, &quarantine, trackers));
+
+            assert_eq!(
+                batch.upsert_paths,
+                HashSet::from([track.clone()]),
+                "{trackers:?}"
+            );
+            assert!(batch.remove_paths.is_empty(), "{trackers:?}");
+            assert!(batch.rename_pairs.is_empty(), "{trackers:?}");
+            assert!(batch.deferred_paths.is_empty(), "{trackers:?}");
+            assert!(!batch.reconciliation_required, "{trackers:?}");
+        }
+    }
+
+    #[test]
+    fn watcher_batch_resolves_unassociated_audio_renames_by_path() {
+        use notify::event::RenameMode;
+
+        // FSEvents reports each side of a tag save as its own Name::Any.
+        let library = TestDirectory::new("tag-commit-name-any");
+        let track = library.path().join("track.flac");
+        let staged = library.path().join(TEST_TAG_STAGING_NAME);
+        let quarantine = library.path().join(TEST_QUARANTINE_NAME);
+        std::fs::write(&track, b"tagged audio").expect("publish tagged track");
+
+        let batch = debounced_batch(
+            [&track, &quarantine, &staged, &track]
+                .into_iter()
+                .map(|path| rename_event(RenameMode::Any, &[path_str(path)], None))
+                .collect(),
+        );
+
+        assert_eq!(batch.upsert_paths, HashSet::from([track]));
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+    }
+
+    #[test]
+    fn watcher_batch_turns_cross_extension_file_renames_into_path_changes() {
+        let library = TestDirectory::new("cross-extension-renames");
+        let root = library.path();
+
+        // rsync, Syncthing, and browsers publish a finished download by
+        // renaming a hidden temporary file onto the final audio name.
+        let published = root.join("song.flac");
+        std::fs::write(&published, b"audio").expect("publish synced track");
+        let batch = debounced_batch(rename_halves(
+            &root.join(".song.flac.XyZ123"),
+            &published,
+            Some(21),
+        ));
+        assert_eq!(batch.upsert_paths, HashSet::from([published]));
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.rename_pairs.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+
+        // A track renamed to a non-audio name is a removal of the track.
+        let original = root.join("old.flac");
+        let backup = root.join("old.flac.bak");
+        std::fs::write(&backup, b"audio").expect("rename track to backup");
+        let batch = debounced_batch(rename_halves(&original, &backup, None));
+        assert_eq!(batch.remove_paths, HashSet::from([original]));
+        assert!(batch.upsert_paths.is_empty());
+        assert!(batch.rename_pairs.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+
+        // A directory keeps its pair so its tracks keep their identities.
+        let old_album = root.join("Album");
+        let new_album = root.join("Album (2020)");
+        std::fs::create_dir(&new_album).expect("rename album folder");
+        let batch = debounced_batch(rename_halves(&old_album, &new_album, Some(22)));
+        assert_eq!(
+            batch.rename_pairs,
+            HashSet::from([WatcherRenamePair {
+                from: old_album,
+                to: new_album,
+            }])
+        );
+        assert!(!batch.reconciliation_required);
+    }
+
+    #[tokio::test]
+    async fn tag_commit_refreshes_the_track_in_place_without_a_library_rescan() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("watcher-tag-commit-end-to-end");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+
+        let track_path = root.join("track.flac");
+        std::fs::write(
+            &track_path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write committed track");
+        let track_key = track_path.to_string_lossy().into_owned();
+        insert_rename_test_track(&db, "tagged-track", &track_key, "Before Tag Save", 3).await;
+
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(idle_backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: event_rx,
+            ingress_overflowed: Arc::new(AtomicBool::new(false)),
+            watched_directories: HashSet::new(),
+        };
+        for event in tag_commit_events(
+            &track_path,
+            &root.join(TEST_TAG_STAGING_NAME),
+            &root.join(TEST_QUARANTINE_NAME),
+            Some((31, 32)),
+        ) {
+            event_tx
+                .send(Ok(event))
+                .await
+                .expect("queue tag commit event");
+        }
+        drop(event_tx);
+
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let mut completed_commands = HashMap::new();
+        process_directory_events(
+            &db,
+            std::slice::from_ref(&root),
+            &library_events,
+            &command_rx,
+            &mut completed_commands,
+            watcher,
+            &test_playlist_sidebar_refresh(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("watcher loop exits cleanly");
+
+        let events: Vec<LibraryEvent> =
+            std::iter::from_fn(|| library_event_rx.try_recv().ok()).collect();
+        let upserted: Vec<&Track> = events
+            .iter()
+            .filter_map(|event| match event {
+                LibraryEvent::TrackUpserted(track) => Some(track.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(upserted.len(), 1, "{events:?}");
+        assert_eq!(upserted[0].file_path.as_deref(), Some(track_key.as_str()));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                LibraryEvent::FullSync(_)
+                    | LibraryEvent::ScanComplete
+                    | LibraryEvent::TrackRemoved(_)
+            )),
+            "a tag save must not reconcile the library: {events:?}"
+        );
+
+        let row = track::Entity::find()
+            .filter(track::Column::FilePath.eq(&track_key))
+            .one(db.as_ref())
+            .await
+            .expect("query tagged track")
+            .expect("tagged track keeps its row");
+        assert_eq!(row.id, "tagged-track");
+        assert_eq!(row.play_count, 3);
+        assert_ne!(row.title, "Before Tag Save", "the new tags were read");
     }
 
     #[cfg(unix)]

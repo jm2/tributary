@@ -1860,7 +1860,35 @@ fn quarantine_name(leaf: &OsStr) -> OsString {
         }
         prefix.push(character);
     }
-    format!(".{}.tributary-replaced-{}", prefix, Uuid::new_v4().simple()).into()
+    format!(".{prefix}{QUARANTINE_MARKER}{}", Uuid::new_v4().simple()).into()
+}
+
+const QUARANTINE_MARKER: &str = ".tributary-replaced-";
+
+/// Return whether `path` has the exact shape [`quarantine_name`] emits:
+/// `.<leaf prefix>.tributary-replaced-<32 lowercase hex digits>`.
+///
+/// Such a sibling only ever holds a file mid-replacement, so the watcher
+/// treats it as private rather than as a library path.
+pub(super) fn is_quarantine_file(path: &Path) -> bool {
+    const UUID_DIGITS: usize = 32;
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.as_encoded_bytes();
+    let Some(prefix_len) = name
+        .len()
+        .checked_sub(QUARANTINE_MARKER.len() + UUID_DIGITS)
+    else {
+        return false;
+    };
+    let (prefix, suffix) = name.split_at(prefix_len);
+    let (marker, digits) = suffix.split_at(QUARANTINE_MARKER.len());
+    prefix.first() == Some(&b'.')
+        && marker == QUARANTINE_MARKER.as_bytes()
+        && digits
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
 /// Test-only seam: run the registered post-confirm interposition, if any.
@@ -3213,6 +3241,28 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn quarantine_names_are_recognized_exactly() {
+        let music = Path::new("/music");
+        let long_leaf = "x".repeat(300);
+        for leaf in ["song.flac", "é", long_leaf.as_str()] {
+            let name = quarantine_name(OsStr::new(leaf));
+            assert!(is_quarantine_file(&music.join(&name)), "{name:?}");
+        }
+
+        for name in [
+            "song.flac",
+            ".song.flac",
+            ".tributary-replaced-0123456789abcdef0123456789abcdef",
+            "song.flac.tributary-replaced-0123456789abcdef0123456789abcdef",
+            ".song.flac.tributary-replaced-0123456789ABCDEF0123456789abcdef",
+            ".song.flac.tributary-replaced-0123456789abcdef0123456789abcde",
+            ".song.flac.tributary-replaced-0123456789abcdef0123456789abcdef.flac",
+        ] {
+            assert!(!is_quarantine_file(&music.join(name)), "{name}");
         }
     }
 
