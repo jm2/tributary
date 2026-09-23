@@ -311,6 +311,26 @@ mod tests {
         assert!(ExternalFileHint::new("song.wav", Some("bad/ext")).is_err());
     }
 
+    /// Blank, space-padded ID3v1 fields fall back to the filename and
+    /// "Unknown" names instead of rejecting the opened file as empty.
+    #[test]
+    fn blank_id3v1_fields_are_admitted_with_fallback_names() {
+        let directory = tempfile::tempdir().expect("external media directory");
+        let path = directory.path().join("blank.mp3");
+        std::fs::write(&path, crate::local::tag_parser::blank_id3v1_fixture())
+            .expect("write blank ID3v1 MP3");
+
+        let candidate = ExternalFileCandidate::validate(
+            File::open(&path).expect("open blank MP3"),
+            ExternalFileHint::new("blank.mp3", Some("mp3")).expect("safe hint"),
+        )
+        .expect("a blank-tagged MP3 is valid audio");
+
+        assert_eq!(candidate.parsed.title, "blank");
+        assert_eq!(candidate.parsed.artist_name, "Unknown Artist");
+        assert_eq!(candidate.parsed.album_title, "Unknown Album");
+    }
+
     #[test]
     fn admitted_adapter_retains_original_object_after_path_replacement() {
         let directory = tempfile::tempdir().expect("external media directory");

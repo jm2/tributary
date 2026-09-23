@@ -1022,6 +1022,13 @@ mod tests {
                     .and_then(|value| value.to_str().ok()),
                 Some(token.as_str())
             );
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-plex-client-identifier")
+                    .and_then(|value| value.to_str().ok()),
+                Some(crate::install_id::install_id())
+            );
             assert!(request.body.is_empty());
         }
         service.finish().await;

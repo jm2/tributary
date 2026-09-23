@@ -1,16 +1,21 @@
 //! Preferences window — unified settings for library location, browser
 //! views, and column visibility.
 //!
-//! Uses `adw::PreferencesDialog` with a single page containing three
-//! groups: Library Location, Browser Views, and Visible Columns.
+//! Uses `adw::PreferencesDialog` with a single page containing four
+//! groups: Library Location, Browser Views, Visible Columns, and Equalizer.
 
 use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{info, warn};
 
-// ── Default column visibility ───────────────────────────────────────────
+// ── Tracklist columns ───────────────────────────────────────────────────
 
-/// All column titles in the tracklist, in display order.
+/// Stable IDs of the tracklist columns, in default display order.
+///
+/// Each tracklist `ColumnViewColumn` carries its ID in the `id` property.
+/// Visibility, order, and sort are persisted by ID, never by display title,
+/// so they survive a locale change. The IDs are the English titles that
+/// earlier builds persisted, which keeps existing configurations valid.
 pub const ALL_COLUMNS: &[&str] = &[
     "#",
     "Title",
@@ -32,6 +37,69 @@ pub const ALL_COLUMNS: &[&str] = &[
 const DEFAULT_VISIBLE: &[&str] = ALL_COLUMNS;
 const CURRENT_COLUMN_SCHEMA_VERSION: u32 = 1;
 
+/// Catalog key of a column's display title, or `None` for an unknown ID.
+fn column_title_key(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "#" => "columns.number",
+        "Title" => "columns.title",
+        "Time" => "columns.time",
+        "Artist" => "columns.artist",
+        "Album" => "columns.album",
+        "Genre" => "columns.genre",
+        "Composer" => "columns.composer",
+        "Year" => "columns.year",
+        "Date Modified" => "columns.date_modified",
+        "Bitrate" => "columns.bitrate",
+        "Sample Rate" => "columns.sample_rate",
+        "Plays" => "columns.plays",
+        "Rating" => "columns.rating",
+        "Format" => "columns.format",
+        _ => return None,
+    })
+}
+
+/// Display title of a tracklist column in `locale`.
+///
+/// An unknown ID is returned unchanged.
+pub fn column_title(id: &str, locale: &str) -> String {
+    column_title_key(id).map_or_else(
+        || id.to_string(),
+        |key| rust_i18n::t!(key, locale = locale).into_owned(),
+    )
+}
+
+/// Map a persisted column key to its stable column ID.
+///
+/// Earlier builds persisted display titles, and the Rating title was already
+/// translated, so a non-English session could have stored it localized. Any
+/// catalog's title for a known column maps back to that column's ID; an
+/// unrecognized key yields `None` and is dropped by callers.
+pub fn column_id_from_persisted(key: &str) -> Option<&'static str> {
+    if let Some(id) = ALL_COLUMNS.iter().copied().find(|id| *id == key) {
+        return Some(id);
+    }
+    rust_i18n::available_locales!()
+        .into_iter()
+        .find_map(|locale| {
+            ALL_COLUMNS
+                .iter()
+                .copied()
+                .find(|id| column_title(id, locale.as_ref()) == key)
+        })
+}
+
+/// Rewrite persisted column keys as stable IDs, dropping unknown keys and
+/// duplicates while preserving order.
+fn normalize_column_keys(keys: &mut Vec<String>) {
+    let mut ids: Vec<String> = Vec::with_capacity(keys.len());
+    for id in keys.iter().filter_map(|key| column_id_from_persisted(key)) {
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    }
+    *keys = ids;
+}
+
 // ── Persisted configuration ─────────────────────────────────────────────
 
 /// Application configuration persisted to `config.json`.
@@ -40,10 +108,11 @@ pub struct AppConfig {
     /// Which browser panes are visible.
     #[serde(default)]
     pub browser_views: BrowserViewsConfig,
-    /// Which tracklist columns are visible (by title).
+    /// Which tracklist columns are visible (by stable column ID).
     #[serde(default = "default_visible_columns")]
     pub visible_columns: Vec<String>,
-    /// Tracklist column display order (by title). Persisted across restarts.
+    /// Tracklist column display order (by stable column ID). Persisted
+    /// across restarts.
     #[serde(default = "default_column_order")]
     pub column_order: Vec<String>,
     /// One-time evolution marker for newly introduced tracklist columns.
@@ -85,6 +154,13 @@ pub struct AppConfig {
     /// Default: `Medium` (48 dp). Persisted across restarts.
     #[serde(default)]
     pub album_pane_artwork_size: AlbumArtSize,
+    /// Equalizer state for the local output. A malformed value resets only
+    /// this field when the file loads.
+    #[serde(
+        default,
+        deserialize_with = "crate::audio::equalizer::EqualizerSettings::deserialize_lenient"
+    )]
+    pub equalizer: crate::audio::equalizer::EqualizerSettings,
 }
 
 /// Thumbnail side length for the browser Album pane.
@@ -303,6 +379,7 @@ impl Default for AppConfig {
             group_by_album_artist: false,
             album_pane_artwork: false,
             album_pane_artwork_size: AlbumArtSize::default(),
+            equalizer: crate::audio::equalizer::EqualizerSettings::default(),
         }
     }
 }
@@ -599,12 +676,15 @@ pub fn load_config() -> AppConfig {
     }
 }
 
-/// Expose each newly introduced column exactly once for established profiles.
+/// Normalize persisted column keys to stable IDs, then expose each newly
+/// introduced column exactly once for established profiles.
 ///
-/// Column titles are persistence keys. A version marker distinguishes an old
-/// profile that could not mention Rating from a current profile where the user
-/// intentionally hid or reordered it.
+/// A version marker distinguishes an old profile that could not mention
+/// Rating from a current profile where the user intentionally hid or
+/// reordered it.
 fn migrate_column_schema(config: &mut AppConfig) {
+    normalize_column_keys(&mut config.visible_columns);
+    normalize_column_keys(&mut config.column_order);
     if config.column_schema_version >= CURRENT_COLUMN_SCHEMA_VERSION {
         return;
     }
@@ -700,6 +780,10 @@ pub fn save_config(config: &AppConfig) -> bool {
 /// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
+/// * `active_output` — the output the equalizer group applies its settings to
+///
+/// Returns the page so the caller can append integration groups (Last.fm).
+#[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     column_view: &gtk::ColumnView,
@@ -708,7 +792,8 @@ pub fn show_preferences(
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
-) {
+    active_output: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::audio::output::AudioOutput>>>,
+) -> adw::PreferencesPage {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
@@ -1092,13 +1177,14 @@ pub fn show_preferences(
 
     const COLUMNS_PER_ROW: usize = 4;
 
+    let locale = rust_i18n::locale();
     let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
         .iter()
         .enumerate()
-        .map(|(i, &col_title)| {
-            let is_visible = cfg.visible_columns.iter().any(|c| c == col_title);
+        .map(|(i, &col_id)| {
+            let is_visible = cfg.visible_columns.iter().any(|c| c == col_id);
             let check = gtk::CheckButton::builder()
-                .label(col_title)
+                .label(column_title(col_id, &locale))
                 .active(is_visible)
                 // Fill the homogeneous cell, but keep the label left-aligned
                 // so column text aligns down each grid column.
@@ -1109,15 +1195,15 @@ pub fn show_preferences(
             // Wire each column toggle
             let config = config.clone();
             let cv = column_view.clone();
-            let title = col_title.to_string();
+            let id = col_id.to_string();
             check.connect_toggled(move |btn| {
                 let mut cfg = config.borrow_mut();
                 if btn.is_active() {
-                    if !cfg.visible_columns.contains(&title) {
-                        cfg.visible_columns.push(title.clone());
+                    if !cfg.visible_columns.contains(&id) {
+                        cfg.visible_columns.push(id.clone());
                     }
                 } else {
-                    cfg.visible_columns.retain(|c| c != &title);
+                    cfg.visible_columns.retain(|c| c != &id);
                 }
                 apply_column_visibility(&cv, &cfg.visible_columns);
                 save_config(&cfg);
@@ -1126,7 +1212,7 @@ pub fn show_preferences(
             let col = (i % COLUMNS_PER_ROW) as i32;
             let row = (i / COLUMNS_PER_ROW) as i32;
             columns_grid.attach(&check, col, row, 1, 1);
-            (col_title, check)
+            (col_id, check)
         })
         .collect();
 
@@ -1159,8 +1245,8 @@ pub fn show_preferences(
                     .collect();
                 cfg.column_order = default_column_order();
             }
-            for (title, check) in &checks {
-                check.set_active(DEFAULT_VISIBLE.contains(&title.as_str()));
+            for (id, check) in &checks {
+                check.set_active(DEFAULT_VISIBLE.contains(&id.as_str()));
             }
             let cfg = config.borrow();
             apply_column_visibility(&cv, &cfg.visible_columns);
@@ -1173,30 +1259,42 @@ pub fn show_preferences(
     columns_group.add(&columns_grid);
     columns_group.add(&reset_btn);
     page.add(&columns_group);
+    page.add(&super::equalizer_panel::preferences_group(
+        &prefs_dialog,
+        config,
+        active_output,
+    ));
 
     prefs_dialog.add(&page);
     drop(cfg);
 
     prefs_dialog.present(Some(parent));
+    page
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Apply column visibility to the `ColumnView` based on the config.
+/// The `ColumnView`'s columns that carry a stable ID, with their positions.
 ///
-/// Skips the sentinel column (empty title) used to absorb GTK4's
-/// rightmost-column auto-expansion.
-pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]) {
+/// The sentinel column that absorbs GTK4's rightmost-column auto-expansion
+/// has no ID and is never yielded.
+fn identified_columns(
+    column_view: &gtk::ColumnView,
+) -> impl Iterator<Item = (u32, gtk::ColumnViewColumn, gtk::glib::GString)> {
     let columns = column_view.columns();
-    for i in 0..columns.n_items() {
-        if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
-            if let Some(title) = col.title() {
-                if title.is_empty() {
-                    continue; // sentinel column
-                }
-                col.set_visible(visible.iter().any(|v| v == title.as_str()));
-            }
-        }
+    (0..columns.n_items()).filter_map(move |position| {
+        let column = columns
+            .item(position)
+            .and_downcast::<gtk::ColumnViewColumn>()?;
+        let id = column.id()?;
+        Some((position, column, id))
+    })
+}
+
+/// Apply column visibility to the `ColumnView` based on the config.
+pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]) {
+    for (_, column, id) in identified_columns(column_view) {
+        column.set_visible(visible.iter().any(|v| v == id.as_str()));
     }
 }
 
@@ -1205,48 +1303,22 @@ pub fn apply_column_visibility(column_view: &gtk::ColumnView, visible: &[String]
 /// Iterates the saved order and moves each column to its target position
 /// using `insert_column` (which also removes from the old position).
 pub fn apply_column_order(column_view: &gtk::ColumnView, order: &[String]) {
-    if order.is_empty() {
-        return;
-    }
-    for (target_pos, title) in order.iter().enumerate() {
-        let columns = column_view.columns();
-        // Find the column with this title at its current position.
-        let mut found_at = None;
-        for i in 0..columns.n_items() {
-            if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
-                if let Some(col_title) = col.title() {
-                    if col_title.as_str() == title {
-                        found_at = Some((i, col.clone()));
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some((current_pos, col)) = found_at {
+    for (target_pos, wanted) in order.iter().enumerate() {
+        let found = identified_columns(column_view).find(|(_, _, id)| id.as_str() == wanted);
+        if let Some((current_pos, column, _)) = found {
             if current_pos as usize != target_pos {
-                column_view.remove_column(&col);
-                column_view.insert_column(target_pos as u32, &col);
+                column_view.remove_column(&column);
+                column_view.insert_column(target_pos as u32, &column);
             }
         }
     }
 }
 
-/// Read the current column order from the `ColumnView`.
-///
-/// Skips the sentinel column (empty title).
+/// Read the current column order from the `ColumnView` as stable IDs.
 pub fn read_column_order(column_view: &gtk::ColumnView) -> Vec<String> {
-    let columns = column_view.columns();
-    let mut order = Vec::new();
-    for i in 0..columns.n_items() {
-        if let Some(col) = columns.item(i).and_downcast_ref::<gtk::ColumnViewColumn>() {
-            if let Some(title) = col.title() {
-                if !title.is_empty() {
-                    order.push(title.to_string());
-                }
-            }
-        }
-    }
-    order
+    identified_columns(column_view)
+        .map(|(_, _, id)| id.to_string())
+        .collect()
 }
 
 /// Update browser pane visibility based on config.
@@ -1976,9 +2048,69 @@ mod tests {
         assert_eq!(config.visible_columns, ["Title"]);
         assert_eq!(config.column_order, ["Rating", "Title"]);
     }
+
+    #[test]
+    fn column_ids_are_the_english_titles_and_every_catalog_translates_them() {
+        let locale_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        for locale in rust_i18n::available_locales!() {
+            let locale: &str = locale.as_ref();
+            let path = locale_dir.join(format!("{locale}.yml"));
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let catalog: serde_yaml::Value = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            for &id in ALL_COLUMNS {
+                let key = column_title_key(id).expect("every column ID has a title key");
+                let field = key.strip_prefix("columns.").expect("columns.* key");
+                let title = column_title(id, locale);
+                assert_eq!(
+                    catalog["columns"][field].as_str(),
+                    Some(title.as_str()),
+                    "{locale}.{key} must be present in the catalog"
+                );
+                if locale == "en" {
+                    // Stored configurations hold English titles; the IDs must
+                    // stay equal to them for those configurations to apply.
+                    assert_eq!(title, id);
+                }
+                assert_eq!(
+                    column_id_from_persisted(&title),
+                    Some(id),
+                    "{locale} title {title:?} must map back to {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_localized_titles_map_to_stable_ids_and_unknown_keys_drop() {
+        let mut config = AppConfig {
+            visible_columns: vec!["Bewertung".to_string(), "Title".to_string()],
+            column_order: vec![
+                "Titel".to_string(),
+                "評価".to_string(),
+                "Country".to_string(),
+                "Title".to_string(),
+                "Plays".to_string(),
+            ],
+            column_schema_version: CURRENT_COLUMN_SCHEMA_VERSION,
+            ..AppConfig::default()
+        };
+
+        migrate_column_schema(&mut config);
+        assert_eq!(config.visible_columns, ["Rating", "Title"]);
+        assert_eq!(config.column_order, ["Title", "Rating", "Plays"]);
+
+        let reloaded: AppConfig =
+            serde_json::from_value(serde_json::to_value(&config).expect("serialize column config"))
+                .expect("deserialize column config");
+        assert_eq!(reloaded.visible_columns, config.visible_columns);
+        assert_eq!(reloaded.column_order, config.column_order);
+    }
 }
 
-/// GTK-touching tests for the browser pane/gutter traversal. These are
+/// GTK-touching tests for the browser pane/gutter traversal and the
+/// tracklist column visibility/order helpers. These are
 /// helpers folded into the crate's single consolidated GTK-initializing
 /// test (browser.rs `gtk_widget_contracts_hold_on_one_session`) — never
 /// standalone `#[test]`s — so only one test ever owns the GTK session.
@@ -1991,7 +2123,11 @@ mod tests {
 pub mod widget_tests {
     use super::update_browser_visibility;
     use super::BrowserViewsConfig;
-    use gtk::prelude::{BoxExt, WidgetExt};
+    use super::{
+        apply_column_order, apply_column_visibility, column_title, identified_columns,
+        read_column_order, AppConfig, ALL_COLUMNS,
+    };
+    use gtk::prelude::{BoxExt, CastNone, ListModelExt, WidgetExt};
 
     /// Mirror of `build_browser`'s pane row: SearchEntry stand-in, then
     /// the horizontal panes_box alternating genre, gutter, artist,
@@ -2177,5 +2313,116 @@ pub mod widget_tests {
         lone_leading_pane_leaves_no_dangling_gutters();
         lone_trailing_pane_leaves_no_dangling_gutters();
         all_panes_hidden_hide_the_browser_box();
+    }
+
+    /// The production tracklist, with every column titled as a German
+    /// session titles it. Titles are derived from IDs through the same
+    /// `column_title` the tracklist uses, with an explicit locale because
+    /// rust-i18n's current locale is process-global and tests run in
+    /// parallel.
+    fn german_tracklist() -> gtk::ColumnView {
+        let (admission, _commands) =
+            crate::ui::library_commands::LibraryCommandAdmission::channel();
+        let (_, _, _, column_view, _, _) = crate::ui::tracklist::build_tracklist(&[], admission);
+        for (_, column, id) in identified_columns(&column_view) {
+            column.set_title(Some(&column_title(&id, "de")));
+        }
+        column_view
+    }
+
+    fn visible_ids(column_view: &gtk::ColumnView) -> Vec<String> {
+        identified_columns(column_view)
+            .filter(|(_, column, _)| column.is_visible())
+            .map(|(_, _, id)| id.to_string())
+            .collect()
+    }
+
+    fn column_by_id(column_view: &gtk::ColumnView, wanted: &str) -> gtk::ColumnViewColumn {
+        identified_columns(column_view)
+            .find(|(_, _, id)| id == wanted)
+            .map(|(_, column, _)| column)
+            .unwrap_or_else(|| panic!("column {wanted} exists"))
+    }
+
+    /// Visibility and order apply by stable ID whatever the display titles
+    /// are, and the order read back for persistence is IDs, never titles.
+    pub fn column_state_is_keyed_by_id_under_a_non_english_locale() {
+        let (admission, _commands) =
+            crate::ui::library_commands::LibraryCommandAdmission::channel();
+        let (_, _, _, built, _, _) = crate::ui::tracklist::build_tracklist(&[], admission);
+        let locale = rust_i18n::locale();
+        assert_eq!(read_column_order(&built), ALL_COLUMNS);
+        for (_, column, id) in identified_columns(&built) {
+            assert_eq!(
+                column.title().as_deref(),
+                Some(column_title(&id, &locale).as_str())
+            );
+        }
+        let n_columns = built.columns().n_items() as usize;
+        assert_eq!(
+            n_columns,
+            ALL_COLUMNS.len() + 1,
+            "only the sentinel column lacks a stable ID"
+        );
+
+        let column_view = german_tracklist();
+        assert_eq!(
+            column_by_id(&column_view, "Rating").title().as_deref(),
+            Some("Bewertung")
+        );
+
+        let config = AppConfig::default();
+        apply_column_visibility(&column_view, &config.visible_columns);
+        assert_eq!(visible_ids(&column_view), ALL_COLUMNS);
+
+        let visible = vec!["Title".to_string(), "Rating".to_string()];
+        apply_column_visibility(&column_view, &visible);
+        assert_eq!(visible_ids(&column_view), visible);
+
+        let mut order = config.column_order;
+        order.reverse();
+        apply_column_order(&column_view, &order);
+        assert_eq!(read_column_order(&column_view), order);
+        assert_eq!(
+            column_view
+                .columns()
+                .item(ALL_COLUMNS.len() as u32)
+                .and_downcast::<gtk::ColumnViewColumn>()
+                .and_then(|column| column.id()),
+            None,
+            "the sentinel column stays last"
+        );
+    }
+
+    /// Radio mode retitles Artist and Album and hides non-station columns,
+    /// but every column keeps its ID, so the persisted order stays valid and
+    /// music mode restores the localized music titles.
+    pub fn radio_columns_keep_their_ids() {
+        let column_view = german_tracklist();
+        let locale = rust_i18n::locale();
+
+        crate::ui::radio::apply_radio_columns(&column_view, true);
+        assert_eq!(
+            visible_ids(&column_view),
+            ["Title", "Artist", "Album", "Genre", "Bitrate", "Format"]
+        );
+        assert_eq!(
+            column_by_id(&column_view, "Artist").title().as_deref(),
+            Some(rust_i18n::t!("columns.country", locale = &*locale).as_ref())
+        );
+        assert_eq!(
+            column_by_id(&column_view, "Album").title().as_deref(),
+            Some(rust_i18n::t!("columns.state_province", locale = &*locale).as_ref())
+        );
+        assert_eq!(read_column_order(&column_view), ALL_COLUMNS);
+
+        crate::ui::radio::apply_radio_columns(&column_view, false);
+        assert_eq!(visible_ids(&column_view), ALL_COLUMNS);
+        for (_, column, id) in identified_columns(&column_view) {
+            assert_eq!(
+                column.title().as_deref(),
+                Some(column_title(&id, &locale).as_str())
+            );
+        }
     }
 }

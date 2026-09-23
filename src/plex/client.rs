@@ -17,6 +17,7 @@ use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
     redact_url_secrets, strip_request_url, validate_base_url,
 };
+use crate::install_id::install_id;
 
 use super::api::PlexSignInResponse;
 
@@ -166,7 +167,7 @@ impl PlexClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Plex-Client-Identifier",
-            HeaderValue::from_static(CLIENT_NAME),
+            HeaderValue::from_static(install_id()),
         );
         headers.insert("X-Plex-Product", HeaderValue::from_static(CLIENT_NAME));
         headers.insert(
@@ -438,7 +439,7 @@ fn build_http_client(
     default_headers.insert("X-Plex-Token", plex_auth_header(auth_token)?);
     default_headers.insert(
         "X-Plex-Client-Identifier",
-        HeaderValue::from_static(CLIENT_NAME),
+        HeaderValue::from_static(install_id()),
     );
     default_headers.insert("X-Plex-Product", HeaderValue::from_static(CLIENT_NAME));
     default_headers.insert(
@@ -654,7 +655,12 @@ mod tests {
         let rendered = error.to_string();
         assert!(!rendered.contains(&username));
         assert!(!rendered.contains(&password));
-        assert_eq!(service.requests().len(), 1);
+        let requests = service.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers.get("x-plex-client-identifier"),
+            Some(&HeaderValue::from_static(install_id()))
+        );
         service.finish().await;
     }
 

@@ -12,6 +12,13 @@
 //! relays its typed runtime status into the application snapshot and forwards
 //! the disconnect-and-purge, same-account reauthorization, and manual-pause
 //! recovery controls to the exact active runtime.
+//!
+//! A capable build also owns the one desktop-authorization owner. Its grant
+//! comes back here: with no generation active, `Connect` installs it as a new
+//! vault account and activates it; with a generation active, reauthorization
+//! and disconnect go through the runtime, which holds the vault lease for its
+//! whole life. The owner itself takes that lease only while no generation
+//! exists, so no vault operation can wait on a running runtime.
 #![allow(clippy::redundant_pub_crate)] // Explicit crate-internal lifecycle authority boundary.
 
 use std::collections::HashSet;
@@ -27,9 +34,19 @@ use tokio::task::JoinHandle;
 
 use crate::architecture::SourceId;
 
+use super::authorization::{
+    spawn_lastfm_authorization, LastFmAuthorizationGrant, LastFmAuthorizationHandle,
+    LastFmAuthorizationShutdown, LastFmAuthorizationTransport, SystemLastFmAuthorizationClock,
+};
 use super::client::{AppCredentials, LastFmClient};
-use super::credentials::{OsSessionCredentialStore, ProtectedString, SessionCredentialStore};
+use super::credentials::{
+    CredentialError, LastFmAccountBinding, OsSessionCredentialStore, SessionCredentialStore,
+    StoredSession,
+};
 use super::delivery::{LastFmClock, LastFmTransport, SystemLastFmClock};
+use super::lifecycle::{
+    acquire_vault_lifecycle, recover_quarantined_lastfm_queue, LastFmQuarantinedQueueRecoveryError,
+};
 use super::playback_coordinator::{
     LastFmPlaybackCoordinatorActivation, LastFmPlaybackCoordinatorBinding,
     LastFmPlaybackCoordinatorOutcome,
@@ -37,9 +54,10 @@ use super::playback_coordinator::{
 use super::policy::{LastFmLivePolicy, LastFmPolicyGeneration};
 use super::runtime::{
     spawn_lastfm_runtime, LastFmManualPauseRecovery, LastFmRuntimeActivation,
-    LastFmRuntimeAdmissionError, LastFmRuntimeBarrier, LastFmRuntimeHandle, LastFmRuntimeOperation,
-    LastFmRuntimePhase, LastFmRuntimeShutdown, LastFmRuntimeStatus,
+    LastFmRuntimeAdmissionError, LastFmRuntimeBarrier, LastFmRuntimeCommandError,
+    LastFmRuntimeHandle, LastFmRuntimeOperation, LastFmRuntimeShutdown, LastFmRuntimeStatus,
 };
+use super::storage::{self, LastFmClosedAndDrainedQueue, LastFmQueueError};
 
 const APPLICATION_COMMAND_CAPACITY: usize = 2;
 const MAX_ENABLED_REMOTE_SOURCES: usize = 256;
@@ -130,35 +148,14 @@ pub(crate) enum LastFmApplicationCommandError {
     GenerationActive,
     #[error("Last.fm application generation is not active")]
     GenerationInactive,
-}
-
-/// Content-free outcome of one admitted disconnect-and-purge.
-///
-/// When `credential_cleanup_required` is true the queue purge and session
-/// wipe committed but the protected-store deletion did not complete: the
-/// generation is retained so the credential-cleanup retry control stays
-/// reachable, and the runtime status relay reports the cleanup phase.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LastFmApplicationDisconnect {
-    purged_scrobbles: u64,
-    credential_cleanup_required: bool,
-}
-
-impl LastFmApplicationDisconnect {
-    const fn new(purged_scrobbles: u64, credential_cleanup_required: bool) -> Self {
-        Self {
-            purged_scrobbles,
-            credential_cleanup_required,
-        }
-    }
-
-    pub(crate) const fn purged_scrobbles(&self) -> u64 {
-        self.purged_scrobbles
-    }
-
-    pub(crate) const fn credential_cleanup_required(&self) -> bool {
-        self.credential_cleanup_required
-    }
+    #[error("Last.fm consent and enablement are required")]
+    ConsentRequired,
+    #[error("Last.fm protected credential store is unavailable")]
+    CredentialStore,
+    #[error("a Last.fm account is already stored")]
+    AccountPresent,
+    #[error("Last.fm queue belongs to an account that can no longer be loaded")]
+    QuarantinedQueue,
 }
 
 /// Typed failure of an admitted disconnect-and-purge.
@@ -172,6 +169,8 @@ pub(crate) enum LastFmApplicationDisconnectError {
     RuntimeRefused(LastFmRuntimeAdmissionError),
     #[error("Last.fm runtime stopped before disconnect completed")]
     RuntimeStopped,
+    #[error("Last.fm disconnect did not complete and can be retried")]
+    Incomplete,
     #[error("Last.fm application generation did not drain")]
     Drain,
 }
@@ -205,7 +204,7 @@ impl LastFmApplicationActivation {
     /// current consent and enablement grants no activation authority and is
     /// refused here rather than inferring consent from a build credential,
     /// vault record, queued row, or discoverable account.
-    pub(in crate::lastfm) fn issue_from_policy_generation(
+    pub(crate) fn issue_from_policy_generation(
         generation: &LastFmPolicyGeneration,
     ) -> Result<Self, LastFmApplicationAdmissionError> {
         let Some(enabled_remote_sources) = generation.activation_remote_sources() else {
@@ -313,6 +312,7 @@ struct HandleInner {
     commands: async_channel::Sender<Command>,
     ingress: Arc<Mutex<IngressGate>>,
     status: watch::Receiver<LastFmApplicationStatus>,
+    authorization: Option<LastFmAuthorizationHandle>,
 }
 
 /// Cloneable, nonblocking control and status surface.
@@ -376,21 +376,52 @@ impl LastFmApplicationHandle {
         Ok(LastFmApplicationOperation { receiver })
     }
 
-    /// Disconnect and purge the active account generation.
+    /// Install a freshly authorized account and activate it.
     ///
-    /// The active runtime owns the destructive purge ordering (close
-    /// admissions, retire delivery, drain and transactionally purge the
-    /// durable queue, wipe the session, delete the exact vault record,
-    /// compare-and-delete the cleanup marker). Once the purge completes
-    /// without pending credential cleanup, the owner drains the generation
-    /// in the bridge-before-runtime order and returns to `AwaitingConsent`,
-    /// where a successor activation may be admitted. With incomplete
-    /// credential cleanup the generation is retained so the runtime's
-    /// credential-cleanup retry control stays reachable.
+    /// Admitted only while no generation is active or starting. The owner
+    /// requires current consent and enablement, stores the grant as a new
+    /// vault account (refusing if a readable account is already stored or if
+    /// queued rows belong to an account that can no longer be loaded), and
+    /// then runs the ordinary activation for the live policy generation.
+    pub(crate) fn try_connect(
+        &self,
+        grant: LastFmAuthorizationGrant,
+    ) -> Result<LastFmApplicationOperation<()>, LastFmApplicationAdmissionError> {
+        let mut ingress = self.lock_ingress()?;
+        if !ingress.build_available {
+            return Err(LastFmApplicationAdmissionError::BuildUnavailable);
+        }
+        if !ingress.database_admitted {
+            return Err(LastFmApplicationAdmissionError::DatabaseRequired);
+        }
+        if ingress.generation_active || ingress.activation_pending {
+            return Err(LastFmApplicationAdmissionError::GenerationActive);
+        }
+        let (completion, receiver) = oneshot::channel();
+        self.commands_try_send(Command::Connect { grant, completion })?;
+        ingress.activation_pending = true;
+        Ok(LastFmApplicationOperation { receiver })
+    }
+
+    /// Disconnect and purge the stored account.
+    ///
+    /// With a generation active, the runtime owns the destructive purge
+    /// ordering (close admissions, retire delivery, drain and transactionally
+    /// purge the durable queue, wipe the session, delete the exact vault
+    /// record, compare-and-delete the cleanup marker). Once that completes the
+    /// owner drains the generation in the bridge-before-runtime order and
+    /// returns to `AwaitingConsent`, where a successor activation may be
+    /// admitted. If the runtime could not finish, the generation is retained
+    /// and a repeat disconnect retries: the purge again, or only the
+    /// credential deletion once the purge has committed.
+    ///
+    /// With no generation active this is the explicit discard of a queue whose
+    /// account can no longer be loaded; a readable stored account is refused
+    /// with `GenerationInactive`.
     pub(crate) fn try_disconnect_and_purge(
         &self,
     ) -> Result<
-        LastFmApplicationOperation<LastFmApplicationDisconnect, LastFmApplicationDisconnectError>,
+        LastFmApplicationOperation<u64, LastFmApplicationDisconnectError>,
         LastFmApplicationAdmissionError,
     > {
         let ingress = self.lock_ingress()?;
@@ -403,28 +434,25 @@ impl LastFmApplicationHandle {
         Ok(LastFmApplicationOperation { receiver })
     }
 
-    /// Forward one same-account reauthorization to the active runtime.
+    /// Forward one same-account reauthorization grant to the active runtime.
     ///
     /// The admitted command resolves to the runtime's own admission result:
     /// `Ok` carries the typed runtime operation to await, and the inner
     /// `Err` carries the runtime's typed refusal (`NotActive` when no
     /// generation is installed). No secret crosses the completion channel;
-    /// the pair is delivered to the exact active runtime or dropped.
+    /// the grant is delivered to the exact active runtime or dropped. The
+    /// runtime saves the renewed key under its own vault lease and clears
+    /// the durable reauthentication pause before delivery resumes.
     pub(crate) fn try_reauthorize_same_account(
         &self,
-        username: String,
-        key: ProtectedString,
+        grant: LastFmAuthorizationGrant,
     ) -> Result<
         LastFmApplicationOperation<Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError>>,
         LastFmApplicationAdmissionError,
     > {
         drop(self.lock_ingress()?);
         let (completion, receiver) = oneshot::channel();
-        self.commands_try_send(Command::ReauthorizeSameAccount {
-            username,
-            key,
-            completion,
-        })?;
+        self.commands_try_send(Command::ReauthorizeSameAccount { grant, completion })?;
         Ok(LastFmApplicationOperation { receiver })
     }
 
@@ -472,6 +500,11 @@ impl LastFmApplicationHandle {
 
     pub(crate) fn subscribe_status(&self) -> watch::Receiver<LastFmApplicationStatus> {
         self.inner.status.clone()
+    }
+
+    /// The process desktop-authorization owner; `None` in unavailable builds.
+    pub(crate) fn authorization(&self) -> Option<LastFmAuthorizationHandle> {
+        self.inner.authorization.clone()
     }
 
     fn lock_ingress(&self) -> Result<MutexGuard<'_, IngressGate>, LastFmApplicationAdmissionError> {
@@ -543,13 +576,15 @@ enum Command {
         activation: LastFmApplicationActivation,
         completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
     },
+    Connect {
+        grant: LastFmAuthorizationGrant,
+        completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
+    },
     DisconnectAndPurge {
-        completion:
-            oneshot::Sender<Result<LastFmApplicationDisconnect, LastFmApplicationDisconnectError>>,
+        completion: oneshot::Sender<Result<u64, LastFmApplicationDisconnectError>>,
     },
     ReauthorizeSameAccount {
-        username: String,
-        key: ProtectedString,
+        grant: LastFmAuthorizationGrant,
         completion: oneshot::Sender<
             Result<
                 Result<LastFmRuntimeOperation<()>, LastFmRuntimeAdmissionError>,
@@ -599,6 +634,7 @@ struct ApplicationOwner {
     live_policy: LastFmLivePolicy,
     database: Option<DatabaseConnection>,
     generation: Option<ActiveGeneration>,
+    authorization: Option<LastFmAuthorizationShutdown>,
     #[cfg(test)]
     attachment_publish_gate: Option<AttachmentPublishGate>,
     #[cfg(test)]
@@ -654,6 +690,16 @@ impl ApplicationOwner {
                         return Err(error);
                     }
                 }
+                Command::Connect { grant, completion } => {
+                    if let Err(error) = self.connect(grant, completion).await {
+                        self.reject_queued();
+                        let _ = self.publish(
+                            LastFmApplicationPhase::Failed,
+                            Some(LastFmApplicationCommandError::Drain),
+                        );
+                        return Err(error);
+                    }
+                }
                 Command::DisconnectAndPurge { completion } => {
                     if let Err(error) = self.disconnect_and_purge(completion).await {
                         self.reject_queued();
@@ -664,15 +710,14 @@ impl ApplicationOwner {
                         return Err(error);
                     }
                 }
-                Command::ReauthorizeSameAccount {
-                    username,
-                    key,
-                    completion,
-                } => {
+                Command::ReauthorizeSameAccount { grant, completion } => {
                     let result = match self.generation.as_ref() {
-                        Some(generation) => generation
-                            .runtime_handle
-                            .reauthorize_same_account(username, key),
+                        Some(generation) => {
+                            let (username, key) = grant.into_authorized_session().into_parts();
+                            generation
+                                .runtime_handle
+                                .reauthorize_same_account(username.as_str().to_owned(), key)
+                        }
                         None => Err(LastFmRuntimeAdmissionError::NotActive),
                     };
                     let _ = completion.send(Ok(result));
@@ -709,8 +754,8 @@ impl ApplicationOwner {
             }
         }
 
-        // A start/claim/activation failure is terminal but not itself a
-        // failed drain. Preserve that diagnosis while completing the empty
+        // A playback-ingress claim or coordinator-activation failure is
+        // terminal but not itself a failed drain. Preserve that diagnosis while completing the empty
         // generation and persistent barrier normally.
         if self.phase()? == LastFmApplicationPhase::Failed {
             self.reject_queued();
@@ -899,11 +944,7 @@ impl ApplicationOwner {
         // runtime, storage, or credential work, exactly like the
         // superseded-generation refusals below.
         if self.live_policy.snapshot().generation() != activation.policy_generation() {
-            self.fail_terminal_before_completion(
-                LastFmApplicationCommandError::RuntimeStart,
-                completion,
-            )?;
-            return Ok(());
+            return self.refuse_activation(LastFmApplicationCommandError::RuntimeStart, completion);
         }
         let Some(activation) =
             LastFmRuntimeActivation::issue_after_consent_and_enablement(&self.live_policy)
@@ -912,11 +953,7 @@ impl ApplicationOwner {
             // command acceptance and processing (revoked consent, disabled
             // integration, or a replaced policy). Refuse before any runtime
             // start, exactly as a superseded generation would at spawn time.
-            self.fail_terminal_before_completion(
-                LastFmApplicationCommandError::RuntimeStart,
-                completion,
-            )?;
-            return Ok(());
+            return self.refuse_activation(LastFmApplicationCommandError::RuntimeStart, completion);
         };
         let started = spawn_lastfm_runtime(
             activation,
@@ -927,12 +964,11 @@ impl ApplicationOwner {
             Arc::clone(&self.clock),
         )
         .await;
+        // A refused start (no stored account, locked vault, quarantined
+        // queue, superseded policy) never created a runtime, so the owner
+        // stays dormant and a later activation can be admitted.
         let Ok((runtime_handle, runtime_shutdown)) = started else {
-            self.fail_terminal_before_completion(
-                LastFmApplicationCommandError::RuntimeStart,
-                completion,
-            )?;
-            return Ok(());
+            return self.refuse_activation(LastFmApplicationCommandError::RuntimeStart, completion);
         };
         let runtime_barrier = runtime_shutdown.barrier();
 
@@ -1055,43 +1091,38 @@ impl ApplicationOwner {
 
     async fn disconnect_and_purge(
         &mut self,
-        completion: oneshot::Sender<
-            Result<LastFmApplicationDisconnect, LastFmApplicationDisconnectError>,
-        >,
+        completion: oneshot::Sender<Result<u64, LastFmApplicationDisconnectError>>,
     ) -> Result<(), LastFmApplicationShutdownError> {
         let Some(generation) = self.generation.as_ref() else {
-            let _ = completion.send(Err(LastFmApplicationDisconnectError::GenerationInactive));
+            let _ = completion.send(self.discard_quarantined_queue().await);
             return Ok(());
         };
         // The runtime owns the destructive purge ordering. The await is
         // deliberately inside the owner: purge completion is the point at
         // which the generation must drain, so the owner must observe it
-        // before any successor activation is processed.
-        let purge = match generation.runtime_handle.disconnect_and_purge() {
-            Ok(operation) => operation,
-            Err(admission) => {
-                let _ = completion.send(Err(LastFmApplicationDisconnectError::RuntimeRefused(
-                    admission,
-                )));
+        // before any successor activation is processed. Once the purge has
+        // committed the runtime refuses a second purge; a repeat disconnect
+        // then retries only the credential deletion.
+        let runtime = &generation.runtime_handle;
+        let outcome = match runtime.disconnect_and_purge() {
+            Ok(purge) => purge.wait().await.map_err(disconnect_failure),
+            Err(LastFmRuntimeAdmissionError::CredentialCleanupRequired) => {
+                match runtime.retry_credential_cleanup() {
+                    Ok(retry) => retry.wait().await.map(|()| 0).map_err(disconnect_failure),
+                    Err(admission) => {
+                        Err(LastFmApplicationDisconnectError::RuntimeRefused(admission))
+                    }
+                }
+            }
+            Err(admission) => Err(LastFmApplicationDisconnectError::RuntimeRefused(admission)),
+        };
+        let purged_scrobbles = match outcome {
+            Ok(purged_scrobbles) => purged_scrobbles,
+            Err(failure) => {
+                let _ = completion.send(Err(failure));
                 return Ok(());
             }
         };
-        let Ok(purged_scrobbles) = purge.wait().await else {
-            // A stopped runtime can no longer report its purge outcome, and
-            // the barrier path below owns the terminal failure publication.
-            let _ = completion.send(Err(LastFmApplicationDisconnectError::RuntimeStopped));
-            return Ok(());
-        };
-        // A committed purge with incomplete protected-store deletion leaves
-        // the runtime in its credential-cleanup phase: retain the generation
-        // so the retry control stays reachable, and keep relaying the
-        // runtime's typed status.
-        let cleanup_required = generation.runtime_handle.subscribe_status().borrow().phase
-            == LastFmRuntimePhase::CredentialCleanup;
-        if cleanup_required {
-            let _ = completion.send(Ok(LastFmApplicationDisconnect::new(purged_scrobbles, true)));
-            return Ok(());
-        }
 
         // Clean disconnect: drain the generation in the bridge-before-
         // runtime order and return to AwaitingConsent. A concurrent close
@@ -1103,11 +1134,63 @@ impl ApplicationOwner {
             return Ok(());
         }
         self.publish(LastFmApplicationPhase::AwaitingConsent, None)?;
-        let _ = completion.send(Ok(LastFmApplicationDisconnect::new(
-            purged_scrobbles,
-            false,
-        )));
+        let _ = completion.send(Ok(purged_scrobbles));
         Ok(())
+    }
+
+    /// Explicitly discard queued rows whose account can no longer be loaded
+    /// (missing or corrupt vault record). A readable account is refused: it
+    /// is disconnected through its own runtime generation instead.
+    async fn discard_quarantined_queue(&self) -> Result<u64, LastFmApplicationDisconnectError> {
+        let Some(database) = self.database.clone() else {
+            return Err(LastFmApplicationDisconnectError::GenerationInactive);
+        };
+        let recovered =
+            recover_quarantined_lastfm_queue(database, Arc::clone(&self.credentials)).await;
+        match recovered {
+            Ok(recovery) => {
+                // Clear a recorded quarantine refusal so the surface reads
+                // the discarded state; a racing close keeps its own phase.
+                let mut ingress = self
+                    .lock_ingress()
+                    .map_err(|_| LastFmApplicationDisconnectError::OwnerStopped)?;
+                if ingress.open {
+                    ingress.publish(LastFmApplicationPhase::AwaitingConsent, None);
+                }
+                Ok(recovery.purged_scrobbles())
+            }
+            Err(LastFmQuarantinedQueueRecoveryError::ValidSessionPresent) => {
+                Err(LastFmApplicationDisconnectError::GenerationInactive)
+            }
+            Err(_) => Err(LastFmApplicationDisconnectError::Incomplete),
+        }
+    }
+
+    /// Install a freshly authorized account, then activate it.
+    ///
+    /// Consent is checked before the vault is touched, so a grant can never
+    /// be stored without it. Admission guaranteed that no generation is
+    /// active, so no runtime holds the vault lease the install waits for.
+    async fn connect(
+        &mut self,
+        grant: LastFmAuthorizationGrant,
+        completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
+    ) -> Result<(), LastFmApplicationShutdownError> {
+        let Ok(activation) =
+            LastFmApplicationActivation::issue_from_policy_generation(&self.live_policy.snapshot())
+        else {
+            return self
+                .refuse_activation(LastFmApplicationCommandError::ConsentRequired, completion);
+        };
+        let Some(database) = self.database.clone() else {
+            return self.refuse_activation(LastFmApplicationCommandError::OwnerStopped, completion);
+        };
+        if let Err(failure) =
+            install_new_account(&database, Arc::clone(&self.credentials), grant).await
+        {
+            return self.refuse_activation(failure, completion);
+        }
+        self.activate(activation, completion).await
     }
 
     async fn close_generation(&mut self) -> Result<(), LastFmApplicationShutdownError> {
@@ -1198,11 +1281,31 @@ impl ApplicationOwner {
         Ok(())
     }
 
+    /// Refuse an admitted activation or connect before any runtime exists.
+    /// The owner returns to dormant with the fixed failure recorded, then
+    /// wakes the waiter, so completion stays a status-observation boundary.
+    fn refuse_activation(
+        &self,
+        failure: LastFmApplicationCommandError,
+        completion: oneshot::Sender<Result<(), LastFmApplicationCommandError>>,
+    ) -> Result<(), LastFmApplicationShutdownError> {
+        {
+            let mut ingress = self.lock_ingress()?;
+            ingress.activation_pending = false;
+            if ingress.open {
+                ingress.publish(LastFmApplicationPhase::AwaitingConsent, Some(failure));
+            }
+        }
+        let _ = completion.send(Err(failure));
+        Ok(())
+    }
+
     fn reject_queued(&self) {
         while let Ok(command) = self.commands.try_recv() {
             match command {
                 Command::AttachDatabase { completion, .. }
-                | Command::Activate { completion, .. } => {
+                | Command::Activate { completion, .. }
+                | Command::Connect { completion, .. } => {
                     let _ = completion.send(Err(LastFmApplicationCommandError::OwnerStopped));
                 }
                 Command::DisconnectAndPurge { completion } => {
@@ -1277,6 +1380,86 @@ struct AttachmentPublishGate {
 struct RuntimeExitGate {
     reached: async_channel::Sender<()>,
     release: async_channel::Receiver<()>,
+}
+
+/// Classify a failed runtime disconnect step. A stopped runtime can no longer
+/// report its outcome (the barrier path owns that terminal failure); any
+/// other failure left the generation in its purge-retry or credential-cleanup
+/// state, where the next disconnect resumes.
+fn disconnect_failure(failure: LastFmRuntimeCommandError) -> LastFmApplicationDisconnectError {
+    if failure == LastFmRuntimeCommandError::OwnerStopped {
+        LastFmApplicationDisconnectError::RuntimeStopped
+    } else {
+        LastFmApplicationDisconnectError::Incomplete
+    }
+}
+
+/// Store a freshly authorized account in an empty vault under the lease.
+///
+/// A readable stored account is never replaced here (disconnect first). A
+/// corrupt record is overwritten, and an empty cleanup tombstone left by a
+/// completed credential deletion is cleared. Queued rows bound to any other
+/// account are a quarantine that only the explicit discard may remove, so
+/// the install is refused before the vault is written.
+async fn install_new_account(
+    database: &DatabaseConnection,
+    credentials: Arc<dyn SessionCredentialStore>,
+    grant: LastFmAuthorizationGrant,
+) -> Result<(), LastFmApplicationCommandError> {
+    use LastFmApplicationCommandError as Error;
+
+    let (username, key) = grant.into_authorized_session().into_parts();
+    let session = StoredSession::new(username.as_str(), key).map_err(|_| Error::CredentialStore)?;
+    let lease = acquire_vault_lifecycle().await;
+    let loader = Arc::clone(&credentials);
+    let (lease, loaded) = tokio::task::spawn_blocking(move || (lease, loader.load()))
+        .await
+        .map_err(|_| Error::CredentialStore)?;
+    match loaded {
+        Ok(None) | Err(CredentialError::InvalidData) => {}
+        Ok(Some(_)) => return Err(Error::AccountPresent),
+        Err(_) => return Err(Error::CredentialStore),
+    }
+    prepare_queue_for_new_account(database, session.account_binding()).await?;
+    let (_lease, saved) = tokio::task::spawn_blocking(move || {
+        let saved = credentials.save(&session);
+        (lease, saved)
+    })
+    .await
+    .map_err(|_| Error::CredentialStore)?;
+    saved.map_err(|_| Error::CredentialStore)
+}
+
+/// Clear an empty cleanup marker left by a completed credential deletion,
+/// then require that nothing in the queue belongs to another account.
+async fn prepare_queue_for_new_account(
+    database: &DatabaseConnection,
+    binding: LastFmAccountBinding,
+) -> Result<(), LastFmApplicationCommandError> {
+    if let Some(previous) = storage::has_empty_cleanup_tombstone(database)
+        .await
+        .map_err(queue_failure)?
+    {
+        let authority = LastFmClosedAndDrainedQueue::issue_after_barrier();
+        storage::clear_empty_cleanup_after_missing_vault(database, previous, &authority)
+            .await
+            .map_err(queue_failure)?;
+    }
+    storage::validate_account_queue_state(database, binding)
+        .await
+        .map(|_| ())
+        .map_err(queue_failure)
+}
+
+/// Rows or markers bound to another account are a quarantine; anything else
+/// is a transient storage failure the user can retry.
+const fn queue_failure(error: LastFmQueueError) -> LastFmApplicationCommandError {
+    match error {
+        LastFmQueueError::AccountMismatch | LastFmQueueError::CorruptStorage => {
+            LastFmApplicationCommandError::QuarantinedQueue
+        }
+        _ => LastFmApplicationCommandError::RuntimeStart,
+    }
 }
 
 async fn close_coordinator(activation: LastFmPlaybackCoordinatorActivation) -> bool {
@@ -1447,7 +1630,10 @@ impl fmt::Debug for LastFmApplicationBarrier {
 ///
 /// Credential probing constructs no database, vault operation, or network
 /// request. Missing or malformed build credentials leave a dormant,
-/// fail-closed owner whose database ingress rejects without retaining input.
+/// fail-closed owner whose database ingress rejects without retaining input
+/// and which has no authorization owner. A capable build also spawns the one
+/// desktop-authorization owner over the same client; its drain joins this
+/// owner's.
 pub(crate) fn spawn_lastfm_application_owner(
     coordinator: LastFmPlaybackCoordinatorBinding,
     completion_runtime: tokio::runtime::Handle,
@@ -1457,17 +1643,37 @@ pub(crate) fn spawn_lastfm_application_owner(
     APPLICATION_OWNER_CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| LastFmApplicationOwnerClaimError)?;
-    let transport = AppCredentials::from_build()
+    let client = AppCredentials::from_build()
         .and_then(LastFmClient::new)
         .ok()
-        .map(|client| Arc::new(client) as Arc<dyn LastFmTransport>);
-    Ok(spawn_with_dependencies(
+        .map(Arc::new);
+    let authorization = client.as_ref().map(|client| {
+        // The window composes this owner on the GTK thread, outside any
+        // runtime context; the authorization owner spawns onto the ambient one.
+        let _runtime = completion_runtime.enter();
+        spawn_lastfm_authorization(
+            Arc::clone(client) as Arc<dyn LastFmAuthorizationTransport>,
+            Arc::new(SystemLastFmAuthorizationClock::default()),
+        )
+    });
+    Ok(spawn_with_options(
         coordinator,
         completion_runtime,
         Arc::new(OsSessionCredentialStore),
-        transport,
+        client.map(|client| client as Arc<dyn LastFmTransport>),
         Arc::new(SystemLastFmClock),
         live_policy,
+        ApplicationSpawnOptions {
+            authorization,
+            #[cfg(test)]
+            attachment_publish_gate: None,
+            #[cfg(test)]
+            activation_start_gate: None,
+            #[cfg(test)]
+            runtime_exit_gate: None,
+            #[cfg(test)]
+            panic_cleanup_gate: None,
+        },
     ))
 }
 
@@ -1487,6 +1693,7 @@ fn spawn_with_dependencies(
         clock,
         live_policy,
         ApplicationSpawnOptions {
+            authorization: None,
             #[cfg(test)]
             attachment_publish_gate: None,
             #[cfg(test)]
@@ -1500,6 +1707,7 @@ fn spawn_with_dependencies(
 }
 
 struct ApplicationSpawnOptions {
+    authorization: Option<(LastFmAuthorizationHandle, LastFmAuthorizationShutdown)>,
     #[cfg(test)]
     attachment_publish_gate: Option<AttachmentPublishGate>,
     #[cfg(test)]
@@ -1534,10 +1742,12 @@ fn spawn_with_options(
         status_sender,
         status: initial_status,
     }));
+    let (authorization, authorization_shutdown) = options.authorization.unzip();
     let inner = Arc::new(HandleInner {
         commands,
         ingress: Arc::clone(&ingress),
         status,
+        authorization,
     });
     let mut owner = ApplicationOwner {
         commands: receiver,
@@ -1550,6 +1760,7 @@ fn spawn_with_options(
         live_policy,
         database: None,
         generation: None,
+        authorization: authorization_shutdown,
         #[cfg(test)]
         attachment_publish_gate: options.attachment_publish_gate,
         #[cfg(test)]
@@ -1566,13 +1777,20 @@ fn spawn_with_options(
             sender: completion_sender,
             drained: false,
         };
-        let result = match AssertUnwindSafe(owner.run()).catch_unwind().await {
+        let mut result = match AssertUnwindSafe(owner.run()).catch_unwind().await {
             Ok(result) => result,
             Err(_) => {
                 owner.quiesce_after_panic().await;
                 Err(LastFmApplicationShutdownError)
             }
         };
+        // Join the authorization owner last: an in-flight flow can outlive
+        // no part of the application drain.
+        if let Some(authorization) = owner.authorization.take() {
+            if authorization.shutdown().await.is_err() {
+                result = Err(LastFmApplicationShutdownError);
+            }
+        }
         guard.drained = result.is_ok();
         result
     });
@@ -1607,10 +1825,11 @@ mod tests {
     use crate::lastfm::delivery::LastFmDeliveryPrimitiveError;
     use crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOwner;
     use crate::lastfm::policy::LastFmPolicyGeneration;
+    use crate::lastfm::runtime::LastFmRuntimePhase;
 
     /// One live policy slot publishing generation 1 with the same empty
     /// opt-in set the test activations carry.
-    fn live_policy_for_test() -> LastFmLivePolicy {
+    pub(super) fn live_policy_for_test() -> LastFmLivePolicy {
         let live = LastFmLivePolicy::default();
         live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
         live
@@ -1724,7 +1943,7 @@ mod tests {
         }
     }
 
-    struct PendingTransport;
+    pub(super) struct PendingTransport;
 
     #[async_trait]
     impl LastFmTransport for PendingTransport {
@@ -1745,7 +1964,7 @@ mod tests {
         }
     }
 
-    struct FixedClock;
+    pub(super) struct FixedClock;
 
     #[async_trait]
     impl LastFmClock for FixedClock {
@@ -1771,7 +1990,7 @@ mod tests {
         (owner, binding)
     }
 
-    async fn migrated_database() -> DatabaseConnection {
+    pub(super) async fn migrated_database() -> DatabaseConnection {
         let database = Database::connect("sqlite::memory:")
             .await
             .expect("in-memory database");
@@ -1942,6 +2161,7 @@ mod tests {
             Arc::new(FixedClock),
             live_policy_for_test(),
             ApplicationSpawnOptions {
+                authorization: None,
                 attachment_publish_gate: Some(AttachmentPublishGate {
                     reached: attachment_reached,
                     release: attachment_releases,
@@ -2223,8 +2443,7 @@ mod tests {
             .await
             .expect("disconnect deadline")
             .expect("disconnect purged and drained");
-        assert_eq!(outcome.purged_scrobbles(), 0);
-        assert!(!outcome.credential_cleanup_required());
+        assert_eq!(outcome, 0);
         let status = *handle.subscribe_status().borrow();
         assert_eq!(status.phase, LastFmApplicationPhase::AwaitingConsent);
         assert_eq!(status.runtime, None);
@@ -2314,10 +2533,10 @@ mod tests {
             Err(LastFmApplicationDisconnectError::GenerationInactive)
         );
         let reauthorization = handle
-            .try_reauthorize_same_account(
-                "reauthorization-listener".to_string(),
-                ProtectedString::new("fedcba9876543210fedcba9876543210"),
-            )
+            .try_reauthorize_same_account(LastFmAuthorizationGrant::for_test(
+                "reauthorization-listener",
+                "fedcba9876543210fedcba9876543210",
+            ))
             .expect("reauthorization admitted");
         assert_not_active_refusal(
             reauthorization.wait().await.expect("forward admitted"),
@@ -2377,10 +2596,10 @@ mod tests {
         activate_first_policy_generation(&handle, &live).await;
 
         let reauthorization = handle
-            .try_reauthorize_same_account(
-                "reauthorization-listener".to_string(),
-                ProtectedString::new("fedcba9876543210fedcba9876543210"),
-            )
+            .try_reauthorize_same_account(LastFmAuthorizationGrant::for_test(
+                "reauthorization-listener",
+                "fedcba9876543210fedcba9876543210",
+            ))
             .expect("reauthorization admitted");
         assert_forwarded_refusal(
             reauthorization
@@ -2456,6 +2675,7 @@ mod tests {
             Arc::new(FixedClock),
             live_policy_for_test(),
             ApplicationSpawnOptions {
+                authorization: None,
                 attachment_publish_gate: None,
                 activation_start_gate: Some(ActivationStartGate {
                     reached: start_reached,
@@ -2618,6 +2838,7 @@ mod tests {
             Arc::new(FixedClock),
             live_policy_for_test(),
             ApplicationSpawnOptions {
+                authorization: None,
                 attachment_publish_gate: None,
                 activation_start_gate: None,
                 runtime_exit_gate: Some(RuntimeExitGate {
@@ -2769,6 +2990,7 @@ mod tests {
             Arc::new(FixedClock),
             live_policy_for_test(),
             ApplicationSpawnOptions {
+                authorization: None,
                 attachment_publish_gate: None,
                 activation_start_gate: None,
                 runtime_exit_gate: None,
@@ -3008,12 +3230,13 @@ mod tests {
         (live, coordinator_owner, handle, shutdown)
     }
 
-    /// Asserts the owner's published snapshot records the terminal runtime-
-    /// start refusal. Completion is the observation boundary: the terminal
-    /// snapshot is published before the waiter wakes.
-    fn assert_terminal_runtime_start_refusal(handle: &LastFmApplicationHandle) {
+    /// Asserts the owner published the runtime-start refusal and stayed
+    /// dormant, able to admit a later activation. Completion is the
+    /// observation boundary: the snapshot is published before the waiter
+    /// wakes.
+    fn assert_dormant_runtime_start_refusal(handle: &LastFmApplicationHandle) {
         let status = *handle.subscribe_status().borrow();
-        assert_eq!(status.phase, LastFmApplicationPhase::Failed);
+        assert_eq!(status.phase, LastFmApplicationPhase::AwaitingConsent);
         assert_eq!(
             status.failure,
             Some(LastFmApplicationCommandError::RuntimeStart)
@@ -3023,7 +3246,7 @@ mod tests {
     /// Drains the owner and asserts a clean shutdown: the drain deadline is
     /// met, the barrier drains fully, and the playback coordinator observed
     /// the final state.
-    async fn assert_owner_drains(
+    pub(super) async fn assert_owner_drains(
         shutdown: LastFmApplicationShutdown,
         coordinator_owner: &mut LastFmPlaybackCoordinatorOwner,
     ) {
@@ -3045,7 +3268,7 @@ mod tests {
     /// A queued application activation freezes its issuing generation. When
     /// the live policy is replaced by a still-consented, enabled successor
     /// before the owner processes the command, the activation is spent: the
-    /// owner must refuse terminal before minting a runtime activation, so no
+    /// owner must refuse before minting a runtime activation, so no
     /// runtime starts and the vault is never read — the successor's source
     /// set must never be governed under the predecessor's consent.
     #[tokio::test]
@@ -3070,13 +3293,13 @@ mod tests {
                 .expect("superseded activation deadline"),
             Err(LastFmApplicationCommandError::RuntimeStart)
         );
-        assert_terminal_runtime_start_refusal(&handle);
+        assert_dormant_runtime_start_refusal(&handle);
         assert_owner_drains(shutdown, &mut coordinator_owner).await;
     }
 
     /// The refusal is by generation identity, not by the successor's
     /// consent state: a revoked or disabled replacement goes through the
-    /// same terminal path, and the vault still is never read.
+    /// same refusal, and the vault still is never read.
     #[tokio::test]
     async fn revoked_generation_refuses_queued_activation_before_runtime_start() {
         let (live, mut coordinator_owner, handle, shutdown) =
@@ -3098,7 +3321,7 @@ mod tests {
                 .expect("revoked activation deadline"),
             Err(LastFmApplicationCommandError::RuntimeStart)
         );
-        assert_terminal_runtime_start_refusal(&handle);
+        assert_dormant_runtime_start_refusal(&handle);
         assert_owner_drains(shutdown, &mut coordinator_owner).await;
     }
 
@@ -3149,3 +3372,7 @@ mod tests {
         source_registry.shutdown().wait().await;
     }
 }
+
+#[cfg(test)]
+#[path = "production_account_tests.rs"]
+mod account_tests;

@@ -133,6 +133,29 @@ where
     (application_result, coordinator_result, source_barrier)
 }
 
+/// Resume the account a previous session connected, once the persisted
+/// policy grants consent and enablement. A refused start (no stored account,
+/// locked vault) leaves the owner dormant; the settings surface can retry.
+async fn resume_lastfm_account(
+    application: &crate::lastfm::production::LastFmApplicationHandle,
+    policy: &crate::lastfm::policy::LastFmLivePolicy,
+) {
+    let Ok(activation) =
+        crate::lastfm::production::LastFmApplicationActivation::issue_from_policy_generation(
+            &policy.snapshot(),
+        )
+    else {
+        return;
+    };
+    match application.try_activate(activation) {
+        Ok(operation) => match operation.wait().await {
+            Ok(()) => info!("Last.fm scrobbling resumed"),
+            Err(error) => info!(category = %error, "Last.fm scrobbling did not resume"),
+        },
+        Err(error) => warn!(category = %error, "Last.fm resume was not admitted"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LastFmDatabaseCompositionOutcome {
     UnavailableBuild,
@@ -542,6 +565,31 @@ impl SourceReducerContext {
             invalidate_source_playback,
             invalidate_playlist_playback,
         }
+    }
+}
+
+/// Remove a confirmed manually added server and release its Saved claim.
+///
+/// Persisted absence is the authority for releasing Saved, so a failed write
+/// leaves both the row and the claim untouched. The lifecycle baseline
+/// reducer then owns Saved demotion, final projection clearing, row removal,
+/// and active-source fallback.
+fn remove_manual_server(
+    source_registry: &crate::source_registry::SourceRegistry,
+    remote_provenance: &crate::source_registry::ProvenanceClaims,
+    source_id: crate::architecture::SourceId,
+) {
+    if !remove_saved_server(source_id) {
+        tracing::warn!(%source_id, "Could not persist saved server removal");
+        return;
+    }
+    if !remote_provenance.release(
+        source_registry,
+        source_id,
+        crate::source_lifecycle::SourceProvenance::Saved,
+        "saved-config",
+    ) {
+        tracing::warn!(%source_id, "Saved source claim was unavailable after removal");
     }
 }
 
@@ -1431,31 +1479,21 @@ pub(crate) fn build_window(
     let lastfm_playback = lastfm_playback_owner
         .bind_window(source_registry.clone())
         .expect("the unique process playback coordinator binds one window epoch");
-    // The durable Last.fm policy generation starts closed and is replaced
-    // wholesale once the migrated database becomes available. Playback queue
-    // capture reads it synchronously; no shipping path mutates policy yet,
-    // so the feature stays fail-closed until the consent/settings slice
-    // lands. The database-init task publishes successors from off the GTK
-    // thread, so the slot is a `Send` mutex rather than a `RefCell`.
-    let lastfm_policy: std::sync::Arc<
-        std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::lastfm::policy::LastFmPolicyGeneration::default(),
-    ));
+    // The durable Last.fm policy generation starts closed and is published
+    // once the migrated database becomes available. One live handle is
+    // cloned into queue capture, dispatch, the application owner, and the
+    // settings surface, so every consumer and the runtime's supervision
+    // observe the same generation and every write goes through it.
+    let lastfm_policy = crate::lastfm::policy::LastFmLivePolicy::default();
     // Compose the process application owner before asynchronous database
-    // initialization. It remains Dormant until a future consent/policy layer
-    // issues the move-only activation authority; ordinary builds without
-    // injected credentials perform no Last.fm database, vault, or network
-    // work. The live policy handle wraps the SAME shared generation slot the
-    // playback capture contexts clone, so queue capture and dispatch
-    // admission observe one authoritative live generation: capture freezes
-    // its identity into each minted occurrence, and dispatch re-derives the
-    // current generation's authority from this slot at the moment of use.
+    // initialization. It stays dormant until the persisted policy grants
+    // consent and a stored account exists; ordinary builds without injected
+    // credentials perform no Last.fm database, vault, or network work.
     let (lastfm_application, lastfm_application_shutdown) =
         match crate::lastfm::production::spawn_lastfm_application_owner(
             lastfm_playback.clone(),
             rt_handle.clone(),
-            crate::lastfm::policy::LastFmLivePolicy::from_shared(lastfm_policy.clone()),
+            lastfm_policy.clone(),
         ) {
             Ok(owner) => owner,
             Err(error) => {
@@ -1467,6 +1505,11 @@ pub(crate) fn build_window(
             }
         };
     let lastfm_application_shutdown = Rc::new(RefCell::new(Some(lastfm_application_shutdown)));
+    let lastfm_settings = crate::ui::lastfm_settings::LastFmSettingsContext::new(
+        lastfm_application.clone(),
+        lastfm_policy.clone(),
+        rt_handle.clone(),
+    );
     // The owner is deliberately non-cloneable. Keep the unique value alive
     // for the native window and mutate it only at the close barrier; all
     // ordinary playback callbacks receive the epoch-scoped binding instead.
@@ -2124,6 +2167,7 @@ pub(crate) fn build_window(
     let engine_source_registry = source_registry.clone();
     let engine_lastfm_application = lastfm_application.clone();
     let engine_lastfm_policy = lastfm_policy.clone();
+    let engine_lastfm_settings = lastfm_settings.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
@@ -2132,13 +2176,7 @@ pub(crate) fn build_window(
                 // default: the feature stays off rather than guessing at a
                 // malformed record.
                 match crate::lastfm::policy::load_policy_generation(&db).await {
-                    Ok(policy) => {
-                        // Recovering publish: the shared slot must stay
-                        // writable even after a poisoned lock, because the
-                        // value is replaced wholesale and re-validated on
-                        // every read.
-                        *crate::lastfm::policy::lock_policy_slot(&engine_lastfm_policy) = policy;
-                    }
+                    Ok(policy) => engine_lastfm_policy.publish(policy),
                     Err(error) => {
                         tracing::warn!(
                             category = %error,
@@ -2146,6 +2184,7 @@ pub(crate) fn build_window(
                         );
                     }
                 }
+                engine_lastfm_settings.attach_database(db.clone());
                 let lastfm_phase = engine_lastfm_application.subscribe_status().borrow().phase;
                 let lastfm_database_outcome = compose_lastfm_database(lastfm_phase, || {
                     engine_lastfm_application
@@ -2159,6 +2198,13 @@ pub(crate) fn build_window(
                     }
                     LastFmDatabaseCompositionOutcome::Attached => {
                         info!("Last.fm application database attached");
+                        // The vault read may wait on a keyring unlock; it
+                        // must not hold up the library engine below.
+                        let application = engine_lastfm_application.clone();
+                        let policy = engine_lastfm_policy.clone();
+                        tokio::spawn(async move {
+                            resume_lastfm_account(&application, &policy).await;
+                        });
                     }
                     LastFmDatabaseCompositionOutcome::AlreadyAttached => {
                         warn!(
@@ -2206,8 +2252,9 @@ pub(crate) fn build_window(
                     warn!(%error, "Server playlist coordinator owner failed after database error");
                 }
                 tracing::error!(error = %e, "Failed to initialise database");
+                let failure = crate::db::connection::DatabaseInitFailure::of(&e);
                 let _ = engine_tx_clone
-                    .send(LibraryEvent::Error(format!("Database error: {e}")))
+                    .send(LibraryEvent::DatabaseUnavailable(failure))
                     .await;
             }
         }
@@ -2371,6 +2418,8 @@ pub(crate) fn build_window(
     {
         let source_registry = source_registry.clone();
         let remote_provenance = remote_provenance.clone();
+        let win = window.downgrade();
+        let sidebar_store = sidebar_store.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
@@ -2379,23 +2428,18 @@ pub(crate) fn build_window(
                     tracing::warn!("Ignoring delete for invalid source identity");
                     continue;
                 };
-                // Persisted absence is the authority for releasing Saved.
-                // A failed write leaves both the row and claim untouched.
-                if !remove_saved_server(source_id) {
-                    tracing::warn!(%source_id, "Could not persist saved server removal");
+                let Some(win) = win.upgrade() else {
+                    break;
+                };
+                let Some((_, source)) = sidebar_source_by_id(&sidebar_store, source_id) else {
                     continue;
-                }
-                if !remote_provenance.release(
-                    &source_registry,
-                    source_id,
-                    crate::source_lifecycle::SourceProvenance::Saved,
-                    "saved-config",
-                ) {
-                    tracing::warn!(%source_id, "Saved source claim was unavailable after removal");
-                }
-
-                // The lifecycle baseline reducer owns Saved demotion, final
-                // projection clearing, row removal, and active-source fallback.
+                };
+                let source_registry = source_registry.clone();
+                let remote_provenance = remote_provenance.clone();
+                let dialog = super::confirm_dialog::remove_server(&source.name(), move || {
+                    remove_manual_server(&source_registry, &remote_provenance, source_id);
+                });
+                dialog.present(Some(&win));
             }
         });
     }
@@ -2562,6 +2606,7 @@ pub(crate) fn build_window(
 
     // Wrap the raw Player in LocalOutput → Box<dyn AudioOutput>.
     let local_output = LocalOutput::new(player);
+    local_output.set_equalizer(&app_config.borrow().equalizer);
     let active_output: SharedAudioOutput = Rc::new(RefCell::new(Box::new(local_output)));
     *active_output_slot.borrow_mut() = Some(active_output.clone());
     let active_output_target = Rc::new(RefCell::new(super::output_switch::OutputTarget::Local));
@@ -2974,11 +3019,9 @@ pub(crate) fn build_window(
         let cv = column_view.clone();
         let active_source_key = active_source_key.clone();
         sorter.connect_changed(move |_, _| {
-            // Don't persist sort state while viewing a radio station: in
-            // radio mode the Artist/Album columns are renamed to
-            // Country/State-Province, so the saved title could never be
-            // re-matched against the music-mode columns on the next launch
-            // (issue #38).
+            // Don't persist sort state while viewing a radio station: radio
+            // mode repurposes the Artist/Album columns as Country and
+            // State/Province, so a station sort is not the user's music sort.
             if super::radio::is_radio_backend(&active_source_key.borrow()) {
                 return;
             }
@@ -3475,9 +3518,9 @@ pub(crate) fn build_window(
                 let save_queued = save_queued.clone();
                 glib::idle_add_local_once(move || {
                     save_queued.set(false);
-                    // Skip persistence while in radio mode — the renamed
-                    // Artist→Country / Album→State-Province columns would
-                    // corrupt the saved column order (issue #38).
+                    // Skip persistence while in radio mode, which
+                    // repurposes and hides columns; the saved order is the
+                    // music layout.
                     if super::radio::is_radio_backend(&active_source_key.borrow()) {
                         return;
                     }
@@ -3598,6 +3641,8 @@ pub(crate) fn build_window(
         let cfg = app_config.clone();
         let bs = browser_state.clone();
         let master_for_pref = master_tracks.clone();
+        let output_for_prefs = active_output.clone();
+        let lastfm_settings = lastfm_settings.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
             let bw_for_aa = bw.clone();
@@ -3635,7 +3680,7 @@ pub(crate) fn build_window(
                         size.pixel_size(),
                     );
                 });
-            preferences::show_preferences(
+            let page = preferences::show_preferences(
                 &win,
                 &cv,
                 &bw,
@@ -3643,7 +3688,12 @@ pub(crate) fn build_window(
                 on_aa_change,
                 on_art_change,
                 on_art_size_change,
+                &output_for_prefs,
             );
+            page.add(&crate::ui::lastfm_settings::build_lastfm_group(
+                &win,
+                &lastfm_settings,
+            ));
         });
         window.add_action(&prefs_action);
     }
@@ -4551,6 +4601,12 @@ fn setup_library_events(
                     }
                 }
 
+                LibraryEvent::DatabaseUnavailable(failure) => {
+                    scan_spinner.set_spinning(false);
+                    scan_spinner.set_visible(false);
+                    show_database_unavailable(&window, failure);
+                }
+
                 LibraryEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Library engine error");
                     scan_spinner.set_spinning(false);
@@ -4560,6 +4616,28 @@ fn setup_library_events(
             }
         }
     });
+}
+
+/// Tell the user the library database is unavailable, naming the failed
+/// stage. The underlying error was already logged where it occurred.
+fn show_database_unavailable(
+    window: &adw::ApplicationWindow,
+    failure: crate::db::connection::DatabaseInitFailure,
+) {
+    use crate::db::connection::DatabaseInitFailure;
+
+    let body = match failure {
+        DatabaseInitFailure::Open => rust_i18n::t!("errors.database.open_failed"),
+        DatabaseInitFailure::Upgrade => rust_i18n::t!("errors.database.upgrade_failed"),
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(rust_i18n::t!("errors.database.heading").as_ref())
+        .body(body.as_ref())
+        .close_response("ok")
+        .default_response("ok")
+        .build();
+    dialog.add_response("ok", rust_i18n::t!("dialogs.ok").as_ref());
+    dialog.present(Some(window));
 }
 
 #[allow(clippy::too_many_arguments)]

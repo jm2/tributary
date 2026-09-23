@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Equalizer** — A ten-band equalizer in Preferences for playback on this computer, with
+  Flat, Pop, Rock, Jazz, and Classical presets, a preamp, and optional soft clip protection.
+  Changes apply to the playing track immediately and are remembered between sessions.
+- **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure
+  and connecting, reconnecting, or disconnecting an account. Builds without Last.fm application
+  credentials, including current releases, show the feature as unavailable.
 - **Display-backed GTK test gate** — A dedicated CI job runs the crate's production
   widget contracts under a real X (Xvfb) display on one GTK-owning thread with
   `TRIBUTARY_GTK_GATE=require`, so a widget test that cannot reach a display fails the
@@ -73,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **AirPlay outputs need a sender** — AirPlay receivers are listed in the output selector only
+  when the installed GStreamer provides `raopsink`, so builds without it no longer offer rows that
+  fail on play. The README describes routing to AirPlay through the operating system meanwhile.
 - **Implementation backlog** — Reconcile completed slices and Gas City dependencies, add eleven
   corrective and seven engineering records, and expose operator/release acceptance separately.
   Preserve the prior detailed contracts and delivery history in an archive; no feature is marked
@@ -82,11 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the repository.
 - **Last.fm preparation** — Persist consent and per-source policy generations for future
   scrobbling activation, with transactional updates and validation. Scrobbling remains disabled.
-- **Dependency maintenance** — Refresh Rust dependencies and the release-upload action,
-  and keep the fuzz lockfile synchronized with dependency updates.
-- **Dependency security audits** — Audit the root and independent fuzz Cargo lockfiles
-  separately, each with its own scoped advisory exceptions and fixture proof that the
-  intended lock was selected, so a fuzz-only finding cannot hide behind a green root audit.
+- **Dependency maintenance** — Refresh Rust dependencies and the release-upload action.
+- **Single dependency lockfile** — The fuzz harness now shares the application's Cargo
+  workspace and lockfile, so Dependabot updates no longer need a manual fuzz-lock repair and
+  the security audit covers one lock.
 - **macOS packaging throughput** — Inspect each immutable Homebrew dylib source once per
   bundle build instead of once per plugin that links it, and apply each binary's equivalent
   `install_name_tool -change` edits in a single invocation. Forbidden-component policy is
@@ -113,6 +121,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
+  12 servers, which by default reject the older authentication header Tributary used to
+  send. Earlier Jellyfin versions keep working.
+- **One device per install** — Each Tributary install now presents its own device identity
+  to Jellyfin and Plex, so signing in on a second computer, or adding the same Jellyfin
+  server twice, no longer signs out your other Tributary sessions.
+- **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row from
+  the output selector, and receivers or Chromecasts that share a display name no longer hide each
+  other.
+- **Year edits** — Changing or clearing the year in Properties now takes effect for MP3
+  and M4A files, and replaces the existing date on FLAC and Ogg files instead of being
+  hidden by it.
+- **Legacy ID3v1 tags** — Editing an MP3 that only has an ID3v1 tag keeps its title,
+  artist and album. Blank ID3v1 fields now fall back to the file name and "Unknown"
+  names, so these files are no longer rejected on removable devices or when opened from
+  the file manager.
+- **Playlist edits during a library scan** — Creating, renaming, deleting, importing, or
+  editing playlists (and other library changes) while a scan is running now waits
+  briefly for the scan instead of failing at once with "database is locked".
+- **Upgrading libraries from 0.5.x** — A playlist entry whose song was deleted and had a
+  blank artist tag no longer stops the upgrade and leaves the library empty; such
+  entries, which could never be matched again, are removed during the upgrade. If the
+  library database cannot be opened or upgraded, Tributary now shows an error instead
+  of an empty library.
+- **Rating column in non-English languages** — The Rating column no longer stays hidden
+  when Tributary runs in a language other than English, so ratings can be edited again.
+  Track list column titles and the Preferences column checkboxes are now translated, and
+  saved column visibility, order and sort carry over unchanged.
+- **Confirm before deleting a playlist or removing a server** — Deleting a playlist or
+  removing a saved server from the sidebar now asks for confirmation first, with Cancel
+  as the default, so a misclick no longer discards it immediately.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

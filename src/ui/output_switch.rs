@@ -539,12 +539,12 @@ fn target_for_row(
 
     let icon = row_icon_name(activated_row);
     let host_port = activated_row.widget_name().to_string();
-    if icon == "video-display-symbolic" {
+    if icon == CHROMECAST_ROW_ICON {
         let address = host_port.parse().ok()?;
         return Some(OutputTarget::Chromecast { address });
     }
-    if icon == "network-wireless-symbolic" {
-        let (host, port) = parse_host_port(&host_port, 7000);
+    if icon == AIRPLAY_ROW_ICON {
+        let (host, port) = parse_host_port(airplay_row_endpoint(&host_port), 7000);
         return Some(OutputTarget::AirPlay { host, port });
     }
 
@@ -558,7 +558,34 @@ fn target_for_row(
     })
 }
 
-fn row_icon_name(row: &gtk::ListBoxRow) -> gtk::glib::GString {
+/// Icons of discovered receiver rows. The icon is a row's kind
+/// discriminator: AirPlay and Chromecast rows both store an endpoint.
+pub(super) const AIRPLAY_ROW_ICON: &str = "network-wireless-symbolic";
+pub(super) const CHROMECAST_ROW_ICON: &str = "video-display-symbolic";
+
+/// Separates a discovered AirPlay row's `host:port` endpoint from its device
+/// identifier in the row widget name.
+const AIRPLAY_ROW_ID_SEPARATOR: char = '|';
+
+/// Widget name of a discovered AirPlay row: `host:port`, plus `|<device id>`
+/// when discovery retained one. Rows are keyed by this identity rather than by
+/// display name, so receivers that share a name stay separately selectable.
+pub(super) fn encode_airplay_row_identity(endpoint: &str, device_id: Option<&str>) -> String {
+    match device_id {
+        Some(id) if !id.is_empty() => format!("{endpoint}{AIRPLAY_ROW_ID_SEPARATOR}{id}"),
+        _ => endpoint.to_string(),
+    }
+}
+
+/// The `host:port` endpoint of an AirPlay row identity, without any device
+/// identifier.
+pub(super) fn airplay_row_endpoint(identity: &str) -> &str {
+    identity
+        .split_once(AIRPLAY_ROW_ID_SEPARATOR)
+        .map_or(identity, |(endpoint, _)| endpoint)
+}
+
+pub(super) fn row_icon_name(row: &gtk::ListBoxRow) -> gtk::glib::GString {
     row.first_child()
         .and_then(|inner| inner.downcast::<gtk::Box>().ok())
         .and_then(|row_box| {
@@ -656,6 +683,24 @@ mod tests {
     use super::*;
     use crate::audio::PlayerEventGeneration;
     use crate::ui::header_bar::RepeatMode;
+
+    #[test]
+    fn airplay_row_identity_round_trips_to_the_endpoint() {
+        let identity = encode_airplay_row_identity("10.0.0.5:7000", Some("AABBCCDDEEFF"));
+        assert_eq!(identity, "10.0.0.5:7000|AABBCCDDEEFF");
+        assert_eq!(
+            parse_host_port(airplay_row_endpoint(&identity), 7000),
+            ("10.0.0.5".to_string(), 7000)
+        );
+
+        for bare in [
+            encode_airplay_row_identity("den.local:5000", None),
+            encode_airplay_row_identity("den.local:5000", Some("")),
+        ] {
+            assert_eq!(bare, "den.local:5000");
+            assert_eq!(airplay_row_endpoint(&bare), "den.local:5000");
+        }
+    }
 
     #[derive(Debug, Default)]
     struct FakeOutputState {

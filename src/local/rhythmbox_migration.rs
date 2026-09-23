@@ -10,9 +10,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Set};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -1399,7 +1397,7 @@ pub async fn apply_rhythmbox_migration(
     request: &RhythmboxMigrationRequest,
 ) -> Result<RhythmboxMigrationOutcome, RhythmboxMigrationError> {
     let prepared = &request.prepared;
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
 
     let result = apply_rhythmbox_migration_in(&transaction, prepared).await;
     match result {

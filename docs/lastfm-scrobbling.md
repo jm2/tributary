@@ -1,13 +1,12 @@
 # Last.fm scrobbling contract
 
-- Status: accepted P2.1 design; internal protocol/desktop-authorization/vault/queue/playback-evidence,
-  registry-bound external and removable attribution, playback-owner, delivery/lifecycle,
-  now-playing, process-coordinator/production-ingress, sealed headless Active runtime-bridge, and
-  headless application-owner boundaries plus first-window/database/ordered-shutdown composition
-  implemented; production startup remains Dormant because no activation authority is issued, and
-  product integration is pending
+- Status: accepted P2.1 design; the internal foundation, the application owner with its account
+  controls, and the LF3 consent/account settings group are implemented. Shipped builds carry no
+  application credentials, so they report Last.fm as unavailable and do no Last.fm work until LF4
+  injects them. Local-library attribution is still closed
+  ([#336](https://github.com/jm2/tributary/issues/336))
 - Decision date: 2026-07-20
-- Implementation status date: 2026-07-27
+- Implementation status date: 2026-09-23
 - Tracking issue: [#50](https://github.com/jm2/tributary/issues/50)
 - Playback evidence foundation: [`playback-history.md`](playback-history.md)
 
@@ -245,6 +244,33 @@ in debug, release, and the fuzz workspace; the declared Rust 1.92 locked all-tar
 formatting, and diff checks are clean; and the dependency audit reports only the two documented
 allowed unmaintained warnings.
 
+### LF3 settings and activation (2026-09-23)
+
+The paragraphs above predate LF3. The Preferences group now drives the application owner, and every
+write goes through it:
+
+- **Connect** records the localized consent through `LastFmLivePolicy::commit`, which persists the
+  policy row and publishes the new generation to queue capture, dispatch, and runtime supervision.
+  It then runs the browser flow of the authorization owner (which the application owner constructs
+  on capable builds) and passes the grant to the owner's `Connect`. That stores a new vault account
+  under the vault lease, which the owner takes only while no runtime generation exists, and then
+  activates it from the live policy. Startup activates a stored account when the persisted policy
+  grants consent.
+- **Reconnect** after provider code 9 goes through the running runtime's same-account
+  reauthorization, which saves the renewed key under the runtime's own lease and clears the durable
+  pause. A different username is refused; switching accounts is Disconnect followed by Connect.
+- **Disconnect** runs the runtime's purge. If credential deletion fails, the generation is kept and
+  the next Disconnect retries only the deletion. Connect clears an empty cleanup marker left by a
+  completed deletion, but refuses rows from an account that can no longer be loaded. Disconnect
+  then discards those rows explicitly.
+- A refused runtime start (no stored account, locked vault, quarantined queue) leaves the owner
+  dormant instead of failed, so a later Connect or retry can succeed.
+
+Not yet covered: a disable or withdraw-consent control, per-source opt-in, and pending-count and
+manual-recovery UI. Publishing a superseding policy while a runtime is active retires that runtime,
+and the owner currently treats that as a terminal failure. No LF3 control publishes while a runtime
+is active.
+
 The central rule is:
 
 > Tributary submits only a bounded snapshot of structured track metadata after current,
@@ -346,10 +372,10 @@ HTTP, XML/JSON, database, and credential-store details remain in sanitized diagn
 
 One non-cloneable, process-lifetime Last.fm application owner is the sole bridge from already-issued
 product enablement authority to the lower-level vault, runtime, and playback-coordinator owners.
-Authorization remains a separate owner and must produce the durable account authority before
-activation. Shipping composition creates the application owner after the exact first-window
-coordinator bind and before asynchronous database initialization; it exposes only a bounded,
-content-free control/status surface. Missing or
+Authorization remains a separate owner, constructed by the application owner on capable builds,
+and must produce the durable account authority before activation. Shipping composition creates the
+application owner after the exact first-window coordinator bind and before asynchronous database
+initialization; it exposes only a bounded, content-free control/status surface. Missing or
 malformed build credentials produce the fixed `UnavailableBuild` classification until shutdown,
 without reading the vault, touching the Last.fm queue, or contacting a network service.
 Otherwise it remains dormant until one migrated database has been attached and then a move-only
@@ -361,11 +387,9 @@ one bounded set of exact remote `SourceId` choices. The application owner never 
 enablement from a build credential, a vault record, queued rows, source connectivity, or a manually
 discoverable account. The preference representation, consent-version migration, disable versus
 disconnect behavior, and stale source-choice cleanup must be specified with the settings slice
-before any persisted policy can issue this request. The currently composed handle intentionally
-offers only one database attachment, one activation, close, and content-free phase/failure status.
-That settings slice must also resolve one-shot activation versus a fully drained successor policy
-generation and compose typed runtime status, disconnect, reauthorization, and recovery controls;
-the present handle cannot support those product actions by itself.
+before any persisted policy can issue this request. The handle now also carries Connect,
+disconnect-and-purge, same-account reauthorization, and manual-recovery controls, and it admits a
+successor activation once a completed disconnect has drained the generation.
 
 Each admitted activation is one fail-closed transaction:
 
@@ -382,7 +406,8 @@ activation lease as one generation. A duplicate or concurrent activation cannot 
 runtime or playback owner. Any failure after runtime start closes and joins that runtime before a
 retry can be considered; a failed coordinator or runtime drain is sticky and terminal. A database
 or start result that completes after close cannot publish AwaitingConsent, Starting, or Active or
-resurrect authority. On the normal path, runtime-start, playback-ingress-claim, and
+resurrect authority. A refused runtime start creates no runtime, so the owner returns to
+`AwaitingConsent` with the fixed failure recorded. On the normal path, playback-ingress-claim and
 coordinator-activation failures publish their content-free terminal snapshot synchronously before
 signalling the command's independent completion channel; after a waiter receives that fixed
 failure, an immediate status read therefore observes `Failed` rather than an intermediate
@@ -409,9 +434,8 @@ drain be joined. The GTK composition now initiates this sequence asynchronously,
 application join before downstream coordinator/output/source teardown, and carries no GTK or
 `RefCell` borrow across the drain.
 
-The headless core is composed into the first window and receives the migrated database on capable
-builds. Shipping still does not persist live policy, construct authorization UI, or issue a
-production activation request.
+The core is composed into the first window, receives the migrated database on capable builds, and
+is driven by the LF3 settings group.
 
 ## Desktop authorization and account identity
 
@@ -428,11 +452,9 @@ Authorization is one cancellable latest-only desktop flow:
    Tributary generates a new random opaque account UUID and atomically stores the three-field
    account record in the operating-system credential vault before enabling scrobbling.
 
-As of 2026-07-22, the internal authorization core implements the bounded latest-only request flow
-through the move-only staged username/session-key result in step 4. No production path constructs
-that owner, records consent, launches the browser, creates an account UUID, installs the staged
-grant in the vault, or applies same/different-account transition policy yet; those operations must
-land as one fail-closed integration rather than exposing a partial feature.
+Since LF3 the application owner constructs this owner on capable builds. The settings group records
+consent before it starts a flow and launches the browser, and the application owner's Connect
+installs the grant with a new random account UUID.
 
 Tributary never asks for a Last.fm password. The request token, session key, username, and opaque
 account UUID have content-redacted error and debug representations. An authorization token is not

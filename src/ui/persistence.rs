@@ -71,12 +71,12 @@ pub fn save_sort_state(column_view: &gtk::ColumnView) {
 
     match cv_sorter.primary_sort_column() {
         Some(column) => {
-            let title = column.title().map(|t| t.to_string()).unwrap_or_default();
+            let id = column.id().map(|id| id.to_string()).unwrap_or_default();
             let dir = match cv_sorter.primary_sort_order() {
                 gtk::SortType::Descending => "desc",
                 _ => "asc",
             };
-            write_setting("sort", &format!("{title}\n{dir}"));
+            write_setting("sort", &format!("{id}\n{dir}"));
         }
         None => {
             // No active sort — remove saved state.
@@ -92,7 +92,14 @@ pub fn restore_sort_state(column_view: &gtk::ColumnView) {
         return;
     };
     let mut lines = text.lines();
-    let Some(title) = lines.next() else { return };
+    // The first line is a stable column ID, or a display title written by an
+    // earlier build.
+    let Some(id) = lines
+        .next()
+        .and_then(super::preferences::column_id_from_persisted)
+    else {
+        return;
+    };
     let order = match lines.next() {
         Some("desc") => gtk::SortType::Descending,
         _ => gtk::SortType::Ascending,
@@ -104,7 +111,7 @@ pub fn restore_sort_state(column_view: &gtk::ColumnView) {
             let Some(col) = col.downcast_ref::<gtk::ColumnViewColumn>() else {
                 continue;
             };
-            if col.title().is_some_and(|t| t == title) {
+            if col.id().is_some_and(|column_id| column_id == id) {
                 column_view.sort_by_column(Some(col), order);
                 return;
             }

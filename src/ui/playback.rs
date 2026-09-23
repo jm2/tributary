@@ -2107,13 +2107,10 @@ pub struct PlaybackContext {
     /// Cloneable window binding to the single process-lifetime Last.fm
     /// playback coordinator. It remains inert while the feature is dormant.
     pub lastfm_playback: LastFmPlaybackCoordinatorBinding,
-    /// Shared current Last.fm policy generation. It starts closed and is
-    /// replaced wholesale after the migrated database loads the persisted
-    /// policy; queue capture freezes its remote-source opt-in set. The
-    /// database-init task publishes successor generations from off the GTK
-    /// thread, so the slot is a `Send` mutex rather than a `RefCell`.
-    pub lastfm_policy:
-        std::sync::Arc<std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>>,
+    /// Live Last.fm policy generation. It starts closed and is published
+    /// after the migrated database loads the persisted policy; queue capture
+    /// freezes its remote-source opt-in set.
+    pub lastfm_policy: crate::lastfm::policy::LastFmLivePolicy,
     /// The tracklist `ColumnView` — used to scroll the currently
     /// playing row into view on track change so the user doesn't lose
     /// their place when sequential / shuffled playback advances.
@@ -2192,10 +2189,7 @@ fn control_current_output(ctx: &PlaybackContext, control: impl FnOnce(&dyn Audio
 /// starts the selected item. Later view mutations do not alter that queue.
 pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     let source_key = ctx.active_source_key.borrow().clone();
-    // Recovering lock: the capture below can transitively reach fallible
-    // adapters (removable media), so the policy slot must survive a poisoned
-    // mutex instead of panicking on every later consumer.
-    let policy = crate::lastfm::policy::lock_policy_slot(&ctx.lastfm_policy);
+    let policy = ctx.lastfm_policy.snapshot();
     let Some(captured) = capture_visible_queue(
         &ctx.model,
         &source_key,
@@ -2205,7 +2199,6 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
     ) else {
         return false;
     };
-    drop(policy);
     let selected = &captured.items[captured.selected_index];
     if selected.uri.is_empty()
         && !is_library_source(selected.identity.media_key.source_id)
@@ -3116,8 +3109,7 @@ pub fn play_external_session(
     super::open_files::invalidate_admission();
     // The external occurrence freezes the exact live generation that was
     // current when the queue was captured, exactly like visible-track capture.
-    let policy_generation =
-        crate::lastfm::policy::lock_policy_slot(&ctx.lastfm_policy).generation();
+    let policy_generation = ctx.lastfm_policy.snapshot().generation();
     let item = QueueItem::external(external, policy_generation);
     let previous_external = ctx.session.borrow().current_external_source_id();
     if !ctx.session.borrow_mut().replace_queue(vec![item], 0) {

@@ -100,10 +100,13 @@ impl fmt::Debug for DesktopAuthToken {
 }
 
 /// Browser URL that carries an ephemeral desktop auth token.
+///
+/// The value stays private to the Last.fm module. The account composition
+/// layer extracts it once per admitted flow for the consent-gated browser
+/// handoff; it never reaches diagnostics, logs, or redacted formatting.
 pub(super) struct DesktopAuthorizationUrl(ProtectedString);
 
 impl DesktopAuthorizationUrl {
-    #[cfg(test)]
     pub(super) fn as_str(&self) -> &str {
         self.0.expose()
     }

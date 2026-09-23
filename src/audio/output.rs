@@ -28,6 +28,7 @@
 //! (local, Subsonic, Jellyfin, Plex, DAAP, radio) are managed by the
 //! sidebar and are completely independent of the active output.
 
+use super::equalizer::EqualizerSettings;
 use super::{PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::local::resolver::ResolvedLocalMedia;
@@ -80,6 +81,19 @@ pub trait AudioOutput {
     fn supervision_lapsed(&self) -> bool {
         false
     }
+
+    // ── Equalizer ───────────────────────────────────────────────────
+
+    /// Whether this output runs Tributary's equalizer. Only the local
+    /// pipeline can, and only while its GStreamer elements are available;
+    /// AirPlay, Chromecast, and MPD receivers render the audio themselves.
+    fn supports_equalizer(&self) -> bool {
+        false
+    }
+
+    /// Apply equalizer settings to the playing stream. Outputs that do not
+    /// support the equalizer ignore them.
+    fn set_equalizer(&self, _settings: &EqualizerSettings) {}
 
     // ── Playback controls ───────────────────────────────────────────
 

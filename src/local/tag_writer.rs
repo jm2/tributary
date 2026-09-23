@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lofty::config::WriteOptions;
 use lofty::file::{TaggedFile, TaggedFileExt};
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 use uuid::Uuid;
 
 use super::root_authority::{
@@ -2301,13 +2301,49 @@ fn ensure_primary_tag<'a>(
     target_label: &str,
 ) -> Result<&'a mut Tag> {
     if tagged_file.primary_tag_mut().is_none() {
-        let tag_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(Tag::new(tag_type));
+        let seeded = seed_primary_tag(tagged_file.primary_tag_type(), tagged_file.first_tag());
+        tagged_file.insert_tag(seeded);
     }
 
     tagged_file.primary_tag_mut().ok_or_else(|| {
         anyhow::anyhow!("No primary tag found and cannot create one for {target_label}")
     })
+}
+
+/// Build a new primary tag of `tag_type` as a copy of the tag the file
+/// already carries, if any. The parser prefers the primary tag, so a new
+/// primary tag holding only the edited field would hide every other field of
+/// an ID3v1- or APE-only file.
+fn seed_primary_tag(tag_type: TagType, existing: Option<&Tag>) -> Tag {
+    let Some(existing) = existing else {
+        return Tag::new(tag_type);
+    };
+    let mut seeded = existing.clone();
+    // ID3v1 stores the year under `Year`, which ID3v2 and MP4 cannot hold;
+    // move it to the recording date before remapping would drop it.
+    if let Some(date) = seeded.date() {
+        seeded.set_date(date);
+    }
+    if existing.tag_type() == TagType::Id3v1 {
+        // ID3v1 text fields are fixed-width and space-padded. Copy the
+        // values, not the padding, and drop fields that were only padding.
+        for key in [
+            ItemKey::TrackTitle,
+            ItemKey::TrackArtist,
+            ItemKey::AlbumTitle,
+            ItemKey::Comment,
+        ] {
+            if let Some(value) = seeded.get_string(key).map(|v| v.trim_end().to_owned()) {
+                if value.is_empty() {
+                    seeded.remove_key(key);
+                } else {
+                    seeded.insert_text(key, value);
+                }
+            }
+        }
+    }
+    seeded.re_map(tag_type);
+    seeded
 }
 
 /// Apply every requested edit to `tag` — only touch fields that are Some —
@@ -2387,13 +2423,8 @@ fn apply_contributor_and_genre_edits(tag: &mut Tag, edits: &TagEdits) {
 fn apply_number_edits(tag: &mut Tag, edits: &TagEdits) -> Result<()> {
     match parse_tag_number("Year", edits.year.as_deref())? {
         NumberEdit::Unchanged => {}
-        NumberEdit::Clear => tag.remove_key(ItemKey::Year),
-        NumberEdit::Set(year) => {
-            tag.insert(TagItem::new(
-                ItemKey::Year,
-                ItemValue::Text(year.to_string()),
-            ));
-        }
+        NumberEdit::Clear => tag.remove_date(),
+        NumberEdit::Set(year) => set_year(tag, year)?,
     }
 
     match parse_tag_number("Track #", edits.track_number.as_deref())? {
@@ -2408,6 +2439,21 @@ fn apply_number_edits(tag: &mut Tag, edits: &TagEdits) -> Result<()> {
         NumberEdit::Set(disc) => tag.set_disk(disc),
     }
 
+    Ok(())
+}
+
+/// Store the year as the recording date (`TDRC`, `©day`, `DATE`): that is
+/// the field readers, this app's parser included, take the year from, and
+/// the only year field ID3v2 and MP4 can hold. A legacy `Year` item (Vorbis
+/// `YEAR`) is rewritten too, so it can never contradict the new date.
+fn set_year(tag: &mut Tag, year: u32) -> Result<()> {
+    let year = year.to_string();
+    if !tag.insert_text(ItemKey::RecordingDate, year.clone()) {
+        anyhow::bail!("{:?} tags cannot store a year", tag.tag_type());
+    }
+    if tag.get(ItemKey::Year).is_some() {
+        tag.insert_text(ItemKey::Year, year);
+    }
     Ok(())
 }
 
@@ -2959,10 +3005,145 @@ mod tests {
         );
         assert_eq!(tag.genre().as_deref(), Some("Fixture Genre"));
         assert_eq!(tag.get_string(ItemKey::Composer), Some("Fixture Composer"));
-        assert_eq!(tag.get_string(ItemKey::Year), Some("2026"));
+        assert_eq!(tag.get_string(ItemKey::RecordingDate), Some("2026"));
         assert_eq!(tag.track(), Some(7));
         assert_eq!(tag.disk(), Some(2));
         assert_eq!(tag.comment().as_deref(), Some("Fixture comment"));
+    }
+
+    const MP3_TDRC_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/mp3_tdrc_2007.mp3"
+    ));
+    const M4A_DAY_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/m4a_day_2007.m4a"
+    ));
+    const FLAC_DATE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/flac_date_2007.flac"
+    ));
+    const OGG_DATE_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/ogg_date_2007.ogg"
+    ));
+    const ID3V1_PADDED_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/id3v1_padded.mp3"
+    ));
+
+    fn parse(track: &Path) -> crate::local::tag_parser::ParsedTrack {
+        crate::local::tag_parser::parse_audio_file(track).expect("parse the written file")
+    }
+
+    /// Every writable format stores the year where the parser reads it:
+    /// an edit replaces the file's existing recording date, a clear removes
+    /// it, and a later edit adds one to the now-undated file.
+    #[test]
+    fn a_year_edit_replaces_and_clears_the_recording_date_in_every_format() {
+        let directory = TestDirectory::new("year-formats");
+        for (name, contents) in [
+            ("tdrc.mp3", MP3_TDRC_FIXTURE),
+            ("day.m4a", M4A_DAY_FIXTURE),
+            ("date.flac", FLAC_DATE_FIXTURE),
+            ("date.ogg", OGG_DATE_FIXTURE),
+        ] {
+            let track = directory.audio_file(name, contents);
+            assert_eq!(parse(&track).year, Some(2007), "{name} starts dated");
+
+            write_tags(&track, &year("2019")).expect("set the year");
+            assert_eq!(parse(&track).year, Some(2019), "{name}: edit");
+
+            write_tags(&track, &year("")).expect("clear the year");
+            assert_eq!(parse(&track).year, None, "{name}: clear");
+
+            write_tags(&track, &year("2021")).expect("set the year again");
+            let parsed = parse(&track);
+            assert_eq!(parsed.year, Some(2021), "{name}: edit of an undated file");
+            assert!(parsed.title_from_tag, "{name}: other fields kept");
+        }
+    }
+
+    /// A Vorbis comment may carry a legacy `YEAR` beside `DATE`. A year edit
+    /// rewrites both and a clear removes both, so they never disagree.
+    #[test]
+    fn a_year_edit_keeps_a_legacy_vorbis_year_consistent() {
+        let directory = TestDirectory::new("year-legacy");
+        let track = directory.audio_file("date.flac", FLAC_DATE_FIXTURE);
+        let mut tagged_file = lofty::read_from_path(&track).expect("read the fixture");
+        let tag = tagged_file
+            .primary_tag_mut()
+            .expect("fixture has a comment");
+        assert!(tag.insert_text(ItemKey::Year, "2007".to_string()));
+        tag.save_to_path(&track, WriteOptions::default())
+            .expect("add a legacy YEAR");
+
+        let dates = |track: &Path| {
+            let tagged_file = lofty::read_from_path(track).expect("reopen the FLAC");
+            let tag = tagged_file.primary_tag().expect("comment kept");
+            [ItemKey::RecordingDate, ItemKey::Year]
+                .map(|key| tag.get_string(key).map(str::to_owned))
+        };
+        write_tags(&track, &year("2019")).expect("set the year");
+        assert_eq!(
+            dates(&track),
+            [Some("2019".to_owned()), Some("2019".to_owned())]
+        );
+
+        write_tags(&track, &year("")).expect("clear the year");
+        assert_eq!(dates(&track), [None, None]);
+    }
+
+    #[test]
+    fn a_year_edit_fails_when_the_tag_has_no_date_field() {
+        let mut tag = Tag::new(TagType::AiffText);
+
+        let error = apply_tag_edits(&mut tag, &year("2020"))
+            .expect_err("AIFF text chunks cannot store a date");
+        assert!(error.to_string().contains("cannot store a year"), "{error}");
+    }
+
+    /// Editing an ID3v1-only MP3 creates its ID3v2 tag, which the parser then
+    /// prefers. The new tag starts as a copy of the ID3v1 values, without
+    /// their padding, so the edit never hides the other fields.
+    #[test]
+    fn an_id3v1_only_mp3_keeps_its_fields_after_an_edit() {
+        let directory = TestDirectory::new("id3v1-seed");
+        let genre = TagEdits {
+            genre: Some("Jazz".to_string()),
+            ..Default::default()
+        };
+        let track = directory.audio_file("legacy.mp3", ID3V1_PADDED_FIXTURE);
+
+        write_tags(&track, &genre).expect("edit an ID3v1-only MP3");
+
+        let parsed = parse(&track);
+        assert_eq!(parsed.title, "Pad Title");
+        assert_eq!(parsed.artist_name, "Pad Artist");
+        assert_eq!(parsed.album_title, "Pad Album");
+        assert_eq!(parsed.year, Some(2007));
+        assert_eq!(parsed.genre.as_deref(), Some("Jazz"));
+        let tagged_file = lofty::read_from_path(&track).expect("reopen the MP3");
+        let id3v2 = tagged_file
+            .tag(TagType::Id3v2)
+            .expect("the edit adds ID3v2");
+        assert_eq!(id3v2.title().as_deref(), Some("Pad Title"));
+        assert_eq!(id3v2.comment().as_deref(), Some("Pad Comment"));
+
+        // Blank ID3v1 fields are only padding and are not copied at all.
+        let blank = directory.audio_file(
+            "blank.mp3",
+            &crate::local::tag_parser::blank_id3v1_fixture(),
+        );
+        write_tags(&blank, &genre).expect("edit a blank ID3v1-only MP3");
+        let tagged_file = lofty::read_from_path(&blank).expect("reopen the MP3");
+        let id3v2 = tagged_file
+            .tag(TagType::Id3v2)
+            .expect("the edit adds ID3v2");
+        assert_eq!(id3v2.title(), None);
+        assert_eq!(id3v2.artist(), None);
+        assert_eq!(id3v2.album(), None);
+        assert_eq!(id3v2.genre().as_deref(), Some("Jazz"));
     }
 
     /// A removable-media write through a retained mutation target must
@@ -3004,7 +3185,7 @@ mod tests {
         let tag = tagged_file
             .primary_tag()
             .expect("tagged FLAC must have a primary tag");
-        assert_eq!(tag.get_string(ItemKey::Year), Some("2027"));
+        assert_eq!(tag.get_string(ItemKey::RecordingDate), Some("2027"));
     }
 
     /// The bug this authority exists for: if the pathname is swapped between
@@ -3093,7 +3274,7 @@ mod tests {
         let tag =
             ensure_primary_tag(&mut tagged_file, "competing fixture").expect("primary tag exists");
         tag.insert(TagItem::new(
-            ItemKey::Year,
+            ItemKey::RecordingDate,
             ItemValue::Text(competing_year.to_string()),
         ));
         tag.save_to_path(path, WriteOptions::default())
@@ -3165,7 +3346,7 @@ mod tests {
             .primary_tag()
             .expect("tagged FLAC must have a primary tag");
         assert_eq!(
-            tag.get_string(ItemKey::Year),
+            tag.get_string(ItemKey::RecordingDate),
             Some("2026"),
             "the write must land on the exact file behind the link"
         );
@@ -3527,7 +3708,7 @@ mod tests {
         // The competing edit is preserved; the requested year never landed.
         let tagged = lofty::read_from_path(&track).expect("reopen the competing file");
         let tag = tagged.primary_tag().expect("primary tag");
-        assert_eq!(tag.get_string(ItemKey::Year), Some("1999"));
+        assert_eq!(tag.get_string(ItemKey::RecordingDate), Some("1999"));
         assert!(
             directory.temp_files().is_empty(),
             "a refused commit leaves no staged sibling behind"
@@ -3745,7 +3926,7 @@ mod tests {
 
         let tagged = lofty::read_from_path(&track).expect("reopen the written file");
         let tag = tagged.primary_tag().expect("primary tag");
-        assert_eq!(tag.get_string(ItemKey::Year), Some("2026"));
+        assert_eq!(tag.get_string(ItemKey::RecordingDate), Some("2026"));
         assert!(directory.temp_files().is_empty());
     }
 
@@ -3869,7 +4050,7 @@ mod tests {
 
         let tagged = lofty::read_from_path(&track).expect("reopen the competing file");
         let tag = tagged.primary_tag().expect("primary tag");
-        assert_eq!(tag.get_string(ItemKey::Year), Some("1999"));
+        assert_eq!(tag.get_string(ItemKey::RecordingDate), Some("1999"));
         assert!(directory.temp_files().is_empty());
     }
 
@@ -3984,7 +4165,7 @@ mod tests {
             tagged_file
                 .primary_tag()
                 .expect("primary tag")
-                .get_string(ItemKey::Year),
+                .get_string(ItemKey::RecordingDate),
             Some("2026"),
             "the replacement must land beside the admitted file in the retained directory"
         );

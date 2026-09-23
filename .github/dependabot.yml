@@ -14,11 +14,8 @@ version: 2
 updates:
   # ── Rust crates (Cargo.toml / Cargo.lock) ─────────────────────────────────
   #
-  # The fuzz crate is deliberately a separate Cargo workspace and therefore
-  # needs its own Dependabot entry below. A root update can still change direct
-  # production dependencies inherited by fuzz through its path dependency on
-  # Tributary; CI detects that cross-lock drift and the repository-owned repair
-  # command is documented in docs/dependency-updates.md.
+  # The fuzz harness is a member of the root workspace, so this one entry and
+  # the single root Cargo.lock cover it.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -53,29 +50,6 @@ updates:
         exclude-patterns:
           - "sea-orm"
           - "sea-orm-migration"
-        update-types:
-          - "minor"
-          - "patch"
-
-  # ── Rust fuzz workspace (fuzz/Cargo.toml / fuzz/Cargo.lock) ───────────────
-  - package-ecosystem: "cargo"
-    directory: "/fuzz"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    cooldown:
-      default-days: 5
-    groups:
-      seaorm-security:
-        applies-to: security-updates
-        patterns:
-          - "sea-orm"
-          - "sea-orm-migration"
-
-      fuzz-minor-and-patch:
-        applies-to: version-updates
-        patterns:
-          - "*"
         update-types:
           - "minor"
           - "patch"

@@ -27,9 +27,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history so the dependency policy can diff PR lock state
-          # against the exact base commit it resolves at run time.
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Test package compliance policies
@@ -43,7 +40,6 @@ jobs:
       - name: Test dependency update policy
         run: |
           python3 scripts/test_dependency_update_policy.py
-          python3 scripts/test_audit_lockfiles.py
           python3 scripts/sync_rust_toolchain.py --check
 
       - name: Check backlog consistency
@@ -56,32 +52,13 @@ jobs:
           python3 scripts/test_check_backlog_consistency_rework2.py
           python3 scripts/test_check_backlog_consistency_rework3.py
 
-      - name: Verify root and fuzz lock update coherence
-        if: github.event_name == 'pull_request'
-        env:
-          DEPENDENCY_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          # checkout checks out the PR merge commit (refs/pull/<n>/merge),
-          # whose first parent is the base-branch tip the merge was built
-          # against. The PR's recorded base.sha can be older than that tip
-          # once the base branch advances, so diffing against it attributes
-          # the base's own lock updates to the PR and fails this check
-          # spuriously (blocked PR #175). Diff against the merge's actual
-          # first parent instead; fall back to the recorded base.sha only
-          # when HEAD is not a merge commit.
-          if git rev-parse --verify --quiet HEAD^2 >/dev/null; then
-            DEPENDENCY_BASE_SHA="$(git rev-parse HEAD^1)"
-          fi
-          python3 scripts/sync_fuzz_lock.py check --base-ref "$DEPENDENCY_BASE_SHA"
-
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # Root/fuzz lock coherence is not a security audit: the fuzz workspace is
-      # a separate graph with its own Cargo.lock, so both locks are audited
-      # explicitly with their own scoped advisory exceptions.
-      - name: Audit root and fuzz lockfiles
-        run: python3 scripts/audit_lockfiles.py
+      # The fuzz harness is a workspace member, so the single root Cargo.lock
+      # covers every dependency graph; exceptions live in .cargo/audit.toml.
+      - name: Audit Cargo.lock
+        run: cargo audit
 
   # ── MSRV (minimum supported Rust version) ─────────────────────────────────
   # Compile-proof for the `rust-version` declared in Cargo.toml. Keep the
@@ -213,17 +190,11 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: cargo test --all-targets
 
-      # The fuzz crate is its own workspace, so the main fmt/clippy passes
-      # never see it and its lockfile can drift (a drifted kstring once
-      # raised its effective MSRV past the toolchain unnoticed). --locked
-      # pins the committed resolution.
-      - name: Fuzz workspace fmt + clippy
+      # The fuzz harness is a non-default workspace member: `cargo fmt` above
+      # already covers it, but the clippy passes do not.
+      - name: Clippy (fuzz harness)
         if: matrix.arch == 'x86_64'
-        env:
-          CARGO_TARGET_DIR: target
-        run: |
-          cargo fmt --manifest-path fuzz/Cargo.toml --package tributary-fuzz -- --check
-          cargo clippy --manifest-path fuzz/Cargo.toml --package tributary-fuzz --all-targets --locked -- -D warnings
+        run: cargo clippy -p tributary-fuzz --all-targets --locked -- -D warnings
 
       - name: Upload Linux binary
         uses: actions/upload-artifact@v7
