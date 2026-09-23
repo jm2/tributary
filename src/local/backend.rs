@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Statement,
 };
 use uuid::Uuid;
 
@@ -237,9 +237,7 @@ impl MediaBackend for LocalBackend {
         track_id: &TrackId,
         rating: Option<Rating>,
     ) -> BackendResult<Option<Track>> {
-        let transaction = self
-            .db
-            .begin()
+        let transaction = crate::db::begin_write(&self.db)
             .await
             .map_err(|error| BackendError::Internal(error.into()))?;
         let update = transaction

@@ -112,11 +112,14 @@ For every valid predecessor row it:
 
 No metadata or path heuristic participates in migration. The migration neither resolves an orphan
 nor invents a new track ID. Existing order and repeated occurrences survive even when multiple rows
-name the same local track. A legacy row with no track identity and no usable path or normalized
-title-and-artist evidence is corrupt rather than an unmatched import, so the migration rejects it.
-All table creation, copying, constraint/index restoration, and foreign-key validation occur in one
-transaction; any error restores the complete predecessor schema and data so the upgrade remains
-retryable.
+name the same local track. Before the copy, the migration deletes (and logs the count of) any
+legacy row with no track identity and no usable path or complete title-and-artist evidence, using
+the same Unicode whitespace definition as the orphan-evidence constraint. Released versions
+produced such rows: adding a track stored its trimmed artist and no path, so a whitespace-only
+artist tag left a blank fingerprint once the track was deleted. Nothing could ever relink such a
+row, and the target constraint rejects it. All table creation, copying, constraint/index
+restoration, and foreign-key validation occur in one transaction; any error restores the complete
+predecessor schema and data so the upgrade remains retryable.
 
 The reverse migration is exact or it does not run. It can rebuild the predecessor schema while all
 rows are representable as local entries, but it transactionally refuses a non-local or otherwise

@@ -54,10 +54,38 @@ async fn connect_and_migrate(db_path: &Path) -> Result<DatabaseConnection, DbErr
     let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
 
     info!("Running pending migrations");
-    Migrator::up(&db, None).await?;
-    migration::revalidate_critical_objects(&db).await?;
+    let upgrade = async {
+        Migrator::up(&db, None).await?;
+        migration::revalidate_critical_objects(&db).await
+    };
+    upgrade.await.map_err(|error| match error {
+        DbErr::Migration(_) => error,
+        other => DbErr::Migration(other.to_string()),
+    })?;
 
     Ok(db)
+}
+
+/// Which start-up stage failed, so the UI can name it without showing the
+/// underlying error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseInitFailure {
+    /// The data directory or the database file could not be opened.
+    Open,
+    /// A schema migration or the post-migration schema check failed.
+    Upgrade,
+}
+
+impl DatabaseInitFailure {
+    /// Classify an error from [`get_or_init_db`]: every failure after the
+    /// database file opened is reported as [`DbErr::Migration`].
+    pub const fn of(error: &DbErr) -> Self {
+        if matches!(error, DbErr::Migration(_)) {
+            Self::Upgrade
+        } else {
+            Self::Open
+        }
+    }
 }
 
 /// Obtain the shared database connection, initialising it on first call.
@@ -197,6 +225,53 @@ mod tests {
         }
     }
 
+    /// A playlist rename reads before it writes. While another pooled
+    /// connection holds the write lock it must wait for that writer and then
+    /// succeed, instead of failing with "database is locked" the moment its
+    /// read transaction tries to become a writer.
+    #[tokio::test]
+    async fn read_then_write_playlist_mutation_waits_for_a_concurrent_writer() {
+        let file = TestDatabase::new("write-lock");
+        let db = connect_and_migrate(file.path())
+            .await
+            .expect("open database");
+        let manager = crate::local::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Before")
+            .await
+            .expect("create playlist");
+
+        let writer = crate::db::begin_write(&db)
+            .await
+            .expect("begin competing write");
+        a_track("track-1", "/music/one.flac")
+            .insert(&writer)
+            .await
+            .expect("stage competing write");
+
+        let rename = tokio::spawn({
+            let id = playlist.id.clone();
+            async move { manager.rename_playlist(&id, "After").await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !rename.is_finished(),
+            "the rename must still be waiting for the write lock"
+        );
+        writer.commit().await.expect("commit competing write");
+
+        rename
+            .await
+            .expect("rename task")
+            .expect("rename succeeds once the competing writer commits");
+        let renamed = playlist::Entity::find_by_id(playlist.id)
+            .one(&db)
+            .await
+            .expect("load playlist")
+            .expect("playlist exists");
+        assert_eq!(renamed.name, "After");
+    }
+
     /// A current migration ledger is not proof that mutable critical SQLite
     /// objects still exist. Every process startup must validate them after
     /// the migrator's otherwise-no-op ledger check.
@@ -217,6 +292,21 @@ mod tests {
             .await
             .expect_err("startup must reject a current but damaged migration installation");
         assert!(error.to_string().contains("trigger object"));
+        assert_eq!(
+            DatabaseInitFailure::of(&error),
+            DatabaseInitFailure::Upgrade
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unopenable_database_is_an_open_failure() {
+        let path = std::env::temp_dir()
+            .join(format!("tributary-db-missing-{}", Uuid::new_v4()))
+            .join("library.db");
+        let error = connect_and_migrate(&path)
+            .await
+            .expect_err("the parent directory does not exist");
+        assert_eq!(DatabaseInitFailure::of(&error), DatabaseInitFailure::Open);
     }
 
     /// P1.5's guarantee, asserted end to end against a real pool: deleting a

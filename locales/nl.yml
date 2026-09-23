@@ -314,6 +314,10 @@ errors:
     playback_failed: "Het afspelen van audio is mislukt"
     airplay_raopsink_missing: "AirPlay 1-weergave is niet beschikbaar: deze build bevat geen compatibele GStreamer-raopsink-zender"
     mpd_exclusive_control_required: "Voeg deze MPD-uitvoer opnieuw toe, bevestig exclusieve partitiecontrole en selecteer deze opnieuw vóór het afspelen"
+  database:
+    heading: "Bibliotheek niet beschikbaar"
+    open_failed: "Tributary kon de bibliotheekdatabase niet openen, waardoor uw bibliotheek en afspeellijsten niet kunnen worden weergegeven. Zie het logboek voor details."
+    upgrade_failed: "Tributary kon de bibliotheekdatabase niet bijwerken voor deze versie, waardoor uw bibliotheek en afspeellijsten niet kunnen worden weergegeven. Zie het logboek voor details."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

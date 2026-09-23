@@ -373,7 +373,7 @@ impl PlaylistManager {
     ) -> Result<playlist::Model, DbErr> {
         let storage = smart_rules_storage(rules)?;
         let now = now_rfc3339();
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let result = playlist::ActiveModel {
             id: Set(Uuid::new_v4().to_string()),
             name: Set(name.to_string()),
@@ -409,7 +409,7 @@ impl PlaylistManager {
         name: &str,
         imported: &[ImportedTrack],
     ) -> Result<PlaylistImportResult, DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let all_tracks = track::Entity::find().all(&txn).await?;
         let match_index = ImportedTrackMatchIndex::new(&all_tracks);
         let now = now_rfc3339();
@@ -515,7 +515,7 @@ impl PlaylistManager {
 
     /// Delete a playlist and all its entries (cascade).
     pub async fn delete_playlist(&self, id: &str) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         require_editable_playlist(&txn, id).await?;
         let deleted = playlist::Entity::delete_by_id(id.to_string())
             .exec(&txn)
@@ -530,7 +530,7 @@ impl PlaylistManager {
 
     /// Rename a playlist.
     pub async fn rename_playlist(&self, id: &str, new_name: &str) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         require_editable_playlist(&txn, id).await?;
         let mut model: playlist::ActiveModel = playlist::Entity::find_by_id(id.to_string())
             .one(&txn)
@@ -617,7 +617,7 @@ impl PlaylistManager {
         Authorize: FnOnce() -> Option<Authority>,
         Authority: Send + 'static,
     {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         require_editable_regular_playlist(&txn, playlist_id).await?;
         if inputs.is_empty() {
             let Some(authority) = authorize() else {
@@ -754,7 +754,7 @@ impl PlaylistManager {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         require_editable_regular_playlist(&txn, playlist_id).await?;
         if entry_ids.is_empty() {
             txn.commit().await?;
@@ -813,7 +813,7 @@ impl PlaylistManager {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         require_editable_regular_playlist(&txn, playlist_id).await?;
         let current = playlist_entry::Entity::find()
             .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
@@ -843,7 +843,7 @@ impl PlaylistManager {
     /// Rows are stored as contiguous positions; a playlist without an order
     /// row keeps the historical `created_at` fallback ordering.
     pub async fn set_sidebar_order(&self, ordered_ids: &[String]) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let current = playlist::Entity::find().all(&txn).await?;
         let requested: HashSet<&str> = ordered_ids.iter().map(String::as_str).collect();
         let current_ids: HashSet<&str> = current
@@ -997,7 +997,7 @@ impl PlaylistManager {
     ) -> Result<(), DbErr> {
         let storage = smart_rules_storage(rules)?;
 
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let mut model: playlist::ActiveModel = load_editable_smart_playlist(&txn, playlist_id)
             .await?
             .into();
@@ -1077,7 +1077,7 @@ impl PlaylistManager {
     ///
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let orphans = orphan_reconciliation_query().all(&txn).await?;
 
         if orphans.is_empty() {

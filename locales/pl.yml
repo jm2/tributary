@@ -316,6 +316,10 @@ errors:
     playback_failed: "Odtwarzanie dźwięku nie powiodło się"
     airplay_raopsink_missing: "Odtwarzanie AirPlay 1 jest niedostępne: ta kompilacja nie zawiera zgodnego nadajnika GStreamer raopsink"
     mpd_exclusive_control_required: "Dodaj ponownie to wyjście MPD, potwierdź wyłączną kontrolę nad partycją, a następnie wybierz je ponownie przed odtwarzaniem"
+  database:
+    heading: "Biblioteka niedostępna"
+    open_failed: "Tributary nie może otworzyć bazy danych biblioteki, więc biblioteka i listy odtwarzania nie mogą zostać wyświetlone. Szczegóły znajdują się w dzienniku."
+    upgrade_failed: "Tributary nie może zaktualizować bazy danych biblioteki do tej wersji, więc biblioteka i listy odtwarzania nie mogą zostać wyświetlone. Szczegóły znajdują się w dzienniku."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

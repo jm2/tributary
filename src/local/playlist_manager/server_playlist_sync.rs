@@ -400,7 +400,7 @@ impl PlaylistManager {
     {
         validate_snapshot_source(source_id, snapshot)?;
         let name = initial_snapshot_name(snapshot, fallback_name)?;
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let playlist = insert_regular_playlist(&txn, &name).await?;
         insert_server_snapshot_entries(&txn, &playlist.id, source_id, snapshot.track_ids()).await?;
 
@@ -499,7 +499,7 @@ impl PlaylistManager {
     {
         validate_snapshot_source(source_id, snapshot)?;
         let name = initial_snapshot_name(snapshot, fallback_name)?;
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         if let Some(existing) = find_link_by_native(&txn, source_id, snapshot.native_id()).await? {
             txn.rollback().await?;
             return Ok(ServerPlaylistCreateOutcome::AlreadyLinked(existing));
@@ -661,7 +661,7 @@ impl PlaylistManager {
     {
         validate_snapshot_source(source_id, snapshot)?;
         validate_ticket_identity(&ticket, source_id, snapshot.native_id())?;
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let Some(link) = load_ticket_link(&txn, &ticket).await? else {
             txn.rollback().await?;
             return Ok(ServerPlaylistPullOutcome::Superseded);
@@ -829,7 +829,7 @@ impl PlaylistManager {
         Authority: Send + 'static,
     {
         validate_ticket_identity(&ticket, source_id, native_id)?;
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         let Some(link) = load_ticket_link(&txn, &ticket).await? else {
             txn.rollback().await?;
             return Ok(ServerPlaylistMissingOutcome::Superseded);
@@ -892,7 +892,7 @@ impl PlaylistManager {
         Admission: Future<Output = Option<Guard>>,
         Guard: Send + 'static,
     {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         if load_ticket_link(&txn, &ticket).await?.is_none() {
             txn.rollback().await?;
             return Ok(ServerPlaylistUnlinkOutcome::Superseded);
@@ -948,7 +948,7 @@ impl PlaylistManager {
         Admission: Future<Output = Option<Guard>>,
         Guard: Send + 'static,
     {
-        let txn = self.db.begin().await?;
+        let txn = crate::db::begin_write(&self.db).await?;
         if load_ticket_link(&txn, &ticket).await?.is_none() {
             txn.rollback().await?;
             return Ok(ServerPlaylistRemoveOutcome::Superseded);

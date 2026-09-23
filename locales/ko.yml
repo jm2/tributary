@@ -314,6 +314,10 @@ errors:
     playback_failed: "오디오 재생에 실패했습니다"
     airplay_raopsink_missing: "AirPlay 1 재생을 사용할 수 없습니다. 이 빌드에는 호환되는 GStreamer raopsink 송신기가 없습니다"
     mpd_exclusive_control_required: "이 MPD 출력을 다시 추가하고 파티션 독점 제어를 확인한 다음 재생 전에 다시 선택하세요"
+  database:
+    heading: "라이브러리를 사용할 수 없음"
+    open_failed: "Tributary가 라이브러리 데이터베이스를 열 수 없어 라이브러리와 재생목록을 표시할 수 없습니다. 자세한 내용은 로그를 확인하세요."
+    upgrade_failed: "Tributary가 이 버전에 맞게 라이브러리 데이터베이스를 업그레이드할 수 없어 라이브러리와 재생목록을 표시할 수 없습니다. 자세한 내용은 로그를 확인하세요."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

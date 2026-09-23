@@ -354,6 +354,10 @@ errors:
     playback_failed: "Audio playback failed"
     airplay_raopsink_missing: "AirPlay 1 playback is unavailable: this build has no compatible GStreamer raopsink sender"
     mpd_exclusive_control_required: "Re-add this MPD output, confirm exclusive partition control, then select it again before playback"
+  database:
+    heading: "Library Unavailable"
+    open_failed: "Tributary could not open its library database, so your library and playlists cannot be shown. See the log for details."
+    upgrade_failed: "Tributary could not upgrade its library database for this version, so your library and playlists cannot be shown. See the log for details."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

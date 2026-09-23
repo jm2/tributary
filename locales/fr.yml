@@ -314,6 +314,10 @@ errors:
     playback_failed: "La lecture audio a échoué"
     airplay_raopsink_missing: "La lecture AirPlay 1 n'est pas disponible : cette version ne contient aucun émetteur GStreamer raopsink compatible"
     mpd_exclusive_control_required: "Ajoutez à nouveau cette sortie MPD, confirmez le contrôle exclusif de la partition, puis sélectionnez-la à nouveau avant la lecture"
+  database:
+    heading: "Bibliothèque indisponible"
+    open_failed: "Tributary n’a pas pu ouvrir la base de données de la bibliothèque ; votre bibliothèque et vos listes de lecture ne peuvent donc pas être affichées. Consultez le journal pour plus de détails."
+    upgrade_failed: "Tributary n’a pas pu mettre à niveau la base de données de la bibliothèque pour cette version ; votre bibliothèque et vos listes de lecture ne peuvent donc pas être affichées. Consultez le journal pour plus de détails."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

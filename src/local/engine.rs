@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, Statement, TransactionTrait,
+    Set, Statement,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -140,6 +140,9 @@ pub enum LibraryEvent {
         outcome: RootReauthorizationOutcome,
         message: Option<String>,
     },
+    /// The library database could not be opened or upgraded, so the engine
+    /// never started. The detailed error is only logged.
+    DatabaseUnavailable(crate::db::connection::DatabaseInitFailure),
     /// An error occurred.
     Error(String),
 }
@@ -1156,7 +1159,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
     let result: anyhow::Result<()> = async {
         if root_reauthorization_receipt::Entity::find_by_id(request.request_id.clone())
             .one(&transaction)
@@ -3206,7 +3209,7 @@ async fn persist_root_scan_status(
         && scan.is_complete()
         && (scan.reconciliation_authoritative || confirms_identity);
     let last_checked_at = Utc::now().to_rfc3339();
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
 
     let stored = if let Some(state) = previous {
         let mut active: library_root::ActiveModel = state.clone().into();
@@ -3680,7 +3683,7 @@ async fn record_playback_history(
     track_id: &TrackId,
     counted_at_ms: i64,
 ) -> anyhow::Result<Option<Track>> {
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
     let update = transaction
         .execute_raw(Statement::from_sql_and_values(
             transaction.get_database_backend(),
@@ -7338,7 +7341,9 @@ enum GuardedTrackUpsertOutcome {
 }
 
 /// Apply one parsed-track mutation only if its filesystem evidence still
-/// holds after the SQL write and immediately before commit.
+/// holds after the SQL write and immediately before commit. The guard runs
+/// while this transaction holds SQLite's write lock, so other connections'
+/// writers wait for it within their busy timeout.
 async fn upsert_track_with_commit_guard<F, Fut>(
     db: &DatabaseConnection,
     parsed: &ParsedTrack,
@@ -7349,7 +7354,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
     let result = upsert_track(&transaction, parsed, existing).await;
     match result {
         Ok(model) if commit_guard().await => {
@@ -7385,7 +7390,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
     let result = track::Entity::delete_by_id(id).exec(&transaction).await;
     match result {
         Ok(result) if result.rows_affected == 0 => {
@@ -7463,7 +7468,7 @@ where
             "parsed rename destination does not match the paired target path"
         ));
     }
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
 
     let result: anyhow::Result<RenameTrackOutcome> = async {
         let Some(source) = track::Entity::find()
@@ -7573,7 +7578,7 @@ where
         ));
     }
 
-    let transaction = db.begin().await?;
+    let transaction = crate::db::begin_write(db).await?;
 
     let result: anyhow::Result<RenameDirectoryOutcome> = async {
         let rows = track::Entity::find().all(&transaction).await?;
