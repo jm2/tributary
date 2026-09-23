@@ -10,22 +10,21 @@ use std::io::Write;
 use std::path::Path;
 use tracing::{info, warn};
 
-use crate::architecture::{AdvertisedHttpRoute, SourceId};
+use crate::architecture::SourceId;
 use crate::local::engine::LibraryEvent;
 
 use super::objects::SourceObject;
+
+// A saved server connects through the URL the user entered. Unauthenticated
+// discovery addresses never apply to it, so these helpers take no route.
 
 async fn authenticate_manual_jellyfin(
     server_url: &str,
     username: &str,
     password: &str,
-    advertised_route: Option<AdvertisedHttpRoute>,
 ) -> crate::architecture::backend::BackendResult<crate::jellyfin::client::JellyfinClient> {
     crate::jellyfin::client::JellyfinClient::authenticate_with_route(
-        server_url,
-        username,
-        password,
-        advertised_route,
+        server_url, username, password, None,
     )
     .await
 }
@@ -34,15 +33,8 @@ async fn authenticate_manual_plex(
     server_url: &str,
     username: &str,
     password: &str,
-    advertised_route: Option<AdvertisedHttpRoute>,
 ) -> crate::architecture::backend::BackendResult<crate::plex::client::PlexClient> {
-    crate::plex::client::PlexClient::authenticate_with_route(
-        server_url,
-        username,
-        password,
-        advertised_route,
-    )
-    .await
+    crate::plex::client::PlexClient::authenticate(server_url, username, password).await
 }
 
 async fn connect_manual_subsonic(
@@ -50,16 +42,8 @@ async fn connect_manual_subsonic(
     server_url: &str,
     username: &str,
     password: &str,
-    advertised_route: Option<AdvertisedHttpRoute>,
 ) -> crate::architecture::backend::BackendResult<crate::subsonic::SubsonicBackend> {
-    crate::subsonic::SubsonicBackend::connect_with_route(
-        server_name,
-        server_url,
-        username,
-        password,
-        advertised_route,
-    )
-    .await
+    crate::subsonic::SubsonicBackend::connect(server_name, server_url, username, password).await
 }
 
 /// Validate a standard remote backend URL before it reaches persistence,
@@ -337,6 +321,9 @@ fn upsert_saved_source_in_store(
         source.set_name(&saved.name);
         source.set_server_url(&saved.url);
         source.set_manually_added(true);
+        // A saved row connects through its configured URL, never through the
+        // unauthenticated addresses discovery advertised for it.
+        source.set_advertised_route(None);
         source.set_connecting(true);
 
         // SourceObject fields are deliberately plain GTK-side state rather
@@ -726,11 +713,6 @@ pub fn show_add_server_dialog(
                 return;
             }
         };
-        // Promotion deliberately reuses the discovered SourceObject. Snapshot
-        // its ephemeral route for this immediate connection before async work
-        // starts; persistence stores identity and endpoint, never the route.
-        let advertised_route = saved_source.advertised_route();
-
         let server_url = saved.url.clone();
         let server_name = saved.name.clone();
         let backend_type = backend_type.to_string();
@@ -767,9 +749,7 @@ pub fn show_add_server_dialog(
                 on_generation,
                 move || async move {
                     info!("Authenticating with Jellyfin (manual)...");
-                    let client =
-                        authenticate_manual_jellyfin(&server_url, &user, &pass, advertised_route)
-                            .await?;
+                    let client = authenticate_manual_jellyfin(&server_url, &user, &pass).await?;
                     Ok(crate::jellyfin::JellyfinBackend::stage_authenticated(
                         &server_name,
                         client,
@@ -779,16 +759,13 @@ pub fn show_add_server_dialog(
             "plex" => {
                 source_registry.connect_standard(source_id, on_generation, move || async move {
                     info!("Authenticating with Plex (manual)...");
-                    let client =
-                        authenticate_manual_plex(&server_url, &user, &pass, advertised_route)
-                            .await?;
+                    let client = authenticate_manual_plex(&server_url, &user, &pass).await?;
                     crate::plex::PlexBackend::from_client(&server_name, client).await
                 })
             }
             _ => source_registry.connect_standard(source_id, on_generation, move || async move {
                 info!("Authenticating with Subsonic (manual)...");
-                connect_manual_subsonic(&server_name, &server_url, &user, &pass, advertised_route)
-                    .await
+                connect_manual_subsonic(&server_name, &server_url, &user, &pass).await
             }),
         };
 
@@ -1174,7 +1151,7 @@ mod tests {
             ["192.0.2.9:443".parse().expect("socket address")],
         )
         .expect("route");
-        discovered.set_advertised_route(Some(route.clone()));
+        discovered.set_advertised_route(Some(route));
         store.insert(insert_pos, &discovered);
 
         let existing_source_id =
@@ -1207,90 +1184,13 @@ mod tests {
         assert_eq!(owner_count, 1);
         assert_eq!(promoted.source_id(), Some(discovered_source_id));
         assert_eq!(discovered.source_id(), Some(discovered_source_id));
-        assert_eq!(promoted.advertised_route(), Some(route));
+        assert_eq!(
+            promoted.advertised_route(),
+            None,
+            "a saved row never keeps a discovery route"
+        );
         assert!(promoted.manually_added());
         assert!(promoted.connecting());
-    }
-
-    #[tokio::test]
-    async fn promoted_discovery_route_reaches_the_immediate_manual_connection() {
-        use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
-
-        let service = MockHttpService::start(vec![
-            MockRoute::get("/rest/ping.view").reply(MockResponse::json(serde_json::json!({
-                "subsonic-response": { "status": "ok" }
-            }))),
-            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "artists": { "index": [] }
-                }
-            }))),
-        ])
-        .await;
-        let address: std::net::SocketAddr = service
-            .base_url()
-            .strip_prefix("http://")
-            .expect("fixture HTTP origin")
-            .parse()
-            .expect("fixture socket address");
-        let server_url = format!("http://promoted.invalid:{}", address.port());
-        let origin = url::Url::parse(&server_url).expect("non-resolvable advertised origin");
-        let route = crate::architecture::AdvertisedHttpRoute::new(&origin, [address])
-            .expect("loopback advertised route");
-
-        let store = gtk::gio::ListStore::new::<SourceObject>();
-        let insert_pos = super::super::window::ensure_category_header_store(&store, "subsonic");
-        let discovered = SourceObject::discovered("Discovered", "subsonic", server_url.as_str());
-        let source_id = discovered.source_id().expect("discovered source ID");
-        discovered.set_advertised_route(Some(route.clone()));
-        store.insert(insert_pos, &discovered);
-
-        let mut servers = Vec::new();
-        assert!(add_saved_server_to(
-            &mut servers,
-            "subsonic",
-            "Saved",
-            &server_url,
-            Some(source_id),
-        )
-        .expect("persist discovered owner"));
-        let promoted =
-            upsert_saved_source_in_store(&store, None, &servers[0]).expect("promote owner");
-        let captured_route = promoted
-            .advertised_route()
-            .expect("promotion retains the discovery route");
-        assert_eq!(captured_route, route);
-
-        let fixture_password = uuid::Uuid::new_v4().to_string();
-        let connection = connect_manual_subsonic(
-            "Saved",
-            &server_url,
-            "fixture-user",
-            &fixture_password,
-            Some(captured_route),
-        )
-        .await;
-
-        let requests = service.requests();
-        let connection_error = connection.as_ref().err().map(ToString::to_string);
-        assert!(
-            connection.is_ok(),
-            "immediate manual connection uses the retained route: {connection_error:?}; requests: {requests:?}"
-        );
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].uri.path(), "/rest/ping.view");
-        let expected_host = format!("promoted.invalid:{}", address.port());
-        for request in requests {
-            assert_eq!(
-                request
-                    .headers
-                    .get(axum::http::header::HOST)
-                    .and_then(|value| value.to_str().ok()),
-                Some(expected_host.as_str())
-            );
-        }
-        service.finish().await;
     }
 
     #[test]
