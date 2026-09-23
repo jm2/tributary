@@ -115,6 +115,7 @@ impl JellyfinClient {
     /// Posts to `/Users/AuthenticateByName`, extracts the `AccessToken`
     /// and `User.Id` from the response, and returns a fully authenticated
     /// client.
+    #[cfg(test)]
     pub(crate) async fn authenticate(
         server_url: &str,
         username: &str,
@@ -289,11 +290,6 @@ impl JellyfinClient {
     /// The Jellyfin user ID this client is configured for.
     pub fn user_id(&self) -> &str {
         &self.user_id
-    }
-
-    /// The raw API key / access token.
-    pub fn api_key(&self) -> &str {
-        &self.api_key
     }
 
     /// The base URL of the Jellyfin server.
@@ -1111,9 +1107,9 @@ mod tests {
         assert_parse_error_omits(&error, sentinel, &["fixture-token", &password]);
     }
 
-    /// A Jellyfin catalogue body whose `TotalRecordCount` is a string instead
-    /// of the expected integer exercises the generic catalogue parser with a
-    /// short and a large sentinel value.
+    /// A Jellyfin catalogue body whose `Items` is a string instead of the
+    /// expected array exercises the generic catalogue parser with a short and
+    /// a large sentinel value.
     #[tokio::test]
     async fn catalogue_parse_failures_omit_response_content_from_diagnostics() {
         let cases = [
@@ -1128,8 +1124,7 @@ mod tests {
         for payload in cases {
             let service = MockHttpService::start(vec![MockRoute::get("/Users/user-id/Items")
                 .reply(MockResponse::json(serde_json::json!({
-                    "Items": [],
-                    "TotalRecordCount": payload
+                    "Items": payload
                 })))])
             .await;
             let client =

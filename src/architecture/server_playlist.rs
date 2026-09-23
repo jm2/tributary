@@ -124,20 +124,18 @@ impl ServerPlaylistSnapshot {
         self.name.as_deref()
     }
 
+    #[cfg(test)]
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
     }
 
+    #[cfg(test)]
     pub const fn advertised_track_count(&self) -> Option<u64> {
         self.advertised_track_count
     }
 
     pub fn track_ids(&self) -> &[TrackId] {
         &self.track_ids
-    }
-
-    pub fn into_track_ids(self) -> Vec<TrackId> {
-        self.track_ids
     }
 }
 

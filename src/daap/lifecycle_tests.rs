@@ -427,17 +427,12 @@ fn claim_saved(registry: &SourceRegistry, source_id: SourceId) {
         .is_some());
 }
 
-fn connect_daap(
-    registry: &SourceRegistry,
-    source_id: SourceId,
-    name: &'static str,
-    base_url: String,
-) -> u64 {
+fn connect_daap(registry: &SourceRegistry, source_id: SourceId, base_url: String) -> u64 {
     registry
         .connect_daap(
             source_id,
             |_| {},
-            move || async move { DaapBackend::login(name, &base_url, None).await },
+            move || async move { DaapBackend::login(&base_url, None).await },
         )
         .expect("DAAP connect admitted")
 }
@@ -501,7 +496,7 @@ async fn shutdown_during_held_login_waits_then_logs_out_without_catalogue_reques
     let source_id = SourceId::random();
     claim_saved(&registry, source_id);
 
-    connect_daap(&registry, source_id, "Held login", server.base_url.clone());
+    connect_daap(&registry, source_id, server.base_url.clone());
     server.wait_for_requests(MockEndpoint::Login, 1).await;
 
     let barrier = registry.shutdown();
@@ -537,20 +532,10 @@ async fn superseding_held_login_retires_it_without_reaching_catalogue_routes() {
     let source_id = SourceId::random();
     claim_saved(&registry, source_id);
 
-    connect_daap(
-        &registry,
-        source_id,
-        "Held predecessor",
-        first_server.base_url.clone(),
-    );
+    connect_daap(&registry, source_id, first_server.base_url.clone());
     first_server.wait_for_requests(MockEndpoint::Login, 1).await;
 
-    let successor_generation = connect_daap(
-        &registry,
-        source_id,
-        "Successor",
-        second_server.base_url.clone(),
-    );
+    let successor_generation = connect_daap(&registry, source_id, second_server.base_url.clone());
     let (successor_epoch, _) = wait_for_catalogue(&registry, source_id, successor_generation).await;
 
     first_login_gate.add_permits(1);
@@ -596,7 +581,7 @@ async fn disconnect_during_held_update_aborts_catalogue_and_logs_out_once() {
     let source_id = SourceId::random();
     claim_saved(&registry, source_id);
 
-    connect_daap(&registry, source_id, "Held update", server.base_url.clone());
+    connect_daap(&registry, source_id, server.base_url.clone());
     server.wait_for_requests(MockEndpoint::Update, 1).await;
     let waiter = registry.disconnect(source_id).expect("staged DAAP session");
     // Do not let the fixture itself keep escaped catalogue work inert. If the
@@ -640,7 +625,7 @@ async fn malformed_post_login_routes_fail_and_logout_exactly_once() {
         let source_id = SourceId::random();
         claim_saved(&registry, source_id);
 
-        connect_daap(&registry, source_id, "Malformed", server.base_url.clone());
+        connect_daap(&registry, source_id, server.base_url.clone());
         server.wait_for_requests(MockEndpoint::Logout, 1).await;
         let snapshot = wait_for_failed_retirement(&registry, source_id).await;
         let failure = snapshot.failure.expect("correlated connect failure");
@@ -696,12 +681,7 @@ async fn gzip_encoded_items_publish_the_catalogue_and_logout_exactly_once() {
     let source_id = SourceId::random();
     claim_saved(&registry, source_id);
 
-    let generation = connect_daap(
-        &registry,
-        source_id,
-        "Gzip catalogue",
-        server.base_url.clone(),
-    );
+    let generation = connect_daap(&registry, source_id, server.base_url.clone());
     let (_, tracks) = wait_for_catalogue(&registry, source_id, generation).await;
     assert_eq!(tracks.len(), 1);
     assert_eq!(tracks[0].title, "Gzip Song");
@@ -725,8 +705,7 @@ async fn replacement_rejects_stale_epoch_stream_and_art_before_adapter_invocatio
     let source_id = SourceId::random();
     claim_saved(&registry, source_id);
 
-    let first_generation =
-        connect_daap(&registry, source_id, "First", first_server.base_url.clone());
+    let first_generation = connect_daap(&registry, source_id, first_server.base_url.clone());
     let (first_epoch, first_tracks) =
         wait_for_catalogue(&registry, source_id, first_generation).await;
     assert!(first_tracks
@@ -748,12 +727,7 @@ async fn replacement_rejects_stale_epoch_stream_and_art_before_adapter_invocatio
     assert!(first_stream.is_active());
     assert!(first_artwork.is_active());
 
-    let second_generation = connect_daap(
-        &registry,
-        source_id,
-        "Second",
-        second_server.base_url.clone(),
-    );
+    let second_generation = connect_daap(&registry, source_id, second_server.base_url.clone());
     let (second_epoch, _) = wait_for_catalogue(&registry, source_id, second_generation).await;
     assert_ne!(first_epoch, second_epoch);
     first_server
@@ -903,7 +877,7 @@ async fn assert_daap_direct_raw_row_divergence(server: &MockDaapServer) {
         MockEndpoint::Items,
         MockResponse::dmap(raw_row_items_response()),
     );
-    let backend = DaapBackend::login("Raw rows direct", &server.base_url, None)
+    let backend = DaapBackend::login(&server.base_url, None)
         .await
         .expect("direct raw-row login");
     let direct_tracks = backend.load_catalogue().await.expect("direct catalogue");
@@ -946,12 +920,7 @@ async fn attribution_profiles_are_frozen_from_raw_dmap_rows() {
     let source_id = SourceId::random();
     claim_saved(&registry, source_id);
 
-    let generation = connect_daap(
-        &registry,
-        source_id,
-        "Raw rows DAAP",
-        server.base_url.clone(),
-    );
+    let generation = connect_daap(&registry, source_id, server.base_url.clone());
     let (session_epoch, tracks) = wait_for_catalogue(&registry, source_id, generation).await;
     assert_eq!(tracks.len(), 4);
 

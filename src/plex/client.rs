@@ -210,11 +210,6 @@ impl PlexClient {
         Self::new_with_route(server.url.as_str(), &server.access_token, server.route)
     }
 
-    /// The raw auth token.
-    pub fn auth_token(&self) -> &str {
-        &self.auth_token
-    }
-
     /// The base URL of the Plex server.
     pub fn base_url(&self) -> &Url {
         &self.base_url

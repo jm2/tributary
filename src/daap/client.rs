@@ -89,6 +89,7 @@ pub(super) struct DaapCatalogueScope {
 }
 
 impl DaapCatalogueScope {
+    #[cfg(test)]
     pub(crate) const fn database_id(self) -> u32 {
         self.database_id
     }
@@ -125,6 +126,7 @@ impl DaapClient {
     /// # Arguments
     /// * `server_url` — Base URL (e.g. `http://192.168.1.50:3689`)
     /// * `password` — Optional share password (DAAP uses password-only auth)
+    #[cfg(test)]
     pub async fn login(server_url: &str, password: Option<&str>) -> BackendResult<Self> {
         Self::login_with_route(server_url, password, None).await
     }
@@ -399,34 +401,6 @@ impl DaapClient {
         Ok(mlit_items)
     }
 
-    /// Issue a bounded server-info request to verify the active server is
-    /// still responsive.
-    pub async fn ping(&self) -> BackendResult<()> {
-        let url = format!(
-            "{}/server-info",
-            self.base_url.as_str().trim_end_matches('/')
-        );
-        let resp = self
-            .http
-            .get(&url)
-            .timeout(CONTROL_RESPONSE_DEADLINE)
-            .send()
-            .await
-            .map_err(|error| daap_request_error("DAAP ping failed", error))?;
-
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP ping HTTP {}", resp.status()),
-                source: None,
-            });
-        }
-
-        read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
-            .await
-            .map_err(|error| daap_body_error("Failed to read DAAP ping body", error))?;
-        Ok(())
-    }
-
     /// Construct a credential-isolated cover-art request for a track.
     ///
     /// DAAP serves artwork at `/databases/{db}/items/{id}/extra_data/artwork`.
@@ -511,15 +485,6 @@ impl DaapClient {
         logout_session(&self.http, &self.base_url, self.session_id).await;
     }
 
-    /// Probe a DAAP server's `/server-info` to check whether it requires
-    /// a password.
-    ///
-    /// Returns `Some(false)` for open shares (msau == 0 or absent),
-    /// `Some(true)` for password-protected shares, or `None` on error.
-    pub async fn probe_requires_password(server_url: &str) -> Option<bool> {
-        Self::probe_requires_password_with_route(server_url, None).await
-    }
-
     /// Probe through the exact mDNS-advertised route, when one is available.
     pub(crate) async fn probe_requires_password_with_route(
         server_url: &str,
@@ -556,18 +521,6 @@ impl DaapClient {
         // msau: 0 = no auth, 1 = basic, 2 = digest
         let auth_method = dmap::find_u8(children, b"msau").unwrap_or(0);
         Some(auth_method != 0)
-    }
-
-    // ── Accessors ───────────────────────────────────────────────────
-
-    /// The base URL of the DAAP server.
-    pub fn base_url(&self) -> &Url {
-        &self.base_url
-    }
-
-    /// The active session ID.
-    pub fn session_id(&self) -> u32 {
-        self.session_id
     }
 }
 

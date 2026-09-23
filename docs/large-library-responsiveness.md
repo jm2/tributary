@@ -116,17 +116,13 @@ after a `Q4_ENVIRONMENT runner=…` header.
 | --- | --- | --- |
 | `scan_tracks_persisted` | tracks | Rows committed by the initial scan. |
 | `scan_parse_invocations` | parses | Files that entered the parse branch in the baseline scan. |
-| `scan_albums` | albums | Distinct albums the backend reports after the scan. |
-| `scan_artists` | artists | Distinct artists the backend reports after the scan. |
+| `scan_albums` | albums | Distinct album identities in the published catalogue after the scan. |
+| `scan_artists` | artists | Distinct artist identities in the published catalogue after the scan. |
 | `scan_elapsed` | ms | Wall time for the initial scan to settle. |
 | `scan_events` | events | `LibraryEvent`s emitted during the scan. |
 | `scan_throughput` | tracks/s | Persisted rows per second of scan time. |
 | `backend_list_tracks` | ms | Full catalogue read through `MediaBackend`. |
 | `catalogue_retained_bytes` | bytes | Estimated retained bytes of the published snapshot (fixed `Track` size plus every heap-owned string, including the backend-native track id and any `stream_url`/`cover_art_url`). |
-| `backend_list_albums` | ms | Album aggregation latency. |
-| `backend_list_artists` | ms | Artist aggregation latency. |
-| `backend_search` | ms | Filter/search latency. |
-| `backend_get_stats` | ms | Aggregate statistics latency. |
 | `update_burst_count` | updates | Direct-backend rating mutations in the burst. |
 | `update_burst_total` | ms | Total direct-backend burst wall time. |
 | `update_burst_per_update` | ms | Mean latency per direct-backend rating mutation. |
@@ -147,10 +143,9 @@ component of `delayed_parse_scan_elapsed`.
 **Invalid baseline, kept for the record:** the numbers recorded 2026-09-17 at
 `polecat/tr-7nguk` `621b56cf` on `dev-linux-x86_64-polecat-dag` were taken over
 the collapsed catalogue (every fixture file untagged, so all rows shared one
-`Unknown Artist` / `Unknown Album` pair). Their `backend_list_albums` /
-`backend_list_artists` figures measured a one-result aggregation, not the
-intended 834/209 (10k) and 8 334/2 084 (100k) fan-out, and must not be cited
-as Q4 measurements.
+`Unknown Artist` / `Unknown Album` pair). Their album and artist figures
+measured a one-result aggregation, not the intended 834/209 (10k) and
+8 334/2 084 (100k) fan-out, and must not be cited as Q4 measurements.
 
 Current baseline, recorded over the fanned-out tagged catalogue on the
 reference development runner `dev-linux-x86_64-polecat-rictus` (Rust release
@@ -166,21 +161,18 @@ profile, in-memory SQLite, 100 µs per-file parse delay for the delayed pass):
 | `scan_throughput` | 1 814 tracks/s | 1 677 tracks/s |
 | `backend_list_tracks` | 80 ms | 896 ms |
 | `catalogue_retained_bytes` | 6 950 000 bytes | 69 500 000 bytes |
-| `backend_list_albums` | 7.1 ms | 113 ms |
-| `backend_list_artists` | 8.4 ms | 105 ms |
-| `backend_search` | 0.8 ms | 0.9 ms |
-| `backend_get_stats` | 9.6 ms | 118 ms |
 | `update_burst_per_update` | 0.12 ms | 0.14 ms |
 | `command_fifo_flush_settlement` | 12 ms | 16 ms |
 | `delayed_parse_scan_elapsed` | 8 441 ms | 66 826 ms |
 | `delayed_parse_files_parsed` | 10 000 parses | 100 000 parses |
 | `delayed_parse_estimated_delay_total_ms` | 1 000 ms | 10 000 ms |
 
-Recorded 2026-09-17 at `polecat/tr-7nguk` `cbf1d710`. Album/artist aggregation
-now costs real work over real fan-out (834→8 334 album groups, 209→2 084
-artist groups) — compare against the invalid collapsed-catalogue baseline
-above only to see what the collapsed shape hid, never as a regression
-reference.
+Recorded 2026-09-17 at `polecat/tr-7nguk` `cbf1d710` over real fan-out
+(834→8 334 album groups, 209→2 084 artist groups) — compare against the
+invalid collapsed-catalogue baseline above only to see what the collapsed
+shape hid, never as a regression reference. That run also timed backend
+album, artist, search, and statistics queries; those backend methods have
+since been removed because nothing in the application called them.
 
 `catalogue_retained_bytes` in this table predates the metric fix that now
 counts the heap-native track id (and any `stream_url`/`cover_art_url`):

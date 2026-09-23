@@ -63,10 +63,8 @@ mod localization_catalog {
 }
 use localization_catalog::*;
 
-#[allow(dead_code)]
 mod architecture;
 mod audio;
-#[allow(dead_code)]
 mod daap;
 mod db;
 mod desktop_integration;
@@ -80,7 +78,6 @@ pub(crate) mod http_security;
 #[allow(dead_code)]
 pub(crate) mod http_test_service;
 mod install_id;
-#[allow(dead_code)]
 mod jellyfin;
 pub(crate) mod lastfm;
 #[allow(dead_code)]
@@ -88,7 +85,6 @@ mod local;
 mod panic_reporting;
 mod paths;
 mod platform_runtime;
-#[allow(dead_code)]
 mod plex;
 mod radio;
 mod remote_rating_wire;

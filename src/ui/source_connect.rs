@@ -1090,7 +1090,6 @@ pub fn setup_source_connect(state: &WindowState) {
             ));
 
             let server_url = url_for_closure.clone();
-            let server_name = name_for_closure.clone();
             let advertised_route = advertised_route.clone();
             let source = src.clone();
             let sidebar_store_for_generation = sidebar_store.clone();
@@ -1123,13 +1122,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 },
                 move || async move {
                     info!("Connecting to passwordless DAAP server...");
-                    crate::daap::DaapBackend::login_with_route(
-                        &server_name,
-                        &server_url,
-                        None,
-                        advertised_route,
-                    )
-                    .await
+                    crate::daap::DaapBackend::login_with_route(&server_url, None, advertised_route)
+                        .await
                 },
             );
             if generation.is_none() {
@@ -1313,7 +1307,6 @@ pub fn setup_source_connect(state: &WindowState) {
                             info!("Connecting to DAAP server...");
                             let password = (!pass.is_empty()).then_some(pass.as_str());
                             crate::daap::DaapBackend::login_with_route(
-                                &server_name,
                                 &server_url,
                                 password,
                                 advertised_route,
@@ -1327,7 +1320,6 @@ pub fn setup_source_connect(state: &WindowState) {
                         move || async move {
                             info!("Authenticating with Subsonic...");
                             crate::subsonic::SubsonicBackend::connect_with_route(
-                                &server_name,
                                 &server_url,
                                 &user,
                                 &pass,

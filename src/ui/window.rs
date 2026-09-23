@@ -2250,7 +2250,7 @@ pub(crate) fn build_window(
             },
             move || async move {
                 info!("Connecting to Subsonic server...");
-                crate::subsonic::SubsonicBackend::connect("Subsonic", &url, &user, &pass).await
+                crate::subsonic::SubsonicBackend::connect(&url, &user, &pass).await
             },
         );
     }
@@ -2314,7 +2314,7 @@ pub(crate) fn build_window(
             },
             move || async move {
                 info!("Connecting to DAAP server...");
-                crate::daap::DaapBackend::login("DAAP", &url, password.as_deref()).await
+                crate::daap::DaapBackend::login(&url, password.as_deref()).await
             },
         );
     }
