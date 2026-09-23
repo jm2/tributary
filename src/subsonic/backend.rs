@@ -308,6 +308,12 @@ impl SubsonicBackend {
         // Per-item failures keep the original log-and-skip semantics: a
         // failed `getArtist` drops that artist entirely, a failed `getAlbum`
         // drops just that album (the artist's `album_count` still counts it).
+        //
+        // An album with several album artists is listed by `getArtist` under
+        // each of them. It is fetched once and assembled under the first
+        // artist that lists it, and a song ID the server repeats is kept only
+        // at its first occurrence: native track IDs must be unique within a
+        // catalogue or the source's playlist entries cannot be resolved.
 
         // Phase 1 — fetch each artist's album list concurrently. Each future
         // owns a cheap `SubsonicClient` clone (reqwest's `Client` is
@@ -351,55 +357,48 @@ impl SubsonicBackend {
         // each fetch completes, so positions now line up with `api_artists`.
         artist_albums.sort_by_key(|(idx, _)| *idx);
 
-        // Phase 2 — fetch the songs for every album concurrently. Build an
-        // owned (artist-pos, album-pos, id, name) descriptor list first so the
-        // futures own their data (same `Send + 'static` reasoning as phase 1).
-        let album_reqs: Vec<(usize, usize, String, String)> = artist_albums
+        // Phase 2 — fetch the songs for every distinct album concurrently.
+        // Build an owned (id, name) descriptor list first so the futures own
+        // their data (same `Send + 'static` reasoning as phase 1).
+        let mut requested_album_ids = HashSet::new();
+        let album_reqs: Vec<(String, String)> = artist_albums
             .iter()
-            .enumerate()
-            .filter_map(|(ai, (_, albums))| albums.as_ref().map(|al| (ai, al)))
-            .flat_map(|(ai, albums)| {
-                albums
-                    .iter()
-                    .enumerate()
-                    .map(move |(bi, album)| (ai, bi, album.id.clone(), album.name.clone()))
-            })
+            .filter_map(|(_, albums)| albums.as_ref())
+            .flatten()
+            .filter(|album| requested_album_ids.insert(album.id.as_str()))
+            .map(|album| (album.id.clone(), album.name.clone()))
             .collect();
-        let album_songs: Vec<(usize, usize, Option<Vec<SongEntry>>)> =
-            futures::stream::iter(album_reqs)
-                .map(|(ai, bi, id, name)| {
-                    let client = client.clone();
-                    async move {
-                        let songs = match client
-                            .get_with_params("getAlbum.view", &[("id", &id)])
-                            .await
-                        {
-                            Ok(env) => Some(env.response.album.map(|a| a.song).unwrap_or_default()),
-                            Err(e) => {
-                                tracing::warn!(
-                                    album = %name,
-                                    error = %e,
-                                    "Failed to fetch album detail, skipping"
-                                );
-                                None
-                            }
-                        };
-                        (ai, bi, songs)
-                    }
-                })
-                .buffer_unordered(FETCH_CONCURRENCY)
-                .collect()
-                .await;
+        let album_songs: Vec<(String, Option<Vec<SongEntry>>)> = futures::stream::iter(album_reqs)
+            .map(|(id, name)| {
+                let client = client.clone();
+                async move {
+                    let songs = match client
+                        .get_with_params("getAlbum.view", &[("id", &id)])
+                        .await
+                    {
+                        Ok(env) => Some(env.response.album.map(|a| a.song).unwrap_or_default()),
+                        Err(e) => {
+                            tracing::warn!(
+                                album = %name,
+                                error = %e,
+                                "Failed to fetch album detail, skipping"
+                            );
+                            None
+                        }
+                    };
+                    (id, songs)
+                }
+            })
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .collect()
+            .await;
 
-        // Index the fetched songs by (artist position, album position).
-        // Albums whose `getAlbum` failed are absent here and so are skipped
-        // during assembly below.
-        let mut songs_by_album: HashMap<(usize, usize), Vec<SongEntry>> = HashMap::new();
-        for (ai, bi, songs) in album_songs {
-            if let Some(songs) = songs {
-                songs_by_album.insert((ai, bi), songs);
-            }
-        }
+        // Index the fetched songs by album ID. Albums whose `getAlbum` failed
+        // are absent here and so are skipped during assembly below.
+        let mut songs_by_album: HashMap<String, Vec<SongEntry>> = album_songs
+            .into_iter()
+            .filter_map(|(id, songs)| songs.map(|songs| (id, songs)))
+            .collect();
 
         // Phase 3 — assemble the cache deterministically in artist/album
         // order, mirroring the original sequential walk exactly.
@@ -411,6 +410,8 @@ impl SubsonicBackend {
         let mut attribution_profiles = HashMap::new();
         let mut representation_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
+        let mut assembled_track_ids = HashSet::new();
+        let mut skipped_duplicate_track_ids = 0usize;
 
         for (ai, (_, albums)) in artist_albums.iter().enumerate() {
             // A failed `getArtist` drops the artist entirely.
@@ -422,18 +423,23 @@ impl SubsonicBackend {
 
             let mut artist_track_count = 0u32;
 
-            for (bi, api_album) in api_albums.iter().enumerate() {
-                // A failed `getAlbum` drops just this album.
-                let Some(songs) = songs_by_album.get(&(ai, bi)) else {
+            for api_album in api_albums {
+                // A failed `getAlbum` drops just this album; taking the songs
+                // out assembles a shared album only under its first artist.
+                let Some(songs) = songs_by_album.remove(&api_album.id) else {
                     continue;
                 };
                 let album_uuid = deterministic_uuid(&api_album.id);
 
-                for song in songs {
+                for song in &songs {
                     let Ok(track_id) = TrackId::remote(song.id.clone()) else {
                         skipped_invalid_track_ids += 1;
                         continue;
                     };
+                    if !assembled_track_ids.insert(track_id.clone()) {
+                        skipped_duplicate_track_ids += 1;
+                        continue;
+                    }
                     let track_uuid = deterministic_uuid(&song.id);
                     let track = song_to_track(
                         song,
@@ -493,6 +499,7 @@ impl SubsonicBackend {
             albums = all_albums.len(),
             tracks = all_tracks.len(),
             skipped_invalid_track_ids,
+            skipped_duplicate_track_ids,
             "Subsonic library loaded"
         );
 
@@ -1249,6 +1256,87 @@ mod tests {
             "/gateway/rest/stream.view"
         );
         assert_eq!(service.requests().len(), 6);
+        service.finish().await;
+    }
+
+    fn artist_listing(id: &str, name: &str, album_ids: &[&str]) -> MockRoute {
+        let albums: Vec<_> = album_ids
+            .iter()
+            .map(|album_id| serde_json::json!({"id": album_id, "name": album_id}))
+            .collect();
+        MockRoute::get("/rest/getArtist.view")
+            .with_query("id", id)
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artist": {"id": id, "name": name, "album": albums}
+                }
+            })))
+    }
+
+    fn album_listing(id: &str, song_ids: &[&str]) -> MockRoute {
+        let songs: Vec<_> = song_ids
+            .iter()
+            .map(|song_id| serde_json::json!({"id": song_id, "title": song_id}))
+            .collect();
+        MockRoute::get("/rest/getAlbum.view")
+            .with_query("id", id)
+            .reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "album": {"id": id, "name": id, "song": songs}
+                }
+            })))
+    }
+
+    #[tokio::test]
+    async fn shared_albums_and_repeated_songs_yield_one_row_per_native_id() {
+        // "duet" has two album artists, so `getArtist` lists it under both;
+        // "solo" repeats a song that "duet" already returned.
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )),
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [{"artist": [
+                        {"id": "first", "name": "First"},
+                        {"id": "second", "name": "Second"}
+                    ]}]}
+                }
+            }))),
+            artist_listing("first", "First", &["duet"]),
+            artist_listing("second", "Second", &["duet", "solo"]),
+            // One reply each: a shared album is fetched only once.
+            album_listing("duet", &["duet-1", "duet-2"]),
+            album_listing("solo", &["duet-2", "solo-1"]),
+        ])
+        .await;
+        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", "pw")
+            .await
+            .expect("connect to fixture");
+
+        let cache = backend.cache.read().await;
+        let track_ids: Vec<_> = cache
+            .tracks
+            .iter()
+            .map(|track| track.native_track_id.as_ref().expect("native ID").as_str())
+            .collect();
+        assert_eq!(track_ids, ["duet-1", "duet-2", "solo-1"]);
+        let first_uuid = deterministic_uuid("first");
+        assert!(cache.tracks[..2]
+            .iter()
+            .all(|track| track.artist_id == Some(first_uuid)));
+        let album_titles: Vec<_> = cache.albums.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(album_titles, ["duet", "solo"]);
+        let track_counts: Vec<_> = cache
+            .artists
+            .iter()
+            .map(|artist| (artist.name.as_str(), artist.track_count))
+            .collect();
+        assert_eq!(track_counts, [("First", 2), ("Second", 1)]);
+        drop(cache);
         service.finish().await;
     }
 
