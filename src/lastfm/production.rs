@@ -146,8 +146,6 @@ pub(crate) enum LastFmApplicationCommandError {
     Drain,
     #[error("Last.fm application generation is already active")]
     GenerationActive,
-    #[error("Last.fm application generation is not active")]
-    GenerationInactive,
     #[error("Last.fm consent and enablement are required")]
     ConsentRequired,
     #[error("Last.fm protected credential store is unavailable")]
@@ -171,8 +169,6 @@ pub(crate) enum LastFmApplicationDisconnectError {
     RuntimeStopped,
     #[error("Last.fm disconnect did not complete and can be retried")]
     Incomplete,
-    #[error("Last.fm application generation did not drain")]
-    Drain,
 }
 
 /// Move-only authority issued after explicit consent and enablement.
@@ -185,10 +181,12 @@ pub(crate) enum LastFmApplicationDisconnectError {
 #[must_use = "Last.fm activation authority must be consumed or explicitly discarded"]
 pub(crate) struct LastFmApplicationActivation {
     policy_generation: u64,
+    #[cfg(test)]
     enabled_remote_sources: HashSet<SourceId>,
 }
 
 impl LastFmApplicationActivation {
+    #[cfg(test)]
     pub(in crate::lastfm) fn issue_after_explicit_consent_and_enablement(
         policy_generation: u64,
         enabled_remote_sources: HashSet<SourceId>,
@@ -226,6 +224,7 @@ impl LastFmApplicationActivation {
         }
         Ok(Self {
             policy_generation,
+            #[cfg(test)]
             enabled_remote_sources,
         })
     }
@@ -460,6 +459,7 @@ impl LastFmApplicationHandle {
     ///
     /// The admitted command resolves to the runtime's own admission result;
     /// `NotActive` reports that no generation is installed.
+    #[allow(dead_code, reason = "no settings control issues manual recovery yet")]
     pub(crate) fn try_issue_manual_pause_recovery(
         &self,
     ) -> Result<
@@ -477,6 +477,7 @@ impl LastFmApplicationHandle {
     ///
     /// The admitted command resolves to the runtime's own admission result;
     /// a foreign or stale authority is refused by the runtime itself.
+    #[allow(dead_code, reason = "no settings control issues manual recovery yet")]
     pub(crate) fn try_resume_after_manual_recovery(
         &self,
         recovery: LastFmManualPauseRecovery,
@@ -592,6 +593,7 @@ enum Command {
             >,
         >,
     },
+    #[allow(dead_code, reason = "no settings control issues manual recovery yet")]
     IssueManualPauseRecovery {
         completion: oneshot::Sender<
             Result<
@@ -600,6 +602,7 @@ enum Command {
             >,
         >,
     },
+    #[allow(dead_code, reason = "no settings control issues manual recovery yet")]
     ResumeAfterManualRecovery {
         recovery: LastFmManualPauseRecovery,
         completion: oneshot::Sender<
@@ -1558,6 +1561,7 @@ pub(crate) struct LastFmApplicationShutdown {
 }
 
 impl LastFmApplicationShutdown {
+    #[cfg(test)]
     pub(crate) fn barrier(&self) -> LastFmApplicationBarrier {
         LastFmApplicationBarrier {
             completion: self.completion.clone(),
@@ -1590,10 +1594,12 @@ impl fmt::Debug for LastFmApplicationShutdown {
 
 /// Cloneable persistent proof of normal drain or abnormal owner loss.
 #[derive(Clone)]
+#[cfg(test)]
 pub(crate) struct LastFmApplicationBarrier {
     completion: watch::Receiver<LastFmApplicationDrainState>,
 }
 
+#[cfg(test)]
 impl LastFmApplicationBarrier {
     pub(crate) fn state(&self) -> LastFmApplicationDrainState {
         *self.completion.borrow()
@@ -1617,6 +1623,7 @@ impl LastFmApplicationBarrier {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for LastFmApplicationBarrier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1677,6 +1684,7 @@ pub(crate) fn spawn_lastfm_application_owner(
     ))
 }
 
+#[cfg(test)]
 fn spawn_with_dependencies(
     coordinator: LastFmPlaybackCoordinatorBinding,
     completion_runtime: tokio::runtime::Handle,

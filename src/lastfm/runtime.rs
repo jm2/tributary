@@ -675,6 +675,7 @@ impl LastFmRuntimeHandle {
     }
 
     /// Close all public admission and append the terminal FIFO marker.
+    #[cfg(test)]
     pub fn close_and_flush(&self) -> bool {
         request_shutdown(&self.inner)
     }
@@ -1162,7 +1163,8 @@ struct ActiveAccount {
 /// draining the durable queue after its authority is gone.
 struct PolicySupervision {
     generation: u64,
-    live: LastFmLivePolicy,
+    /// Keeps the watch sender behind `changes` alive for the owner's life.
+    _live: LastFmLivePolicy,
     changes: watch::Receiver<LastFmPolicyGeneration>,
 }
 
@@ -1179,7 +1181,7 @@ impl PolicySupervision {
         changes.borrow_and_update();
         Self {
             generation,
-            live: live.clone(),
+            _live: live.clone(),
             changes,
         }
     }
@@ -3457,10 +3459,6 @@ impl LastFmRuntimeBarrier {
         *self.completion.borrow()
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.state() != LastFmRuntimeDrainState::Pending || self.completion.has_changed().is_err()
-    }
-
     pub async fn wait(&self) -> Result<(), LastFmRuntimeShutdownError> {
         let mut completion = self.completion.clone();
         loop {
@@ -3545,16 +3543,6 @@ impl LastFmRuntimeActivation {
                 _private: (),
                 policy_generation: generation.generation(),
             })
-    }
-
-    /// Construct one activation from an already-consented, enabled
-    /// generation for downstream tests that must not run a live policy slot.
-    #[cfg(test)]
-    pub(in crate::lastfm) fn for_test() -> Self {
-        let live = LastFmLivePolicy::default();
-        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
-        Self::issue_after_consent_and_enablement(&live)
-            .expect("enabled test generation issues an activation")
     }
 }
 
@@ -4149,12 +4137,6 @@ mod tests {
     impl GatedCredentialStore {
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
-        }
-
-        fn release(&self) {
-            let (released, signal) = &*self.gate;
-            *released.lock().unwrap() = true;
-            signal.notify_all();
         }
     }
 

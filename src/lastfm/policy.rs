@@ -103,16 +103,6 @@ impl LastFmConsentRecord {
             disclosure_revision,
         })
     }
-
-    /// The accepted disclosure language tag.
-    pub fn locale(&self) -> &str {
-        &self.locale
-    }
-
-    /// The accepted disclosure revision inside that locale.
-    pub const fn disclosure_revision(&self) -> u32 {
-        self.disclosure_revision
-    }
 }
 
 impl fmt::Debug for LastFmConsentRecord {
@@ -141,11 +131,13 @@ impl LastFmPolicyGeneration {
     }
 
     /// The accepted disclosure, if any.
+    #[cfg(test)]
     pub const fn consent(&self) -> Option<&LastFmConsentRecord> {
         self.consent.as_ref()
     }
 
     /// Whether the integration is enabled. Enablement requires consent.
+    #[cfg(test)]
     pub const fn is_enabled(&self) -> bool {
         self.enabled
     }

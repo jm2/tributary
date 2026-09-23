@@ -67,6 +67,23 @@ impl UnboundLastFmScrobble {
         .map(|payload| Self { payload })
     }
 
+    /// Attach the exact current vault-derived account authority.
+    ///
+    /// Keeping this inside `crate::lastfm` prevents playback producers from
+    /// selecting or retaining account identity themselves.
+    pub(in crate::lastfm) fn bind(
+        self,
+        account_binding: LastFmAccountBinding,
+    ) -> PendingLastFmScrobble {
+        PendingLastFmScrobble {
+            account_binding,
+            payload: self.payload,
+        }
+    }
+}
+
+#[cfg(test)]
+impl UnboundLastFmScrobble {
     #[must_use]
     pub const fn occurrence_id(&self) -> Uuid {
         self.payload.occurrence_id
@@ -105,20 +122,6 @@ impl UnboundLastFmScrobble {
     #[must_use]
     pub const fn started_at_unix_secs(&self) -> i64 {
         self.payload.started_at_unix_secs
-    }
-
-    /// Attach the exact current vault-derived account authority.
-    ///
-    /// Keeping this inside `crate::lastfm` prevents playback producers from
-    /// selecting or retaining account identity themselves.
-    pub(in crate::lastfm) fn bind(
-        self,
-        account_binding: LastFmAccountBinding,
-    ) -> PendingLastFmScrobble {
-        PendingLastFmScrobble {
-            account_binding,
-            payload: self.payload,
-        }
     }
 }
 
@@ -198,6 +201,7 @@ impl ValidatedLastFmScrobble {
     }
 }
 
+#[cfg(test)]
 impl PendingLastFmScrobble {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::lastfm) fn try_new(
@@ -616,6 +620,7 @@ pub async fn batch_availability(
 }
 
 /// Compatibility wrapper for callers that do not need the delayed deadline.
+#[cfg(test)]
 pub async fn due_batch(
     db: &DatabaseConnection,
     account_binding: LastFmAccountBinding,
@@ -979,6 +984,7 @@ pub async fn purge_quarantined_after_admission_closed(
 }
 
 /// Number of private rows retained in the single-account queue.
+#[cfg(test)]
 pub async fn queue_len(db: &DatabaseConnection) -> Result<u64, LastFmQueueError> {
     lastfm_scrobble::Entity::find()
         .count(db)
@@ -992,6 +998,7 @@ pub async fn queue_len(db: &DatabaseConnection) -> Result<u64, LastFmQueueError>
 /// delivery read, validation cannot stop at the 50-row protocol batch limit:
 /// every retained row must be canonical, belong to the expected account, and
 /// fit within the global queue bound before the exact count is returned.
+#[cfg(test)]
 pub async fn validate_account_queue(
     db: &DatabaseConnection,
     account_binding: LastFmAccountBinding,

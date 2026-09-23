@@ -113,11 +113,7 @@ pub struct LastFmDeliveryResultEvent {
 
 impl LastFmDeliveryResultEvent {
     #[must_use]
-    pub const fn generation(&self) -> LastFmDeliveryGeneration {
-        self.generation
-    }
-
-    #[must_use]
+    #[cfg(test)]
     pub fn row_count(&self) -> usize {
         self.receipt.len()
     }
@@ -235,6 +231,7 @@ impl LastFmDeliveryWorker {
         true
     }
 
+    #[cfg(test)]
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
@@ -249,6 +246,7 @@ impl LastFmDeliveryWorker {
         self.cancellation.clone()
     }
 
+    #[cfg(test)]
     pub async fn join(mut self) -> Result<LastFmDeliveryWorkerExit, LastFmDeliveryWorkerJoinError> {
         self.join_inner().await
     }
