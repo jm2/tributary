@@ -14,7 +14,7 @@ are out of scope.
 The **Equalizer** group sits at the bottom of Preferences:
 
 | Control | Values |
-|---------|--------|
+| ------- | ------ |
 | Enable equalizer | on / off (off on a fresh install) |
 | Preset | Flat, Pop, Rock, Jazz, Classical, Custom |
 | Preamp | −24 to +12 dB in 0.5 dB steps |
@@ -27,7 +27,7 @@ preset to Custom. Choosing Custom keeps the current gains. Changes apply to the 
 straight away.
 
 | Preset | Preamp | 29 | 59 | 119 | 237 | 474 | 947 | 1.9k | 3.8k | 7.5k | 15k |
-|--------|-------:|---:|---:|----:|----:|----:|----:|-----:|-----:|-----:|----:|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Flat | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | Pop | −2 | 1 | 2 | 3 | 2 | 0 | −1 | −1 | 0 | 1 | 2 |
 | Rock | −1 | 3 | 2 | 0 | −1 | −1 | 0 | 2 | 3 | 3 | 2 |

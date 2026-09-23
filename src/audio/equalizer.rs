@@ -175,53 +175,28 @@ struct EqualizerBin {
 }
 
 impl EqualizerBin {
+    const CHAIN: &'static str = "audioresample ! audioconvert \
+        ! capsfilter caps=audio/x-raw,format=F32LE,layout=interleaved \
+        ! volume name=preamp ! equalizer-10bands name=bands ! rglimiter name=limiter \
+        ! audioconvert ! audioresample";
+
     /// Build the bin with neutral settings.
     ///
     /// # Errors
     /// Fails when an element is not installed (`equalizer-10bands` and
-    /// `rglimiter` ship in gst-plugins-good) or the bin cannot be linked.
-    fn new() -> Result<Self, glib::BoolError> {
-        let make = |factory: &str| gst::ElementFactory::make(factory).build();
-        let named =
-            |factory: &str, name: &str| gst::ElementFactory::make(factory).name(name).build();
-        let format = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("audio/x-raw")
-                    .field("format", "F32LE")
-                    .field("layout", "interleaved")
-                    .build(),
-            )
-            .build()?;
-        let preamp = named("volume", "preamp")?;
-        let bands = named("equalizer-10bands", "bands")?;
-        let limiter = named("rglimiter", "limiter")?;
-        let chain = [
-            make("audioresample")?,
-            make("audioconvert")?,
-            format,
-            preamp.clone(),
-            bands.clone(),
-            limiter.clone(),
-            make("audioconvert")?,
-            make("audioresample")?,
-        ];
-
-        let bin = gst::Bin::with_name("equalizer");
-        bin.add_many(&chain)?;
-        gst::Element::link_many(&chain)?;
-        for (element, direction) in [(&chain[0], "sink"), (&chain[7], "src")] {
-            let pad = element
-                .static_pad(direction)
-                .ok_or_else(|| glib::bool_error!("equalizer element has no {direction} pad"))?;
-            bin.add_pad(&gst::GhostPad::with_target(&pad)?)?;
-        }
-
+    /// `rglimiter` ship in gst-plugins-good) or the chain cannot be linked.
+    fn new() -> Result<Self, glib::Error> {
+        let bin = gst::parse::bin_from_description_with_name(Self::CHAIN, true, "equalizer")?;
+        let element = |name: &str| {
+            bin.by_name(name).ok_or_else(|| {
+                glib::Error::new(gst::CoreError::Failed, "equalizer element missing")
+            })
+        };
         let equalizer = Self {
+            preamp: element("preamp")?,
+            bands: element("bands")?,
+            limiter: element("limiter")?,
             bin,
-            preamp,
-            bands,
-            limiter,
         };
         equalizer.apply(&EqualizerSettings::default());
         Ok(equalizer)

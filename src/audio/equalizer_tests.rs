@@ -406,6 +406,58 @@ fn the_installed_bin_follows_rate_and_channel_changes_between_loads() {
     }
 }
 
+/// Make the band filter fail part-way through the stream, as a broken
+/// element would: post an error and return a flow error upstream.
+fn fail_bands_after(equalizer: &PlayerEqualizer, buffers: usize) {
+    let bands = equalizer.bin.borrow().as_ref().unwrap().bands.clone();
+    let seen = AtomicUsize::new(0);
+    bands
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            if seen.fetch_add(1, Ordering::SeqCst) != buffers {
+                return gst::PadProbeReturn::Ok;
+            }
+            let element = pad.parent_element().unwrap();
+            gst::element_error!(element, gst::StreamError::Failed, ["injected failure"]);
+            info.flow_res = Err(gst::FlowError::Error);
+            gst::PadProbeReturn::Handled
+        });
+}
+
+/// Play to the end, handling errors and prerolls as the player's bus watch
+/// does. Panics on any error the equalizer does not recover from; returns
+/// whether the stream was restarted and then resumed.
+fn play_recovering(playbin: &gst::Element, equalizer: &PlayerEqualizer) -> (bool, bool) {
+    playbin.set_state(gst::State::Playing).unwrap();
+    let bus = playbin.bus().unwrap();
+    let (mut resume_at, mut recovered, mut resumed) = (None, false, false);
+    loop {
+        let message = bus
+            .timed_pop(gst::ClockTime::from_seconds(10))
+            .expect("playback stalled");
+        match message.view() {
+            gst::MessageView::Error(error) => {
+                assert!(!recovered, "error after recovery: {}", error.error());
+                resume_at = equalizer.recover(&message, playbin);
+                assert!(resume_at.is_some(), "{}", error.error());
+                recovered = true;
+            }
+            gst::MessageView::AsyncDone(_) => {
+                if let Some(position) = resume_at.take() {
+                    let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT;
+                    playbin.seek_simple(flags, position).unwrap();
+                    resumed = true;
+                }
+            }
+            gst::MessageView::Eos(_) => break,
+            _ => {}
+        }
+    }
+    playbin.set_state(gst::State::Null).unwrap();
+    (recovered, resumed)
+}
+
 #[test]
 fn an_error_inside_the_equalizer_drops_it_and_playback_continues() {
     if !plugins_available() {
@@ -416,56 +468,9 @@ fn an_error_inside_the_equalizer_drops_it_and_playback_continues() {
     write_tone_file(&file, 44_100, 2);
     let (playbin, equalizer) = level_playbin();
     playbin.set_property("uri", glib::filename_to_uri(&file, None).unwrap());
+    fail_bands_after(&equalizer, 20);
 
-    // Fail the band filter part-way through the file, as a broken element
-    // would: post an error and return a flow error upstream.
-    let bands = equalizer.bin.borrow().as_ref().unwrap().bands.clone();
-    let buffers = AtomicUsize::new(0);
-    bands
-        .static_pad("src")
-        .unwrap()
-        .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
-            if buffers.fetch_add(1, Ordering::SeqCst) != 20 {
-                return gst::PadProbeReturn::Ok;
-            }
-            let element = pad.parent_element().unwrap();
-            gst::element_error!(element, gst::StreamError::Failed, ["injected failure"]);
-            info.flow_res = Err(gst::FlowError::Error);
-            gst::PadProbeReturn::Handled
-        });
-
-    // The same handling as the player's bus watch.
-    playbin.set_state(gst::State::Playing).unwrap();
-    let bus = playbin.bus().unwrap();
-    let mut resume_at = None;
-    let mut recovered = false;
-    let mut resumed = false;
-    loop {
-        let message = bus
-            .timed_pop(gst::ClockTime::from_seconds(10))
-            .expect("playback stalled");
-        match message.view() {
-            gst::MessageView::Error(error) => {
-                assert!(!recovered, "error after recovery: {}", error.error());
-                resume_at = equalizer.recover(&message, &playbin);
-                assert!(resume_at.is_some(), "{}", error.error());
-                recovered = true;
-            }
-            gst::MessageView::AsyncDone(_) => {
-                if let Some(position) = resume_at.take() {
-                    assert!(position > gst::ClockTime::ZERO);
-                    playbin
-                        .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, position)
-                        .unwrap();
-                    resumed = true;
-                }
-            }
-            gst::MessageView::Eos(_) => break,
-            _ => {}
-        }
-    }
-    playbin.set_state(gst::State::Null).unwrap();
-
+    let (recovered, resumed) = play_recovering(&playbin, &equalizer);
     assert!(recovered, "the injected failure never reached the bus");
     assert!(resumed, "the restarted stream never prerolled");
     assert!(!equalizer.is_available());

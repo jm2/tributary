@@ -180,13 +180,18 @@ impl Panel {
     }
 }
 
-/// Build the group showing `settings`. Edits call `on_change` with the new
-/// settings; `unavailable` disables every control and explains why.
-pub fn build(
-    settings: EqualizerSettings,
-    unavailable: Option<&str>,
-    on_change: Rc<dyn Fn(&EqualizerSettings)>,
-) -> (adw::PreferencesGroup, Rc<Panel>) {
+fn combo_row(title: &str, labels: &[String], selected: u32) -> adw::ComboRow {
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    adw::ComboRow::builder()
+        .title(title)
+        .model(&gtk::StringList::new(&labels))
+        .selected(selected)
+        .build()
+}
+
+/// The group holding `controls`, all disabled with the reason as the
+/// description when the equalizer is `unavailable`.
+fn group(controls: &[gtk::Widget], unavailable: Option<&str>) -> adw::PreferencesGroup {
     let description = unavailable.map_or_else(
         || rust_i18n::t!("equalizer.description").into_owned(),
         str::to_owned,
@@ -195,52 +200,72 @@ pub fn build(
         .title(rust_i18n::t!("equalizer.title").as_ref())
         .description(description)
         .build();
+    for control in controls {
+        group.add(control);
+        control.set_sensitive(unavailable.is_none());
+    }
+    group
+}
 
-    let enabled = adw::SwitchRow::builder()
-        .title(rust_i18n::t!("equalizer.enabled").as_ref())
-        .active(settings.enabled)
-        .build();
-    let preset_names: Vec<String> = Preset::ALL.into_iter().map(preset_label).collect();
-    let preset = adw::ComboRow::builder()
-        .title(rust_i18n::t!("equalizer.preset").as_ref())
-        .model(&gtk::StringList::new(
-            &preset_names.iter().map(String::as_str).collect::<Vec<_>>(),
-        ))
-        .selected(position(settings.preset))
-        .build();
+/// The preamp row followed by the band rows, with their sliders.
+fn gain_rows(settings: &EqualizerSettings) -> (Vec<gtk::Widget>, gtk::Scale, Vec<gtk::Scale>) {
     let (preamp_row, preamp) = gain_row(&rust_i18n::t!("equalizer.preamp"), settings.preamp_db);
-    let band_rows: Vec<_> = BAND_CENTERS_HZ
+    let (band_rows, bands): (Vec<_>, Vec<_>) = BAND_CENTERS_HZ
         .iter()
         .zip(settings.bands_db)
         .map(|(hz, db)| gain_row(&frequency_label(*hz), db))
+        .unzip();
+    let rows = std::iter::once(preamp_row)
+        .chain(band_rows)
+        .map(Cast::upcast)
         .collect();
-    let clip_protection = adw::ComboRow::builder()
-        .title(rust_i18n::t!("equalizer.clip_protection").as_ref())
-        .model(&gtk::StringList::new(&[
-            rust_i18n::t!("equalizer.clip_off").as_ref(),
-            rust_i18n::t!("equalizer.clip_soft").as_ref(),
-        ]))
-        .selected(u32::from(settings.clip_protection == ClipProtection::Soft))
-        .build();
-    let reset = gtk::Button::builder()
+    (rows, preamp, bands)
+}
+
+fn clip_protection_row(protection: ClipProtection) -> adw::ComboRow {
+    combo_row(
+        &rust_i18n::t!("equalizer.clip_protection"),
+        &[
+            rust_i18n::t!("equalizer.clip_off").into_owned(),
+            rust_i18n::t!("equalizer.clip_soft").into_owned(),
+        ],
+        u32::from(protection == ClipProtection::Soft),
+    )
+}
+
+fn reset_button() -> gtk::Button {
+    gtk::Button::builder()
         .label(rust_i18n::t!("equalizer.reset_flat").as_ref())
         .css_classes(["flat"])
         .halign(gtk::Align::Center)
         .margin_top(4)
+        .build()
+}
+
+/// Build the group showing `settings`. Edits call `on_change` with the new
+/// settings; `unavailable` disables every control and explains why.
+pub fn build(
+    settings: EqualizerSettings,
+    unavailable: Option<&str>,
+    on_change: Rc<dyn Fn(&EqualizerSettings)>,
+) -> (adw::PreferencesGroup, Rc<Panel>) {
+    let enabled = adw::SwitchRow::builder()
+        .title(rust_i18n::t!("equalizer.enabled").as_ref())
+        .active(settings.enabled)
         .build();
+    let preset = combo_row(
+        &rust_i18n::t!("equalizer.preset"),
+        &Preset::ALL.map(preset_label),
+        position(settings.preset),
+    );
+    let (gain_rows, preamp, bands) = gain_rows(&settings);
+    let clip_protection = clip_protection_row(settings.clip_protection);
+    let reset = reset_button();
 
-    let mut controls: Vec<gtk::Widget> = vec![
-        enabled.clone().upcast(),
-        preset.clone().upcast(),
-        preamp_row.upcast(),
-    ];
-    controls.extend(band_rows.iter().map(|(row, _)| row.clone().upcast()));
+    let mut controls: Vec<gtk::Widget> = vec![enabled.clone().upcast(), preset.clone().upcast()];
+    controls.extend(gain_rows);
     controls.extend([clip_protection.clone().upcast(), reset.clone().upcast()]);
-    for control in &controls {
-        group.add(control);
-        control.set_sensitive(unavailable.is_none());
-    }
-
+    let group = group(&controls, unavailable);
     let panel = Rc::new(Panel {
         settings: Cell::new(settings),
         syncing: Cell::new(false),
@@ -248,7 +273,7 @@ pub fn build(
         enabled,
         preset,
         preamp,
-        bands: band_rows.into_iter().map(|(_, scale)| scale).collect(),
+        bands,
         clip_protection,
         reset,
     });
