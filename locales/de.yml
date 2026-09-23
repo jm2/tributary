@@ -53,6 +53,10 @@ browser:
   all: "Alle"
   folder_root_unavailable: "%{name} (nicht verfügbar)"
   folder_unavailable_notice: "Dieser Ordner ist derzeit nicht verfügbar"
+  album_artwork: "Albumcover in der Album-Ansicht"
+  album_artwork_size_small: "Klein"
+  album_artwork_size_medium: "Mittel"
+  album_artwork_size_large: "Groß"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -209,6 +213,34 @@ playlist_io:
   export_failed_heading: "XSPF-Wiedergabeliste konnte nicht exportiert werden"
   export_unchanged_body: "%{error}\n\nDas Ziel blieb unverändert; eine temporäre Datei wurde entfernt."
   export_worker_failed_body: "Der Exportprozess wurde beendet, bevor er ein Ergebnis melden konnte: %{error}"
+
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Diesem Musikbibliotheksordner vertrauen?"
+  legacy_body: "Tributary hat %{count} Titel unter %{path} gespeichert, aber dieser Ordner wurde vor Einführung der Identitätsprüfung für Bibliotheken eingerichtet. Vertrauen Sie ihm nur, wenn es sich um dieselbe Bibliothek handelt, die Sie bisher verwendet haben. Bis dahin bewahrt Tributary die gespeicherten Metadaten auf, indiziert jedoch keine Änderungen und entfernt keine fehlenden Titel dieses Ordners aus der Bibliothek. Sobald das Vertrauen hergestellt ist, kann ein späterer vollständiger Abgleich gespeicherte Titel entfernen, die dann noch fehlen."
+  replacement_heading: "Identität des Musikbibliotheksordners geändert"
+  replacement_body: "Der Ordner unter %{path} konnte nicht als die Bibliothek verifiziert werden, der Tributary zuvor vertraut hat und die %{count} gespeicherte Titel umfasst. Verwenden Sie diesen Ordner nur, wenn Sie diese Bibliothek absichtlich ersetzt oder verschoben haben. Tributary bewahrt die gespeicherten Metadaten auf, während das Vertrauen hergestellt wird; ein späterer vollständiger Abgleich kann Titel entfernen, die in diesem Ordner weiterhin fehlen."
+  empty_new_heading: "Diesen Musikbibliotheksordner einrichten?"
+  empty_new_body: "Tributary hat unter %{path} keine unterstützten Audiodateien gefunden. Dies kann eine neue, leere Bibliothek sein, aber auch bedeuten, dass ein Wechseldatenträger oder eine Netzwerkfreigabe nicht eingehängt ist. Fahren Sie nur fort, wenn dies der vorgesehene Bibliotheksstandort ist."
+  empty_heading: "Keine unterstützten Audiodateien gefunden"
+  empty_body: "Tributary hat unter %{path} keine unterstützten Audiodateien gefunden, dort aber %{count} Titel gespeichert. Dies kann bedeuten, dass ein Wechseldatenträger oder eine Netzwerkfreigabe nicht eingehängt ist. Fahren Sie nur fort, wenn dies der vorgesehene Datenträger der Bibliothek ist und dessen unterstützte Audiodateien absichtlich fehlen."
+  empty_new_final_heading: "Diesen Bibliotheksstandort bestätigen?"
+  empty_new_final_body: "Unter %{path} sind derzeit keine unterstützten Audiodateien sichtbar. Bestätigen Sie, dass dies der vorgesehene Bibliotheksstandort ist – und nicht etwa ein Laufwerk oder eine Netzwerkfreigabe, die nicht eingehängt ist. Beim künftigen vollständigen Einlesen werden hier hinzugefügte oder entfernte Dateien berücksichtigt; Tributary löscht niemals die Audiodateien selbst."
+  empty_final_heading: "Diesem Musikbibliotheksordner trotzdem vertrauen?"
+  empty_final_body: "Unter %{path} sind derzeit keine unterstützten Audiodateien sichtbar. Dieser Pfad ist möglicherweise nur ein leerer Einhängepunkt ohne eingehängten Datenträger und nicht die vorgesehene Bibliothek. Beim ersten Einlesen zur Aufnahme des Ordners bleiben alle %{count} gespeicherten Titel erhalten, aber ein späteres vollständiges, maßgebliches Einlesen kann jeden gespeicherten Titel entfernen, der in diesem Ordner weiterhin fehlt. Tributary löscht niemals die Audiodateien selbst."
+  not_now: "Nicht jetzt"
+  keep_existing: "Bestehende Bibliothek behalten"
+  trust_folder: "Ordner vertrauen"
+  use_folder: "Diesen Ordner verwenden"
+  review_empty_risk: "Risiko prüfen"
+  trust_empty_anyway: "Ordner trotzdem vertrauen"
+  pending_toast: "Musikbibliotheksordner wird geprüft, bevor ihm vertraut wird…"
+  trusted_toast: "Musikbibliotheksordner als vertrauenswürdig eingestuft und aktiv."
+  replacement_trusted_toast: "Neuer Musikbibliotheksordner als vertrauenswürdig eingestuft und aktiv."
+  empty_trusted_toast: "Musikbibliotheksordner als vertrauenswürdig eingestuft und aktiv."
+  unavailable_toast: "Das Vertrauen konnte nicht hergestellt werden, da der Ordner nicht verfügbar ist oder sein Einlesen unvollständig war. Die gespeicherten Metadaten bleiben geschützt."
+  stale_toast: "Der Ordner hat sich geändert, bevor das Vertrauen hergestellt werden konnte. Er bleibt nicht verfügbar, und die gespeicherten Metadaten bleiben geschützt."
+  failed_toast: "Tributary konnte das Vertrauen zu diesem Musikbibliotheksordner nicht abschließend herstellen. Er bleibt nicht verfügbar, und die gespeicherten Metadaten bleiben geschützt."
 
 # ── Context menu ───────────────────────────────────────────────────
 context:

@@ -53,6 +53,10 @@ browser:
   all: "Alles"
   folder_root_unavailable: "%{name} (niet beschikbaar)"
   folder_unavailable_notice: "Deze map is momenteel niet beschikbaar"
+  album_artwork: "Albumhoezen in de albumweergave"
+  album_artwork_size_small: "Klein"
+  album_artwork_size_medium: "Middelgroot"
+  album_artwork_size_large: "Groot"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -209,6 +213,34 @@ playlist_io:
   export_failed_heading: "XSPF-afspeellijst kon niet worden geëxporteerd"
   export_unchanged_body: "%{error}\n\nDe bestemming is ongewijzigd gebleven; eventuele tijdelijke bestanden zijn verwijderd."
   export_worker_failed_body: "Het exportproces is gestopt voordat het een resultaat kon melden: %{error}"
+
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Deze bibliotheekmap vertrouwen?"
+  legacy_body: "Tributary heeft %{count} nummers in %{path} opgeslagen, maar deze map dateert van vóór de identiteitscontrole voor bibliotheken. Vertrouw de map alleen als het dezelfde bibliotheek is die u eerder gebruikte. Tot die tijd behoudt Tributary de opgeslagen metagegevens, maar worden wijzigingen niet geïndexeerd en worden ontbrekende nummers uit deze map niet uit de bibliotheek verwijderd. Zodra het vertrouwen is vastgesteld, kan een latere volledige afstemming opgeslagen nummers verwijderen die nog steeds ontbreken."
+  replacement_heading: "Identiteit van bibliotheekmap gewijzigd"
+  replacement_body: "De map in %{path} kon niet worden geverifieerd als de bibliotheek die Tributary eerder vertrouwde, met %{count} opgeslagen nummers. Gebruik deze map alleen als u die bibliotheek bewust hebt vervangen of verplaatst. Tributary behoudt de opgeslagen metagegevens terwijl het vertrouwen wordt vastgesteld; een latere volledige afstemming kan nummers verwijderen die nog steeds in deze map ontbreken."
+  empty_new_heading: "Deze bibliotheekmap instellen?"
+  empty_new_body: "Tributary heeft geen ondersteunde audiobestanden gevonden in %{path}. Dit kan een nieuwe, lege bibliotheek zijn, maar het kan ook betekenen dat een verwisselbaar station of een gedeelde netwerkmap niet is aangekoppeld. Ga alleen door als dit de bedoelde bibliotheeklocatie is."
+  empty_heading: "Geen ondersteunde audiobestanden gevonden"
+  empty_body: "Tributary heeft geen ondersteunde audiobestanden gevonden in %{path}, maar heeft daar wel %{count} nummers opgeslagen. Dit kan betekenen dat een verwisselbaar station of een gedeelde netwerkmap niet is aangekoppeld. Ga alleen door als dit het bedoelde bibliotheekvolume is en de ondersteunde audiobestanden er bewust niet op staan."
+  empty_new_final_heading: "Deze bibliotheeklocatie bevestigen?"
+  empty_new_final_body: "Er zijn momenteel geen ondersteunde audiobestanden zichtbaar in %{path}. Bevestig dat dit de bedoelde bibliotheeklocatie is en niet een station of gedeelde netwerkmap die niet is aangekoppeld. Toekomstige volledige scans verwerken bestanden die hier worden toegevoegd of verwijderd; Tributary verwijdert nooit de audiobestanden zelf."
+  empty_final_heading: "Deze bibliotheekmap toch vertrouwen?"
+  empty_final_body: "Er zijn momenteel geen ondersteunde audiobestanden zichtbaar in %{path}. Dit pad is mogelijk alleen een leeg koppelpunt zonder aangekoppeld volume, en niet de bedoelde bibliotheek. De registratiescan behoudt alle %{count} opgeslagen nummers, maar een latere volledige, doorslaggevende scan kan elk opgeslagen nummer verwijderen dat nog steeds in deze map ontbreekt. Tributary verwijdert nooit de audiobestanden zelf."
+  not_now: "Niet nu"
+  keep_existing: "Bestaande bibliotheek behouden"
+  trust_folder: "Map vertrouwen"
+  use_folder: "Deze map gebruiken"
+  review_empty_risk: "Risico bekijken"
+  trust_empty_anyway: "Map toch vertrouwen"
+  pending_toast: "Bibliotheekmap controleren voordat deze wordt vertrouwd…"
+  trusted_toast: "Bibliotheekmap vertrouwd en actief."
+  replacement_trusted_toast: "Nieuwe bibliotheekmap vertrouwd en actief."
+  empty_trusted_toast: "Bibliotheekmap vertrouwd en actief."
+  unavailable_toast: "Het vertrouwen kon niet worden vastgesteld omdat de map niet beschikbaar is of de scan ervan onvolledig was. Opgeslagen metagegevens blijven beschermd."
+  stale_toast: "De map is gewijzigd voordat het vertrouwen kon worden vastgesteld. De map blijft niet beschikbaar en opgeslagen metagegevens blijven beschermd."
+  failed_toast: "Tributary kon het vertrouwen in die bibliotheekmap niet vaststellen. De map blijft niet beschikbaar en opgeslagen metagegevens blijven beschermd."
 
 # ── Context menu ───────────────────────────────────────────────────
 context:

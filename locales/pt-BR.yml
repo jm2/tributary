@@ -53,6 +53,10 @@ browser:
   all: "Todos"
   folder_root_unavailable: "%{name} (indisponível)"
   folder_unavailable_notice: "Esta pasta está indisponível no momento"
+  album_artwork: "Capas no painel de álbuns"
+  album_artwork_size_small: "Pequeno"
+  album_artwork_size_medium: "Médio"
+  album_artwork_size_large: "Grande"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -209,6 +213,34 @@ playlist_io:
   export_failed_heading: "Não foi possível exportar a lista de reprodução XSPF"
   export_unchanged_body: "%{error}\n\nO destino não foi alterado; todos os arquivos temporários foram removidos."
   export_worker_failed_body: "O processo de exportação foi interrompido antes de informar um resultado: %{error}"
+
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Confiar nesta pasta da biblioteca?"
+  legacy_body: "O Tributary tem %{count} faixas registradas em %{path}, mas esta pasta é anterior às verificações de identidade da biblioteca. Confie nela somente se for a mesma biblioteca que você usava antes. Até lá, o Tributary preserva os metadados salvos, mas não indexará alterações nem removerá da biblioteca as faixas ausentes desta pasta. Depois que a confiança for estabelecida, uma reconciliação completa posterior poderá remover as faixas registradas que continuarem ausentes."
+  replacement_heading: "A identidade da pasta da biblioteca mudou"
+  replacement_body: "Não foi possível verificar se a pasta em %{path} é a biblioteca em que o Tributary confiava anteriormente, que tem %{count} faixas registradas. Use esta pasta somente se você substituiu ou moveu essa biblioteca intencionalmente. O Tributary preserva os metadados registrados enquanto a confiança é estabelecida; uma reconciliação completa posterior poderá remover as faixas que continuarem ausentes desta pasta."
+  empty_new_heading: "Configurar esta pasta da biblioteca?"
+  empty_new_body: "O Tributary não encontrou arquivos de áudio compatíveis em %{path}. Pode ser uma biblioteca nova e vazia, mas também pode significar que uma unidade removível ou um compartilhamento de rede não está montado. Continue somente se esta for a localização pretendida da biblioteca."
+  empty_heading: "Nenhum arquivo de áudio compatível encontrado"
+  empty_body: "O Tributary não encontrou arquivos de áudio compatíveis em %{path}, mas tem %{count} faixas registradas nesse local. Isso pode significar que uma unidade removível ou um compartilhamento de rede não está montado. Continue somente se este for o volume pretendido da biblioteca e a ausência dos arquivos de áudio compatíveis for intencional."
+  empty_new_final_heading: "Confirmar esta localização da biblioteca?"
+  empty_new_final_body: "No momento, nenhum arquivo de áudio compatível está visível em %{path}. Confirme que esta é a localização pretendida da biblioteca, e não uma unidade ou um compartilhamento de rede desmontado. As futuras verificações completas refletirão os arquivos adicionados ou removidos aqui; o Tributary nunca exclui os próprios arquivos de áudio."
+  empty_final_heading: "Confiar nesta pasta da biblioteca mesmo assim?"
+  empty_final_body: "No momento, nenhum arquivo de áudio compatível está visível em %{path}. Este caminho pode ser apenas um ponto de montagem vazio, sem volume montado, e não a biblioteca pretendida. A verificação de inclusão preserva todas as %{count} faixas registradas, mas uma verificação completa e definitiva posterior poderá remover todas as faixas registradas que continuarem ausentes desta pasta. O Tributary nunca exclui os próprios arquivos de áudio."
+  not_now: "Agora não"
+  keep_existing: "Manter a biblioteca atual"
+  trust_folder: "Confiar na pasta"
+  use_folder: "Usar esta pasta"
+  review_empty_risk: "Revisar o risco"
+  trust_empty_anyway: "Confiar na pasta mesmo assim"
+  pending_toast: "Verificando a pasta da biblioteca antes de confiar nela…"
+  trusted_toast: "Pasta da biblioteca marcada como confiável e ativa."
+  replacement_trusted_toast: "Nova pasta da biblioteca marcada como confiável e ativa."
+  empty_trusted_toast: "Pasta da biblioteca marcada como confiável e ativa."
+  unavailable_toast: "Não foi possível estabelecer a confiança porque a pasta está indisponível ou a verificação dela ficou incompleta. Os metadados registrados continuam protegidos."
+  stale_toast: "A pasta mudou antes que a confiança pudesse ser estabelecida. Ela continua indisponível, e os metadados registrados continuam protegidos."
+  failed_toast: "O Tributary não conseguiu concluir o estabelecimento da confiança nessa pasta da biblioteca. Ela continua indisponível, e os metadados registrados continuam protegidos."
 
 # ── Context menu ───────────────────────────────────────────────────
 context:

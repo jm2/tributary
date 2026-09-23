@@ -53,6 +53,10 @@ browser:
   all: "全部"
   folder_root_unavailable: "%{name}（無法使用）"
   folder_unavailable_notice: "此資料夾目前無法使用"
+  album_artwork: "專輯檢視封面"
+  album_artwork_size_small: "小"
+  album_artwork_size_medium: "中"
+  album_artwork_size_large: "大"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -209,6 +213,34 @@ playlist_io:
   export_failed_heading: "無法匯出 XSPF 播放清單"
   export_unchanged_body: "%{error}\n\n目的地未變更；所有暫存檔案均已移除。"
   export_worker_failed_body: "匯出程序在回報結果前已停止：%{error}"
+
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "信任此音樂庫資料夾？"
+  legacy_body: "Tributary 記錄了 %{path} 下的 %{count} 首曲目，但此資料夾是在音樂庫身分檢查功能推出之前設定的。僅當它與您先前使用的是同一個音樂庫時才信任它。在此之前，Tributary 會保留已儲存的元資料，但不會為此資料夾中的變更建立索引，也不會從音樂庫移除遺失的曲目。建立信任後，之後的完整核對可能會移除仍然遺失的已記錄曲目。"
+  replacement_heading: "音樂庫資料夾身分已變更"
+  replacement_body: "無法驗證 %{path} 的資料夾是否為 Tributary 先前信任的音樂庫（該音樂庫有 %{count} 首已記錄曲目）。僅當您有意取代或移動了該音樂庫時才使用此資料夾。在建立信任期間，Tributary 會保留已記錄的元資料；之後的完整核對可能會移除此資料夾中仍然遺失的曲目。"
+  empty_new_heading: "設定此音樂庫資料夾？"
+  empty_new_body: "Tributary 在 %{path} 下找不到支援的音訊檔案。這可能是新的空白音樂庫，但也可能表示卸除式磁碟機或網路共用資料夾尚未掛接。僅當這是預期的音樂庫位置時才繼續。"
+  empty_heading: "找不到支援的音訊檔案"
+  empty_body: "Tributary 在 %{path} 下找不到支援的音訊檔案，但記錄了該位置的 %{count} 首曲目。這可能表示卸除式磁碟機或網路共用資料夾尚未掛接。僅當這是預期的音樂庫磁碟區，且其中刻意不含支援的音訊檔案時才繼續。"
+  empty_new_final_heading: "確認此音樂庫位置？"
+  empty_new_final_body: "%{path} 下目前沒有可見的支援音訊檔案。請確認這是預期的音樂庫位置，而不是尚未掛接的磁碟機或網路共用資料夾。之後的完整掃描將反映在此處新增或移除的檔案；Tributary 絕不會刪除音訊檔案本身。"
+  empty_final_heading: "仍要信任此音樂庫資料夾？"
+  empty_final_body: "%{path} 下目前沒有可見的支援音訊檔案。此路徑可能只是未掛接任何內容的掛接點，而不是預期的音樂庫。登錄掃描會保留全部 %{count} 首已記錄曲目，但之後的完整權威掃描可能會移除此資料夾中仍然遺失的每一首已記錄曲目。Tributary 絕不會刪除音訊檔案本身。"
+  not_now: "暫不"
+  keep_existing: "保留現有音樂庫"
+  trust_folder: "信任資料夾"
+  use_folder: "使用此資料夾"
+  review_empty_risk: "檢視風險"
+  trust_empty_anyway: "仍然信任資料夾"
+  pending_toast: "信任前正在檢查音樂庫資料夾…"
+  trusted_toast: "音樂庫資料夾已受信任並已啟用。"
+  replacement_trusted_toast: "新的音樂庫資料夾已受信任並已啟用。"
+  empty_trusted_toast: "音樂庫資料夾已受信任並已啟用。"
+  unavailable_toast: "由於資料夾無法使用或其掃描未完成，無法完成信任。已記錄的元資料仍受保護。"
+  stale_toast: "資料夾在信任完成前已變更。它仍無法使用，已記錄的元資料仍受保護。"
+  failed_toast: "Tributary 無法完成對該音樂庫資料夾的信任。它仍無法使用，已記錄的元資料仍受保護。"
 
 # ── Context menu ───────────────────────────────────────────────────
 context:

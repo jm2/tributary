@@ -53,6 +53,10 @@ browser:
   all: "Tutti"
   folder_root_unavailable: "%{name} (non disponibile)"
   folder_unavailable_notice: "Questa cartella al momento non è disponibile"
+  album_artwork: "Copertine nel pannello degli album"
+  album_artwork_size_small: "Piccola"
+  album_artwork_size_medium: "Media"
+  album_artwork_size_large: "Grande"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -209,6 +213,34 @@ playlist_io:
   export_failed_heading: "Impossibile esportare la playlist XSPF"
   export_unchanged_body: "%{error}\n\nLa destinazione non è stata modificata; ogni file temporaneo è stato rimosso."
   export_worker_failed_body: "Il processo di esportazione si è interrotto prima di comunicare un risultato: %{error}"
+
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Considerare attendibile questa cartella della libreria?"
+  legacy_body: "Tributary ha in memoria %{count} brani in %{path}, ma questa cartella risale a prima dei controlli di identità della libreria. Considerala attendibile solo se è la stessa libreria che usavi in precedenza. Fino ad allora, Tributary conserva i metadati salvati, ma non indicizzerà le modifiche né rimuoverà dalla libreria i brani mancanti in questa cartella. Una volta stabilita l’attendibilità, una successiva riconciliazione completa potrebbe rimuovere i brani memorizzati che risultano ancora mancanti."
+  replacement_heading: "L’identità della cartella della libreria è cambiata"
+  replacement_body: "Non è stato possibile verificare che la cartella in %{path} sia la libreria che Tributary considerava attendibile in precedenza, con %{count} brani memorizzati. Usa questa cartella solo se hai sostituito o spostato intenzionalmente quella libreria. Tributary conserva i metadati memorizzati mentre viene stabilita l’attendibilità; una successiva riconciliazione completa potrebbe rimuovere i brani ancora mancanti in questa cartella."
+  empty_new_heading: "Configurare questa cartella della libreria?"
+  empty_new_body: "Tributary non ha trovato file audio supportati in %{path}. Potrebbe trattarsi di una nuova libreria vuota, ma potrebbe anche significare che un’unità rimovibile o una condivisione di rete non è montata. Continua solo se questa è la posizione prevista per la libreria."
+  empty_heading: "Nessun file audio supportato trovato"
+  empty_body: "Tributary non ha trovato file audio supportati in %{path}, ma ha in memoria %{count} brani in quella posizione. Questo può significare che un’unità rimovibile o una condivisione di rete non è montata. Continua solo se questo è il volume previsto per la libreria e l’assenza dei suoi file audio supportati è intenzionale."
+  empty_new_final_heading: "Confermare questa posizione della libreria?"
+  empty_new_final_body: "Al momento non sono visibili file audio supportati in %{path}. Conferma che questa è la posizione prevista per la libreria e non un’unità o una condivisione di rete non montata. Le future scansioni complete rifletteranno i file aggiunti o rimossi qui; Tributary non elimina mai i file audio stessi."
+  empty_final_heading: "Considerare comunque attendibile questa cartella della libreria?"
+  empty_final_body: "Al momento non sono visibili file audio supportati in %{path}. Questo percorso potrebbe essere solo un punto di montaggio vuoto, senza alcun volume montato, e non la libreria prevista. La scansione iniziale di registrazione conserva tutti i %{count} brani memorizzati, ma una successiva scansione completa e definitiva potrebbe rimuovere ogni brano memorizzato ancora assente da questa cartella. Tributary non elimina mai i file audio stessi."
+  not_now: "Non ora"
+  keep_existing: "Mantieni la libreria esistente"
+  trust_folder: "Considera attendibile la cartella"
+  use_folder: "Usa questa cartella"
+  review_empty_risk: "Valuta il rischio"
+  trust_empty_anyway: "Considera comunque attendibile la cartella"
+  pending_toast: "Verifica della cartella della libreria prima di considerarla attendibile…"
+  trusted_toast: "Cartella della libreria attendibile e attiva."
+  replacement_trusted_toast: "Nuova cartella della libreria attendibile e attiva."
+  empty_trusted_toast: "Cartella della libreria attendibile e attiva."
+  unavailable_toast: "Impossibile stabilire l’attendibilità perché la cartella non è disponibile o la sua scansione era incompleta. I metadati memorizzati restano protetti."
+  stale_toast: "La cartella è cambiata prima che fosse possibile stabilirne l’attendibilità. Rimane non disponibile e i metadati memorizzati restano protetti."
+  failed_toast: "Tributary non è riuscito a completare l’attendibilità di questa cartella della libreria. Rimane non disponibile e i metadati memorizzati restano protetti."
 
 # ── Context menu ───────────────────────────────────────────────────
 context:

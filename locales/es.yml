@@ -53,6 +53,10 @@ browser:
   all: "Todos"
   folder_root_unavailable: "%{name} (no disponible)"
   folder_unavailable_notice: "Esta carpeta no está disponible en este momento"
+  album_artwork: "Carátulas en el panel de álbumes"
+  album_artwork_size_small: "Pequeño"
+  album_artwork_size_medium: "Mediano"
+  album_artwork_size_large: "Grande"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -209,6 +213,34 @@ playlist_io:
   export_failed_heading: "No se pudo exportar la lista XSPF"
   export_unchanged_body: "%{error}\n\nEl destino no se modificó; se eliminó cualquier archivo temporal."
   export_worker_failed_body: "El proceso de exportación se detuvo antes de informar un resultado: %{error}"
+
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "¿Confiar en esta carpeta de la biblioteca?"
+  legacy_body: "Tributary tiene registradas %{count} pistas en %{path}, pero esta carpeta es anterior a las comprobaciones de identidad de la biblioteca. Confíe en ella solo si es la misma biblioteca que usaba antes. Hasta entonces, Tributary conserva los metadatos guardados, pero no indexará cambios ni quitará de la biblioteca las pistas que falten en esta carpeta. Una vez establecida la confianza, una conciliación completa posterior podrá quitar las pistas registradas que sigan faltando."
+  replacement_heading: "La identidad de la carpeta de la biblioteca cambió"
+  replacement_body: "No se pudo verificar que la carpeta en %{path} sea la biblioteca en la que Tributary confiaba antes, que tiene %{count} pistas registradas. Use esta carpeta solo si reemplazó o movió esa biblioteca intencionadamente. Tributary conserva los metadatos registrados mientras se establece la confianza; una conciliación completa posterior podrá quitar las pistas que sigan faltando en esta carpeta."
+  empty_new_heading: "¿Configurar esta carpeta de la biblioteca?"
+  empty_new_body: "Tributary no encontró archivos de audio compatibles en %{path}. Puede tratarse de una biblioteca nueva y vacía, pero también puede significar que una unidad extraíble o un recurso compartido de red no está montado. Continúe solo si esta es la ubicación prevista de la biblioteca."
+  empty_heading: "No se encontraron archivos de audio compatibles"
+  empty_body: "Tributary no encontró archivos de audio compatibles en %{path}, pero tiene registradas %{count} pistas allí. Esto puede significar que una unidad extraíble o un recurso compartido de red no está montado. Continúe solo si este es el volumen previsto de la biblioteca y la ausencia de sus archivos de audio compatibles es intencionada."
+  empty_new_final_heading: "¿Confirmar esta ubicación de la biblioteca?"
+  empty_new_final_body: "Actualmente no hay archivos de audio compatibles visibles en %{path}. Confirme que esta es la ubicación prevista de la biblioteca y no una unidad o un recurso compartido de red sin montar. Los futuros escaneos completos reflejarán los archivos añadidos o eliminados aquí; Tributary nunca elimina los propios archivos de audio."
+  empty_final_heading: "¿Confiar de todos modos en esta carpeta de la biblioteca?"
+  empty_final_body: "Actualmente no hay archivos de audio compatibles visibles en %{path}. Esta ruta puede ser solo un punto de montaje vacío, sin ningún volumen montado, y no la biblioteca prevista. El escaneo de incorporación conserva las %{count} pistas registradas, pero un escaneo completo y definitivo posterior podrá quitar todas las pistas registradas que sigan faltando en esta carpeta. Tributary nunca elimina los propios archivos de audio."
+  not_now: "Ahora no"
+  keep_existing: "Conservar la biblioteca actual"
+  trust_folder: "Confiar en la carpeta"
+  use_folder: "Usar esta carpeta"
+  review_empty_risk: "Revisar el riesgo"
+  trust_empty_anyway: "Confiar en la carpeta de todos modos"
+  pending_toast: "Comprobando la carpeta de la biblioteca antes de confiar en ella…"
+  trusted_toast: "Carpeta de la biblioteca marcada como de confianza y activa."
+  replacement_trusted_toast: "Nueva carpeta de la biblioteca marcada como de confianza y activa."
+  empty_trusted_toast: "Carpeta de la biblioteca marcada como de confianza y activa."
+  unavailable_toast: "No se pudo establecer la confianza porque la carpeta no está disponible o su escaneo quedó incompleto. Los metadatos registrados siguen protegidos."
+  stale_toast: "La carpeta cambió antes de que se pudiera establecer la confianza. Sigue sin estar disponible y los metadatos registrados siguen protegidos."
+  failed_toast: "Tributary no pudo terminar de establecer la confianza en esa carpeta de la biblioteca. Sigue sin estar disponible y los metadatos registrados siguen protegidos."
 
 # ── Context menu ───────────────────────────────────────────────────
 context:
