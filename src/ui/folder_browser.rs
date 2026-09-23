@@ -803,6 +803,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_fixtures {
     use super::*;
+    use std::path::Path;
 
     fn windows_root(path_text: &str) -> BrowsableRoot {
         BrowsableRoot {
