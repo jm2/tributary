@@ -100,6 +100,8 @@ mod server_playlist_coordinator;
 mod source_lifecycle;
 mod source_registry;
 mod subsonic;
+#[cfg(test)]
+mod test_log_capture;
 mod ui;
 
 use std::cell::RefCell;
