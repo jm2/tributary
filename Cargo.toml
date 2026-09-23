@@ -8,6 +8,14 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/jm2/tributary"
 authors = ["Tributary Contributors"]
 
+# The fuzz harness is a workspace member so the repository has a single
+# Cargo.lock. `default-members` keeps plain `cargo build`/`test`/`clippy` scoped
+# to the application; the fuzz crate builds only through cargo-fuzz or an
+# explicit `-p tributary-fuzz`.
+[workspace]
+members = [".", "fuzz"]
+default-members = ["."]
+
 [dependencies]
 # GTK4 / Libadwaita UI
 gtk = { version = "0.11", package = "gtk4", features = ["v4_16"] }

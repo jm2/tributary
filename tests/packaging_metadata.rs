@@ -2,7 +2,6 @@ use toml::Value;
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 const ROOT_LOCK: &str = include_str!("../Cargo.lock");
-const FUZZ_LOCK: &str = include_str!("../fuzz/Cargo.lock");
 const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.tributary.Tributary.desktop");
@@ -1270,13 +1269,31 @@ fn seaorm_runtime_and_migration_dependencies_move_as_one_unit() {
         "SeaORM runtime and migration manifest requirements must match"
     );
 
-    for (name, source) in [("root", ROOT_LOCK), ("fuzz", FUZZ_LOCK)] {
-        assert_eq!(
-            locked_version(source, "sea-orm"),
-            locked_version(source, "sea-orm-migration"),
-            "{name} lockfile must resolve SeaORM runtime and migration to one version"
-        );
-    }
+    assert_eq!(
+        locked_version(ROOT_LOCK, "sea-orm"),
+        locked_version(ROOT_LOCK, "sea-orm-migration"),
+        "Cargo.lock must resolve SeaORM runtime and migration to one version"
+    );
+}
+
+#[test]
+fn fuzz_harness_shares_the_root_lockfile_without_joining_default_builds() {
+    let workspace = &manifest()["workspace"];
+    assert_eq!(
+        workspace["members"],
+        Value::Array(vec![".".into(), "fuzz".into()])
+    );
+    assert_eq!(
+        workspace["default-members"],
+        Value::Array(vec![".".into()]),
+        "plain cargo builds and tests must stay scoped to the application"
+    );
+    assert!(
+        !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/Cargo.lock")
+            .exists(),
+        "the fuzz harness must resolve through the root Cargo.lock only"
+    );
 }
 
 #[test]
@@ -1323,22 +1340,6 @@ fn dependabot_groups_coupled_updates_and_excludes_toolchains_from_automerge() {
     assert_eq!(
         yaml_string_list(routine_cargo, "exclude-patterns"),
         ["sea-orm", "sea-orm-migration"]
-    );
-
-    let fuzz = dependabot_update(&config, "cargo", "/fuzz");
-    let fuzz_seaorm_security = &fuzz["groups"]["seaorm-security"];
-    assert_eq!(
-        fuzz_seaorm_security["applies-to"].as_str(),
-        Some("security-updates")
-    );
-    assert_eq!(
-        yaml_string_list(fuzz_seaorm_security, "patterns"),
-        ["sea-orm", "sea-orm-migration"]
-    );
-    let fuzz_group = &fuzz["groups"]["fuzz-minor-and-patch"];
-    assert_eq!(
-        yaml_string_list(fuzz_group, "update-types"),
-        ["minor", "patch"]
     );
 
     let compiler = dependabot_update(&config, "rust-toolchain", "/.github");
