@@ -23,6 +23,7 @@
 //! to the pattern used by [`LibraryEngine`](crate::local::engine::LibraryEngine).
 
 pub mod airplay_output;
+mod cast_http_parse;
 pub mod cast_http_server;
 pub mod chromecast_output;
 pub mod equalizer;
@@ -811,7 +812,7 @@ fn is_protected_loopback_ticket_uri(candidate: &str) -> bool {
         Some((id, extension)) => (
             id,
             !extension.contains('.')
-                && cast_http_server::PROTECTED_TICKET_AUDIO_EXTENSIONS.contains(&extension),
+                && cast_http_parse::PROTECTED_TICKET_AUDIO_EXTENSIONS.contains(&extension),
         ),
         None => (route, true),
     };
