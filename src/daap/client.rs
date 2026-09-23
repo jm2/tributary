@@ -13,9 +13,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, USER_AGENT};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use tracing::{debug, info, warn};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
@@ -72,6 +73,11 @@ pub struct DaapClient {
     session_id: u32,
     http: Client,
     advertised_route: Option<AdvertisedHttpRoute>,
+    /// Share password for control requests. Password-protected
+    /// libdmapsharing (Rhythmbox) shares demand Basic credentials on
+    /// `/update` and `/databases` as well as `/login`; media requests never
+    /// carry it.
+    password: Option<Zeroizing<String>>,
 }
 
 /// Catalogue coordinates discovered only after a logged-in DAAP session is
@@ -109,6 +115,7 @@ impl DaapClient {
             session_id: 42,
             http: build_http_client(&base_url, None).expect("DAAP client"),
             advertised_route: None,
+            password: None,
         }
     }
 
@@ -183,14 +190,10 @@ impl DaapClient {
         let login_url = format!("{}/login", base_url.as_str().trim_end_matches('/'));
         debug!(url = %redact_url_secrets(&login_url), "DAAP: requesting login");
 
-        let mut login_req = http.get(&login_url);
-        if let Some(pw) = password {
-            if !pw.is_empty() {
-                login_req = login_req.basic_auth("", Some(pw));
-            }
-        }
-
-        let resp = login_req
+        let password = password
+            .filter(|password| !password.is_empty())
+            .map(|password| Zeroizing::new(password.to_owned()));
+        let resp = with_share_password(http.get(&login_url), password.as_ref())
             .timeout(CONTROL_RESPONSE_DEADLINE)
             .send()
             .await
@@ -223,7 +226,14 @@ impl DaapClient {
             session_id,
             http,
             advertised_route,
+            password,
         })
+    }
+
+    /// A GET on the DAAP control channel, carrying the share password when
+    /// there is one.
+    fn control_get(&self, url: &str) -> RequestBuilder {
+        with_share_password(self.http.get(url), self.password.as_ref())
     }
 
     /// Discover update/database coordinates for this exact logged-in session.
@@ -232,7 +242,6 @@ impl DaapClient {
     pub(super) async fn discover_catalogue_scope(&self) -> BackendResult<DaapCatalogueScope> {
         let base_url = &self.base_url;
         let session_id = self.session_id;
-        let http = &self.http;
         let session_details: BackendResult<(u32, u32)> = async {
             // ── Step C: Update ──────────────────────────────────────
             let update_url = format!(
@@ -243,7 +252,7 @@ impl DaapClient {
             debug!(url = %redact_url_secrets(&update_url), "DAAP: requesting update");
 
             let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
-                http.get(&update_url)
+                self.control_get(&update_url)
                     .timeout(CONTROL_RESPONSE_DEADLINE)
                     .send()
                     .await
@@ -280,7 +289,7 @@ impl DaapClient {
             debug!(url = %redact_url_secrets(&databases_url), "DAAP: requesting databases");
 
             let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
-                http.get(&databases_url)
+                self.control_get(&databases_url)
                     .timeout(CONTROL_RESPONSE_DEADLINE)
                     .send()
                     .await
@@ -356,8 +365,7 @@ impl DaapClient {
         debug!(url = %redact_url_secrets(&url), "DAAP: fetching tracks");
 
         let resp = // lgtm[rs/cleartext-transmission] DAAP is a LAN-only protocol; plaintext HTTP is by design.
-            self.http
-                .get(&url)
+            self.control_get(&url)
                 .timeout(ITEMS_RESPONSE_DEADLINE)
                 .send()
                 .await
@@ -565,6 +573,17 @@ impl DaapClient {
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
+
+/// DAAP authenticates with the share password alone; the user name is empty.
+fn with_share_password(
+    request: RequestBuilder,
+    password: Option<&Zeroizing<String>>,
+) -> RequestBuilder {
+    match password {
+        Some(password) => request.basic_auth("", Some(password.as_str())),
+        None => request,
+    }
+}
 
 /// Build a `reqwest::Client` with DAAP-required default headers.
 fn build_http_client(
@@ -783,6 +802,7 @@ mod tests {
             session_id: 42,
             http: build_http_client(&base_url, None).expect("DAAP client"),
             advertised_route: None,
+            password: None,
         }
     }
 
@@ -1093,6 +1113,7 @@ mod tests {
             session_id: 42,
             http: build_http_client(&base_url, Some(&route)).expect("routed client"),
             advertised_route: Some(route.clone()),
+            password: None,
         };
 
         let stream = client
@@ -1121,5 +1142,101 @@ mod tests {
             artwork.private_query_pairs(),
             &[("session-id".to_string(), "42".to_string())]
         );
+    }
+
+    const SHARE_PASSWORD: &str = "share-secret";
+    /// `Basic base64(":share-secret")`: DAAP authenticates with an empty user.
+    const SHARE_AUTHORIZATION: &str = "Basic OnNoYXJlLXNlY3JldA==";
+
+    fn tlv(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(payload.len()).expect("fixture DMAP payload fits u32");
+        [tag.as_slice(), &length.to_be_bytes(), payload].concat()
+    }
+
+    fn tlv_u32(tag: &[u8; 4], value: u32) -> Vec<u8> {
+        tlv(tag, &value.to_be_bytes())
+    }
+
+    /// A password-protected libdmapsharing (Rhythmbox) share: `/login`,
+    /// `/update` and `/databases` answer 401 without the share's Basic
+    /// credentials, while `/server-info` and `/databases/...` are open.
+    async fn serve_password_protected_share() -> (Url, tokio::task::JoinHandle<()>) {
+        use axum::http::{header, StatusCode, Uri};
+        use axum::response::{IntoResponse as _, Response};
+
+        async fn respond(uri: Uri, headers: axum::http::HeaderMap) -> Response {
+            let path = uri.path();
+            let authorized = headers
+                .get(header::AUTHORIZATION)
+                .is_some_and(|value| value == SHARE_AUTHORIZATION);
+            if matches!(path, "/login" | "/update" | "/databases") && !authorized {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            let ok = tlv_u32(b"mstt", 200);
+            let body = match path {
+                "/server-info" => tlv(b"msrv", &ok),
+                "/login" => tlv(b"mlog", &[ok, tlv_u32(b"mlid", 7)].concat()),
+                "/update" => tlv(b"mupd", &[ok, tlv_u32(b"musr", 3)].concat()),
+                "/databases" => {
+                    let database = tlv(b"mlit", &tlv_u32(b"miid", 1));
+                    tlv(b"avdb", &[ok, tlv(b"mlcl", &database)].concat())
+                }
+                "/databases/1/items" => tlv(b"adbs", &[ok, tlv(b"mlcl", &[])].concat()),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            ([(header::CONTENT_TYPE, DMAP_CONTENT_TYPE)], body).into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind DAAP fixture");
+        let origin = format!(
+            "http://{}/",
+            listener.local_addr().expect("fixture address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().fallback(respond))
+                .await
+                .expect("serve DAAP fixture");
+        });
+        (Url::parse(&origin).expect("fixture URL"), server)
+    }
+
+    #[tokio::test]
+    async fn password_protected_share_authenticates_every_control_request() {
+        let (origin, server) = serve_password_protected_share().await;
+
+        let refused = DaapClient::login(origin.as_str(), None).await;
+        assert!(matches!(
+            refused,
+            Err(BackendError::AuthenticationFailed { .. })
+        ));
+
+        let client = DaapClient::login(origin.as_str(), Some(SHARE_PASSWORD))
+            .await
+            .expect("login with the share password");
+        let scope = client
+            .discover_catalogue_scope()
+            .await
+            .expect("update and databases accept the share password");
+        assert_eq!(scope.database_id(), 1);
+        assert!(client
+            .fetch_tracks(scope)
+            .await
+            .expect("fetch items")
+            .is_empty());
+
+        let stream = client
+            .stream_request(scope, 9, Some("mp3"))
+            .expect("stream request");
+        assert!(stream
+            .required_headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none());
+        assert_eq!(
+            stream.private_query_pairs(),
+            &[("session-id".to_string(), "7".to_string())]
+        );
+        server.abort();
     }
 }

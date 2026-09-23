@@ -124,6 +124,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.
+- **Password-protected Rhythmbox shares** — Tributary can now load the library from a
+  Rhythmbox share that requires a password, instead of failing with a sign-in error right
+  after the password is accepted.
 - **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
   12 servers, which by default reject the older authentication header Tributary used to
   send. Earlier Jellyfin versions keep working.
