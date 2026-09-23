@@ -1901,7 +1901,7 @@ fn workflow_actions_are_pinned_to_full_commit_shas() {
             if name == "dtolnay/rust-toolchain" {
                 toolchain_installs += 1;
                 assert_eq!(
-                    revision, RUST_TOOLCHAIN_ACTION_SHA,
+                    revision, rust_toolchain_action_sha(),
                     "{workflow}: every toolchain install must use the one reviewed action commit"
                 );
             }
