@@ -1153,6 +1153,10 @@ struct WorkerSession<T> {
     cleanup_attempts: u8,
     last_heartbeat: Instant,
     last_poll: Instant,
+    /// The transport failed mid-protocol. It is never used again; the app
+    /// and media session are kept so the next Stop or shutdown can
+    /// reconnect and run the normal cleanup.
+    stranded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1210,7 +1214,7 @@ fn run_cast_worker<C>(
                 .map_or(Duration::ZERO, |last_attempt| {
                     timing.cleanup_retry.saturating_sub(last_attempt.elapsed())
                 }),
-            Some(session) if session.media_session_id.is_some() => timing.tick,
+            Some(session) if session.media_session_id.is_some() && !session.stranded => timing.tick,
             _ => Duration::from_hours(1),
         };
         match worker_rx.recv_timeout(wait) {
@@ -1262,7 +1266,14 @@ fn run_cast_worker<C>(
                         true
                     }
                     CommandKind::Stop => {
-                        match cleanup_session(&mut active, command.owner, &intent_epoch) {
+                        let cleanup = match reconnect_stranded(&mut connector, &mut active) {
+                            Ok(()) => cleanup_session(&mut active, command.owner, &intent_epoch),
+                            // The stranded session is kept so another Stop
+                            // (or shutdown) can retry once the receiver is
+                            // reachable.
+                            Err(failure) => CleanupOutcome::Failed(failure),
+                        };
+                        match cleanup {
                             CleanupOutcome::Completed => {
                                 set_state_and_emit(
                                     command.owner,
@@ -1284,6 +1295,7 @@ fn run_cast_worker<C>(
                         true
                     }
                     CommandKind::Shutdown => {
+                        let _ = reconnect_stranded(&mut connector, &mut active);
                         cleanup_unconditionally(&mut active);
                         break;
                     }
@@ -1350,6 +1362,7 @@ fn run_cast_worker<C>(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = reconnect_stranded(&mut connector, &mut active);
                 cleanup_unconditionally(&mut active);
                 break;
             }
@@ -1455,6 +1468,7 @@ fn handle_load<C>(
         cleanup_attempts: 0,
         last_heartbeat: Instant::now(),
         last_poll: Instant::now(),
+        stranded: false,
     });
 
     if !is_current(owner, intent_epoch) {
@@ -1637,21 +1651,53 @@ fn cleanup_then_fail<T>(
         let _ = cleanup_session(active, owner, intent_epoch);
     } else {
         // A timeout, partial frame, TLS error, or malformed response can leave
-        // unread bytes or a half-written request on the Cast stream. Drop the
-        // session immediately instead of multiplying one deadline across
-        // cleanup calls on a protocol state that is no longer synchronized.
-        active.take();
+        // unread bytes or a half-written request on the Cast stream. Never
+        // issue cleanup on that desynchronized stream; strand the session so
+        // a later Stop or shutdown reconnects and stops the receiver app.
+        strand_session(active);
     }
     if is_current(owner, intent_epoch) {
         fail_cast(owner, failure, intent_epoch, current_state, event_tx);
     }
 }
 
-/// Return whether an in-flight operation was superseded, dropping a session
+/// Stop using a session whose transport became unusable while keeping its
+/// app and media session (see [`WorkerSession::stranded`]).
+fn strand_session<T>(active: &mut Option<WorkerSession<T>>) {
+    if let Some(session) = active.as_mut() {
+        session.stranded = true;
+        // The virtual connection to the app died with the transport.
+        session.app_connected = false;
+    }
+}
+
+/// Give a stranded session a fresh transport connected to its receiver app
+/// so the normal cleanup can run on it. On failure the session stays
+/// stranded.
+fn reconnect_stranded<C>(
+    connector: &mut C,
+    active: &mut Option<WorkerSession<C::Transport>>,
+) -> CastResult<()>
+where
+    C: CastConnector,
+{
+    let Some(session) = active.as_mut().filter(|session| session.stranded) else {
+        return Ok(());
+    };
+    let mut transport = connector.connect()?;
+    transport.connect_receiver()?;
+    transport.connect_app(&session.app)?;
+    session.transport = transport;
+    session.app_connected = true;
+    session.stranded = false;
+    Ok(())
+}
+
+/// Return whether an in-flight operation was superseded, stranding a session
 /// that the completed operation proved can no longer be used safely.
 ///
 /// A newer intent may arrive while blocking Cast I/O is still within its
-/// deadline. Keeping a stream that then reports a transport/protocol failure
+/// deadline. Reusing a stream that then reports a transport/protocol failure
 /// would make the newer intent spend another full operation budget attempting
 /// cleanup on a desynchronized connection.
 fn discard_poisoned_session_if_stale<T, U>(
@@ -1667,7 +1713,7 @@ fn discard_poisoned_session_if_stale<T, U>(
         .as_ref()
         .is_err_and(|failure| !failure.connection_usable)
     {
-        active.take();
+        strand_session(active);
     }
     true
 }
@@ -1691,7 +1737,7 @@ fn handle_control<T>(
     if session.owner.epoch != owner.epoch {
         return;
     }
-    if session.retired {
+    if session.retired || session.stranded {
         return;
     }
     let Some(media_session_id) = session.media_session_id else {
@@ -1767,7 +1813,7 @@ fn poll_active<T>(
         return;
     };
     let owner = session.owner;
-    if session.retired {
+    if session.retired || session.stranded {
         return;
     }
     let Some(media_session_id) = session.media_session_id else {
@@ -1929,6 +1975,11 @@ where
     let Some(mut session) = active.take() else {
         return CleanupOutcome::Completed;
     };
+    if session.stranded {
+        // Its transport is unusable. Stop and shutdown reconnect it first;
+        // a load replaces it anyway.
+        return CleanupOutcome::Completed;
+    }
     session.retired = true;
     let mut first_failure = None;
 
@@ -2018,7 +2069,7 @@ fn cleanup_unconditionally<T>(active: &mut Option<WorkerSession<T>>)
 where
     T: CastTransport,
 {
-    if let Some(mut session) = active.take() {
+    if let Some(mut session) = active.take().filter(|session| !session.stranded) {
         if let Some(media_session_id) = session.media_session_id {
             if session
                 .transport
@@ -3806,7 +3857,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_poisoned_control_drops_without_delaying_the_new_intent() {
+    fn superseded_poisoned_control_stops_through_a_fresh_connection() {
         let shared = FakeShared::new();
         let harness = Harness::new(Arc::clone(&shared));
         let first = harness.next_owner(1);
@@ -3833,13 +3884,96 @@ mod tests {
         release.send(()).expect("release pause");
         harness.fence(stop);
 
-        assert_eq!(shared.actions(), vec![Action::Point(Point::Pause)]);
+        // The poisoned stream is never reused: Stop reconnects to the
+        // receiver app and runs the normal cleanup on the new connection.
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Pause),
+                Action::Point(Point::Connect),
+                Action::Point(Point::ReceiverConnect),
+                Action::Point(Point::AppConnect),
+                Action::Stop(42),
+                Action::Point(Point::AppDisconnect),
+                Action::Point(Point::AppStop),
+            ]
+        );
         assert!(!harness.events().iter().any(|event| matches!(
             event,
             PlayerEvent::Error { generation, .. }
                 if *generation == PlayerEventGeneration::from_raw(1)
         )));
         harness.shutdown();
+    }
+
+    /// Load one media session, then fail its next status poll with an
+    /// I/O-level error so the session is stranded. Returns the load owner.
+    fn strand_after_stalled_poll(harness: &Harness, shared: &FakeShared) -> CommandOwner {
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                media: test_load_media(),
+                uri: "https://music.test/a".to_string(),
+                volume: 0.5,
+            },
+        );
+        harness.fence(load);
+        *shared.poison_at.lock().expect("poison lock") = Some(Point::Status);
+        harness.send(load, CommandKind::PollNow);
+        harness.fence(load);
+        *shared.poison_at.lock().expect("poison lock") = None;
+        shared.clear_actions();
+        let _ = harness.events();
+        load
+    }
+
+    fn fresh_connection_cleanup() -> Vec<Action> {
+        vec![
+            Action::Point(Point::Connect),
+            Action::Point(Point::ReceiverConnect),
+            Action::Point(Point::AppConnect),
+            Action::Stop(42),
+            Action::Point(Point::AppDisconnect),
+            Action::Point(Point::AppStop),
+        ]
+    }
+
+    #[test]
+    fn stop_after_a_stalled_poll_reconnects_and_stops_the_receiver_app() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let load = strand_after_stalled_poll(&harness, &shared);
+
+        // The stranded transport is never used again.
+        harness.send(load, CommandKind::Pause);
+        harness.send(load, CommandKind::PollNow);
+        harness.fence(load);
+        assert!(shared.actions().is_empty());
+
+        let stop = harness.next_owner(1);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+        assert_eq!(shared.actions(), fresh_connection_cleanup());
+        assert!(matches!(
+            harness.events().as_slice(),
+            [PlayerEvent::StateChanged {
+                state: PlayerState::Stopped,
+                ..
+            }]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn shutdown_after_a_stalled_poll_reconnects_and_stops_the_receiver_app() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        strand_after_stalled_poll(&harness, &shared);
+
+        harness.shutdown();
+
+        assert_eq!(shared.actions(), fresh_connection_cleanup());
     }
 
     #[test]
