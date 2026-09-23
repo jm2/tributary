@@ -133,6 +133,16 @@ fn identity_is_owned_by_source(identity: &PlaybackIdentity, source_key: &str) ->
     source_id == Some(identity.media_key.source_id)
 }
 
+/// Whether a projected row shows a local-library track that committed
+/// library changes may update in place: a local row that is not a
+/// playlist occurrence standing in for a missing or unmatched track.
+pub(super) fn shows_local_library_track(row: &TrackObject) -> bool {
+    row.source_id() == Some(SourceId::local())
+        && row
+            .playlist_occurrence_binding()
+            .is_none_or(|binding| binding.state() == PlaylistOccurrenceState::AvailableLocal)
+}
+
 /// Overlay committed local-library URIs onto an existing playlist projection.
 ///
 /// Playlist rows and the local library share stable track IDs, but each
@@ -148,15 +158,9 @@ pub(super) fn refresh_projected_library_uris(
         return 0;
     }
 
-    let accepts_local_refresh = |row: &TrackObject| {
-        row.source_id() == Some(SourceId::local())
-            && row
-                .playlist_occurrence_binding()
-                .is_none_or(|binding| binding.state() == PlaylistOccurrenceState::AvailableLocal)
-    };
     let projected_ids: HashSet<String> = projected_rows
         .iter()
-        .filter(|row| accepts_local_refresh(row))
+        .filter(|row| shows_local_library_track(row))
         .map(TrackObject::track_id)
         .collect();
     let mut committed_uris = HashMap::with_capacity(projected_ids.len());
@@ -173,7 +177,7 @@ pub(super) fn refresh_projected_library_uris(
 
     let mut refreshed = 0;
     for row in projected_rows {
-        if !accepts_local_refresh(row) {
+        if !shows_local_library_track(row) {
             continue;
         }
         let Some(uri) = committed_uris.get(&row.track_id()) else {

@@ -83,6 +83,9 @@ mod imp {
         pub icon_name: RefCell<String>,
         pub header_kind: Cell<Option<HeaderKind>>,
         pub playlist_kind: Cell<Option<PlaylistSidebarKind>>,
+        /// Whether this smart playlist's rules read play count, last-played
+        /// time or rating (see `PlaylistSidebarEntry::reads_play_statistics`).
+        pub playlist_reads_play_statistics: Cell<bool>,
         /// Base URL for remote servers (e.g. `https://music.example.com`).
         pub server_url: RefCell<String>,
         /// Stable logical source identity. This is independent from the
@@ -356,9 +359,19 @@ impl SourceObject {
         self.playlist_kind().and_then(linked_playlist_status_key)
     }
 
+    /// Whether a counted play or a rating can change this playlist's tracks:
+    /// true only for a smart playlist whose rules read those values.
+    pub fn playlist_reads_play_statistics(&self) -> bool {
+        self.imp().playlist_reads_play_statistics.get()
+    }
+
     /// Create a playlist row from one authoritative engine publication.
     pub fn playlist_entry(entry: &PlaylistSidebarEntry) -> Self {
-        Self::playlist_with_kind(entry.name(), entry.playlist_id(), entry.kind())
+        let obj = Self::playlist_with_kind(entry.name(), entry.playlist_id(), entry.kind());
+        obj.imp()
+            .playlist_reads_play_statistics
+            .set(entry.reads_play_statistics());
+        obj
     }
 
     fn playlist_with_kind(name: &str, playlist_id: &str, kind: PlaylistSidebarKind) -> Self {

@@ -137,19 +137,12 @@ impl SourceNavigation {
             })
     }
 
-    /// Retire all pending/cache-eligible requests in one source namespace.
-    ///
-    /// Playlist reconciliation uses this before clearing `playlist:*` cache
-    /// rows.  A pre-reconciliation query that completes afterward therefore
-    /// cannot repopulate that cache.
-    pub fn invalidate_prefix(&mut self, prefix: &str) {
-        self.latest_by_key
-            .retain(|source_key, _| !source_key.starts_with(prefix));
-    }
-
     /// Retire pending/cache-eligible work for exactly one source key.
     ///
-    /// The active request is intentionally left intact. Callers removing an
+    /// Playlist invalidation calls this before dropping a stale cached
+    /// projection, so a query that read pre-commit rows and completes
+    /// afterwards cannot repopulate it. The active request is intentionally
+    /// left intact. Callers removing an
     /// active source can then perform their visible fallback as a separate,
     /// explicit navigation transition.
     pub fn invalidate_key(&mut self, key: &str) {
@@ -318,7 +311,7 @@ mod tests {
         let mut navigation = SourceNavigation::new("local");
         let request = navigation.select("playlist:a");
 
-        navigation.invalidate_prefix("playlist:");
+        navigation.invalidate_key("playlist:a");
 
         assert_eq!(
             navigation.completion(&request),
@@ -332,7 +325,7 @@ mod tests {
         navigation.select("playlist:a");
         let remote = navigation.select("https://music.example.test/");
 
-        navigation.invalidate_prefix("playlist:");
+        navigation.invalidate_key("playlist:a");
 
         assert!(navigation.is_current(&remote));
         assert!(!navigation.is_key("playlist:a"));
