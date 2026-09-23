@@ -70,14 +70,12 @@ mod audio;
 mod daap;
 mod db;
 mod desktop_integration;
-#[allow(dead_code)]
 mod device;
 mod discovery;
 mod external_file;
 pub(crate) mod http_body;
 pub(crate) mod http_security;
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) mod http_test_service;
 mod install_id;
 #[allow(dead_code)]
