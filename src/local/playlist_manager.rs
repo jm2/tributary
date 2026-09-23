@@ -25,6 +25,28 @@ use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track}
 /// snapshot ordering.
 const SIDEBAR_ORDER_TABLE: &str = "playlist_sidebar_order";
 
+/// Seeds for random-limited smart playlists, keyed by playlist ID and kept
+/// for the life of the process. Re-evaluating a playlist — after a counted
+/// play, a rating, a library change, an export or when it is reopened — then
+/// keeps its random selection; saving new rules draws a new one.
+static RANDOM_LIMIT_SEEDS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn random_limit_seed(playlist_id: &str) -> u64 {
+    *RANDOM_LIMIT_SEEDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(playlist_id.to_string())
+        .or_insert_with(|| fastrand::u64(..))
+}
+
+fn forget_random_limit_seed(playlist_id: &str) {
+    RANDOM_LIMIT_SEEDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(playlist_id);
+}
+
 mod server_playlist_sync;
 
 // Record E is the first production consumer of this complete engine surface.
@@ -524,6 +546,7 @@ impl PlaylistManager {
             return Err(DbErr::RecordNotFound("Playlist not found".to_string()));
         }
         txn.commit().await?;
+        forget_random_limit_seed(id);
         info!(id = %id, "Playlist deleted");
         Ok(())
     }
@@ -1015,6 +1038,7 @@ impl PlaylistManager {
         model.updated_at = Set(now_rfc3339());
         model.update(&txn).await?;
         txn.commit().await?;
+        forget_random_limit_seed(playlist_id);
         info!(id = %playlist_id, "Smart playlist rules updated");
         Ok(())
     }
@@ -1060,7 +1084,8 @@ impl PlaylistManager {
         // in `smart_rules::apply_compound_sort` (decorate-sort-undecorate).
         let all_tracks = track::Entity::find().all(&txn).await?;
         txn.commit().await?;
-        let results = smart_rules::evaluate(&rules, &all_tracks);
+        let results =
+            smart_rules::evaluate_seeded(&rules, &all_tracks, random_limit_seed(playlist_id));
         Ok(results)
     }
 
@@ -2109,6 +2134,76 @@ mod tests {
             .map(|track| track.id)
             .collect();
         assert_eq!(unrated_ids, ["none"]);
+    }
+
+    #[tokio::test]
+    async fn random_limited_smart_playlist_keeps_its_selection_across_a_rating() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let mut tracks = Vec::new();
+        for n in 0..40 {
+            let id = format!("track-{n:02}");
+            tracks.push(
+                insert_track(
+                    &db,
+                    &id,
+                    &format!("/music/{id}.flac"),
+                    &id,
+                    "Artist",
+                    "Album",
+                    Some(180),
+                )
+                .await,
+            );
+        }
+        let ten_random_unrated = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::Rating,
+                operator: smart_rules::RuleOperator::IsUnrated,
+                value: smart_rules::RuleValue::Number(1),
+            }],
+            limit: Some(smart_rules::SmartLimit {
+                value: 10,
+                unit: smart_rules::LimitUnit::Items,
+                selected_by: smart_rules::LimitSort::Random,
+            }),
+            sort_order: Vec::new(),
+        };
+        let playlist = manager
+            .create_smart_playlist("Ten random unrated", &ten_random_unrated)
+            .await
+            .expect("create random-limited smart playlist");
+        let selection = |models: Vec<track::Model>| -> Vec<String> {
+            models.into_iter().map(|track| track.id).collect()
+        };
+        let before = selection(
+            manager
+                .evaluate_smart_playlist(&playlist.id)
+                .await
+                .expect("evaluate random selection"),
+        );
+        assert_eq!(before.len(), 10);
+
+        // Rating an unselected track removes it from the matched set.
+        let rated = tracks
+            .into_iter()
+            .find(|track| !before.contains(&track.id))
+            .expect("an unselected track");
+        let mut rated: track::ActiveModel = rated.into();
+        rated.rating = Set(Some(80));
+        rated.update(&db).await.expect("commit rating");
+
+        let after = selection(
+            manager
+                .evaluate_smart_playlist(&playlist.id)
+                .await
+                .expect("re-evaluate after rating"),
+        );
+        assert_eq!(
+            after, before,
+            "a rating must not reshuffle a random-limited selection"
+        );
     }
 
     #[tokio::test]
