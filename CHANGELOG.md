@@ -121,6 +121,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Very large playlist selections** — Adding more than about 32,000 tracks to a playlist
+  at once, or removing that many entries, no longer fails.
+- **XSPF import and export** — Exports keep an existing file's permissions, new exports are
+  readable by other programs, and exporting over a symlink updates the file it points to. A
+  playlist with one bad duration still imports, and files over 64 MiB are refused with a clear
+  message.
+- **Playlist housekeeping** — The default smart playlists no longer come back after you delete
+  them, Rhythmbox imports keep their original playlist order, and file changes no longer re-read
+  the whole library whenever some playlist entries are unmatched.
 - **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
   12 servers, which by default reject the older authentication header Tributary used to
   send. Earlier Jellyfin versions keep working.
