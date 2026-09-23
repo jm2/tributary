@@ -113,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
+  12 servers, which by default reject the older authentication header Tributary used to
+  send. Earlier Jellyfin versions keep working.
 - **One device per install** — Each Tributary install now presents its own device identity
   to Jellyfin and Plex, so signing in on a second computer, or adding the same Jellyfin
   server twice, no longer signs out your other Tributary sessions.

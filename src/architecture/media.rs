@@ -827,10 +827,7 @@ fn validate_public_endpoint(endpoint: &Url) -> BackendResult<()> {
 }
 
 fn is_allowed_auth_header(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "authorization" | "x-emby-authorization" | "x-plex-token"
-    )
+    matches!(name.as_str(), "authorization" | "x-plex-token")
 }
 
 fn is_allowed_required_header(name: &HeaderName) -> bool {
@@ -1016,7 +1013,6 @@ mod tests {
 
         let sensitive = [
             reqwest::header::AUTHORIZATION,
-            HeaderName::from_static("x-emby-authorization"),
             HeaderName::from_static("x-plex-token"),
         ];
         for name in sensitive {
