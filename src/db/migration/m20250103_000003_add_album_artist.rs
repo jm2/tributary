@@ -8,6 +8,11 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // SQLite can commit the ALTER before the migration ledger row is
+        // written, so a retry must accept the column already being there.
+        if manager.has_column("tracks", "album_artist_name").await? {
+            return Ok(());
+        }
         manager
             .alter_table(
                 Table::alter()
@@ -23,6 +28,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if !manager.has_column("tracks", "album_artist_name").await? {
+            return Ok(());
+        }
         manager
             .alter_table(
                 Table::alter()

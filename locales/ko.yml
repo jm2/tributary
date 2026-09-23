@@ -352,6 +352,11 @@ errors:
     heading: "라이브러리를 사용할 수 없음"
     open_failed: "Tributary가 라이브러리 데이터베이스를 열 수 없어 라이브러리와 재생목록을 표시할 수 없습니다. 자세한 내용은 로그를 확인하세요."
     upgrade_failed: "Tributary가 이 버전에 맞게 라이브러리 데이터베이스를 업그레이드할 수 없어 라이브러리와 재생목록을 표시할 수 없습니다. 자세한 내용은 로그를 확인하세요."
+    backup_saved: "업그레이드 전 라이브러리의 사본을 %{path}에 저장했습니다."
+    newer_version: "이 라이브러리 데이터베이스는 최신 버전의 Tributary에서 만들어져 이 버전에서는 열 수 없습니다. 최신 버전을 다시 설치하거나, Tributary를 종료한 다음 library.db를 %{path}에 있는 이전 사본으로 바꾸세요."
+  open_files:
+    unsupported_location: "이 위치를 열 수 없습니다. Tributary는 이 컴퓨터에 있는 파일만 열 수 있습니다."
+    closing: "Tributary를 종료하는 중입니다. 종료된 후 다시 여세요."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

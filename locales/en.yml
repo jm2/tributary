@@ -393,6 +393,11 @@ errors:
     heading: "Library Unavailable"
     open_failed: "Tributary could not open its library database, so your library and playlists cannot be shown. See the log for details."
     upgrade_failed: "Tributary could not upgrade its library database for this version, so your library and playlists cannot be shown. See the log for details."
+    backup_saved: "A copy of your library from before the upgrade was saved to %{path}."
+    newer_version: "This library database was created by a newer version of Tributary, which this version cannot open. Reinstall the newer version, or quit Tributary and replace library.db with an earlier copy from %{path}."
+  open_files:
+    unsupported_location: "Can’t open this location. Tributary can only open files on this computer."
+    closing: "Tributary is closing. Open it again once it has closed."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

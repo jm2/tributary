@@ -352,6 +352,11 @@ errors:
     heading: "Bibliotheek niet beschikbaar"
     open_failed: "Tributary kon de bibliotheekdatabase niet openen, waardoor uw bibliotheek en afspeellijsten niet kunnen worden weergegeven. Zie het logboek voor details."
     upgrade_failed: "Tributary kon de bibliotheekdatabase niet bijwerken voor deze versie, waardoor uw bibliotheek en afspeellijsten niet kunnen worden weergegeven. Zie het logboek voor details."
+    backup_saved: "Een kopie van uw bibliotheek van vóór de upgrade is opgeslagen in %{path}."
+    newer_version: "Deze bibliotheekdatabase is gemaakt door een nieuwere versie van Tributary en kan niet worden geopend door deze versie. Installeer de nieuwere versie opnieuw, of sluit Tributary af en vervang library.db door een eerdere kopie uit %{path}."
+  open_files:
+    unsupported_location: "Deze locatie kan niet worden geopend. Tributary kan alleen bestanden op deze computer openen."
+    closing: "Tributary wordt afgesloten. Open het opnieuw zodra het is afgesloten."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

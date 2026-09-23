@@ -1,26 +1,27 @@
 //! Database connection factory and migration runner.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sea_orm::{DatabaseConnection, DbErr, SqlxSqliteConnector};
 use sea_orm_migration::MigratorTrait;
 use tokio::sync::OnceCell;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::migration::{self, Migrator};
+use super::upgrade::{self, LedgerState};
 
 /// How long a statement waits for a competing writer before failing busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Shared database connection — initialised once, reused everywhere.
+/// Shared database connection, or the reason it could not be opened.
 ///
-/// Using a `OnceCell` ensures that `init_db()` only runs migrations and
-/// opens the SQLite file a single time.  Subsequent callers get a cheap
-/// clone of the same connection (SeaORM's `DatabaseConnection` is
-/// internally `Arc`-wrapped and safe to share across tasks).
-static SHARED_DB: OnceCell<DatabaseConnection> = OnceCell::const_new();
+/// Initialised once per process. A failure is kept as well: every later
+/// caller gets the same error instead of reopening the file and re-running
+/// the migrations that already failed. SeaORM's `DatabaseConnection` is
+/// internally `Arc`-wrapped, so each caller receives a cheap clone.
+static SHARED_DB: OnceCell<Result<DatabaseConnection, DatabaseInitError>> = OnceCell::const_new();
 
 /// Settings applied to *every* connection in the pool.
 ///
@@ -45,67 +46,151 @@ fn sqlite_connect_options(db_path: &Path) -> SqliteConnectOptions {
         .busy_timeout(BUSY_TIMEOUT)
 }
 
-/// Open a connection pool against `db_path` and run every pending migration.
-async fn connect_and_migrate(db_path: &Path) -> Result<DatabaseConnection, DbErr> {
+/// Open a connection pool against `db_path` and run every pending migration,
+/// copying the database aside first when it already holds a library.
+async fn connect_and_migrate(db_path: &Path) -> Result<DatabaseConnection, DatabaseInitError> {
     let pool = SqlitePoolOptions::new()
         .connect_with(sqlite_connect_options(db_path))
         .await
-        .map_err(|e| DbErr::Custom(format!("Failed to open database: {e}")))?;
+        .map_err(|e| {
+            DatabaseInitError::new(
+                DatabaseInitFailure::Open,
+                format!("Failed to open database: {e}"),
+            )
+        })?;
     let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+
+    let backup = match upgrade::ledger_state(&db).await {
+        Ok(LedgerState::Newer { unknown }) => {
+            let backups = upgrade::backup_dir(db_path);
+            let detail = format!("a newer build applied migration {unknown}");
+            return Err(DatabaseInitError::new(
+                DatabaseInitFailure::NewerVersion { backups },
+                detail,
+            ));
+        }
+        Ok(LedgerState::Known { applied, pending }) if applied > 0 && pending > 0 => {
+            back_up_before_upgrade(&db, db_path, applied).await
+        }
+        Ok(LedgerState::Known { .. }) => None,
+        Err(error) => {
+            return Err(DatabaseInitError::new(
+                DatabaseInitFailure::Upgrade { backup: None },
+                error.to_string(),
+            ));
+        }
+    };
 
     info!("Running pending migrations");
     let upgrade = async {
         Migrator::up(&db, None).await?;
         migration::revalidate_critical_objects(&db).await
     };
-    upgrade.await.map_err(|error| match error {
-        DbErr::Migration(_) => error,
-        other => DbErr::Migration(other.to_string()),
+    upgrade.await.map_err(|error| {
+        DatabaseInitError::new(DatabaseInitFailure::Upgrade { backup }, error.to_string())
     })?;
 
     Ok(db)
 }
 
+/// A failed copy is logged and the upgrade goes ahead: refusing to start
+/// would leave the library just as unavailable as a failed upgrade.
+async fn back_up_before_upgrade(
+    db: &DatabaseConnection,
+    db_path: &Path,
+    applied: usize,
+) -> Option<PathBuf> {
+    match upgrade::back_up(db, db_path, applied).await {
+        Ok(path) => {
+            info!(path = %path.display(), "Backed up the library database");
+            Some(path)
+        }
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "Upgrading the library database without a backup");
+            None
+        }
+    }
+}
+
 /// Which start-up stage failed, so the UI can name it without showing the
 /// underlying error text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DatabaseInitFailure {
     /// The data directory or the database file could not be opened.
     Open,
     /// A schema migration or the post-migration schema check failed.
-    Upgrade,
+    /// `backup` is the copy taken before the migrations started, if any.
+    Upgrade { backup: Option<PathBuf> },
+    /// A newer Tributary has migrated the database. Downgrades are not
+    /// supported; `backups` is where the pre-upgrade copies are kept.
+    NewerVersion { backups: PathBuf },
 }
 
-impl DatabaseInitFailure {
-    /// Classify an error from [`get_or_init_db`]: every failure after the
-    /// database file opened is reported as [`DbErr::Migration`].
-    pub const fn of(error: &DbErr) -> Self {
-        if matches!(error, DbErr::Migration(_)) {
-            Self::Upgrade
-        } else {
-            Self::Open
+/// Why the shared database is unavailable for the rest of this process.
+#[derive(Clone, Debug)]
+pub struct DatabaseInitError {
+    failure: DatabaseInitFailure,
+    detail: String,
+}
+
+impl DatabaseInitError {
+    fn new(failure: DatabaseInitFailure, detail: impl Into<String>) -> Self {
+        Self {
+            failure,
+            detail: detail.into(),
+        }
+    }
+
+    /// The failed stage, for user-facing copy.
+    pub const fn failure(&self) -> &DatabaseInitFailure {
+        &self.failure
+    }
+}
+
+impl std::fmt::Display for DatabaseInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl From<DatabaseInitError> for DbErr {
+    fn from(error: DatabaseInitError) -> Self {
+        match error.failure {
+            DatabaseInitFailure::Open => Self::Custom(error.detail),
+            DatabaseInitFailure::Upgrade { .. } | DatabaseInitFailure::NewerVersion { .. } => {
+                Self::Migration(error.detail)
+            }
         }
     }
 }
 
 /// Obtain the shared database connection, initialising it on first call.
 ///
-/// This is the preferred entry point for all code that needs DB access.
 /// The first invocation opens the SQLite file, enables WAL mode, and
-/// runs pending migrations.  Every subsequent call returns instantly.
-pub async fn get_or_init_db() -> Result<DatabaseConnection, DbErr> {
-    let db = SHARED_DB
-        .get_or_try_init(|| async {
+/// runs pending migrations. Every later call returns the same connection,
+/// or the same failure, without touching the file again.
+pub async fn get_or_init_db() -> Result<DatabaseConnection, DatabaseInitError> {
+    SHARED_DB
+        .get_or_init(|| async {
             // Return errors instead of panicking: callers wrap this in
             // graceful `match init_db() { Err(e) => … }` handling, and a
             // panic inside this spawned task would be swallowed by tokio,
             // silently killing the library engine with no user feedback.
             let data_dir = crate::paths::data_dir()
-                .ok_or_else(|| DbErr::Custom("Could not determine data directory".into()))?
+                .ok_or_else(|| {
+                    DatabaseInitError::new(
+                        DatabaseInitFailure::Open,
+                        "Could not determine data directory",
+                    )
+                })?
                 .join("tributary");
 
-            std::fs::create_dir_all(&data_dir)
-                .map_err(|e| DbErr::Custom(format!("Failed to create data directory: {e}")))?;
+            std::fs::create_dir_all(&data_dir).map_err(|e| {
+                DatabaseInitError::new(
+                    DatabaseInitFailure::Open,
+                    format!("Failed to create data directory: {e}"),
+                )
+            })?;
 
             let db_path = data_dir.join("library.db");
             info!(path = %db_path.display(), "Opening database");
@@ -113,21 +198,16 @@ pub async fn get_or_init_db() -> Result<DatabaseConnection, DbErr> {
             let db = connect_and_migrate(&db_path).await?;
 
             info!("Database ready");
-            Ok::<DatabaseConnection, DbErr>(db)
+            Ok(db)
         })
-        .await?;
-    Ok(db.clone())
+        .await
+        .clone()
 }
 
-/// Initialise the SQLite database.
-///
-/// Creates the data directory and database file if they don't exist,
-/// then runs all pending migrations.
-///
-/// **Prefer [`get_or_init_db`] instead** — this function is retained
-/// for backward compatibility but now delegates to the shared pool.
+/// [`get_or_init_db`] with the failure as a [`DbErr`], for callers that fold
+/// it into their own database error handling.
 pub async fn init_db() -> Result<DatabaseConnection, DbErr> {
-    get_or_init_db().await
+    get_or_init_db().await.map_err(DbErr::from)
 }
 
 #[cfg(test)]
@@ -293,8 +373,8 @@ mod tests {
             .expect_err("startup must reject a current but damaged migration installation");
         assert!(error.to_string().contains("trigger object"));
         assert_eq!(
-            DatabaseInitFailure::of(&error),
-            DatabaseInitFailure::Upgrade
+            error.failure(),
+            &DatabaseInitFailure::Upgrade { backup: None }
         );
     }
 
@@ -306,7 +386,129 @@ mod tests {
         let error = connect_and_migrate(&path)
             .await
             .expect_err("the parent directory does not exist");
-        assert_eq!(DatabaseInitFailure::of(&error), DatabaseInitFailure::Open);
+        assert_eq!(error.failure(), &DatabaseInitFailure::Open);
+    }
+
+    /// A library from an older release is copied aside once, at its old
+    /// schema, and then upgraded through the whole chain on a file-backed
+    /// multi-connection pool without losing its rows.
+    #[tokio::test]
+    async fn an_older_library_is_backed_up_and_then_upgraded() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("library.db");
+        {
+            let pool = SqlitePoolOptions::new()
+                .connect_with(sqlite_connect_options(&path))
+                .await
+                .expect("open legacy database");
+            let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+            Migrator::up(&db, Some(3))
+                .await
+                .expect("apply the early schema");
+            db.execute_unprepared(
+                "INSERT INTO tracks (id, file_path, title, artist_name, album_title, \
+                 play_count, date_added, date_modified) VALUES ('track-1', \
+                 '/music/one.flac', 'Title', 'Artist', 'Album', 7, \
+                 '2025-01-01T00:00:00+00:00', '2025-01-01T00:00:00+00:00')",
+            )
+            .await
+            .expect("insert legacy track");
+            db.close().await.expect("close legacy database");
+        }
+
+        let db = connect_and_migrate(&path).await.expect("upgrade database");
+        let upgraded = track::Entity::find_by_id("track-1".to_string())
+            .one(&db)
+            .await
+            .expect("load track")
+            .expect("track survives the upgrade");
+        assert_eq!(upgraded.play_count, 7);
+        db.close().await.expect("close upgraded database");
+
+        let backups = backup_files(&dir.path().join("backups"));
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        let name = backups[0].file_name().and_then(|name| name.to_str());
+        assert!(
+            name.is_some_and(|name| name.starts_with("library-schema3-")),
+            "{name:?}"
+        );
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&backups[0])
+                    .read_only(true),
+            )
+            .await
+            .expect("open backup");
+        let copy = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+        let ledger = Migrator::get_migration_models(&copy)
+            .await
+            .expect("read backup ledger");
+        assert_eq!(ledger.len(), 3, "the copy predates the upgrade");
+        let row = copy
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT play_count FROM tracks WHERE id = 'track-1'",
+            ))
+            .await
+            .expect("query backup")
+            .expect("the copy holds the legacy track");
+        assert_eq!(row.try_get::<i32>("", "play_count").expect("play count"), 7);
+
+        connect_and_migrate(&path)
+            .await
+            .expect("reopen current database");
+        assert_eq!(
+            backup_files(&dir.path().join("backups")).len(),
+            1,
+            "a current database is not copied again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_database_is_not_backed_up() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        connect_and_migrate(&dir.path().join("library.db"))
+            .await
+            .expect("create database");
+        assert!(!dir.path().join("backups").exists());
+    }
+
+    /// A downgrade meets a ledger naming migrations this build lacks. It is
+    /// reported as such, before anything touches the database.
+    #[tokio::test]
+    async fn a_database_from_a_newer_build_is_refused() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("library.db");
+        let db = connect_and_migrate(&path).await.expect("create database");
+        db.execute_unprepared(
+            "INSERT INTO seaql_migrations (version, applied_at) \
+             VALUES ('m20991231_000099_from_a_newer_build', 0)",
+        )
+        .await
+        .expect("record a future migration");
+        db.close().await.expect("close database");
+
+        let error = connect_and_migrate(&path)
+            .await
+            .expect_err("an older build must refuse a newer ledger");
+        assert_eq!(
+            error.failure(),
+            &DatabaseInitFailure::NewerVersion {
+                backups: dir.path().join("backups")
+            }
+        );
+        assert!(!dir.path().join("backups").exists());
+    }
+
+    fn backup_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("backup entry").path())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// P1.5's guarantee, asserted end to end against a real pool: deleting a

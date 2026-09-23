@@ -8,7 +8,7 @@
 //! the action is fired immediately. Candidate order within that exact
 //! delivery is preserved; an older undrained or in-flight delivery is stale.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +22,9 @@ static ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static PENDING: RefCell<Vec<(u64, PathBuf)>> = const { RefCell::new(Vec::new()) };
+    /// An OS-open request named a location without a local path, and the
+    /// window has not yet told the user it cannot be opened.
+    static UNSUPPORTED_LOCATION: Cell<bool> = const { Cell::new(false) };
 }
 
 /// One ordered batch drained from the GTK-owned pending queue.
@@ -94,6 +97,17 @@ pub fn enqueue<I: IntoIterator<Item = PathBuf>>(paths: I) {
         q.borrow_mut()
             .extend(paths.into_iter().map(|path| (generation, path)));
     });
+}
+
+/// Remember that a delivered location cannot be opened, for the window's
+/// next `play-pending-files` activation to report.
+pub fn note_unsupported_location() {
+    UNSUPPORTED_LOCATION.with(|noted| noted.set(true));
+}
+
+/// Whether an unsupported location is waiting to be reported; clears it.
+pub(super) fn take_unsupported_location() -> bool {
+    UNSUPPORTED_LOCATION.with(|noted| noted.replace(false))
 }
 
 /// Take all currently-queued paths, leaving the queue empty.
@@ -189,5 +203,40 @@ mod tests {
         enqueue([PathBuf::from("stopped")]);
         invalidate_admission();
         assert!(drain().is_empty(), "Stop must not restamp pending paths");
+    }
+
+    /// The open, close and database-recovery notices must come from every
+    /// catalog rather than fall back to English, and keep their placeholder.
+    #[test]
+    fn lifecycle_notices_are_translated_in_every_catalog() {
+        let keys = [
+            "errors.open_files.unsupported_location",
+            "errors.open_files.closing",
+            "errors.database.backup_saved",
+            "errors.database.newer_version",
+        ];
+        for key in keys {
+            let english = rust_i18n::t!(key, locale = "en", path = "/backups");
+            assert_ne!(english, key, "{key} is missing from the English catalog");
+            for locale in rust_i18n::available_locales!() {
+                let text = rust_i18n::t!(key, locale = &locale, path = "/backups");
+                if key.starts_with("errors.database.") {
+                    assert!(text.contains("/backups"), "{locale} {key} drops %{{path}}");
+                }
+                if locale != "en" {
+                    assert_ne!(text, english, "{locale} {key} falls back to English");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unsupported_location_is_reported_once() {
+        let _ = take_unsupported_location();
+        assert!(!take_unsupported_location());
+        note_unsupported_location();
+        note_unsupported_location();
+        assert!(take_unsupported_location());
+        assert!(!take_unsupported_location());
     }
 }

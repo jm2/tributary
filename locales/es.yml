@@ -352,6 +352,11 @@ errors:
     heading: "Biblioteca no disponible"
     open_failed: "Tributary no pudo abrir la base de datos de la biblioteca, por lo que no se pueden mostrar su biblioteca ni sus listas de reproducción. Consulte el registro para ver los detalles."
     upgrade_failed: "Tributary no pudo actualizar la base de datos de la biblioteca para esta versión, por lo que no se pueden mostrar su biblioteca ni sus listas de reproducción. Consulte el registro para ver los detalles."
+    backup_saved: "Se guardó una copia de su biblioteca anterior a la actualización en %{path}."
+    newer_version: "Esta base de datos de la biblioteca fue creada por una versión más reciente de Tributary y esta versión no puede abrirla. Vuelva a instalar la versión más reciente, o cierre Tributary y reemplace library.db por una copia anterior de %{path}."
+  open_files:
+    unsupported_location: "No se puede abrir esta ubicación. Tributary solo puede abrir archivos de este equipo."
+    closing: "Tributary se está cerrando. Vuelva a abrirlo cuando se haya cerrado."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

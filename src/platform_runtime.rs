@@ -141,9 +141,11 @@ fn set_gstreamer_if_unset(unversioned: &str, versioned: &str, value: impl AsRef<
     }
 }
 
+/// The user cache directory, or the temporary directory when the OS
+/// provides none: a missing cache location must not stop start-up.
 #[cfg(target_os = "macos")]
-fn cache_base() -> anyhow::Result<PathBuf> {
-    dirs::cache_dir().ok_or_else(|| anyhow!("operating system did not provide a user cache path"))
+fn cache_base() -> PathBuf {
+    dirs::cache_dir().unwrap_or_else(env::temp_dir)
 }
 
 #[cfg(target_os = "windows")]
@@ -422,27 +424,46 @@ fn configure_macos_bundle(probe_root: Option<&Path>) -> anyhow::Result<bool> {
         env::var_os("GST_REGISTRY_1_0").as_deref(),
         env::var_os("GDK_PIXBUF_MODULE_FILE").as_deref(),
     );
-    let caches = if needs_cache {
-        let cache_base = if let Some(root) = probe_root {
-            validate_probe_cache_root(root, &layout.app_root)?
-        } else {
-            cache_base()?
-        };
-        let paths = runtime_cache_paths(&cache_base, "macos", env::consts::ARCH, &layout.app_root)?;
+    let select_caches = |cache_base: &Path| -> anyhow::Result<RuntimeCachePaths> {
+        let paths = runtime_cache_paths(cache_base, "macos", env::consts::ARCH, &layout.app_root)?;
         ensure_cache_outside_install(&paths.root, &layout.app_root)?;
-        Some(paths)
-    } else {
-        None
+        Ok(paths)
     };
 
-    configure_macos_environment(&layout, caches.as_ref())?;
-
-    if probe_root.is_some() {
+    if let Some(root) = probe_root {
+        // The packaging probe checks these exact caches, so any failure fails it.
+        let caches = if needs_cache {
+            Some(select_caches(
+                validate_probe_cache_root(root, &layout.app_root)?.as_path(),
+            )?)
+        } else {
+            None
+        };
+        configure_macos_environment(&layout, caches.as_ref())?;
         let caches = caches
             .as_ref()
             .ok_or_else(|| anyhow!("platform runtime probe did not select user cache paths"))?;
         run_macos_runtime_probe(&layout, caches)?;
         return Ok(true);
+    }
+
+    // A normal launch degrades instead: a Finder launch shows no stderr, so
+    // failing here would look like the app never started. Without the
+    // caches GStreamer uses its default registry and GDK-Pixbuf may lack
+    // bundled image loaders.
+    let caches = if needs_cache {
+        match select_caches(cache_base().as_path()) {
+            Ok(caches) => Some(caches),
+            Err(error) => {
+                eprintln!("Tributary is starting without its runtime caches: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = configure_macos_environment(&layout, caches.as_ref()) {
+        eprintln!("Tributary is starting without part of its runtime caches: {error:#}");
     }
     Ok(false)
 }
@@ -467,35 +488,92 @@ fn configure_macos_environment(
         set_gstreamer_if_unset("GST_PLUGIN_SCANNER", "GST_PLUGIN_SCANNER_1_0", &gst_scanner);
     }
 
-    if should_set_gstreamer_env(
+    // Both caches are attempted even if the first fails.
+    let registry = configure_gstreamer_registry(caches);
+    let pixbuf = configure_pixbuf_loaders(layout, caches);
+    registry.and(pixbuf)
+}
+
+#[cfg(target_os = "macos")]
+fn configure_gstreamer_registry(caches: Option<&RuntimeCachePaths>) -> anyhow::Result<()> {
+    if !should_set_gstreamer_env(
         env::var_os("GST_REGISTRY").as_deref(),
         env::var_os("GST_REGISTRY_1_0").as_deref(),
     ) {
-        let caches =
-            caches.ok_or_else(|| anyhow!("GStreamer user cache path was not configured"))?;
-        create_cache_parent(&caches.gst_registry)?;
-        env::set_var("GST_REGISTRY", &caches.gst_registry);
+        return Ok(());
     }
+    let caches = caches.ok_or_else(|| anyhow!("GStreamer user cache path was not configured"))?;
+    create_cache_parent(&caches.gst_registry)?;
+    env::set_var("GST_REGISTRY", &caches.gst_registry);
+    Ok(())
+}
 
-    if should_set_env(env::var_os("GDK_PIXBUF_MODULE_FILE").as_deref()) {
-        let caches =
-            caches.ok_or_else(|| anyhow!("GDK-Pixbuf user cache path was not configured"))?;
-        let loader_dir = layout
-            .resources_dir
-            .join("lib")
-            .join("gdk-pixbuf-2.0")
-            .join("2.10.0")
-            .join("loaders");
+#[cfg(target_os = "macos")]
+fn configure_pixbuf_loaders(
+    layout: &MacBundleLayout,
+    caches: Option<&RuntimeCachePaths>,
+) -> anyhow::Result<()> {
+    if !should_set_env(env::var_os("GDK_PIXBUF_MODULE_FILE").as_deref()) {
+        return Ok(());
+    }
+    let caches = caches.ok_or_else(|| anyhow!("GDK-Pixbuf user cache path was not configured"))?;
+    let loader_dir = layout
+        .resources_dir
+        .join("lib")
+        .join("gdk-pixbuf-2.0")
+        .join("2.10.0")
+        .join("loaders");
+    let loaders = bundled_pixbuf_loaders(&loader_dir)?;
+    // The helper takes a noticeable part of start-up, so a cache written by
+    // this version for exactly these loaders is reused.
+    if !pixbuf_cache_is_current(
+        &caches.pixbuf_loaders,
+        &layout.contents_dir,
+        &loader_dir,
+        &loaders,
+    ) {
         let query_helper = layout.macos_dir.join("gdk-pixbuf-query-loaders");
-        let loaders = bundled_pixbuf_loaders(&loader_dir)?;
         let output = run_bounded_helper(&query_helper, &loader_dir, &loaders)?;
         let validated =
             validate_pixbuf_cache_output(&output, &layout.contents_dir, &loader_dir, &loaders)?;
-        atomic_replace(&caches.pixbuf_loaders, validated.as_bytes())?;
-        env::set_var("GDK_PIXBUF_MODULE_FILE", &caches.pixbuf_loaders);
+        atomic_replace(
+            &caches.pixbuf_loaders,
+            stamp_pixbuf_cache(&validated).as_bytes(),
+        )?;
     }
-
+    env::set_var("GDK_PIXBUF_MODULE_FILE", &caches.pixbuf_loaders);
     Ok(())
+}
+
+/// First line of a pixbuf loader cache written by this build. GDK-Pixbuf
+/// treats it as a comment.
+#[cfg(any(test, target_os = "macos"))]
+fn pixbuf_cache_stamp() -> String {
+    format!("# Tributary {} loader cache\n", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn stamp_pixbuf_cache(validated: &str) -> String {
+    format!("{}{validated}", pixbuf_cache_stamp())
+}
+
+/// Whether `path` holds a cache this version wrote that still lists exactly
+/// the bundled loaders.
+#[cfg(any(test, target_os = "macos"))]
+fn pixbuf_cache_is_current(
+    path: &Path,
+    helper_toplevel: &Path,
+    loader_dir: &Path,
+    loaders: &[PathBuf],
+) -> bool {
+    let Ok(contents) = std::fs::read(path) else {
+        return false;
+    };
+    contents
+        .strip_prefix(pixbuf_cache_stamp().as_bytes())
+        .is_some_and(|body| {
+            validate_pixbuf_cache_output(body, helper_toplevel, loader_dir, loaders).is_ok()
+        })
 }
 
 #[cfg(any(test, target_os = "windows", target_os = "macos"))]
@@ -1365,6 +1443,34 @@ mod tests {
                 .unwrap(),
             text
         );
+    }
+
+    #[test]
+    fn pixbuf_cache_is_reused_only_for_this_version_and_loader_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let contents = temp.path().join("Tributary.app/Contents");
+        let loader_dir = contents.join("Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders");
+        let loaders = vec![
+            loader_dir.join("libpixbufloader-png.dylib"),
+            loader_dir.join("libpixbufloader-svg.dylib"),
+        ];
+        let cache = temp.path().join("loaders.cache");
+        let current = |path: &Path| pixbuf_cache_is_current(path, &contents, &loader_dir, &loaders);
+
+        assert!(!current(&cache), "a missing cache is rebuilt");
+        fs::write(&cache, stamp_pixbuf_cache(&cache_text(&loaders))).unwrap();
+        assert!(current(&cache));
+
+        fs::write(&cache, cache_text(&loaders)).unwrap();
+        assert!(!current(&cache), "an unstamped cache predates this version");
+        fs::write(
+            &cache,
+            format!("# Tributary 0.0.0 loader cache\n{}", cache_text(&loaders)),
+        )
+        .unwrap();
+        assert!(!current(&cache), "another version's cache is rebuilt");
+        fs::write(&cache, stamp_pixbuf_cache(&cache_text(&loaders[..1]))).unwrap();
+        assert!(!current(&cache), "a changed loader set is rebuilt");
     }
 
     #[test]
