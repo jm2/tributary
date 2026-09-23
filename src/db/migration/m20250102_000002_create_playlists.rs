@@ -117,6 +117,7 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .name("idx_playlist_entries_playlist_id")
+                    .if_not_exists()
                     .table(PlaylistEntries::Table)
                     .col(PlaylistEntries::PlaylistId)
                     .to_owned(),
@@ -127,6 +128,7 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .name("idx_playlist_entries_track_id")
+                    .if_not_exists()
                     .table(PlaylistEntries::Table)
                     .col(PlaylistEntries::TrackId)
                     .to_owned(),
