@@ -49,6 +49,12 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Fuzz DMAP parser (5 minutes)
+        env:
+          # The fuzz crate shares the root release profile, whose LTO and
+          # symbol stripping are for shipped binaries; turn both off so
+          # sanitizer reports stay symbolized.
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_STRIP: "false"
         run: cargo fuzz run fuzz_dmap -- -max_total_time=300
       - name: Upload crash artifacts
         if: always()

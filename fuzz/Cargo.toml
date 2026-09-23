@@ -13,10 +13,6 @@ libfuzzer-sys = "0.4"
 [dependencies.tributary]
 path = ".."
 
-# Prevent this from interfering with workspaces
-[workspace]
-members = ["."]
-
 [[bin]]
 name = "fuzz_dmap"
 path = "fuzz_targets/fuzz_dmap.rs"
