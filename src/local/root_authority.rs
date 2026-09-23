@@ -30,7 +30,12 @@ const MAX_MARKER_BYTES: u64 = 128;
 /// exposing the same device/inode pair.
 pub(super) struct RootAuthorityLease {
     token: Uuid,
+    /// The configured path. Descendants are addressed below it.
     root: PathBuf,
+    /// The directory `root` named at acquisition. It differs from `root` only
+    /// when the configured path's final component is a symlink; every open of
+    /// the root itself goes through this path without following symlinks.
+    resolved_root: PathBuf,
     expected_marker: String,
     root_handle: RetainedObject,
     marker_handle: RetainedObject,
@@ -1965,10 +1970,14 @@ fn validate_mounted_bound(authority: &MountedRootAuthority, bound: &BoundFile) -
 impl RootAuthorityLease {
     /// Open and retain the exact root and marker currently at `root`.
     ///
-    /// The final root component and marker must be real filesystem entries,
-    /// not symlinks or Windows reparse points. The root must be an absolute
-    /// directory path, and `expected_marker` must be a canonical version-one
-    /// Tributary marker identity. Any uncertainty is returned as an error.
+    /// On Unix a configured root whose final component is a symlink (such as
+    /// `~/Music -> /mnt/data/Music`) is resolved once here, and the lease binds
+    /// the resolved directory; [`Self::validate`] requires the configured path
+    /// to keep resolving there. The marker and every descendant below the root
+    /// must be real filesystem entries, never symlinks or Windows reparse
+    /// points. The root must be an absolute directory path, and
+    /// `expected_marker` must be a canonical version-one Tributary marker
+    /// identity. Any uncertainty is returned as an error.
     pub(super) fn acquire(root: &Path, expected_marker: &str) -> io::Result<Self> {
         if !root.is_absolute() {
             return Err(invalid_input(
@@ -1983,10 +1992,11 @@ impl RootAuthorityLease {
         }
         let expected_marker = parsed_marker;
 
-        let opened_root = open_configured_root(root, false, false)?;
+        let resolved_root = resolve_final_symlink(root)?;
+        let opened_root = open_configured_root(&resolved_root, false, false)?;
         let boundary = boundary_identity(&opened_root.root.file)?;
         let mount_generation = root_mount_generation(&opened_root.root.file)?;
-        let marker_file = open_marker(root, &opened_root.root.file)?;
+        let marker_file = open_marker(&resolved_root, &opened_root.root.file)?;
         ensure_boundary(boundary, &marker_file)?;
         validate_marker_file(&marker_file, &expected_marker)?;
         let marker_handle = RetainedObject::new(marker_file)?;
@@ -1994,6 +2004,7 @@ impl RootAuthorityLease {
         let lease = Self {
             token: Uuid::new_v4(),
             root: root.to_path_buf(),
+            resolved_root,
             expected_marker,
             root_handle: opened_root.root,
             marker_handle,
@@ -2009,6 +2020,19 @@ impl RootAuthorityLease {
         // every other platform.
         lease.validate()?;
         Ok(lease)
+    }
+
+    /// Check that a lease could bind `root` once it carries a marker.
+    ///
+    /// Enrollment calls this before writing a marker, so a root that
+    /// authority would refuse never receives one.
+    pub(super) fn check_root_retainable(root: &Path) -> io::Result<()> {
+        if !root.is_absolute() {
+            return Err(invalid_input(
+                "library root authority requires an absolute configured path",
+            ));
+        }
+        open_configured_root(&resolve_final_symlink(root)?, false, false).map(drop)
     }
 
     /// Return the exact configured path bound by this lease.
@@ -2127,8 +2151,15 @@ impl RootAuthorityLease {
         ensure_boundary(self.boundary, &self.marker_handle.file)?;
         #[cfg(windows)]
         validate_retained_objects(&self.root_ancestors)?;
+        if self.resolved_root != self.root
+            && resolve_final_symlink(&self.root)? != self.resolved_root
+        {
+            return Err(authority_changed(
+                "configured library root no longer resolves to the retained directory",
+            ));
+        }
 
-        let current_root = open_configured_root(&self.root, false, false)?;
+        let current_root = open_configured_root(&self.resolved_root, false, false)?;
         let current_mount_generation = root_mount_generation(&current_root.root.file)?;
         if current_root.root.identity != self.root_handle.identity {
             return Err(authority_changed(
@@ -2148,7 +2179,7 @@ impl RootAuthorityLease {
         #[cfg(windows)]
         compare_object_chains(&self.root_ancestors, &current_root.ancestors)?;
 
-        let current_marker_file = open_marker(&self.root, &current_root.root.file)?;
+        let current_marker_file = open_marker(&self.resolved_root, &current_root.root.file)?;
         ensure_boundary(self.boundary, &current_marker_file)?;
         validate_marker_file(&current_marker_file, &self.expected_marker)?;
         let current_marker = RetainedObject::new(current_marker_file)?;
@@ -2158,7 +2189,7 @@ impl RootAuthorityLease {
             ));
         }
 
-        let after_marker = open_configured_root(&self.root, false, false)?;
+        let after_marker = open_configured_root(&self.resolved_root, false, false)?;
         let after_marker_mount = root_mount_generation(&after_marker.root.file)?;
         if after_marker.root.identity != self.root_handle.identity
             || after_marker_mount != self.mount_generation
@@ -2569,6 +2600,35 @@ fn validate_marker_metadata(_metadata: &std::fs::Metadata) -> io::Result<()> {
     ))
 }
 
+/// Resolve a directory path whose final component is a symlink.
+///
+/// Authority opens a root without following its final component, so a
+/// symlinked library folder or containing directory — a common layout — must
+/// first be resolved to the directory it names. When the final component is a
+/// symlink, the complete chain is followed and the resolved path returned;
+/// the caller binds that directory, so a symlink retargeted afterwards no
+/// longer matches the retained identity. A path whose final component is not
+/// a symlink is returned unchanged; one that cannot be inspected fails closed
+/// through the resolution error. Windows keeps refusing a reparse-point root:
+/// resolution there would pass a verbatim path through untested prefix
+/// handling.
+#[cfg(unix)]
+pub fn resolve_final_symlink(path: &Path) -> io::Result<PathBuf> {
+    // `components()` drops a trailing `/` or `/.`, which would otherwise make
+    // `symlink_metadata` follow the link and report the target directory.
+    let normalized: PathBuf = path.components().collect();
+    match std::fs::symlink_metadata(&normalized).map(|metadata| metadata.file_type().is_symlink()) {
+        Ok(false) => Ok(path.to_path_buf()),
+        _ => std::fs::canonicalize(&normalized),
+    }
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+pub fn resolve_final_symlink(path: &Path) -> io::Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
 #[cfg(unix)]
 fn open_unix_directory_path(path: &Path) -> io::Result<File> {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -2819,8 +2879,9 @@ fn open_configured_root(
     _follow_final_mount_target: bool,
 ) -> io::Result<OpenedRoot> {
     // Configured aliases may contain an ancestor symlink (notably `/var` on
-    // macOS). The final component itself is never followed, and every
-    // descendant operation below is anchored to the retained directory fd.
+    // macOS). The final component itself is never followed here (a lease
+    // resolves a symlinked configured root first), and every descendant
+    // operation below is anchored to the retained directory fd.
     Ok(OpenedRoot {
         root: RetainedObject::new(open_unix_directory_path(path)?)?,
     })
@@ -3690,17 +3751,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_root_and_marker_fail_closed() {
+    fn symlinked_marker_fails_closed() {
         use std::os::unix::fs::symlink;
 
-        let directory = TestDirectory::new("symlink-root-target");
-        directory.write_marker(MARKER);
-        let root_link = directory.path().with_extension("root-link");
-        symlink(directory.path(), &root_link).expect("create root symlink");
-        assert!(RootAuthorityLease::acquire(&root_link, MARKER).is_err());
-        fs::remove_file(&root_link).expect("remove root symlink");
-
-        fs::remove_file(directory.path().join(ROOT_IDENTITY_FILE)).expect("remove marker");
+        let directory = TestDirectory::new("symlink-marker");
         let marker_target = directory.path().join("marker-target");
         fs::write(&marker_target, format!("{MARKER}\n")).expect("write marker target");
         symlink(&marker_target, directory.path().join(ROOT_IDENTITY_FILE))
@@ -3855,33 +3909,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn configured_ancestor_symlink_is_allowed_but_final_symlink_is_not() {
+    fn configured_root_symlinks_resolve_but_symlinks_below_the_root_do_not() {
         use std::os::unix::fs::symlink;
 
         let container = TestDirectory::new("configured-alias");
         let real_parent = container.path().join("real-parent");
         let real_root = real_parent.join("library");
-        fs::create_dir(&real_parent).expect("create real parent");
-        fs::create_dir(&real_root).expect("create real root");
+        let real_album = real_root.join("album");
+        fs::create_dir_all(&real_album).expect("create real album");
+        fs::write(real_album.join("song.flac"), b"audio").expect("write song");
         fs::write(real_root.join(ROOT_IDENTITY_FILE), format!("{MARKER}\n")).expect("write marker");
         let alias = container.path().join("alias");
         symlink(&real_parent, &alias).expect("create parent alias");
-        let aliased_root = alias.join("library");
+        RootAuthorityLease::acquire(&alias.join("library"), MARKER)
+            .expect("acquire through parent alias");
 
-        RootAuthorityLease::acquire(&aliased_root, MARKER).expect("acquire through parent alias");
+        // A symlinked configured root (`~/Music -> /mnt/data/Music`) binds the
+        // resolved directory but keeps addressing descendants by the
+        // configured spelling, including with a redundant trailing slash or dot.
         let final_alias = container.path().join("final-alias");
         symlink(&real_root, &final_alias).expect("create final alias");
-        assert!(RootAuthorityLease::acquire(&final_alias, MARKER).is_err());
-
-        // `O_NOFOLLOW` alone follows the alias when a slash or dot is appended
-        // because the alias is no longer the kernel's final path component.
-        // Authority normalizes only those redundant suffixes before opening.
         let trailing_slash = PathBuf::from(format!("{}/", final_alias.display()));
         let trailing_dot = final_alias.join(".");
-        assert!(RootAuthorityLease::acquire(&trailing_slash, MARKER).is_err());
-        assert!(RootAuthorityLease::acquire(&trailing_dot, MARKER).is_err());
+        for configured in [&final_alias, &trailing_slash, &trailing_dot] {
+            let lease = RootAuthorityLease::acquire(configured, MARKER)
+                .expect("acquire through a symlinked configured root");
+            assert_eq!(lease.root(), configured.as_path());
+            lease
+                .open_regular_file(&final_alias.join("album").join("song.flac"))
+                .expect("open a descendant by its configured path");
+        }
+
+        // Symlinks below the root stay refused.
+        symlink(&real_album, real_root.join("linked-album")).expect("link album");
+        let lease = RootAuthorityLease::acquire(&final_alias, MARKER).expect("acquire lease");
+        assert!(lease
+            .open_regular_file(&final_alias.join("linked-album").join("song.flac"))
+            .is_err());
+        assert!(lease
+            .bind_directory(&final_alias.join("linked-album"))
+            .is_err());
+
+        // Mounted authority does not resolve its root.
+        assert!(MountedRootAuthority::acquire(&final_alias).is_err());
         assert!(MountedRootAuthority::acquire(&trailing_slash).is_err());
         assert!(MountedRootAuthority::acquire(&trailing_dot).is_err());
+
+        // Retargeting the configured symlink, even at a copy carrying the same
+        // marker, revokes the lease bound to the original directory.
+        let copy = TestDirectory::new("configured-alias-copy");
+        copy.write_marker(MARKER);
+        fs::remove_file(&final_alias).expect("remove final alias");
+        symlink(copy.path(), &final_alias).expect("retarget final alias");
+        assert!(lease.validate().is_err());
     }
 
     #[cfg(unix)]

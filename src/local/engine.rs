@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, Statement,
+    QuerySelect, Set, Statement, TransactionTrait,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -347,6 +347,11 @@ pub struct LibraryEngine {
     db: DatabaseConnection,
     music_dirs: Vec<PathBuf>,
     pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
+    /// Whether `music_dirs` is the user's saved folder list, so tracks under
+    /// no configured folder may be forgotten at startup. False when the list
+    /// is only a default, so a missing or unreadable config never discards
+    /// a library.
+    forget_unconfigured_tracks: bool,
     tx: async_channel::Sender<LibraryEvent>,
     command_rx: async_channel::Receiver<LibraryCommand>,
     services: LibraryEngineServices,
@@ -399,6 +404,7 @@ impl LibraryEngine {
         db: DatabaseConnection,
         music_dirs: Vec<PathBuf>,
         pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
+        forget_unconfigured_tracks: bool,
         tx: async_channel::Sender<LibraryEvent>,
         command_rx: async_channel::Receiver<LibraryCommand>,
         services: LibraryEngineServices,
@@ -408,6 +414,7 @@ impl LibraryEngine {
             db,
             music_dirs,
             pending_root_reauthorizations,
+            forget_unconfigured_tracks,
             tx,
             command_rx,
             services,
@@ -422,6 +429,7 @@ impl LibraryEngine {
             db,
             music_dirs,
             pending_root_reauthorizations,
+            forget_unconfigured_tracks,
             tx,
             command_rx,
             services,
@@ -501,6 +509,7 @@ impl LibraryEngine {
         // Resolve explicit old→new identity transfers before either path can
         // be watched or scanned. A rejected request keeps only the old path;
         // an inconsistent durable receipt removes both paths fail-closed.
+        let configured_roots = music_dirs.clone();
         let music_dirs = resolve_pending_root_reauthorizations(
             db.as_ref(),
             music_dirs,
@@ -508,6 +517,30 @@ impl LibraryEngine {
             &tx,
         )
         .await;
+
+        // A folder removed in Preferences is forgotten here, before the scan
+        // publishes the library snapshot.
+        if forget_unconfigured_tracks && admit_scan_mutation(&scan_cancellation) {
+            match forget_tracks_outside_library_roots(
+                db.as_ref(),
+                &configured_roots,
+                &music_dirs,
+                &pending_root_reauthorizations,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(forgotten) => {
+                    info!(
+                        forgotten,
+                        "Forgot tracks outside every configured library folder"
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "Could not forget tracks outside the configured library folders");
+                }
+            }
+        }
 
         // Install before traversing so changes observed during the initial
         // scan are retained for replay after its snapshot is published.
@@ -839,6 +872,59 @@ async fn resolve_pending_root_reauthorizations(
     }
 
     effective_roots
+}
+
+/// Delete the local tracks that lie under no library root, in one transaction.
+///
+/// Removing a folder in Preferences only edits the configuration, so its rows
+/// are deleted at the next startup. Rows under a configured root, an
+/// effective root, or either endpoint of a pending reauthorization are kept
+/// whether or not that root is currently available, so an unmounted volume
+/// or a relocation awaiting its receipt never loses metadata. A deleted row
+/// takes its play count and rating with it, and its playlist entries become
+/// unmatched (`local_track_id` is `ON DELETE SET NULL`), exactly as when a
+/// scan removes a track that left the disk.
+async fn forget_tracks_outside_library_roots(
+    db: &DatabaseConnection,
+    configured_roots: &[PathBuf],
+    effective_roots: &[PathBuf],
+    reauthorizations: &[RootReauthorizationRequest],
+) -> anyhow::Result<usize> {
+    let kept_roots: Vec<&Path> = configured_roots
+        .iter()
+        .chain(effective_roots)
+        .map(PathBuf::as_path)
+        .chain(
+            reauthorizations
+                .iter()
+                .flat_map(|request| [request.old_path(), request.new_path()]),
+        )
+        .collect();
+    let transaction = db.begin().await?;
+    let forgotten: Vec<String> = track::Entity::find()
+        .select_only()
+        .column(track::Column::Id)
+        .column(track::Column::FilePath)
+        .into_tuple::<(String, String)>()
+        .all(&transaction)
+        .await?
+        .into_iter()
+        .filter(|(_, path)| {
+            !kept_roots
+                .iter()
+                .any(|root| Path::new(path).starts_with(root))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    // Bounded statements keep each delete below SQLite's parameter limit.
+    for ids in forgotten.chunks(500) {
+        track::Entity::delete_many()
+            .filter(track::Column::Id.is_in(ids.iter().cloned()))
+            .exec(&transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(forgotten.len())
 }
 
 async fn resolve_root_reauthorization(
@@ -3119,6 +3205,14 @@ fn prepare_durable_root_identity(
     {
         scan.errors.push(format!(
             "library root identity or mount changed before marker creation: {}",
+            scan.root.display()
+        ));
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    if let Err(error) = RootAuthorityLease::check_root_retainable(&scan.root) {
+        scan.errors.push(format!(
+            "library root cannot be retained, so no durable identity was written {}: {error}",
             scan.root.display()
         ));
         return RootIdentityPreparation::Unchanged;
@@ -14933,7 +15027,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_outside_configured_roots_are_not_removed() {
+    fn stale_deletion_ignores_rows_outside_scanned_roots() {
         let configured = TestDirectory::new("configured");
         let unrelated = TestDirectory::new("unrelated");
         let mut scan = scan_root(configured.path().to_path_buf());
@@ -15479,6 +15573,196 @@ mod tests {
         assert_eq!(updated.device_id, stored.device_id);
         assert!(!updated.is_available);
         assert!(!updated.last_scan_complete);
+    }
+
+    async fn tracks_by_path(db: &DatabaseConnection) -> Vec<track::Model> {
+        track::Entity::find()
+            .order_by_asc(track::Column::FilePath)
+            .all(db)
+            .await
+            .expect("query tracks")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_configured_root_is_indexed_and_rescans_stably() {
+        let container = TestDirectory::new("symlinked-root");
+        let target = container.path().join("data-music");
+        std::fs::create_dir_all(target.join("album")).expect("create symlink target");
+        write_minimal_wav(&target.join("album").join("nested.wav"));
+        write_minimal_wav(&target.join("top.wav"));
+        let root = container.path().join("Music");
+        std::os::unix::fs::symlink(&target, &root).expect("link the configured root");
+        let db = rename_test_database().await;
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let roots = [root.clone()];
+
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("first scan");
+        let first = tracks_by_path(&db).await;
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| PathBuf::from(&row.file_path))
+                .collect::<Vec<_>>(),
+            [root.join("album").join("nested.wav"), root.join("top.wav")],
+            "rows are keyed under the configured spelling of the root"
+        );
+        let state = library_root::Entity::find_by_id(root.to_string_lossy().into_owned())
+            .one(&db)
+            .await
+            .expect("query root state")
+            .expect("root state exists");
+        assert!(state.identity_confirmed && state.is_available);
+
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("rescan");
+        assert_eq!(
+            tracks_by_path(&db).await,
+            first,
+            "a rescan keeps every row, ID and path"
+        );
+
+        std::fs::remove_file(target.join("top.wav")).expect("delete a track on disk");
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("reconciling scan");
+        assert_eq!(
+            tracks_by_path(&db).await,
+            first[..1],
+            "reconciliation through the symlinked root removes only the deleted track"
+        );
+    }
+
+    /// Run one production engine startup through its initial scan, then tear
+    /// it down the way the application does at close.
+    async fn run_engine_startup(
+        db: &DatabaseConnection,
+        roots: Vec<PathBuf>,
+        pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
+        forget_unconfigured_tracks: bool,
+    ) {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let (refresh, refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let source_registry =
+            crate::source_registry::SourceRegistry::new(tokio::runtime::Handle::current());
+        let invalidations = source_registry.subscribe_invalidations();
+        let services = LibraryEngineServices::new(
+            refresh,
+            refresh_rx,
+            coordinator,
+            coordinator_shutdown,
+            source_registry,
+            invalidations,
+        );
+        let engine = LibraryEngine::new(
+            db.clone(),
+            roots,
+            pending_root_reauthorizations,
+            forget_unconfigured_tracks,
+            event_tx,
+            command_rx,
+            services,
+            CancellationToken::new(),
+        );
+        let engine_task = tokio::spawn(engine.run());
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Ok(event) = event_rx.recv().await {
+                if matches!(event, LibraryEvent::ScanComplete) {
+                    return;
+                }
+            }
+            panic!("engine stopped before its initial scan completed");
+        })
+        .await
+        .expect("engine startup completes its initial scan");
+        engine_task.abort();
+        drop(command_tx);
+    }
+
+    #[tokio::test]
+    async fn startup_forgets_tracks_of_removed_roots_only() {
+        let container = TestDirectory::new("removed-root");
+        let [removed, offline, reauthorizing] =
+            ["removed", "offline", "reauthorizing"].map(|name| container.path().join(name));
+        for root in [&removed, &offline, &reauthorizing] {
+            std::fs::create_dir(root).expect("create library root");
+            write_minimal_wav(&root.join("song.wav"));
+        }
+        let db = rename_test_database().await;
+        run_engine_startup(
+            &db,
+            vec![removed.clone(), offline.clone(), reauthorizing.clone()],
+            Vec::new(),
+            true,
+        )
+        .await;
+        let indexed = tracks_by_path(&db).await;
+        assert_eq!(indexed.len(), 3, "every root is indexed: {indexed:?}");
+        let removed_track = indexed
+            .iter()
+            .find(|row| Path::new(&row.file_path).starts_with(&removed))
+            .expect("removed root was indexed")
+            .clone();
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Removed root")
+            .await
+            .expect("create playlist");
+        manager
+            .add_track(&playlist.id, &removed_track)
+            .await
+            .expect("link removed-root track to playlist");
+
+        // `removed` leaves the configuration, `offline` stays configured but
+        // is unmounted, and `reauthorizing` is only named by a pending
+        // reauthorization (as after a manual config edit).
+        std::fs::rename(&offline, container.path().join("offline-unmounted"))
+            .expect("take the offline root away");
+        let pending = vec![RootReauthorizationRequest::new(
+            Uuid::new_v4(),
+            reauthorizing.clone(),
+            container.path().join("reauthorized"),
+        )];
+
+        run_engine_startup(&db, vec![offline.clone()], pending.clone(), false).await;
+        assert_eq!(
+            tracks_by_path(&db).await.len(),
+            3,
+            "a defaulted configuration never forgets tracks"
+        );
+
+        run_engine_startup(&db, vec![offline.clone()], pending, true).await;
+        let remaining = tracks_by_path(&db).await;
+        assert!(
+            remaining
+                .iter()
+                .all(|row| !Path::new(&row.file_path).starts_with(&removed)),
+            "the removed root's tracks are forgotten: {remaining:?}"
+        );
+        assert_eq!(
+            indexed
+                .iter()
+                .filter(|row| row.id != removed_track.id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            remaining,
+            "the unavailable and reauthorizing roots keep their rows unchanged"
+        );
+        let entry = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .one(&db)
+            .await
+            .expect("query playlist entry")
+            .expect("the playlist entry survives as an unmatched entry");
+        assert_eq!(entry.local_track_id, None);
     }
 
     #[tokio::test]
@@ -16196,6 +16480,8 @@ mod tests {
             db.clone(),
             vec![root.clone()],
             Vec::new(),
+            // The command track lives outside the fixture root.
+            false,
             event_tx,
             command_rx,
             services,
