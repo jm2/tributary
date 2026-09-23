@@ -1,9 +1,8 @@
 //! Preferences window — unified settings for library location, browser
-//! views, column visibility, and Last.fm scrobbling.
+//! views, and column visibility.
 //!
-//! Uses `adw::PreferencesDialog` with a single page containing four
-//! groups: Library Location, Browser Views, Visible Columns, and
-//! Last.fm Scrobbling.
+//! Uses `adw::PreferencesDialog` with a single page containing three
+//! groups: Library Location, Browser Views, and Visible Columns.
 
 use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -701,13 +700,8 @@ pub fn save_config(config: &AppConfig) -> bool {
 /// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
-/// * `lastfm` — the Last.fm authorization surface context (detached when the
-///   build has no packaged application credentials)
-/// * `lastfm_policy` — the shared policy generation slot the Last.fm group
-///   reads consent state from
-// The two Last.fm params join an existing seven-parameter surface; a params
-// struct would churn every caller for one optional integration group.
-#[allow(clippy::too_many_arguments)]
+///
+/// Returns the page so the caller can append integration groups (Last.fm).
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     column_view: &gtk::ColumnView,
@@ -716,9 +710,7 @@ pub fn show_preferences(
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
-    lastfm: &crate::ui::lastfm_settings::LastFmSettingsContext,
-    lastfm_policy: &std::sync::Arc<std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>>,
-) {
+) -> adw::PreferencesPage {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
@@ -1184,20 +1176,11 @@ pub fn show_preferences(
     columns_group.add(&reset_btn);
     page.add(&columns_group);
 
-    // ── Last.fm scrobbling group (consent, connect, disconnect) ─────
-    // Consent precedes every account flow on this surface: the group
-    // renders the authorization owner's content-free status and gates
-    // the browser handoff behind the localized disclosure.
-    page.add(&crate::ui::lastfm_settings::build_lastfm_group(
-        parent,
-        lastfm,
-        lastfm_policy,
-    ));
-
     prefs_dialog.add(&page);
     drop(cfg);
 
     prefs_dialog.present(Some(parent));
+    page
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

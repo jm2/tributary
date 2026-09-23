@@ -3338,7 +3338,7 @@ mod tests {
                 crate::ui::context_menu::tests::per_row_playlist_drop_target_drives_the_production_drop_path();
                 crate::ui::context_menu::tests::keyboard_add_action_matches_the_drag_payload_contract();
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
-                crate::ui::lastfm_settings::widget_tests::detached_context_renders_the_unavailable_surface();
+                crate::ui::lastfm_settings::widget_tests::render_shows_only_the_offered_actions();
                 crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
                 crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
                 crate::ui::album_pane_art::widget_tests::album_art_row_publishes_combined_accessible_name();

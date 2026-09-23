@@ -1,6 +1,5 @@
 //! Last.fm authentication, scrobbling, and protected session credentials.
 
-pub mod account;
 pub mod authorization;
 pub mod client;
 pub mod credentials;

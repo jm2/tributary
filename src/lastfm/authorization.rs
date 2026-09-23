@@ -6,10 +6,11 @@
 //! authority is consumed atomically before `auth.getSession` is first
 //! awaited.
 //!
-//! This module is intentionally an injected internal core. The account
-//! composition layer (`crate::lastfm::account`) owns production consent, the
-//! consent-gated browser handoff, global single-owner coordination, and
-//! vault installation on top of this owner.
+//! This module is an injected internal core. The production application
+//! owner constructs the single process instance from the build credentials;
+//! the settings surface starts a flow only after consent is recorded, hands
+//! the URL to the system browser, and passes the resulting grant back to the
+//! application owner for vault installation.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
@@ -180,25 +181,22 @@ struct ChallengeInner {
 
 /// Opaque challenge for one exact in-memory request token.
 ///
-/// The token-bearing browser URL remains solely inside the owner; only the
-/// account composition layer's consent-gated handoff extracts it for the
-/// system-browser launch. Successful finish, cancel, supersession, expiry,
-/// terminal failure, or shutdown revokes that internal allocation and every
-/// clone's finish authority.
+/// The token-bearing browser URL remains inside the owner; the settings
+/// surface extracts it once, after consent, for the system-browser launch.
+/// Successful finish, cancel, supersession, expiry, terminal failure, or
+/// shutdown revokes that internal allocation and every clone's finish
+/// authority.
 #[derive(Clone)]
 pub struct LastFmAuthorizationChallenge(Arc<ChallengeInner>);
 
 impl LastFmAuthorizationChallenge {
     /// Consent-gated browser handoff URL for this exact challenge.
     ///
-    /// Only the account composition layer may call this, immediately before
-    /// the system-browser launch and only once the live policy generation is
-    /// consented and enabled. The URL stays private to the module in every
-    /// other direction; revocation (cancel, supersession, expiry, shutdown)
-    /// fails the extraction closed.
-    pub(in crate::lastfm) fn authorization_url(
-        &self,
-    ) -> Result<String, LastFmAuthorizationAdmissionError> {
+    /// Only the settings surface calls this, immediately before the
+    /// system-browser launch and only once the live policy generation is
+    /// consented and enabled. The URL never reaches diagnostics; revocation
+    /// (cancel, supersession, expiry, shutdown) fails the extraction closed.
+    pub(crate) fn authorization_url(&self) -> Result<String, LastFmAuthorizationAdmissionError> {
         let handle = self
             .0
             .handle
@@ -263,16 +261,9 @@ impl LastFmAuthorizationGrant {
         self.0
     }
 
-    pub(in crate::lastfm) fn username(&self) -> &str {
-        self.0.username()
-    }
-
-    /// Recompose an already-admitted authorization result.
-    ///
-    /// The finish authority of the originating challenge is already consumed;
-    /// this wraps the validated identity for the serialized vault installer.
-    pub(in crate::lastfm) fn from_authorized_session(session: DesktopAuthorizedSession) -> Self {
-        Self(session)
+    #[cfg(test)]
+    pub(in crate::lastfm) fn for_test(username: &str, key: &str) -> Self {
+        Self(DesktopAuthorizedSession::for_test(username, key).expect("valid test grant"))
     }
 }
 

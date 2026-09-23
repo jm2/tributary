@@ -1,93 +1,108 @@
-//! Dialog builders and status mapping for the Last.fm settings surface.
-//!
-//! Split verbatim from the former single-file `lastfm_settings.rs` so each
-//! module stays under the repository's per-file and per-function size caps;
-//! the flow futures that drive these dialogs live in the sibling `flows`
-//! module.
+//! Dialogs for the Last.fm settings group: the consent disclosure, the
+//! browser-approval continuation, the disconnect confirmation, and the
+//! system-browser handoff with its copyable fallback.
 
 use adw::prelude::*;
 
-use crate::lastfm::account::LastFmAccountInstallError;
+use super::t;
 
-use super::ConnectFailure;
+/// Present `dialog` and await the user's response.
+pub(super) async fn choose(dialog: adw::AlertDialog, parent: &adw::ApplicationWindow) -> String {
+    let (sender, receiver) = async_channel::bounded::<String>(1);
+    dialog.choose(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |response| {
+            // The callback is synchronous; `try_send` delivers immediately.
+            let _ = sender.try_send(response.to_string());
+        },
+    );
+    receiver.recv().await.unwrap_or_default()
+}
 
-/// Present the localized consent disclosure.
-///
-/// The dialog carries the required disclosure points: what data is sent,
-/// how Last.fm may use it, local offline storage until delivery or purge,
-/// the independent-scrobbling risk from remote sources, and the external
-/// (MPD-style) scrobbler caveat. Accepting records consent and enables the
-/// integration; dismissing stores nothing and leaves the feature off.
-pub(super) fn present_disclosure_dialog(parent: &adw::ApplicationWindow) -> adw::AlertDialog {
+/// A dialog whose first response is the safe default and the close action.
+fn alert(heading: &str, body: &str, responses: &[(&str, String)]) -> adw::AlertDialog {
     let dialog = adw::AlertDialog::builder()
-        .heading(rust_i18n::t!("lastfm.disclosure_title").as_ref())
-        .body(rust_i18n::t!("lastfm.disclosure_body").as_ref())
-        .close_response("decline")
-        .default_response("decline")
+        .heading(heading)
+        .body(body)
+        .close_response(responses[0].0)
+        .default_response(responses[0].0)
         .build();
-    dialog.add_response("decline", rust_i18n::t!("lastfm.decline").as_ref());
-    dialog.add_response("accept", rust_i18n::t!("lastfm.accept").as_ref());
+    for (id, label) in responses {
+        dialog.add_response(id, label);
+    }
+    dialog
+}
+
+/// The localized disclosure: what is sent, how Last.fm may use it, local
+/// offline storage, and the remote-source and external-scrobbler caveats.
+pub(super) fn disclosure_dialog() -> adw::AlertDialog {
+    let dialog = alert(
+        &t("lastfm.disclosure_title"),
+        &t("lastfm.disclosure_body"),
+        &[
+            ("decline", t("lastfm.decline")),
+            ("accept", t("lastfm.accept")),
+        ],
+    );
     dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
-    dialog.present(Some(parent));
     dialog
 }
 
-/// Present the localized "I have approved in the browser" continuation.
-pub(super) fn present_finish_dialog(parent: &adw::ApplicationWindow) -> adw::AlertDialog {
-    let dialog = adw::AlertDialog::builder()
-        .heading(rust_i18n::t!("lastfm.finish_title").as_ref())
-        .body(rust_i18n::t!("lastfm.finish_body").as_ref())
-        .close_response("cancel")
-        .default_response("cancel")
-        .build();
-    dialog.add_response("cancel", rust_i18n::t!("lastfm.cancel").as_ref());
-    dialog.add_response("continue", rust_i18n::t!("lastfm.continue").as_ref());
+pub(super) fn finish_dialog() -> adw::AlertDialog {
+    let dialog = alert(
+        &t("lastfm.finish_title"),
+        &t("lastfm.finish_body"),
+        &[
+            ("cancel", t("lastfm.cancel")),
+            ("continue", t("lastfm.continue")),
+        ],
+    );
     dialog.set_response_appearance("continue", adw::ResponseAppearance::Suggested);
-    dialog.present(Some(parent));
     dialog
 }
 
-/// Present the localized disconnect confirmation. The consequence text
-/// names the credential removal and the pending-scrobble discard up front.
-pub(super) fn present_disconnect_confirmation(parent: &adw::ApplicationWindow) -> adw::AlertDialog {
-    let dialog = adw::AlertDialog::builder()
-        .heading(rust_i18n::t!("lastfm.disconnect_confirm_title").as_ref())
-        .body(rust_i18n::t!("lastfm.disconnect_confirm_body").as_ref())
-        .close_response("cancel")
-        .default_response("cancel")
-        .build();
-    dialog.add_response("cancel", rust_i18n::t!("lastfm.cancel").as_ref());
-    dialog.add_response(
-        "disconnect",
-        rust_i18n::t!("lastfm.disconnect_confirm_accept").as_ref(),
+/// The consequence text names the credential removal and the pending-scrobble
+/// discard up front.
+pub(super) fn disconnect_dialog() -> adw::AlertDialog {
+    let dialog = alert(
+        &t("lastfm.disconnect_confirm_title"),
+        &t("lastfm.disconnect_confirm_body"),
+        &[
+            ("cancel", t("lastfm.cancel")),
+            ("disconnect", t("lastfm.disconnect_confirm_accept")),
+        ],
     );
     dialog.set_response_appearance("disconnect", adw::ResponseAppearance::Destructive);
-    dialog.present(Some(parent));
     dialog
 }
 
-/// Map a connect failure onto its localized status message.
-pub(super) fn connect_failure_message(failure: ConnectFailure) -> String {
-    match failure {
-        ConnectFailure::Unavailable => rust_i18n::t!("lastfm.status_unavailable").to_string(),
-        ConnectFailure::ConsentRequired => {
-            rust_i18n::t!("lastfm.status_consent_required").to_string()
-        }
-        ConnectFailure::AuthorizationUnavailable => {
-            rust_i18n::t!("lastfm.status_authorization_unavailable").to_string()
-        }
-        ConnectFailure::ReplacementRequired => {
-            rust_i18n::t!("lastfm.status_replacement_required").to_string()
-        }
+/// Hand the authorization URL to the system browser once. If no handler
+/// takes it, show it in a copyable field instead. It never reaches logs.
+pub(super) async fn launch_browser(parent: &adw::ApplicationWindow, url: &str) {
+    let (sender, receiver) = async_channel::bounded(1);
+    gtk::UriLauncher::new(url).launch(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let _ = sender.try_send(result.is_ok());
+        },
+    );
+    if receiver.recv().await.unwrap_or(false) {
+        return;
     }
-}
-
-/// Translate an install-stage failure for diagnostics-free status display.
-pub(super) fn install_failure_is_account_rejection(
-    error: &LastFmAccountInstallError,
-) -> Option<&'static str> {
-    match error {
-        LastFmAccountInstallError::VaultAlreadyBound => Some("vault-already-bound"),
-        _ => None,
-    }
+    let fallback = alert(
+        &t("lastfm.disclosure_title"),
+        &t("lastfm.browser_fallback_body"),
+        &[("close", t("lastfm.close"))],
+    );
+    let entry = gtk::Entry::builder()
+        .text(url)
+        .editable(false)
+        .width_chars(72)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    fallback.set_extra_child(Some(&entry));
+    fallback.present(Some(parent));
 }

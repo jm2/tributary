@@ -1241,7 +1241,7 @@ async fn poisoned_internal_ingress_fails_the_entire_owner_closed() {
 }
 
 #[test]
-fn production_challenge_source_surface_stays_module_private() {
+fn production_challenge_source_surface_exposes_only_flow_and_handoff() {
     let source = include_str!("authorization.rs").replace("\r\n", "\n");
     let implementation = source
         .split_once("impl LastFmAuthorizationChallenge {")
@@ -1258,13 +1258,12 @@ fn production_challenge_source_surface_stays_module_private() {
     assert_eq!(
         public_items,
         [
-            "pub(in crate::lastfm) fn authorization_url(",
+            "pub(crate) fn authorization_url(&self) -> Result<String, LastFmAuthorizationAdmissionError> {",
             "pub fn flow(&self) -> LastFmAuthorizationFlow {",
         ]
     );
-    // The browser handoff must remain a module-private seam gated on the
-    // composition layer's consent check, never a public API.
-    assert!(implementation.contains("pub(in crate::lastfm) fn authorization_url("));
+    // The browser handoff stays crate-private and documented as the one
+    // consent-gated extraction, never a public API.
     assert!(implementation.contains("Consent-gated browser handoff URL"));
 }
 

@@ -133,6 +133,29 @@ where
     (application_result, coordinator_result, source_barrier)
 }
 
+/// Resume the account a previous session connected, once the persisted
+/// policy grants consent and enablement. A refused start (no stored account,
+/// locked vault) leaves the owner dormant; the settings surface can retry.
+async fn resume_lastfm_account(
+    application: &crate::lastfm::production::LastFmApplicationHandle,
+    policy: &crate::lastfm::policy::LastFmLivePolicy,
+) {
+    let Ok(activation) =
+        crate::lastfm::production::LastFmApplicationActivation::issue_from_policy_generation(
+            &policy.snapshot(),
+        )
+    else {
+        return;
+    };
+    match application.try_activate(activation) {
+        Ok(operation) => match operation.wait().await {
+            Ok(()) => info!("Last.fm scrobbling resumed"),
+            Err(error) => info!(category = %error, "Last.fm scrobbling did not resume"),
+        },
+        Err(error) => warn!(category = %error, "Last.fm resume was not admitted"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LastFmDatabaseCompositionOutcome {
     UnavailableBuild,
@@ -1431,31 +1454,21 @@ pub(crate) fn build_window(
     let lastfm_playback = lastfm_playback_owner
         .bind_window(source_registry.clone())
         .expect("the unique process playback coordinator binds one window epoch");
-    // The durable Last.fm policy generation starts closed and is replaced
-    // wholesale once the migrated database becomes available. Playback queue
-    // capture reads it synchronously; no shipping path mutates policy yet,
-    // so the feature stays fail-closed until the consent/settings slice
-    // lands. The database-init task publishes successors from off the GTK
-    // thread, so the slot is a `Send` mutex rather than a `RefCell`.
-    let lastfm_policy: std::sync::Arc<
-        std::sync::Mutex<crate::lastfm::policy::LastFmPolicyGeneration>,
-    > = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::lastfm::policy::LastFmPolicyGeneration::default(),
-    ));
+    // The durable Last.fm policy generation starts closed and is published
+    // once the migrated database becomes available. One live handle is
+    // cloned into queue capture, dispatch, the application owner, and the
+    // settings surface, so every consumer and the runtime's supervision
+    // observe the same generation and every write goes through it.
+    let lastfm_policy = crate::lastfm::policy::LastFmLivePolicy::default();
     // Compose the process application owner before asynchronous database
-    // initialization. It remains Dormant until a future consent/policy layer
-    // issues the move-only activation authority; ordinary builds without
-    // injected credentials perform no Last.fm database, vault, or network
-    // work. The live policy handle wraps the SAME shared generation slot the
-    // playback capture contexts clone, so queue capture and dispatch
-    // admission observe one authoritative live generation: capture freezes
-    // its identity into each minted occurrence, and dispatch re-derives the
-    // current generation's authority from this slot at the moment of use.
+    // initialization. It stays dormant until the persisted policy grants
+    // consent and a stored account exists; ordinary builds without injected
+    // credentials perform no Last.fm database, vault, or network work.
     let (lastfm_application, lastfm_application_shutdown) =
         match crate::lastfm::production::spawn_lastfm_application_owner(
             lastfm_playback.clone(),
             rt_handle.clone(),
-            crate::lastfm::policy::LastFmLivePolicy::from_shared(lastfm_policy.clone()),
+            lastfm_policy.clone(),
         ) {
             Ok(owner) => owner,
             Err(error) => {
@@ -1467,31 +1480,11 @@ pub(crate) fn build_window(
             }
         };
     let lastfm_application_shutdown = Rc::new(RefCell::new(Some(lastfm_application_shutdown)));
-    // Compose the process authorization owner for the settings surface.
-    // Builds without packaged application credentials keep the unavailable
-    // classification: the settings context stays detached and every account
-    // action renders its disabled state instead of attempting a flow.
-    let lastfm_authorization_composition =
-        match crate::lastfm::account::spawn_lastfm_authorization_owner() {
-            Ok((handle, shutdown)) => {
-                let context = crate::ui::lastfm_settings::LastFmSettingsContext::default();
-                (
-                    Some(context),
-                    Some(handle),
-                    Rc::new(RefCell::new(Some(shutdown))),
-                )
-            }
-            Err(error) => {
-                info!(
-                    category = %error,
-                    "Last.fm authorization unavailable in this build"
-                );
-                (None, None, Rc::new(RefCell::new(None)))
-            }
-        };
-    let lastfm_settings_context = lastfm_authorization_composition.0.unwrap_or_default();
-    let engine_lastfm_authorization = lastfm_authorization_composition.1;
-    let lastfm_authorization_shutdown = lastfm_authorization_composition.2;
+    let lastfm_settings = crate::ui::lastfm_settings::LastFmSettingsContext::new(
+        lastfm_application.clone(),
+        lastfm_policy.clone(),
+        rt_handle.clone(),
+    );
     // The owner is deliberately non-cloneable. Keep the unique value alive
     // for the native window and mutate it only at the close barrier; all
     // ordinary playback callbacks receive the epoch-scoped binding instead.
@@ -2006,7 +1999,6 @@ pub(crate) fn build_window(
     let shutdown_server_playlist_browser = server_playlist_browser.clone();
     let shutdown_lastfm_application = lastfm_application.clone();
     let shutdown_lastfm_application_owner = lastfm_application_shutdown.clone();
-    let shutdown_lastfm_authorization_owner = lastfm_authorization_shutdown.clone();
     let shutdown_lastfm_playback_owner = lastfm_playback_owner.clone();
     let shutdown_started = Rc::new(Cell::new(false));
     let shutdown_started_for_close = shutdown_started.clone();
@@ -2054,8 +2046,6 @@ pub(crate) fn build_window(
             let shutdown_playback = shutdown_playback.clone();
             let shutdown_output_slot = shutdown_output_slot.clone();
             let shutdown_sources = shutdown_sources.clone();
-            let shutdown_lastfm_authorization_owner =
-                shutdown_lastfm_authorization_owner.clone();
             glib::MainContext::default().spawn_local(async move {
                 let application_drain = async move {
                     match application_shutdown {
@@ -2091,18 +2081,6 @@ pub(crate) fn build_window(
                     .await;
                 if let Err(error) = application_result {
                     warn!(%error, "Last.fm application owner failed to drain");
-                }
-                // The authorization owner is a separate process claim from
-                // the application owner. Retire it after the application
-                // drain so an in-flight connect flow cannot outlive the
-                // window it was started from, and so the one-shot process
-                // claim is released on a deterministic barrier.
-                let authorization_shutdown =
-                    shutdown_lastfm_authorization_owner.borrow_mut().take();
-                if let Some(shutdown) = authorization_shutdown {
-                    if let Err(error) = shutdown.shutdown().await {
-                        warn!(%error, "Last.fm authorization owner failed to drain");
-                    }
                 }
                 if coordinator_result
                     != crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOutcome::Applied
@@ -2164,8 +2142,7 @@ pub(crate) fn build_window(
     let engine_source_registry = source_registry.clone();
     let engine_lastfm_application = lastfm_application.clone();
     let engine_lastfm_policy = lastfm_policy.clone();
-    let engine_lastfm_settings_context = lastfm_settings_context.clone();
-    let engine_lastfm_authorization = engine_lastfm_authorization;
+    let engine_lastfm_settings = lastfm_settings.clone();
     rt_handle.spawn(async move {
         match crate::db::connection::init_db().await {
             Ok(db) => {
@@ -2174,13 +2151,7 @@ pub(crate) fn build_window(
                 // default: the feature stays off rather than guessing at a
                 // malformed record.
                 match crate::lastfm::policy::load_policy_generation(&db).await {
-                    Ok(policy) => {
-                        // Recovering publish: the shared slot must stay
-                        // writable even after a poisoned lock, because the
-                        // value is replaced wholesale and re-validated on
-                        // every read.
-                        *crate::lastfm::policy::lock_policy_slot(&engine_lastfm_policy) = policy;
-                    }
+                    Ok(policy) => engine_lastfm_policy.publish(policy),
                     Err(error) => {
                         tracing::warn!(
                             category = %error,
@@ -2188,22 +2159,8 @@ pub(crate) fn build_window(
                         );
                     }
                 }
+                engine_lastfm_settings.attach_database(db.clone());
                 let lastfm_phase = engine_lastfm_application.subscribe_status().borrow().phase;
-                // The settings surface's account actions need the attached
-                // database plus the process authorization handle. Both exist
-                // only now, so install them through the late-binding context;
-                // before this point the surface renders its unavailable state.
-                if let Some(authorization) = engine_lastfm_authorization.clone() {
-                    engine_lastfm_settings_context.set_state(
-                        crate::ui::lastfm_settings::LastFmSettingsState {
-                            db: db.clone(),
-                            credentials: std::sync::Arc::new(
-                                crate::lastfm::credentials::OsSessionCredentialStore,
-                            ),
-                            authorization,
-                        },
-                    );
-                }
                 let lastfm_database_outcome = compose_lastfm_database(lastfm_phase, || {
                     engine_lastfm_application
                         .try_attach_database(db.clone())
@@ -2216,6 +2173,13 @@ pub(crate) fn build_window(
                     }
                     LastFmDatabaseCompositionOutcome::Attached => {
                         info!("Last.fm application database attached");
+                        // The vault read may wait on a keyring unlock; it
+                        // must not hold up the library engine below.
+                        let application = engine_lastfm_application.clone();
+                        let policy = engine_lastfm_policy.clone();
+                        tokio::spawn(async move {
+                            resume_lastfm_account(&application, &policy).await;
+                        });
                     }
                     LastFmDatabaseCompositionOutcome::AlreadyAttached => {
                         warn!(
@@ -3655,15 +3619,9 @@ pub(crate) fn build_window(
         let cfg = app_config.clone();
         let bs = browser_state.clone();
         let master_for_pref = master_tracks.clone();
-        // The Last.fm group renders the authorization owner's control and
-        // status surface; a detached context (unavailable build) renders
-        // the disabled classification instead of a connect flow.
-        let lastfm_ctx_for_prefs = lastfm_settings_context.clone();
-        let lastfm_policy_for_prefs = lastfm_policy.clone();
+        let lastfm_settings = lastfm_settings.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
-            let lastfm_ctx = lastfm_ctx_for_prefs.clone();
-            let lastfm_policy_slot = lastfm_policy_for_prefs.clone();
             let bw_for_aa = bw.clone();
             let bs_for_aa = bs.clone();
             let master_for_aa = master_for_pref.clone();
@@ -3699,7 +3657,7 @@ pub(crate) fn build_window(
                         size.pixel_size(),
                     );
                 });
-            preferences::show_preferences(
+            let page = preferences::show_preferences(
                 &win,
                 &cv,
                 &bw,
@@ -3707,9 +3665,11 @@ pub(crate) fn build_window(
                 on_aa_change,
                 on_art_change,
                 on_art_size_change,
-                &lastfm_ctx,
-                &lastfm_policy_slot,
             );
+            page.add(&crate::ui::lastfm_settings::build_lastfm_group(
+                &win,
+                &lastfm_settings,
+            ));
         });
         window.add_action(&prefs_action);
     }

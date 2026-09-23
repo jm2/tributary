@@ -216,16 +216,13 @@ fn empty_remote_sources() -> &'static HashSet<SourceId> {
 
 /// Shared live handle to the current policy generation.
 ///
-/// The UI owns one `Arc<Mutex<LastFmPolicyGeneration>>` slot, replaces its
-/// content wholesale after the migrated database loads the persisted policy,
-/// and clones the same `Arc` into every consumer. Queue capture and dispatch
-/// therefore observe one shared live generation source: capture freezes its
-/// exact identity into each minted source authority, and dispatch re-derives
-/// its authority from the same slot at the moment of use.
-///
-/// Every publication also wakes [`Self::subscribe`] watchers, so a runtime
-/// that must terminate when its issuing generation is superseded can react
-/// change-driven instead of polling the slot.
+/// The window creates one handle and clones it into every consumer: queue
+/// capture, dispatch, the application owner, and the settings surface. The
+/// slot is private, so every write goes through [`Self::publish`] or
+/// [`Self::commit`]: capture freezes the current identity into each minted
+/// source authority, dispatch re-derives its authority at the moment of use,
+/// and every publication wakes [`Self::subscribe`] watchers, so a runtime
+/// whose issuing generation is superseded stops change-driven.
 #[derive(Clone)]
 pub struct LastFmLivePolicy {
     slot: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
@@ -243,16 +240,14 @@ impl Default for LastFmLivePolicy {
     }
 }
 
-/// Lock the shared UI policy slot, recovering from a poisoned mutex.
+/// Lock the policy slot, recovering from a poisoned mutex.
 ///
 /// The slot's value is replaced wholesale and re-validated on every read, so
-/// a panic while a guard is held (for example a poisoned removable-media
-/// catalogue panicking inside `play_track_at`'s queue capture) cannot leave a
-/// torn generation behind. Recovering with
-/// [`std::sync::PoisonError::into_inner`] preserves the last published
-/// generation and keeps every later consumer alive: dispatch refuses dormant
-/// generations by value, never by lock state.
-pub fn lock_policy_slot(
+/// a panic while a guard is held cannot leave a torn generation behind.
+/// Recovering with [`std::sync::PoisonError::into_inner`] preserves the last
+/// published generation and keeps every later consumer alive: dispatch
+/// refuses dormant generations by value, never by lock state.
+fn lock_policy_slot(
     slot: &std::sync::Mutex<LastFmPolicyGeneration>,
 ) -> std::sync::MutexGuard<'_, LastFmPolicyGeneration> {
     slot.lock()
@@ -260,32 +255,28 @@ pub fn lock_policy_slot(
 }
 
 impl LastFmLivePolicy {
-    /// Wrap an already-shared UI policy slot.
-    ///
-    /// The watch channel starts at the slot's current value: subscribers only
-    /// observe publications made after they subscribed, so pre-existing state
-    /// is read through [`Self::snapshot`], never misread as a change.
-    pub(crate) fn from_shared(
-        shared: std::sync::Arc<std::sync::Mutex<LastFmPolicyGeneration>>,
-    ) -> Self {
-        let initial = lock_policy_slot(&shared).clone();
-        let (changes, _) = watch::channel(initial);
-        Self {
-            slot: shared,
-            changes: std::sync::Arc::new(changes),
-        }
-    }
-
     /// Freeze one exact observation of the live generation.
     pub(crate) fn snapshot(&self) -> LastFmPolicyGeneration {
         lock_policy_slot(&self.slot).clone()
     }
 
-    /// Publish a successor generation from the database-init path.
+    /// Publish an already-persisted generation (the database-init load).
     pub(crate) fn publish(&self, generation: LastFmPolicyGeneration) {
         *lock_policy_slot(&self.slot) = generation.clone();
         // A publication with no watchers must not fail the publish itself.
         let _ = self.changes.send(generation);
+    }
+
+    /// Persist one whole-snapshot update against the live generation, then
+    /// publish the committed successor to every consumer and watcher.
+    pub(crate) async fn commit(
+        &self,
+        db: &DatabaseConnection,
+        update: LastFmPolicyUpdate,
+    ) -> Result<LastFmPolicyGeneration, LastFmPolicyStoreError> {
+        let successor = commit_policy_update(db, self.snapshot().generation(), update).await?;
+        self.publish(successor.clone());
+        Ok(successor)
     }
 
     /// Watch for live-policy publications.
@@ -936,6 +927,37 @@ mod tests {
         .unwrap();
         assert!(disabled.activation_remote_sources().is_none());
         assert!(disabled.queue_capture_remote_sources().is_empty());
+    }
+
+    /// A committed update persists and reaches the live slot and its
+    /// watchers in one step, so a supervising runtime observes it.
+    #[tokio::test]
+    async fn commit_persists_and_publishes_to_watchers() {
+        let db = database().await;
+        let live = LastFmLivePolicy::default();
+        let mut changes = live.subscribe();
+        changes.borrow_and_update();
+
+        let committed = live
+            .commit(&db, update(Some(consent("en")), true, HashSet::new()))
+            .await
+            .unwrap();
+        assert_eq!(committed.generation(), 1);
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(*changes.borrow_and_update(), committed);
+        assert_eq!(live.snapshot(), committed);
+        assert_eq!(load_policy_generation(&db).await.unwrap(), committed);
+
+        // The compare-and-swap still refuses a writer whose view is stale.
+        let stale = LastFmLivePolicy::default();
+        assert_eq!(
+            stale
+                .commit(&db, update(None, false, HashSet::new()))
+                .await
+                .unwrap_err(),
+            LastFmPolicyStoreError::Conflict
+        );
+        assert!(!changes.has_changed().unwrap());
     }
 
     /// A panic while a policy guard is held (for example a poisoned removable
