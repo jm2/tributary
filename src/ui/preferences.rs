@@ -781,6 +781,8 @@ pub fn save_config(config: &AppConfig) -> bool {
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
 /// * `active_output` — the output the equalizer group applies its settings to
+///
+/// Returns the page so the caller can append integration groups (Last.fm).
 #[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
@@ -791,7 +793,7 @@ pub fn show_preferences(
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
     active_output: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::audio::output::AudioOutput>>>,
-) {
+) -> adw::PreferencesPage {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
@@ -1267,6 +1269,7 @@ pub fn show_preferences(
     drop(cfg);
 
     prefs_dialog.present(Some(parent));
+    page
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

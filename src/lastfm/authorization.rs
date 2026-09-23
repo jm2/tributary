@@ -2,18 +2,18 @@
 //!
 //! The owner retains the request token and staged session behind a bounded,
 //! serialized command lane. Presentation receives only a redacted challenge:
-//! the token-bearing browser URL remains entirely owner-private, while opaque
-//! finish authority is consumed atomically before `auth.getSession` is first
+//! the token-bearing browser URL remains owner-private while opaque finish
+//! authority is consumed atomically before `auth.getSession` is first
 //! awaited.
 //!
-//! This module is intentionally an injected internal core. Production consent,
-//! a concrete browser handoff, global single-owner coordination, and vault
-//! installation remain deferred; no build-credential factory wires this owner
-//! into the application.
+//! This module is an injected internal core. The production application
+//! owner constructs the single process instance from the build credentials;
+//! the settings surface starts a flow only after consent is recorded, hands
+//! the URL to the system browser, and passes the resulting grant back to the
+//! application owner for vault installation.
 
 use std::fmt;
 use std::panic::AssertUnwindSafe;
-#[cfg(test)]
 use std::sync::Weak;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -174,22 +174,29 @@ struct ChallengeInner {
     generation: u64,
     flow: LastFmAuthorizationFlow,
     finish: LastFmAuthorizationFinish,
-    #[cfg(test)]
+    // Weak on purpose: a retained challenge must never keep the owner
+    // handle (and with it the URL authority) alive after shutdown.
     handle: Weak<HandleInner>,
 }
 
 /// Opaque challenge for one exact in-memory request token.
 ///
-/// The token-bearing browser URL remains solely inside the owner and has no
-/// production accessor or handoff. Successful finish, cancel, supersession,
-/// expiry, terminal failure, or shutdown revokes that internal allocation and
-/// every clone's finish authority.
+/// The token-bearing browser URL remains inside the owner; the settings
+/// surface extracts it once, after consent, for the system-browser launch.
+/// Successful finish, cancel, supersession, expiry, terminal failure, or
+/// shutdown revokes that internal allocation and every clone's finish
+/// authority.
 #[derive(Clone)]
 pub struct LastFmAuthorizationChallenge(Arc<ChallengeInner>);
 
 impl LastFmAuthorizationChallenge {
-    #[cfg(test)]
-    fn authorization_url_for_test(&self) -> Result<String, LastFmAuthorizationAdmissionError> {
+    /// Consent-gated browser handoff URL for this exact challenge.
+    ///
+    /// Only the settings surface calls this, immediately before the
+    /// system-browser launch and only once the live policy generation is
+    /// consented and enabled. The URL never reaches diagnostics; revocation
+    /// (cancel, supersession, expiry, shutdown) fails the extraction closed.
+    pub(crate) fn authorization_url(&self) -> Result<String, LastFmAuthorizationAdmissionError> {
         let handle = self
             .0
             .handle
@@ -252,6 +259,11 @@ pub struct LastFmAuthorizationGrant(DesktopAuthorizedSession);
 impl LastFmAuthorizationGrant {
     pub(in crate::lastfm) fn into_authorized_session(self) -> DesktopAuthorizedSession {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(in crate::lastfm) fn for_test(username: &str, key: &str) -> Self {
+        Self(DesktopAuthorizedSession::for_test(username, key).expect("valid test grant"))
     }
 }
 
@@ -832,7 +844,8 @@ enum OwnerEvent {
 struct AuthorizationOwner {
     commands: async_channel::Receiver<Command>,
     ingress: Arc<Mutex<IngressGate>>,
-    #[cfg(test)]
+    // Weak backref for the challenge's consent-gated URL extraction; a
+    // retained challenge must never keep the owner handle alive.
     handle: Weak<HandleInner>,
     transport: Arc<dyn LastFmAuthorizationTransport>,
     clock: Arc<dyn LastFmAuthorizationClock>,
@@ -1184,7 +1197,6 @@ impl AuthorizationOwner {
             generation,
             flow: flow.clone(),
             finish: finish.clone(),
-            #[cfg(test)]
             handle: self.handle.clone(),
         }));
         let ingress = Arc::clone(&self.ingress);
@@ -1826,7 +1838,6 @@ fn spawn_lastfm_authorization_with_options(
     let mut owner = AuthorizationOwner {
         commands: receiver,
         ingress,
-        #[cfg(test)]
         handle: Arc::downgrade(&inner),
         transport,
         clock,
