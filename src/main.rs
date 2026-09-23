@@ -158,6 +158,51 @@ fn pending_files_need_application_activation<W>(
     select_existing_window(active, windows).is_none()
 }
 
+/// Route SIGTERM and SIGINT (logout, `kill`, Ctrl+C) through the normal quit
+/// path, so the close drain still flushes library changes, signs out of
+/// remote servers and saves the window geometry. A second signal exits at
+/// once, for when the drain itself is what the user is interrupting.
+#[cfg(unix)]
+fn forward_termination_signals(app: &adw::Application, rt: &tokio::runtime::Handle) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::signal::unix::{signal, SignalKind};
+
+    static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    let (quit_tx, quit_rx) = async_channel::bounded::<()>(1);
+    // Exit statuses follow the shell's 128 + signal number convention.
+    for (kind, name, exit_status) in [
+        (SignalKind::terminate(), "SIGTERM", 143),
+        (SignalKind::interrupt(), "SIGINT", 130),
+    ] {
+        let quit_tx = quit_tx.clone();
+        rt.spawn(async move {
+            let mut stream = match signal(kind) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, signal = name, "Could not handle signal");
+                    return;
+                }
+            };
+            while stream.recv().await.is_some() {
+                if QUIT_REQUESTED.swap(true, Ordering::SeqCst) {
+                    std::process::exit(exit_status);
+                }
+                info!(signal = name, "Closing on termination signal");
+                let _ = quit_tx.try_send(());
+            }
+        });
+    }
+
+    let app = app.clone();
+    glib::MainContext::default().spawn_local(async move {
+        while quit_rx.recv().await.is_ok() {
+            request_application_quit(&app);
+        }
+    });
+}
+
 const I18N_INITIALIZER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn initialize_i18n_backend() -> Result<(), String> {
@@ -341,6 +386,9 @@ fn main() {
     app.add_action_entries([quit_action, about_action]);
     // <primary> = Cmd on macOS, Ctrl on Linux/Windows.
     app.set_accels_for_action("app.quit", &["<primary>q"]);
+
+    #[cfg(unix)]
+    forward_termination_signals(&app, &rt_handle);
 
     // Claim the process-lifetime Last.fm playback coordinator before GTK can
     // deliver the first activation. The claim is never reusable, including

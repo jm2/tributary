@@ -114,6 +114,20 @@ fn apply_current_seek_intent(
     true
 }
 
+/// Upper bound on the close drain. A tracked operation stuck in kernel I/O
+/// must not leave an inert window on screen forever; past this deadline the
+/// window closes and the process exits with the drain unfinished.
+const CLOSE_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The close-drain step in progress, logged if the deadline expires.
+#[derive(Clone, Copy, Debug)]
+enum CloseDrainStage {
+    LastFm,
+    LibraryFlush,
+    Sources,
+    ServerPlaylists,
+}
+
 /// Join the application-owned bridge/runtime generation before terminating
 /// the process coordinator or revoking source authority.
 ///
@@ -1995,54 +2009,71 @@ pub(crate) fn build_window(
             let shutdown_output_slot = shutdown_output_slot.clone();
             let shutdown_sources = shutdown_sources.clone();
             glib::MainContext::default().spawn_local(async move {
-                let application_drain = async move {
-                    match application_shutdown {
-                        Some(shutdown) => shutdown.shutdown().await,
-                        None => Err(
-                            crate::lastfm::production::LastFmApplicationShutdownError,
-                        ),
+                let stage = Rc::new(Cell::new(CloseDrainStage::LastFm));
+                let drain_stage = stage.clone();
+                let drain = async move {
+                    let application_drain = async move {
+                        match application_shutdown {
+                            Some(shutdown) => shutdown.shutdown().await,
+                            None => Err(
+                                crate::lastfm::production::LastFmApplicationShutdownError,
+                            ),
+                        }
+                    };
+                    let (application_result, coordinator_result, source_barrier) =
+                        drain_lastfm_application_before_sources(
+                            application_drain,
+                            || shutdown_lastfm_playback_owner.borrow_mut().shutdown(),
+                            || {
+                                let external_source =
+                                    shutdown_playback.borrow().current_external_source_id();
+                                // The application owner has retired the Active
+                                // bridge and joined its runtime. Revoke the event
+                                // generation before the first output call, then
+                                // release source authority last.
+                                shutdown_playback.borrow_mut().clear();
+                                let shutdown_output =
+                                    shutdown_output_slot.borrow().as_ref().cloned();
+                                if let Some(shutdown_output) = shutdown_output {
+                                    shutdown_output.borrow().stop();
+                                }
+                                if let Some(source_id) = external_source {
+                                    let _ = shutdown_sources.retire_external(source_id);
+                                }
+                                shutdown_sources.shutdown()
+                            },
+                        )
+                        .await;
+                    if let Err(error) = application_result {
+                        warn!(%error, "Last.fm application owner failed to drain");
                     }
+                    if coordinator_result
+                        != crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOutcome::Applied
+                    {
+                        warn!(
+                            outcome = ?coordinator_result,
+                            "Last.fm playback coordinator failed to shut down cleanly"
+                        );
+                    }
+                    drain_stage.set(CloseDrainStage::LibraryFlush);
+                    if flush_queued && flush_rx.recv().await.is_err() {
+                        warn!("Library mutation shutdown flush was not acknowledged");
+                    }
+                    drain_stage.set(CloseDrainStage::Sources);
+                    source_barrier.wait().await;
+                    drain_stage.set(CloseDrainStage::ServerPlaylists);
+                    server_playlist_barrier.wait().await;
                 };
-                let (application_result, coordinator_result, source_barrier) =
-                    drain_lastfm_application_before_sources(
-                        application_drain,
-                        || shutdown_lastfm_playback_owner.borrow_mut().shutdown(),
-                        || {
-                            let external_source =
-                                shutdown_playback.borrow().current_external_source_id();
-                            // The application owner has retired the Active
-                            // bridge and joined its runtime. Revoke the event
-                            // generation before the first output call, then
-                            // release source authority last.
-                            shutdown_playback.borrow_mut().clear();
-                            let shutdown_output =
-                                shutdown_output_slot.borrow().as_ref().cloned();
-                            if let Some(shutdown_output) = shutdown_output {
-                                shutdown_output.borrow().stop();
-                            }
-                            if let Some(source_id) = external_source {
-                                let _ = shutdown_sources.retire_external(source_id);
-                            }
-                            shutdown_sources.shutdown()
-                        },
-                    )
-                    .await;
-                if let Err(error) = application_result {
-                    warn!(%error, "Last.fm application owner failed to drain");
-                }
-                if coordinator_result
-                    != crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorOutcome::Applied
+                if glib::future_with_timeout(CLOSE_DRAIN_DEADLINE, drain)
+                    .await
+                    .is_err()
                 {
                     warn!(
-                        outcome = ?coordinator_result,
-                        "Last.fm playback coordinator failed to shut down cleanly"
+                        stage = ?stage.get(),
+                        deadline_secs = CLOSE_DRAIN_DEADLINE.as_secs(),
+                        "Close drain did not finish; closing anyway"
                     );
                 }
-                if flush_queued && flush_rx.recv().await.is_err() {
-                    warn!("Library mutation shutdown flush was not acknowledged");
-                }
-                source_barrier.wait().await;
-                server_playlist_barrier.wait().await;
                 shutdown_complete.set(true);
                 window.close();
             });
