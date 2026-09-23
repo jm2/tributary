@@ -28,6 +28,11 @@ const RUST_TOOLCHAIN_ACTION_SHA: &str = "6c977a6ca4077a0ceb28ffbe03f59d46e9ac877
 const FLATPAK_BUILDER_ACTION_SHA: &str = "79327416609af08178ad73b352877e51450790b3";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
+const BUNDLED_GSTREAMER_PLUGINS: &str =
+    include_str!("../build-aux/packaging/bundled-gstreamer-plugins.txt");
+const INNO_SETUP_SCRIPT: &str = include_str!("../build-aux/inno/tributary.iss");
+const EQUALIZER: &str = include_str!("../src/audio/equalizer.rs");
+const NOTICES_HEADER: &str = include_str!("../build-aux/packaging/THIRD-PARTY-NOTICES.header.txt");
 
 fn manifest() -> Value {
     toml::from_str(MANIFEST).expect("Cargo.toml must parse")
@@ -554,6 +559,8 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
         "playready",
         "fairplay",
         "keydb.cfg",
+        "fdk-aac",
+        "fdkaac",
     ] {
         assert!(tokens.contains(&required), "policy is missing {required}");
     }
@@ -580,6 +587,8 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
         "playready.dll",
         "FairPlayRuntime.dll",
         "KEYDB.CFG",
+        "libfdk-aac-2.dll",
+        "libgstfdkaac.dll",
     ] {
         assert!(
             bundle_policy_matches(forbidden, &tokens),
@@ -589,7 +598,7 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
 
     for ordinary_runtime in [
         "libgstlibav.dll",
-        "libgstfdkaac.dll",
+        "libgstfaad.dll",
         "libgstaudioparsers.dll",
         "libgstaes.dll",
         "libgstdvdlpcmdec.dll",
@@ -611,6 +620,293 @@ fn bundled_component_policy_blocks_disc_decryption_without_hiding_codecs() {
     assert!(
         !bundle_policy_matches_relative_path(r"plugins\audio\helper.dll", &tokens),
         "ordinary relative path components must remain eligible"
+    );
+}
+
+/// Allowlist entries as (plugin, platform); `None` ships on every platform.
+fn bundled_gstreamer_plugins() -> Vec<(&'static str, Option<&'static str>)> {
+    BUNDLED_GSTREAMER_PLUGINS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next().expect("allowlist entry has a plugin name");
+            let platform = fields.next();
+            assert!(
+                fields.next().is_none(),
+                "allowlist entry has extra fields: {line}"
+            );
+            (name, platform)
+        })
+        .collect()
+}
+
+#[test]
+fn release_plugin_allowlist_is_well_formed_and_ships_what_the_code_creates() {
+    let plugins = bundled_gstreamer_plugins();
+    let tokens = forbidden_bundle_tokens();
+    let mut unique = std::collections::HashSet::new();
+    for (name, platform) in &plugins {
+        assert!(
+            name.chars().all(|character| character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '_'),
+            "allowlist entry uses a spelling the bundlers reject: {name}"
+        );
+        assert!(
+            matches!(platform, None | Some("windows" | "macos")),
+            "allowlist entry names an unknown platform: {name}"
+        );
+        assert!(unique.insert(*name), "duplicate allowlist entry: {name}");
+        assert!(
+            !bundle_policy_matches(&format!("libgst{name}.dll"), &tokens),
+            "allowlist names a forbidden component: {name}"
+        );
+    }
+    let ships = |plugin: &str, target: &str| {
+        plugins
+            .iter()
+            .any(|(name, platform)| *name == plugin && platform.is_none_or(|only| only == target))
+    };
+
+    // Every element the application or its packaged probes create, the code
+    // that creates it, and the plugin that must ship it.
+    for (element, source, plugin, targets) in [
+        (
+            "playbin3",
+            WINDOWS_RUNTIME_PROBE,
+            "playback",
+            &["windows", "macos"][..],
+        ),
+        (
+            "souphttpsrc",
+            WINDOWS_RUNTIME_PROBE,
+            "soup",
+            &["windows", "macos"],
+        ),
+        (
+            "fakesink",
+            WINDOWS_RUNTIME_PROBE,
+            "coreelements",
+            &["windows", "macos"],
+        ),
+        (
+            "filesrc",
+            WINDOWS_RUNTIME_PROBE,
+            "coreelements",
+            &["windows", "macos"],
+        ),
+        (
+            "wasapi2sink",
+            WINDOWS_RUNTIME_PROBE,
+            "wasapi2",
+            &["windows"],
+        ),
+        ("identity", PLATFORM_RUNTIME, "coreelements", &["macos"]),
+        ("capsfilter", PLATFORM_RUNTIME, "coreelements", &["macos"]),
+        ("osxaudiosink", PLATFORM_RUNTIME, "osxaudio", &["macos"]),
+        (
+            "audioconvert",
+            EQUALIZER,
+            "audioconvert",
+            &["windows", "macos"],
+        ),
+        (
+            "audioresample",
+            EQUALIZER,
+            "audioresample",
+            &["windows", "macos"],
+        ),
+        ("volume", EQUALIZER, "volume", &["windows", "macos"]),
+        (
+            "equalizer-10bands",
+            EQUALIZER,
+            "equalizer",
+            &["windows", "macos"],
+        ),
+        ("rglimiter", EQUALIZER, "replaygain", &["windows", "macos"]),
+    ] {
+        assert!(
+            source.contains(element),
+            "{element} is no longer created by its source"
+        );
+        for target in targets {
+            assert!(
+                ships(plugin, target),
+                "{target} bundle lacks {plugin} for {element}"
+            );
+        }
+    }
+}
+
+#[test]
+fn release_plugin_allowlist_covers_supported_formats_and_excludes_unused_media() {
+    let plugins = bundled_gstreamer_plugins();
+    let ships = |plugin: &str, target: &str| {
+        plugins
+            .iter()
+            .any(|(name, platform)| *name == plugin && platform.is_none_or(|only| only == target))
+    };
+    // Typefinding, parsers, demuxers, and decoders for MP3, FLAC, AAC/ALAC
+    // (M4A), Ogg Vorbis/Opus, WAV, AIFF, and WMA (ASF + libav).
+    for plugin in [
+        "typefindfunctions",
+        "audioparsers",
+        "id3demux",
+        "mpg123",
+        "flac",
+        "isomp4",
+        "libav",
+        "ogg",
+        "vorbis",
+        "opus",
+        "wavparse",
+        "aiff",
+        "asf",
+    ] {
+        for target in ["windows", "macos"] {
+            assert!(
+                ships(plugin, target),
+                "{target} bundle lacks format plugin {plugin}"
+            );
+        }
+    }
+    assert!(!ships("wasapi2", "macos") && !ships("osxaudio", "windows"));
+
+    for unused in [
+        "fdkaac", "faac", "x264", "x265", "openh264", "aom", "svtav1", "vpx", "webrtc", "rtmp",
+        "rtmp2", "srt", "vulkan", "nvcodec", "d3d11", "d3d12", "qsv", "va", "opengl",
+    ] {
+        assert!(
+            !plugins.iter().any(|(name, _)| *name == unused),
+            "unused encoder, video, or network plugin is allowlisted: {unused}"
+        );
+    }
+}
+
+#[test]
+fn windows_bundle_ships_only_allowlisted_plugins_gdbus_and_notices() {
+    let build_windows = BUILD_WINDOWS.replace("\r\n", "\n");
+    let position = |fragment: &str| {
+        build_windows
+            .find(fragment)
+            .unwrap_or_else(|| panic!("Windows bundler lost: {fragment}"))
+    };
+    assert!(
+        build_windows.contains("build-aux\\packaging\\bundled-gstreamer-plugins.txt")
+            && build_windows.contains(
+                "Import-BundledGStreamerPluginAllowlist $BundledGStreamerPluginAllowlistPath 'windows'"
+            )
+            && build_windows.contains("foreach ($pluginName in $BundledGStreamerPluginNames)")
+            && !build_windows.contains("Sync-Directory $gstPluginSrc"),
+        "the Windows bundle must copy only allowlisted GStreamer plugins"
+    );
+    assert!(
+        build_windows.contains("if ($sourceMember.Extension -ieq '.a') { continue }")
+            && build_windows.contains("$_.Extension -ieq '.a'"),
+        "static and import libraries must be neither copied nor shipped"
+    );
+
+    let stale_purge =
+        position("$staleReleaseMembers = @(Get-UnlistedWindowsGStreamerPluginMembers $DIST)");
+    let executable_copy = position("Copy-WindowsBundleFileForced $exePath $exeBundleDest");
+    let gdbus_copy = position("Copy-WindowsBundleFileForced $gdbusSrc $gdbusDest");
+    let closure_seed =
+        position("$initialDllScanTargets = @(Get-WindowsTreeMembersWithoutReparseTraversal $DIST");
+    let notices = position("Write-WindowsThirdPartyNotices -Root $DIST");
+    let probe = position("# ── Packaged Runtime Probe");
+    let archive_section = position("# ── Zip Archive");
+    let archive = position("Write-Info \"Creating zip archive...\"");
+    let final_contents = build_windows[archive_section..]
+        .find("Assert-WindowsBundleReleaseContents $DIST")
+        .map(|offset| archive_section + offset)
+        .expect("the final tree must pass the release-contents contract");
+    assert!(
+        stale_purge < executable_copy
+            && gdbus_copy < closure_seed
+            && closure_seed < notices
+            && notices < probe
+            && final_contents < archive,
+        "purge stale members first, resolve gdbus imports, and attribute the finished tree before the probe and ZIP"
+    );
+    assert!(
+        build_windows.contains("$gdbusSrc = Join-Path $MsysPath \"bin\\gdbus.exe\"")
+            && build_windows.contains("$gdbusDest = Join-Path $DIST \"gdbus.exe\"")
+            && build_windows.contains("'gdbus.exe',")
+            && build_windows.contains("'libgio-2.0-0.dll',"),
+        "gdbus.exe must be bundled beside libgio and asserted there"
+    );
+
+    let installer_only = position("# ── Inno Setup only mode");
+    let installer_compile = build_windows[installer_only..]
+        .find("& $iscc")
+        .map(|offset| installer_only + offset)
+        .expect("the installer-only path must invoke Inno Setup");
+    assert!(
+        build_windows[installer_only..installer_compile]
+            .contains("Assert-WindowsBundleReleaseContents $sourceDir")
+            && build_windows
+                .matches("Assert-WindowsBundleReleaseContents $sourceDir")
+                .count()
+                == 2,
+        "both installer paths must recheck the release contents of their source tree"
+    );
+    assert!(
+        INNO_SETUP_SCRIPT.contains("[InstallDelete]")
+            && INNO_SETUP_SCRIPT
+                .contains("Type: filesandordirs; Name: \"{app}\\lib\\gstreamer-1.0\"")
+            && INNO_SETUP_SCRIPT.contains("Type: files; Name: \"{app}\\*.dll\"")
+            && INNO_SETUP_SCRIPT.contains("CloseApplicationsFilter=tributary.exe,gdbus.exe"),
+        "upgrades must drop plugins and DLLs a previous release installed"
+    );
+}
+
+#[test]
+fn macos_bundle_ships_only_allowlisted_plugins_and_notices() {
+    let position = |fragment: &str| {
+        BUILD_MACOS
+            .find(fragment)
+            .unwrap_or_else(|| panic!("macOS bundler lost: {fragment}"))
+    };
+    assert!(
+        BUILD_MACOS.contains("build-aux/packaging/bundled-gstreamer-plugins.txt")
+            && BUILD_MACOS.contains(
+                "macos_gstreamer_allowlist_load \"$MACOS_GSTREAMER_PLUGIN_ALLOWLIST\" macos"
+            )
+            && BUILD_MACOS
+                .contains("for plugin_name in \"${MACOS_GSTREAMER_PLUGIN_NAMES[@]}\"; do")
+            && !BUILD_MACOS.contains("for plugin in \"${GST_PLUGIN_SRC}\"/*.dylib"),
+        "the macOS bundle must copy only allowlisted GStreamer plugins"
+    );
+    assert!(
+        BUILD_MACOS.contains("MACOS_BUNDLED_BINARY_SOURCES+=(\"$src\")")
+            && BUILD_MACOS.contains("MACOS_BUNDLED_BINARY_SOURCES+=(\"$plugin\")"),
+        "every copied Homebrew binary must be attributed in the notices"
+    );
+    let notices =
+        position("macos_write_third_party_notices \"$RESOURCES_DIR\" \"$HOMEBREW_CELLAR\"");
+    let contents = position("if ! macos_validate_release_contents \"$APP_BUNDLE\"; then");
+    let sign = position("codesign --force --deep --sign - \"$APP_BUNDLE\"");
+    let dmg = position("  create-dmg \\");
+    let dmg_contents = BUILD_MACOS
+        .rfind("if ! macos_validate_release_contents \"$APP_BUNDLE\"; then")
+        .expect("the DMG path must recheck release contents");
+    assert!(
+        notices < contents && contents < sign && sign < dmg_contents && dmg_contents < dmg,
+        "notices and the plugin allowlist must be validated before signing and before the DMG"
+    );
+    assert!(
+        MACOS_PACKAGE_POLICY.contains("Source code offer")
+            && MACOS_PACKAGE_POLICY.contains("-iname 'COPYING*'"),
+        "the macOS release contract must require the source offer and copy keg licenses"
+    );
+    assert!(
+        NOTICES_HEADER.contains("Source code offer")
+            && NOTICES_HEADER.contains("For at least three years")
+            && NOTICES_HEADER.contains("@PACKAGER@")
+            && NOTICES_HEADER.contains("@RECIPES@"),
+        "the shared notices header must carry the GPL source offer"
     );
 }
 

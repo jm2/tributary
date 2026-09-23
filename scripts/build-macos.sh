@@ -111,6 +111,7 @@ source "$MACOS_ICON_POLICY_HELPER"
 # release build must use the repository policy and platform inspection tools
 # even when its parent environment happens to define those hook names.
 readonly MACOS_BUNDLED_COMPONENT_POLICY="${SCRIPT_DIR}/../build-aux/packaging/forbidden-bundled-components.txt"
+readonly MACOS_GSTREAMER_PLUGIN_ALLOWLIST="${SCRIPT_DIR}/../build-aux/packaging/bundled-gstreamer-plugins.txt"
 readonly MACOS_FIND_COMMAND="/usr/bin/find"
 readonly MACOS_OTOOL_COMMAND="/usr/bin/otool"
 readonly MACOS_OD_COMMAND="/usr/bin/od"
@@ -205,6 +206,12 @@ if ! macos_package_policy_load "$MACOS_BUNDLED_COMPONENT_POLICY"; then
   error "$MACOS_PACKAGE_POLICY_REASON"
 fi
 info "Loaded ${MACOS_FORBIDDEN_COMPONENT_TOKEN_COUNT} forbidden bundle filename tokens."
+if ! macos_gstreamer_allowlist_load "$MACOS_GSTREAMER_PLUGIN_ALLOWLIST" macos; then
+  error "$MACOS_PACKAGE_POLICY_REASON"
+fi
+info "Loaded ${#MACOS_GSTREAMER_PLUGIN_NAMES[@]} allowlisted GStreamer plugins."
+# Third-party notices attribute each copied Homebrew file to its keg.
+HOMEBREW_CELLAR="$(cd -P "$(brew --cellar)" && pwd -P)"
 
 ICONSET_SRC="data/tributary.iconset"
 APP_ICONS_SRC="data/icons/hicolor"
@@ -259,6 +266,10 @@ RESOURCES_DIR="${APP_BUNDLE}/Contents/Resources"
 mkdir -p "${RESOURCES_DIR}/share/icons"
 cp -RL "${BREW_PREFIX}/share/icons/hicolor" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
 cp -RL "${BREW_PREFIX}/share/icons/Adwaita" "${RESOURCES_DIR}/share/icons/" 2>/dev/null || true
+MACOS_BUNDLED_DATA_SOURCES+=(
+  "${BREW_PREFIX}/share/icons/hicolor"
+  "${BREW_PREFIX}/share/icons/Adwaita"
+)
 
 # Bundle the app's own hicolor icons (About dialog, etc.)
 info "Bundling app hicolor icons..."
@@ -275,6 +286,7 @@ command -v gtk4-update-icon-cache &>/dev/null && {
 # GLib schemas
 mkdir -p "${RESOURCES_DIR}/share/glib-2.0/schemas"
 cp -RL "${BREW_PREFIX}/share/glib-2.0/schemas" "${RESOURCES_DIR}/share/glib-2.0/" 2>/dev/null || true
+MACOS_BUNDLED_DATA_SOURCES+=("${BREW_PREFIX}/share/glib-2.0/schemas")
 glib-compile-schemas "${RESOURCES_DIR}/share/glib-2.0/schemas" 2>/dev/null || true
 
 # GDK pixbuf loaders
@@ -282,6 +294,7 @@ PIXBUF_LOADER_DIR="${BREW_PREFIX}/lib/gdk-pixbuf-2.0"
 if [[ -d "$PIXBUF_LOADER_DIR" ]]; then
   mkdir -p "${RESOURCES_DIR}/lib"
   cp -RL "$PIXBUF_LOADER_DIR" "${RESOURCES_DIR}/lib/" 2>/dev/null || true
+  MACOS_BUNDLED_DATA_SOURCES+=("$PIXBUF_LOADER_DIR")
 fi
 
 # Bundle the loader-cache generator. Runtime setup invokes this exact signed
@@ -294,17 +307,22 @@ if [[ ! -x "$PIXBUF_QUERY_SRC" ]]; then
 fi
 cp "$PIXBUF_QUERY_SRC" "$PIXBUF_QUERY_DEST"
 chmod u+w "$PIXBUF_QUERY_DEST"
+MACOS_BUNDLED_BINARY_SOURCES+=("$PIXBUF_QUERY_SRC")
 
 # ── Bundle GStreamer plugins ─────────────────────────────────────────────────
 GST_PLUGIN_SRC="${BREW_PREFIX}/lib/gstreamer-1.0"
 GST_PLUGIN_DEST="${RESOURCES_DIR}/lib/gstreamer-1.0"
 if [[ -d "$GST_PLUGIN_SRC" ]]; then
-  info "Bundling GStreamer plugins..."
+  info "Bundling allowlisted GStreamer plugins..."
   mkdir -p "$GST_PLUGIN_DEST"
   GST_PLUGIN_COUNT=0
   GST_PLUGIN_EXCLUDED=0
-  for plugin in "${GST_PLUGIN_SRC}"/*.dylib; do
-    [[ -f "$plugin" ]] || continue
+  for plugin_name in "${MACOS_GSTREAMER_PLUGIN_NAMES[@]}"; do
+    plugin="${GST_PLUGIN_SRC}/libgst${plugin_name}.dylib"
+    if [[ ! -f "$plugin" ]]; then
+      warn "Allowlisted GStreamer plugin is not installed: libgst${plugin_name}.dylib"
+      continue
+    fi
     if ! macos_stage_gstreamer_plugin "$plugin" "$GST_PLUGIN_DEST"; then
       error "GStreamer plugin policy inspection failed: ${MACOS_PACKAGE_POLICY_REASON}"
     fi
@@ -312,6 +330,7 @@ if [[ -d "$GST_PLUGIN_SRC" ]]; then
       warn "Excluding GStreamer plugin: ${MACOS_PACKAGE_POLICY_REASON}"
       GST_PLUGIN_EXCLUDED=$((GST_PLUGIN_EXCLUDED + 1))
     else
+      MACOS_BUNDLED_BINARY_SOURCES+=("$plugin")
       GST_PLUGIN_COUNT=$((GST_PLUGIN_COUNT + 1))
     fi
   done
@@ -340,6 +359,7 @@ if [[ -n "$GST_SCANNER_SRC" ]]; then
   info "Bundling gst-plugin-scanner from ${GST_SCANNER_SRC}..."
   cp "$GST_SCANNER_SRC" "$GST_SCANNER_DEST"
   chmod u+w "$GST_SCANNER_DEST"
+  MACOS_BUNDLED_BINARY_SOURCES+=("$GST_SCANNER_SRC")
 else
   warn "gst-plugin-scanner not found in any known Homebrew location!"
   warn "GStreamer playback may fail when launched from the .app bundle."
@@ -448,6 +468,7 @@ copy_dylib() {
   [[ -f "$dest" ]] && return 1
   cp "$src" "$dest"
   chmod u+w "$dest"
+  MACOS_BUNDLED_BINARY_SOURCES+=("$src")
   install_name_tool -id "@executable_path/../Frameworks/${basename}" "$dest" 2>/dev/null || true
   return 0
 }
@@ -572,6 +593,16 @@ rm -f "$PIXBUF_CACHE"
 # No mutable runtime cache may enter the code signature or be written beside
 # the executable on first launch.
 rm -f "${APP_BUNDLE}/Contents/MacOS/gst-registry.bin"
+
+# Attribute every copied Homebrew file and ship its license files before the
+# bundle is sealed; the notices and plugin allowlist are release contracts.
+if ! macos_write_third_party_notices "$RESOURCES_DIR" "$HOMEBREW_CELLAR" "$REPO_ROOT"; then
+  error "Could not write third-party notices: ${MACOS_PACKAGE_POLICY_REASON}"
+fi
+if ! macos_validate_release_contents "$APP_BUNDLE"; then
+  error "macOS release contents validation failed: ${MACOS_PACKAGE_POLICY_REASON}"
+fi
+info "Third-party notices and the GStreamer plugin allowlist passed."
 
 # Verify critical GStreamer plugins for audio playback. Tributary explicitly
 # owns the system-default route through identity → capsfilter → osxaudiosink,
@@ -701,6 +732,9 @@ info "Signed runtime probe and final signature verification passed."
 if $MAKE_DMG; then
   if ! macos_validate_bundle_copy_control "$APP_BUNDLE"; then
     error "macOS bundle component-policy validation failed before DMG creation: ${MACOS_PACKAGE_POLICY_REASON}"
+  fi
+  if ! macos_validate_release_contents "$APP_BUNDLE"; then
+    error "macOS release contents validation failed before DMG creation: ${MACOS_PACKAGE_POLICY_REASON}"
   fi
   info "macOS bundle component policy passed before DMG creation."
   info "Creating .dmg disk image..."

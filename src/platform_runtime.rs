@@ -2193,6 +2193,186 @@ finally {
         );
     }
 
+    /// Run the Windows release-contents helpers against a synthetic MSYS2
+    /// root: the plugin allowlist, stale-member purges, notice attribution,
+    /// and the gdbus/notices contract all fail closed.
+    #[test]
+    fn powershell_release_contents_helpers_enforce_allowlist_and_notices() {
+        let script = include_str!("../scripts/build-windows.ps1");
+        let region = |start: &str, end: &str| {
+            let from = script.find(start).expect(start);
+            &script[from..from + script[from..].find(end).expect(end)]
+        };
+        let helpers = [
+            region(
+                "function Import-ForbiddenBundledComponentPolicy",
+                "$RepositoryRoot = ",
+            ),
+            region(
+                "function Test-ForbiddenBundledComponentName",
+                "# <<< Windows release contents helpers",
+            ),
+            region(
+                "function Get-ValidatedWindowsBundleCopySourceItem",
+                "# Helper: copy a single file only if",
+            ),
+        ]
+        .concat();
+
+        let temp = tempfile::tempdir().unwrap();
+        let msys = temp.path().join("msys64");
+        let dist = temp.path().join("dist with spaces");
+        let write = |path: PathBuf, contents: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        };
+        let database = msys.join("var/lib/pacman/local");
+        write(
+            database.join("mingw-w64-clang-x86_64-glib2-2.90.0-1/desc"),
+            "%NAME%\nmingw-w64-clang-x86_64-glib2\n\n%BASE%\nmingw-w64-glib2\n\n\
+             %VERSION%\n2.90.0-1\n\n%URL%\nhttps://gitlab.gnome.org/GNOME/glib\n\n\
+             %LICENSE%\nspdx:LGPL-2.1-or-later\n\n",
+        );
+        write(
+            database.join("mingw-w64-clang-x86_64-glib2-2.90.0-1/files"),
+            "%FILES%\nclang64/\nclang64/bin/\nclang64/bin/gdbus.exe\n\
+             clang64/bin/libgio-2.0-0.dll\nclang64/bin/libglib-2.0-0.dll\n\
+             clang64/share/licenses/glib2/\nclang64/share/licenses/glib2/COPYING\n\n",
+        );
+        write(
+            database.join("mingw-w64-clang-x86_64-gstreamer-1.28.7-1/desc"),
+            "%NAME%\nmingw-w64-clang-x86_64-gstreamer\n\n%BASE%\nmingw-w64-gstreamer\n\n\
+             %VERSION%\n1.28.7-1\n\n%LICENSE%\nspdx:LGPL-2.1-or-later\n\n",
+        );
+        write(
+            database.join("mingw-w64-clang-x86_64-gstreamer-1.28.7-1/files"),
+            "%FILES%\nclang64/lib/gstreamer-1.0/libgstcoreelements.dll\n\
+             clang64/libexec/gstreamer-1.0/gst-plugin-scanner.exe\n\n",
+        );
+        write(msys.join("clang64/share/licenses/glib2/COPYING"), "LGPL\n");
+        for member in [
+            "tributary.exe",
+            "gdbus.exe",
+            "libgio-2.0-0.dll",
+            "libglib-2.0-0.dll",
+            "gst-plugin-scanner.exe",
+            "lib/gstreamer-1.0/libgstcoreelements.dll",
+            "share/glib-2.0/schemas/gschemas.compiled",
+        ] {
+            write(dist.join(member), "MZ");
+        }
+
+        let command = [
+            "$ErrorActionPreference = \"Stop\"\nSet-StrictMode -Version Latest\n\
+             function Write-Err { throw \"$args\" }\n",
+            &helpers,
+            r#"
+function Assert-Failure {
+    param([scriptblock]$Action, [string]$Expected)
+    $failure = $null
+    try { & $Action } catch { $failure = $_.Exception.Message }
+    if ($null -eq $failure -or -not $failure.Contains($Expected)) {
+        throw "expected a failure containing '$Expected', got: $failure"
+    }
+}
+
+$repository = $env:TRIBUTARY_REPOSITORY
+$dist = $env:TRIBUTARY_DIST
+$msys = $env:TRIBUTARY_MSYS
+$packaging = [System.IO.Path]::Combine($repository, 'build-aux', 'packaging')
+$ForbiddenBundledComponentTokens = @(Import-ForbiddenBundledComponentPolicy (
+    Join-Path $packaging 'forbidden-bundled-components.txt'))
+$BundledGStreamerPluginNames = @(Import-BundledGStreamerPluginAllowlist (
+    Join-Path $packaging 'bundled-gstreamer-plugins.txt') 'windows')
+if (-not ($BundledGStreamerPluginNames -ccontains 'wasapi2') -or
+    ($BundledGStreamerPluginNames -ccontains 'osxaudio')) {
+    throw "allowlist platform filtering failed"
+}
+function Write-Notices {
+    Write-WindowsThirdPartyNotices -Root $dist -Msys2Root $msys -MsysEnv 'clang64' `
+        -PackagePrefix 'mingw-w64-clang-x86_64' -RepositoryRoot $repository
+}
+
+$packageCount = Write-Notices
+if ($packageCount -ne 2) { throw "expected two attributed packages, got $packageCount" }
+Assert-WindowsBundleReleaseContents $dist
+$notices = [System.IO.File]::ReadAllText((Join-Path $dist 'THIRD-PARTY-NOTICES.txt'))
+foreach ($expected in @(
+    'built by MSYS2 (https://www.msys2.org).',
+    'glib2 2.90.0-1',
+    '  License: LGPL-2.1-or-later',
+    '  Source: https://repo.msys2.org/mingw/sources/mingw-w64-glib2-2.90.0-1.src.tar.zst',
+    '  License files: licenses/glib2/COPYING',
+    'gstreamer 1.28.7-1',
+    '  License files: none shipped by the package; see its source'
+)) {
+    if (-not $notices.Contains($expected)) { throw "notices lack: $expected" }
+}
+foreach ($license in @('glib2/COPYING', 'common/GPL-3.0.txt', 'common/LGPL-2.1.txt')) {
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $dist 'licenses') $license) -PathType Leaf)) {
+        throw "license file was not bundled: $license"
+    }
+}
+
+$pluginDir = [System.IO.Path]::Combine($dist, 'lib', 'gstreamer-1.0')
+[System.IO.File]::WriteAllText((Join-Path $pluginDir 'libgstx264.dll'), 'MZ')
+New-Item -ItemType Directory -Force ([System.IO.Path]::Combine($pluginDir, 'include', 'gst')) | Out-Null
+Assert-Failure { Assert-WindowsBundleReleaseContents $dist } 'outside the allowlist'
+$removed = Remove-WindowsBundleMembers @(Get-UnlistedWindowsGStreamerPluginMembers $dist)
+if ($removed -ne 3) { throw "expected three unlisted plugin members, removed $removed" }
+Assert-WindowsBundleReleaseContents $dist
+
+[System.IO.File]::WriteAllText((Join-Path $dist 'libglib-2.0.dll.a'), 'archive')
+Assert-Failure { Assert-WindowsBundleReleaseContents $dist } 'static or import library'
+$null = Remove-WindowsBundleMembers @(Get-WindowsBundleImportLibraryMembers $dist)
+
+[System.IO.File]::WriteAllText((Join-Path $dist 'libunowned.dll'), 'MZ')
+Assert-Failure { $null = Write-Notices } 'libunowned.dll'
+Remove-Item -LiteralPath (Join-Path $dist 'libunowned.dll')
+$null = Write-Notices
+Remove-Item -LiteralPath (Join-Path $dist 'gdbus.exe')
+Assert-Failure { Assert-WindowsBundleReleaseContents $dist } 'gdbus.exe'
+"#,
+        ]
+        .concat();
+
+        let run = |program: &str| {
+            std::process::Command::new(program)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .env("TRIBUTARY_REPOSITORY", env!("CARGO_MANIFEST_DIR"))
+                .env("TRIBUTARY_DIST", &dist)
+                .env("TRIBUTARY_MSYS", &msys)
+                .output()
+        };
+        let program = if cfg!(target_os = "windows") {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        };
+        let output = match run(program) {
+            Ok(output) => output,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && !cfg!(target_os = "windows") =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not run {program} release-contents regression: {error}"),
+        };
+        let Some(output) =
+            rerun_on_powershell_startup_crash("release-contents regression", output, || {
+                run(program)
+            })
+        else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "PowerShell release-contents regression failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn windows_script_runs_a_sanitized_deadline_bounded_exact_probe() {
         let script = include_str!("../scripts/build-windows.ps1");

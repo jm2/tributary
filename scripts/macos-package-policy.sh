@@ -449,3 +449,249 @@ macos_validate_bundle_copy_control() {
   MACOS_PACKAGE_POLICY_RESULT="allowed"
   return 0
 }
+
+# The release carries only allowlisted GStreamer plugins. Entries are
+# "<name> [windows|macos]"; malformed, duplicate, and forbidden names fail the
+# load so the list cannot silently widen the bundle. Load the bundled-component
+# policy first.
+MACOS_GSTREAMER_PLUGIN_NAMES=()
+
+macos_gstreamer_allowlist_load() {
+  local allowlist="$1"
+  local platform="$2"
+  local line entry name entry_platform
+
+  MACOS_GSTREAMER_PLUGIN_NAMES=()
+  MACOS_PACKAGE_POLICY_REASON=""
+  if [[ $MACOS_FORBIDDEN_COMPONENT_TOKEN_COUNT -eq 0 ]]; then
+    MACOS_PACKAGE_POLICY_REASON="bundled-component policy has not been loaded"
+    return 1
+  fi
+  if [[ ! -f "$allowlist" ]]; then
+    MACOS_PACKAGE_POLICY_REASON="Required GStreamer plugin allowlist is missing: ${allowlist}"
+    return 1
+  fi
+
+  local seen=$'\n'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    entry="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$entry" || "$entry" == \#* ]] && continue
+    if [[ ! "$entry" =~ ^([a-z0-9_]+)([[:space:]]+(windows|macos))?$ ]]; then
+      MACOS_GSTREAMER_PLUGIN_NAMES=()
+      MACOS_PACKAGE_POLICY_REASON="GStreamer plugin allowlist contains an invalid entry: '${entry}'"
+      return 1
+    fi
+    name="${BASH_REMATCH[1]}"
+    entry_platform="${BASH_REMATCH[3]}"
+    if [[ "$seen" == *$'\n'"${name}"$'\n'* ]]; then
+      MACOS_GSTREAMER_PLUGIN_NAMES=()
+      MACOS_PACKAGE_POLICY_REASON="GStreamer plugin allowlist lists '${name}' more than once"
+      return 1
+    fi
+    seen+="${name}"$'\n'
+    if macos_copy_control_path_is_prohibited "libgst${name}"; then
+      MACOS_GSTREAMER_PLUGIN_NAMES=()
+      MACOS_PACKAGE_POLICY_REASON="GStreamer plugin allowlist names a forbidden component: '${name}'"
+      return 1
+    fi
+    if [[ -z "$entry_platform" || "$entry_platform" == "$platform" ]]; then
+      MACOS_GSTREAMER_PLUGIN_NAMES+=("$name")
+    fi
+  done < "$allowlist"
+
+  if [[ ${#MACOS_GSTREAMER_PLUGIN_NAMES[@]} -eq 0 ]]; then
+    MACOS_PACKAGE_POLICY_REASON="GStreamer plugin allowlist contains no ${platform} plugins: ${allowlist}"
+    return 1
+  fi
+  return 0
+}
+
+macos_gstreamer_plugin_is_allowlisted() {
+  local filename="$1"
+  local name known
+  [[ "$filename" =~ ^libgst([a-z0-9_]+)\.dylib$ ]] || return 1
+  name="${BASH_REMATCH[1]}"
+  for known in ${MACOS_GSTREAMER_PLUGIN_NAMES[@]+"${MACOS_GSTREAMER_PLUGIN_NAMES[@]}"}; do
+    [[ "$known" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+# Fail unless every member of the plugin directory is a regular, allowlisted
+# plugin file directly inside it.
+macos_validate_gstreamer_plugin_allowlist() {
+  local plugin_dir="$1"
+  local member relative listing
+
+  MACOS_PACKAGE_POLICY_REASON=""
+  if [[ ! -d "$plugin_dir" ]]; then
+    MACOS_PACKAGE_POLICY_REASON="GStreamer plugin directory is missing: ${plugin_dir}"
+    return 1
+  fi
+  if ! listing="$("${MACOS_FIND_COMMAND:-find}" "$plugin_dir" -mindepth 1 -print)"; then
+    MACOS_PACKAGE_POLICY_REASON="could not enumerate GStreamer plugin directory: ${plugin_dir}"
+    return 2
+  fi
+  while IFS= read -r member; do
+    [[ -n "$member" ]] || continue
+    relative="${member#"$plugin_dir"/}"
+    if [[ "$relative" == */* || -L "$member" || ! -f "$member" ]] \
+      || ! macos_gstreamer_plugin_is_allowlisted "$relative"; then
+      MACOS_PACKAGE_POLICY_REASON="GStreamer plugin directory contains a member outside the allowlist: ${relative}"
+      return 1
+    fi
+  done <<< "$listing"
+  return 0
+}
+
+# Print the physical path of an existing file or directory, resolving
+# symlinks in its final component and in every parent directory.
+macos_physical_path() {
+  local path="$1"
+  local target parent hops=0
+  while [[ -L "$path" ]]; do
+    target="$(readlink "$path")" || return 1
+    [[ "$target" == /* ]] || target="$(dirname -- "$path")/${target}"
+    path="$target"
+    hops=$((hops + 1))
+    [[ $hops -le 40 ]] || return 1
+  done
+  [[ -e "$path" ]] || return 1
+  parent="$(cd -P -- "$(dirname -- "$path")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$parent" "$(basename -- "$path")"
+}
+
+# Set MACOS_HOMEBREW_KEG to "<formula>/<version>" when a bundled source path
+# resolves into a keg below the given physical Cellar directory.
+MACOS_HOMEBREW_KEG=""
+macos_homebrew_keg() {
+  local source="$1"
+  local cellar="$2"
+  local physical rest formula
+  MACOS_HOMEBREW_KEG=""
+  physical="$(macos_physical_path "$source")" || return 1
+  [[ "$physical" == "$cellar"/*/*/* ]] || return 1
+  rest="${physical#"$cellar"/}"
+  formula="${rest%%/*}"
+  rest="${rest#*/}"
+  MACOS_HOMEBREW_KEG="${formula}/${rest%%/*}"
+}
+
+# Print the first string value of a key in a Homebrew keg's SBOM, which
+# Homebrew writes one key per line.
+macos_keg_sbom_value() {
+  local sbom="$1"
+  local key="$2"
+  [[ -f "$sbom" ]] || return 0
+  sed -n "s/^[[:space:]]*\"${key}\":[[:space:]]*\"\\(.*\\)\",\\{0,1\\}[[:space:]]*\$/\\1/p" "$sbom" \
+    | sed -n '1p'
+}
+
+# Attribute every bundled Homebrew file to its keg, copy each keg's license
+# files, and write THIRD-PARTY-NOTICES.txt into the app's Resources.
+# MACOS_BUNDLED_BINARY_SOURCES lists copied Mach-O sources, each of which must
+# belong to a keg; MACOS_BUNDLED_DATA_SOURCES lists copied trees whose
+# linked members are attributed when they come from a keg.
+MACOS_BUNDLED_BINARY_SOURCES=()
+MACOS_BUNDLED_DATA_SOURCES=()
+
+macos_write_third_party_notices() {
+  local resources_dir="$1"
+  local cellar="$2"
+  local repository_root="$3"
+  local notices="${resources_dir}/THIRD-PARTY-NOTICES.txt"
+  local licenses="${resources_dir}/licenses"
+  local kegs=$'\n' source tree member members keg formula version keg_dir
+  local license download license_file license_files license_list header text
+
+  # Callers test this function in a condition, where errexit does not apply,
+  # so every write checks its own status.
+  MACOS_PACKAGE_POLICY_REASON="could not write third-party notices into ${resources_dir}"
+  rm -rf "$licenses" "$notices" || return 1
+
+  for source in ${MACOS_BUNDLED_BINARY_SOURCES[@]+"${MACOS_BUNDLED_BINARY_SOURCES[@]}"}; do
+    if ! macos_homebrew_keg "$source" "$cellar"; then
+      MACOS_PACKAGE_POLICY_REASON="no Homebrew keg owns bundled binary ${source}"
+      return 1
+    fi
+    [[ "$kegs" == *$'\n'"${MACOS_HOMEBREW_KEG}"$'\n'* ]] || kegs+="${MACOS_HOMEBREW_KEG}"$'\n'
+  done
+  for tree in ${MACOS_BUNDLED_DATA_SOURCES[@]+"${MACOS_BUNDLED_DATA_SOURCES[@]}"}; do
+    [[ -e "$tree" ]] || continue
+    if ! members="$("${MACOS_FIND_COMMAND:-find}" "$tree" \( -type l -o -type f \) -print)"; then
+      MACOS_PACKAGE_POLICY_REASON="could not enumerate bundled data source ${tree}"
+      return 2
+    fi
+    while IFS= read -r member; do
+      [[ -n "$member" ]] || continue
+      macos_homebrew_keg "$member" "$cellar" || continue
+      [[ "$kegs" == *$'\n'"${MACOS_HOMEBREW_KEG}"$'\n'* ]] || kegs+="${MACOS_HOMEBREW_KEG}"$'\n'
+    done <<< "$members"
+  done
+
+  MACOS_PACKAGE_POLICY_REASON="could not write third-party notices into ${resources_dir}"
+  mkdir -p "${licenses}/common" || return 1
+  cp "${repository_root}/LICENSE" "${licenses}/common/GPL-3.0.txt" || return 1
+  for text in "${repository_root}/build-aux/packaging/licenses/"*.txt; do
+    cp "$text" "${licenses}/common/" || return 1
+  done
+
+  header="$(cat "${repository_root}/build-aux/packaging/THIRD-PARTY-NOTICES.header.txt")" \
+    || return 1
+  header="${header//@PACKAGER@/Homebrew (https://brew.sh)}"
+  header="${header//@RECIPES@/https://github.com/Homebrew/homebrew-core}"
+  printf '%s\n' "$header" > "$notices" || return 1
+
+  while IFS= read -r keg; do
+    [[ -n "$keg" ]] || continue
+    formula="${keg%%/*}"
+    version="${keg#*/}"
+    keg_dir="${cellar}/${keg}"
+    license="$(macos_keg_sbom_value "${keg_dir}/sbom.spdx.json" licenseConcluded)"
+    if [[ -z "$license" || "$license" == NOASSERTION ]]; then
+      license="$(macos_keg_sbom_value "${keg_dir}/sbom.spdx.json" licenseDeclared)"
+    fi
+    [[ -n "$license" && "$license" != NOASSERTION ]] || license="not recorded in the keg"
+    download="$(macos_keg_sbom_value "${keg_dir}/sbom.spdx.json" downloadLocation)"
+    [[ -n "$download" && "$download" != NOASSERTION ]] \
+      || download="https://formulae.brew.sh/formula/${formula}"
+
+    # Homebrew installs a formula's top-level license files into its keg.
+    if ! license_files="$("${MACOS_FIND_COMMAND:-find}" "$keg_dir" -maxdepth 1 -type f \( \
+      -iname 'COPYING*' -o -iname 'LICENSE*' -o -iname 'LICENCE*' \
+      -o -iname 'NOTICE*' -o -iname 'COPYRIGHT*' \) -print)"; then
+      MACOS_PACKAGE_POLICY_REASON="could not enumerate license files in keg ${keg}"
+      return 2
+    fi
+    license_list=""
+    while IFS= read -r license_file; do
+      [[ -n "$license_file" ]] || continue
+      mkdir -p "${licenses}/${formula}" || return 1
+      cp "$license_file" "${licenses}/${formula}/" || return 1
+      license_list+="${license_list:+, }licenses/${formula}/$(basename -- "$license_file")"
+    done <<< "$(printf '%s\n' "$license_files" | LC_ALL=C sort)"
+    [[ -n "$license_list" ]] || license_list="none shipped by the keg; see its source"
+
+    printf '\n%s %s\n  License: %s\n  Source: %s\n  Build recipe: %s\n  License files: %s\n' \
+      "$formula" "$version" "$license" "$download" \
+      "https://formulae.brew.sh/formula/${formula}" "$license_list" >> "$notices" || return 1
+  done <<< "$(printf '%s' "$kegs" | LC_ALL=C sort)"
+  MACOS_PACKAGE_POLICY_REASON=""
+  return 0
+}
+
+# Fail closed unless the app holds only allowlisted plugins and its
+# third-party notices, license texts, and source offer.
+macos_validate_release_contents() {
+  local app_bundle="$1"
+  local resources="${app_bundle}/Contents/Resources"
+  if ! macos_validate_gstreamer_plugin_allowlist "${resources}/lib/gstreamer-1.0"; then
+    return 1
+  fi
+  if [[ ! -f "${resources}/licenses/common/GPL-3.0.txt" ]] \
+    || ! grep -q 'Source code offer' "${resources}/THIRD-PARTY-NOTICES.txt" 2>/dev/null; then
+    MACOS_PACKAGE_POLICY_REASON="macOS bundle is missing its third-party notices or license texts"
+    return 1
+  fi
+  return 0
+}

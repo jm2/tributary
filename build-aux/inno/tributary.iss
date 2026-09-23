@@ -46,7 +46,7 @@ PrivilegesRequiredOverridesAllowed=commandline
 DisableDirPage=auto
 DisableProgramGroupPage=auto
 CloseApplications=yes
-CloseApplicationsFilter=tributary.exe
+CloseApplicationsFilter=tributary.exe,gdbus.exe
 SetupLogging=yes
 #if TargetArch == "arm64"
 ArchitecturesAllowed=arm64
@@ -61,6 +61,14 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[InstallDelete]
+; The bundle's plugin set, DLL closure, and license files change between
+; releases. Remove the previous ones so a plugin or library dropped from the
+; release does not stay loadable in an upgraded installation.
+Type: filesandordirs; Name: "{app}\lib\gstreamer-1.0"
+Type: files; Name: "{app}\*.dll"
+Type: filesandordirs; Name: "{app}\licenses"
 
 [Files]
 ; Copy everything from the bundled dist directory

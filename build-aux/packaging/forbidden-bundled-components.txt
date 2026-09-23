@@ -1,5 +1,6 @@
 # Case-insensitive filename substrings that release bundles must not contain.
-# Keep this focused on optical-disc copy-control and proprietary DRM support;
+# Keep this focused on optical-disc copy-control, proprietary DRM support, and
+# components whose licenses forbid distribution inside a GPL application;
 # ordinary media codecs and general-purpose cryptography are not prohibited.
 dvdcss
 dvd-pkg
@@ -18,3 +19,6 @@ widevinecdm
 playready
 fairplay
 keydb.cfg
+# The Fraunhofer FDK AAC license is incompatible with the GPL.
+fdk-aac
+fdkaac

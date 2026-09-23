@@ -207,13 +207,14 @@ function Assert-WindowsBundleRootIsNotReparsePoint {
 
 # Delete selected entries deepest-first and non-recursively. DirectoryInfo's
 # zero-argument Delete removes a directory or reparse-point link itself; it
-# cannot walk into a junction target. Every real descendant was enumerated and
-# selected separately because its relative path inherits the forbidden parent.
-function Remove-ForbiddenWindowsBundleMembers {
-    param([string]$Root)
-    $forbiddenMembers = @(Get-ForbiddenWindowsBundleMembers $Root | Sort-Object `
+# cannot walk into a junction target. Every real descendant must be selected
+# separately: a forbidden parent's descendants inherit its relative path, and
+# callers removing a whole directory enumerate its subtree.
+function Remove-WindowsBundleMembers {
+    param([AllowEmptyCollection()][System.IO.FileSystemInfo[]]$Members)
+    $orderedMembers = @($Members | Sort-Object `
         @{ Expression = { $_.FullName.Length }; Descending = $true })
-    foreach ($member in $forbiddenMembers) {
+    foreach ($member in $orderedMembers) {
         try {
             if (($member.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
                 $member.Attributes = $member.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
@@ -223,10 +224,15 @@ function Remove-ForbiddenWindowsBundleMembers {
         catch [System.IO.FileNotFoundException] { }
         catch [System.IO.DirectoryNotFoundException] { }
         catch {
-            throw "Could not safely remove forbidden bundle member '$($member.FullName)': $($_.Exception.Message)"
+            throw "Could not safely remove bundle member '$($member.FullName)': $($_.Exception.Message)"
         }
     }
-    return $forbiddenMembers.Count
+    return $orderedMembers.Count
+}
+
+function Remove-ForbiddenWindowsBundleMembers {
+    param([string]$Root)
+    return Remove-WindowsBundleMembers @(Get-ForbiddenWindowsBundleMembers $Root)
 }
 
 function Assert-WindowsBundleComponentPolicy {
@@ -289,6 +295,283 @@ function Assert-WindowsZipComponentPolicy {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
         Write-Err "Completed Windows ZIP contains $forbiddenEntryCount forbidden entry name(s): $sample"
     }
+}
+
+# >>> Windows release contents helpers
+# The release carries only allowlisted GStreamer plugins. The loader rejects
+# malformed, duplicate, and forbidden entries so the list cannot silently widen
+# the bundle.
+function Import-BundledGStreamerPluginAllowlist {
+    param([string]$Path, [string]$Platform)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Required GStreamer plugin allowlist is missing: $Path"
+    }
+
+    $names = [System.Collections.Generic.List[string]]::new()
+    $known = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $entry = $line.Trim()
+        if (-not $entry -or $entry.StartsWith('#')) { continue }
+        if ($entry -cnotmatch '^([a-z0-9_]+)(?:\s+(windows|macos))?$') {
+            throw "GStreamer plugin allowlist contains an invalid entry: '$entry'"
+        }
+        $name = $Matches[1]
+        $entryPlatform = $Matches[2]
+        if (-not $known.Add($name)) {
+            throw "GStreamer plugin allowlist lists '$name' more than once"
+        }
+        if (Test-ForbiddenBundledComponentName "libgst$name") {
+            throw "GStreamer plugin allowlist names a forbidden component: '$name'"
+        }
+        if (-not $entryPlatform -or $entryPlatform -ceq $Platform) { $names.Add($name) }
+    }
+    if ($names.Count -eq 0) {
+        throw "GStreamer plugin allowlist contains no $Platform plugins: $Path"
+    }
+    return @($names)
+}
+
+function Test-BundledGStreamerPluginFileName {
+    param([AllowNull()][string]$FileName)
+    if ($FileName -cnotmatch '^libgst([a-z0-9_]+)\.dll$') { return $false }
+    return $BundledGStreamerPluginNames -ccontains $Matches[1]
+}
+
+# Anything in the plugin directory other than an allowlisted plugin DLL,
+# including nested directories left by an older incremental bundle.
+function Get-UnlistedWindowsGStreamerPluginMembers {
+    param([string]$Root)
+    $pluginDir = [System.IO.Path]::Combine($Root, 'lib', 'gstreamer-1.0')
+    if (-not (Test-Path -LiteralPath $pluginDir -PathType Container)) { return @() }
+    $pluginDirFull = (Get-Item -LiteralPath $pluginDir -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    return @(Get-WindowsTreeMembersWithoutReparseTraversal $pluginDirFull | Where-Object {
+        $relativePath = $_.FullName.Substring($pluginDirFull.Length).TrimStart([char[]]@('\', '/'))
+        $isDirectory = ($_.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+        $isDirectory -or $relativePath -match '[\\/]' -or
+            -not (Test-BundledGStreamerPluginFileName $relativePath)
+    })
+}
+
+# Static and import libraries (.a, .dll.a) are link-time inputs only.
+function Get-WindowsBundleImportLibraryMembers {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+    return @(Get-WindowsTreeMembersWithoutReparseTraversal $Root | Where-Object {
+        ($_.Attributes -band [System.IO.FileAttributes]::Directory) -eq 0 -and
+            $_.Extension -ieq '.a'
+    })
+}
+
+# Fail closed unless the tree holds only allowlisted plugins, no link-time
+# libraries, GLib's D-Bus helper beside libgio, and the third-party notices.
+function Assert-WindowsBundleReleaseContents {
+    param([string]$Root)
+    $unlistedPlugins = @(Get-UnlistedWindowsGStreamerPluginMembers $Root)
+    if ($unlistedPlugins.Count -gt 0) {
+        $sample = @($unlistedPlugins | Select-Object -First 8 | ForEach-Object { $_.Name }) -join ', '
+        throw "Windows bundle contains $($unlistedPlugins.Count) GStreamer plugin member(s) outside the allowlist: $sample"
+    }
+    $importLibraries = @(Get-WindowsBundleImportLibraryMembers $Root)
+    if ($importLibraries.Count -gt 0) {
+        $sample = @($importLibraries | Select-Object -First 8 | ForEach-Object { $_.Name }) -join ', '
+        throw "Windows bundle contains $($importLibraries.Count) static or import library file(s): $sample"
+    }
+    foreach ($required in @(
+        'gdbus.exe',
+        'libgio-2.0-0.dll',
+        'THIRD-PARTY-NOTICES.txt',
+        [System.IO.Path]::Combine('licenses', 'common', 'GPL-3.0.txt')
+    )) {
+        $item = Get-Item -LiteralPath (Join-Path $Root $required) -Force -ErrorAction SilentlyContinue
+        $unexpected = [System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint
+        if ($null -eq $item -or ($item.Attributes -band $unexpected) -ne 0) {
+            throw "Windows bundle is missing required regular file $required"
+        }
+    }
+    $notices = [System.IO.File]::ReadAllText((Join-Path $Root 'THIRD-PARTY-NOTICES.txt'))
+    if (-not $notices.Contains('Source code offer')) {
+        throw "Windows third-party notices do not contain the source code offer"
+    }
+}
+
+# Read the %SECTION% blocks of one pacman database entry (desc or files).
+function Get-PacmanDatabaseSections {
+    param([string]$Path)
+    $sections = @{}
+    $current = $null
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -cmatch '^%([A-Z0-9]+)%$') {
+            $current = [System.Collections.Generic.List[string]]::new()
+            $sections[$Matches[1]] = $current
+        }
+        elseif ($null -ne $current -and $line) {
+            $current.Add($line)
+        }
+    }
+    return $sections
+}
+
+# Attribute every bundled MSYS2 file to its installed pacman package, copy the
+# license files those packages ship, and write THIRD-PARTY-NOTICES.txt. A DLL
+# or EXE that no package owns cannot be attributed and fails the bundle.
+function Write-WindowsThirdPartyNotices {
+    param(
+        [string]$Root,
+        [string]$Msys2Root,
+        [string]$MsysEnv,
+        [string]$PackagePrefix,
+        [string]$RepositoryRoot
+    )
+    $rootFull = (Get-Item -LiteralPath $Root -Force -ErrorAction Stop).FullName.TrimEnd(
+        [char[]]@('\', '/')
+    )
+    $database = [System.IO.Path]::Combine($Msys2Root, 'var', 'lib', 'pacman', 'local')
+    if (-not (Test-Path -LiteralPath $database -PathType Container)) {
+        throw "MSYS2 package database was not found: $database"
+    }
+
+    $noticesPath = Join-Path $rootFull 'THIRD-PARTY-NOTICES.txt'
+    $licensesRoot = Join-Path $rootFull 'licenses'
+    Remove-Item -LiteralPath $noticesPath -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $licensesRoot) {
+        $staleLicenses = @(Get-WindowsTreeMembersWithoutReparseTraversal $licensesRoot)
+        $staleLicenses += Get-Item -LiteralPath $licensesRoot -Force -ErrorAction Stop
+        $null = Remove-WindowsBundleMembers $staleLicenses
+    }
+
+    # Map each bundled file to the MSYS2 path it was copied from: root DLLs and
+    # gdbus.exe come from bin, the plugin scanner from libexec, and every other
+    # member keeps its path below the environment prefix.
+    $sources = @{}
+    foreach ($member in @(Get-WindowsTreeMembersWithoutReparseTraversal $rootFull)) {
+        if (($member.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { continue }
+        $relative = $member.FullName.Substring($rootFull.Length).TrimStart(
+            [char[]]@('\', '/')
+        ).Replace('\', '/')
+        if ($relative -ieq 'tributary.exe') { continue }
+        $source = if ($relative -ieq 'gst-plugin-scanner.exe') {
+            "$MsysEnv/libexec/gstreamer-1.0/gst-plugin-scanner.exe"
+        }
+        elseif ($relative.Contains('/')) { "$MsysEnv/$relative" }
+        else { "$MsysEnv/bin/$relative" }
+        $sources[$source.ToLowerInvariant()] = $relative
+    }
+
+    $licensePrefix = "$MsysEnv/share/licenses/"
+    $attributed = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $packages = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $database -Directory -Force | Sort-Object Name)) {
+        $filesPath = Join-Path $entry.FullName 'files'
+        $descPath = Join-Path $entry.FullName 'desc'
+        if (-not (Test-Path -LiteralPath $filesPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $descPath -PathType Leaf)) { continue }
+        $files = (Get-PacmanDatabaseSections $filesPath)['FILES']
+        if ($null -eq $files) { continue }
+
+        $owned = 0
+        $licenseSources = [System.Collections.Generic.List[string]]::new()
+        foreach ($file in $files) {
+            if ($sources.ContainsKey($file.ToLowerInvariant())) {
+                $null = $attributed.Add($file)
+                $owned++
+            }
+            if ($file.StartsWith($licensePrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $file.EndsWith('/')) {
+                $licenseSources.Add($file)
+            }
+        }
+        if ($owned -eq 0) { continue }
+
+        $desc = Get-PacmanDatabaseSections $descPath
+        $name = [string]$desc['NAME'][0]
+        $version = [string]$desc['VERSION'][0]
+        $base = if ($desc.ContainsKey('BASE')) { [string]$desc['BASE'][0] } else { $name }
+        $shortName = if ($name.StartsWith("$PackagePrefix-")) {
+            $name.Substring($PackagePrefix.Length + 1)
+        }
+        else { $name }
+        $license = if ($desc.ContainsKey('LICENSE')) {
+            @($desc['LICENSE'] | ForEach-Object { $_ -replace '^spdx:\s*', '' }) -join '; '
+        }
+        else { 'not declared by the package' }
+        $homepage = if ($desc.ContainsKey('URL')) { [string]$desc['URL'][0] } else { '' }
+
+        $licenseFiles = [System.Collections.Generic.List[string]]::new()
+        foreach ($licenseSource in $licenseSources) {
+            $relativeLicense = $licenseSource.Substring($licensePrefix.Length)
+            if ($relativeLicense -match '(^|/)\.\.?(/|$)') {
+                throw "MSYS2 package $name lists an unsafe license path: $licenseSource"
+            }
+            $licenseDestination = [System.IO.Path]::Combine($licensesRoot, $relativeLicense)
+            New-Item -ItemType Directory -Force (Split-Path $licenseDestination) | Out-Null
+            Copy-WindowsBundleFileForced ([System.IO.Path]::Combine($Msys2Root, $licenseSource)) `
+                $licenseDestination
+            $licenseFiles.Add("licenses/$relativeLicense")
+        }
+
+        $packages.Add([pscustomobject]@{
+            Name = $shortName
+            Version = $version
+            License = $license
+            Homepage = $homepage
+            Source = "https://repo.msys2.org/mingw/sources/$base-$version.src.tar.zst"
+            LicenseFiles = @($licenseFiles)
+        })
+    }
+
+    $unattributed = @($sources.Keys | Where-Object {
+        $_ -match '\.(dll|drv|exe)$' -and -not $attributed.Contains($_)
+    } | ForEach-Object { $sources[$_] } | Sort-Object)
+    if ($unattributed.Count -gt 0) {
+        $sample = @($unattributed | Select-Object -First 8) -join ', '
+        throw "No installed MSYS2 package owns $($unattributed.Count) bundled binary file(s): $sample"
+    }
+
+    $commonLicenses = [System.IO.Path]::Combine($licensesRoot, 'common')
+    New-Item -ItemType Directory -Force $commonLicenses | Out-Null
+    Copy-WindowsBundleFileForced (Join-Path $RepositoryRoot 'LICENSE') `
+        (Join-Path $commonLicenses 'GPL-3.0.txt')
+    $packagingDir = [System.IO.Path]::Combine($RepositoryRoot, 'build-aux', 'packaging')
+    foreach ($text in @(Get-ChildItem -LiteralPath (Join-Path $packagingDir 'licenses') -File -Filter '*.txt')) {
+        Copy-WindowsBundleFileForced $text.FullName (Join-Path $commonLicenses $text.Name)
+    }
+
+    $header = [System.IO.File]::ReadAllText((Join-Path $packagingDir 'THIRD-PARTY-NOTICES.header.txt'))
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $header = $header.Replace('@PACKAGER@', 'MSYS2 (https://www.msys2.org)').Replace(
+        '@RECIPES@', 'https://github.com/msys2/MINGW-packages'
+    )
+    foreach ($headerLine in ($header.TrimEnd() -split '\r?\n')) { $lines.Add($headerLine) }
+    foreach ($package in @($packages | Sort-Object Name)) {
+        $lines.Add('')
+        $lines.Add("$($package.Name) $($package.Version)")
+        $lines.Add("  License: $($package.License)")
+        if ($package.Homepage) { $lines.Add("  Homepage: $($package.Homepage)") }
+        $lines.Add("  Source: $($package.Source)")
+        if ($package.LicenseFiles.Count -gt 0) {
+            $lines.Add("  License files: $($package.LicenseFiles -join ', ')")
+        }
+        else {
+            $lines.Add('  License files: none shipped by the package; see its source')
+        }
+    }
+    [System.IO.File]::WriteAllLines($noticesPath, $lines, [System.Text.UTF8Encoding]::new($false))
+    return $packages.Count
+}
+# <<< Windows release contents helpers
+
+$BundledGStreamerPluginAllowlistPath = Join-Path $RepositoryRoot 'build-aux\packaging\bundled-gstreamer-plugins.txt'
+try {
+    $BundledGStreamerPluginNames = @(
+        Import-BundledGStreamerPluginAllowlist $BundledGStreamerPluginAllowlistPath 'windows'
+    )
+}
+catch {
+    Write-Err $_.Exception.Message
 }
 
 function Get-BoundedProbeDiagnostic {
@@ -1321,6 +1604,12 @@ if ($InnoSetup -and $SkipBundle) {
     $outputDir = (Resolve-Path "dist").Path
     Assert-WindowsWasapi2ProbeReceipt $sourceDir
     Assert-WindowsBundleComponentPolicy $sourceDir
+    try {
+        Assert-WindowsBundleReleaseContents $sourceDir
+    }
+    catch {
+        Write-Err "Installer source release contents validation failed: $($_.Exception.Message)"
+    }
     $installerPeImportInspector = [System.IO.Path]::GetFullPath(
         (Join-Path $MsysPath "bin\llvm-readobj.exe")
     )
@@ -1550,10 +1839,11 @@ if (-not (Test-Path -LiteralPath $requiredWasapiPluginSrc -PathType Leaf)) {
 Write-Output "  [ok] wasapi2sink plugin"
 
 $pluginWarnings = @()
-foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-libav")) {
+foreach ($plugin in @("gst-plugins-good", "gst-plugins-bad", "gst-plugins-ugly", "gst-libav")) {
     $pattern = switch ($plugin) {
         "gst-plugins-good" { "libgstaudioparsers.dll" }
-        "gst-plugins-bad" { "libgstfdkaac.dll" }
+        "gst-plugins-bad" { "libgstaiff.dll" }
+        "gst-plugins-ugly" { "libgstasf.dll" }
         "gst-libav" { "libgstlibav.dll" }
     }
     $probe = Join-Path $gstPluginDir $pattern
@@ -1690,6 +1980,9 @@ function Sync-Directory {
         }
         if ($isDirectory) { continue }
 
+        # Static and import libraries are link-time inputs, never runtime files.
+        if ($sourceMember.Extension -ieq '.a') { continue }
+
         $sourceFile = $sourceMember
         $destFile = Join-Path $DstDir $relPath
         if (Test-ForbiddenBundledRelativePath $relPath) {
@@ -1808,6 +2101,18 @@ if ($staleForbiddenMemberCount -gt 0) {
 # through a junction into an external destination.
 Assert-WindowsBundleComponentPolicy $DIST
 
+# The plugin allowlist and the dependency closure decide the rest of the tree
+# on every run. Unlisted plugins, link-time libraries, and root DLLs from an
+# older incremental bundle are removed; the closure below copies back each
+# root DLL that is still imported.
+$staleReleaseMembers = @(Get-UnlistedWindowsGStreamerPluginMembers $DIST) +
+    @(Get-WindowsBundleImportLibraryMembers $DIST) +
+    @(Get-ChildItem -LiteralPath $DIST -File -Force | Where-Object { $_.Extension -ieq '.dll' })
+$staleReleaseMemberCount = Remove-WindowsBundleMembers $staleReleaseMembers
+if ($staleReleaseMemberCount -gt 0) {
+    Write-Info "Removed $staleReleaseMemberCount stale plugin, library, or root DLL member(s) from the incremental Windows bundle."
+}
+
 # Always copy the executable (just built).
 $exeBundleDest = Join-Path $DIST (Split-Path $exePath -Leaf)
 Copy-WindowsBundleFileForced $exePath $exeBundleDest
@@ -1823,11 +2128,19 @@ if (Test-Path $loadersSrc) {
     $totalCopied += $n
 }
 
+# Copy only the allowlisted GStreamer plugins. Their native dependencies arrive
+# through the PE import closure below.
 $gstPluginSrc = Join-Path $MsysPath "lib\gstreamer-1.0"
-if (Test-Path $gstPluginSrc) {
-    $n = Sync-Directory $gstPluginSrc (Join-Path $DIST "lib\gstreamer-1.0") `
-        -SkipForbiddenComponents
-    $totalCopied += $n
+$gstPluginDest = Join-Path $DIST "lib\gstreamer-1.0"
+New-Item -ItemType Directory -Force $gstPluginDest | Out-Null
+foreach ($pluginName in $BundledGStreamerPluginNames) {
+    $pluginFile = "libgst$pluginName.dll"
+    $pluginSource = Join-Path $gstPluginSrc $pluginFile
+    if (-not (Test-Path -LiteralPath $pluginSource -PathType Leaf)) {
+        Write-Warn "Allowlisted GStreamer plugin is not installed: $pluginFile"
+        continue
+    }
+    if (Copy-IfNewer $pluginSource (Join-Path $gstPluginDest $pluginFile)) { $totalCopied++ }
 }
 
 # gst-plugin-scanner is a required part of the packaged GStreamer runtime.
@@ -1845,6 +2158,18 @@ if (-not (Test-Path -LiteralPath $gstScannerSrc -PathType Leaf)) {
 Remove-Item -LiteralPath $legacyGstScannerDest -Force -ErrorAction SilentlyContinue
 Copy-WindowsBundleFileForced $gstScannerSrc $gstScannerDest
 Write-Info "Bundled gst-plugin-scanner.exe (unconditional overwrite)."
+
+# GApplication uniqueness needs a D-Bus session bus. On Windows GLib
+# autolaunches one by running gdbus.exe from the directory that holds libgio;
+# without it a second launch silently runs as another full instance. The
+# closure below resolves its imports like every other bundled executable.
+$gdbusSrc = Join-Path $MsysPath "bin\gdbus.exe"
+$gdbusDest = Join-Path $DIST "gdbus.exe"
+if (-not (Test-Path -LiteralPath $gdbusSrc -PathType Leaf)) {
+    Write-Err "Required GLib D-Bus helper not found at $gdbusSrc. Install the matching $PkgPrefix-glib2 package."
+}
+Copy-WindowsBundleFileForced $gdbusSrc $gdbusDest
+Write-Info "Bundled gdbus.exe beside libgio for single-instance activation."
 
 # Resolve all transitive dependencies for the EXE and plugins without loading
 # them. MSYS2's ldd executes each target under its loader and can hang forever
@@ -2080,6 +2405,19 @@ if (Test-Path $schemasSrc) {
 
 Write-Info "Total incremental sync: $totalCopied file(s) updated."
 
+# Attribute every bundled component and ship its license files before the
+# final gates, so the probe, ZIP, and installer all see the finished tree.
+Write-Info "Writing third-party notices..."
+try {
+    $noticePackageCount = Write-WindowsThirdPartyNotices -Root $DIST -Msys2Root $Msys2Root `
+        -MsysEnv $MsysEnv -PackagePrefix $PkgPrefix -RepositoryRoot $RepositoryRoot
+    Assert-WindowsBundleReleaseContents $DIST
+}
+catch {
+    Write-Err "Windows release contents are incomplete: $($_.Exception.Message)"
+}
+Write-Info "Third-party notices cover $noticePackageCount MSYS2 package(s)."
+
 # Do not execute a bundle that violated the shared packaging policy. This also
 # catches stale or indirectly copied files outside the GStreamer plugin tree.
 Assert-WindowsBundleComponentPolicy $DIST
@@ -2268,6 +2606,12 @@ Write-Info "Packaged Windows runtime probe passed."
 # merely the earlier dependency-closure snapshot, is covered by the policy.
 Assert-WindowsBundleComponentPolicy $DIST
 try {
+    Assert-WindowsBundleReleaseContents $DIST
+}
+catch {
+    Write-Err "Final Windows release contents validation failed: $($_.Exception.Message)"
+}
+try {
     Assert-WindowsBundlePeImportPolicy $DIST $peImportInspector
 }
 catch {
@@ -2324,6 +2668,12 @@ if ($InnoSetup) {
     $sourceDir = (Resolve-Path $DIST).Path
     $outputDir = (Resolve-Path "dist").Path
     Assert-WindowsBundleComponentPolicy $sourceDir
+    try {
+        Assert-WindowsBundleReleaseContents $sourceDir
+    }
+    catch {
+        Write-Err "Installer source release contents validation failed: $($_.Exception.Message)"
+    }
 
     Write-Info "Running Inno Setup compiler..."
     & $iscc /DAppVersion="$CargoVersion" /DSourceDir="$sourceDir" /DOutputDir="$outputDir" /DTargetArch="$InnoArch" $issFile
