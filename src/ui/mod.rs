@@ -5,6 +5,7 @@ pub mod album_art_cache;
 pub mod album_art_cell;
 pub mod album_pane_art;
 pub mod browser;
+mod confirm_dialog;
 pub mod context_menu;
 pub mod discovery_handler;
 pub mod dummy_data;

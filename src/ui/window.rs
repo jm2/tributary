@@ -545,6 +545,31 @@ impl SourceReducerContext {
     }
 }
 
+/// Remove a confirmed manually added server and release its Saved claim.
+///
+/// Persisted absence is the authority for releasing Saved, so a failed write
+/// leaves both the row and the claim untouched. The lifecycle baseline
+/// reducer then owns Saved demotion, final projection clearing, row removal,
+/// and active-source fallback.
+fn remove_manual_server(
+    source_registry: &crate::source_registry::SourceRegistry,
+    remote_provenance: &crate::source_registry::ProvenanceClaims,
+    source_id: crate::architecture::SourceId,
+) {
+    if !remove_saved_server(source_id) {
+        tracing::warn!(%source_id, "Could not persist saved server removal");
+        return;
+    }
+    if !remote_provenance.release(
+        source_registry,
+        source_id,
+        crate::source_lifecycle::SourceProvenance::Saved,
+        "saved-config",
+    ) {
+        tracing::warn!(%source_id, "Saved source claim was unavailable after removal");
+    }
+}
+
 fn sidebar_source_by_id(
     store: &gtk::gio::ListStore,
     source_id: crate::architecture::SourceId,
@@ -2371,6 +2396,8 @@ pub(crate) fn build_window(
     {
         let source_registry = source_registry.clone();
         let remote_provenance = remote_provenance.clone();
+        let win = window.downgrade();
+        let sidebar_store = sidebar_store.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Ok(source_key) = delete_rx.recv().await {
@@ -2379,23 +2406,18 @@ pub(crate) fn build_window(
                     tracing::warn!("Ignoring delete for invalid source identity");
                     continue;
                 };
-                // Persisted absence is the authority for releasing Saved.
-                // A failed write leaves both the row and claim untouched.
-                if !remove_saved_server(source_id) {
-                    tracing::warn!(%source_id, "Could not persist saved server removal");
+                let Some(win) = win.upgrade() else {
+                    break;
+                };
+                let Some((_, source)) = sidebar_source_by_id(&sidebar_store, source_id) else {
                     continue;
-                }
-                if !remote_provenance.release(
-                    &source_registry,
-                    source_id,
-                    crate::source_lifecycle::SourceProvenance::Saved,
-                    "saved-config",
-                ) {
-                    tracing::warn!(%source_id, "Saved source claim was unavailable after removal");
-                }
-
-                // The lifecycle baseline reducer owns Saved demotion, final
-                // projection clearing, row removal, and active-source fallback.
+                };
+                let source_registry = source_registry.clone();
+                let remote_provenance = remote_provenance.clone();
+                let dialog = super::confirm_dialog::remove_server(&source.name(), move || {
+                    remove_manual_server(&source_registry, &remote_provenance, source_id);
+                });
+                dialog.present(Some(&win));
             }
         });
     }
