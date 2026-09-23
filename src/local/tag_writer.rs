@@ -41,8 +41,8 @@ use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 use uuid::Uuid;
 
 use super::root_authority::{
-    resolve_ancestor_chain, ContentRevision, MountedMutationCommit, MountedMutationTarget,
-    MountedRootAuthority, ObjectIdentity, SelectionLocationEvidence,
+    resolve_ancestor_chain, resolve_final_symlink, ContentRevision, MountedMutationCommit,
+    MountedMutationTarget, MountedRootAuthority, ObjectIdentity, SelectionLocationEvidence,
 };
 // Only the unix anchored staging flow captures a staged object identity;
 // the Windows and fallback authorities prove staging identity from the
@@ -1515,7 +1515,7 @@ impl LocalMutationTarget {
         // Re-admit through the same resolved containing directory capture
         // bound, so the identity comparisons below prove the same object on
         // every save — including a selection reached through a symlink.
-        let resolved_parent = match resolve_authority_parent(parent) {
+        let resolved_parent = match resolve_final_symlink(parent) {
             Ok(resolved_parent) => resolved_parent,
             Err(error) => return RetainedTargetAdmission::Unavailable(error),
         };
@@ -1540,43 +1540,6 @@ impl PartialEq for LocalMutationTarget {
 }
 
 impl Eq for LocalMutationTarget {}
-
-/// Resolve a selection's containing directory to the directory object the
-/// authority must bind.
-///
-/// The authority binds directories with the final component never followed
-/// (`O_NOFOLLOW`), so acquiring directly over a symlinked containing
-/// directory — a common music-library layout with top-level tracks — would
-/// refuse a selection the pathname-based addressing used to write. When the
-/// final component is a symlink, resolution follows the complete chain exactly
-/// as the old pathname addressing did and returns the RESOLVED directory: the
-/// authority root, the captured parent identity, and the recorded ancestor
-/// chain are then all defined on the same resolved object, so a symlink
-/// retargeted after admission or a resolved directory replaced in place still
-/// refuses through the identity comparisons. A path whose final component is
-/// not a symlink is returned unchanged — byte-identical to the
-/// pre-resolution behavior. On Windows the no-follow reparse refusal for a
-/// symlinked containing directory is unchanged; resolution there would pass a
-/// verbatim path through untested prefix machinery.
-#[cfg(unix)]
-fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::symlink_metadata(parent).map(|metadata| metadata.file_type().is_symlink()) {
-        Ok(false) => Ok(parent.to_path_buf()),
-        // A symlinked final component resolves through its chain. A vanished
-        // or unreadable parent fails closed through canonicalize's error,
-        // exactly as the direct acquire would have.
-        _ => std::fs::canonicalize(parent),
-    }
-}
-
-// The Windows arm never fails, but it keeps the unix arm's fallible signature
-// so the shared call sites thread both platforms through the same
-// `?`/match handling unchanged.
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn resolve_authority_parent(parent: &Path) -> std::io::Result<PathBuf> {
-    Ok(parent.to_path_buf())
-}
 
 /// Name the capability category of a capture failure when it has one.
 ///
@@ -1632,7 +1595,7 @@ fn capture_local_selection_evidence(path: &Path) -> std::io::Result<LocalSelecti
     // The authority binds the RESOLVED containing directory, so the recorded
     // parent identity and ancestor chain describe the same object the write
     // will re-admit — even when the user's path reaches it through a symlink.
-    let resolved_parent = resolve_authority_parent(parent)?;
+    let resolved_parent = resolve_final_symlink(parent)?;
     let authority = std::sync::Arc::new(MountedRootAuthority::acquire(&resolved_parent)?);
     let target = authority.open_mutation_target(Path::new(leaf))?;
     let parent_identity = authority.root_identity();

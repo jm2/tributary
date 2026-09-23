@@ -152,6 +152,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Confirm before deleting a playlist or removing a server** — Deleting a playlist or
   removing a saved server from the sidebar now asks for confirmation first, with Cancel
   as the default, so a misclick no longer discards it immediately.
+- **Library folders** — A library folder that is itself a symbolic link (for example
+  `~/Music` pointing to another disk) is now indexed instead of showing an empty library.
+  Removing a library folder now forgets its unplayable tracks at the next start, while a
+  folder that is only temporarily unavailable, such as an unmounted drive, keeps them.
+- **Library rescans after tag edits and syncs** — Saving a tag edit, or a sync tool such as
+  rsync or Syncthing finishing a download into your music folder, now updates just that
+  track instead of rescanning the whole library.
+- **Responsiveness on slow or network drives** — Starting Tributary no longer holds up
+  ratings and other edits while it sets up folder watching, and closing the window no
+  longer waits for a library rescan to finish.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

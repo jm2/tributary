@@ -690,7 +690,10 @@ Tributary. Remote, radio, and removable tracks are not counted.
 ### Preferences
 
 Open **Preferences** from the hamburger menu (☰) to:
-- Change the local music library folders (supports multiple directories)
+- Change the local music library folders (supports multiple directories). On Linux and macOS a
+  folder may be a symbolic link to another location; its tracks keep the path you added. Symbolic
+  links inside a library folder are not followed. Removing a folder forgets its tracks, with their
+  play counts and ratings, at the next start; playlists keep those entries as unmatched items.
 - Reauthorize a library folder or import from Rhythmbox
 - Toggle browser filter panes (Genre, Artist, Album)
 - Show/hide tracklist columns
