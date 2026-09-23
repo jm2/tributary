@@ -20,6 +20,7 @@ header:
   main_menu: "メインメニュー"
   playback_position: "再生位置"
   volume: "音量"
+  rescan_library: "ライブラリを再スキャン"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "アルバム"
   folder: "フォルダー"
   all: "すべて"
+  folder_root_unavailable: "%{name}（利用不可）"
+  folder_unavailable_notice: "このフォルダーは現在利用できません"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:

@@ -20,6 +20,7 @@ header:
   main_menu: "Главное меню"
   playback_position: "Позиция воспроизведения"
   volume: "Громкость"
+  rescan_library: "Пересканировать библиотеку"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "Альбом"
   folder: "Папка"
   all: "Все"
+  folder_root_unavailable: "%{name} (недоступна)"
+  folder_unavailable_notice: "Эта папка сейчас недоступна"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:

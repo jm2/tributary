@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rhythmbox import, Last.fm sign-in response, and cast streaming URL and byte-range parsers,
   each started from committed sample inputs and stopped at fixed time and iteration limits.
 - **Folder browsing** — Browse the local library by configured root and folder, with
-  distinct identities for multiple roots, lazy navigation, and visible reasons when a root
-  is unavailable or has changed identity.
+  distinct identities for multiple roots, lazy navigation, and a visible notice when a
+  root is unavailable.
 - **Playlist drag and drop** — Drop selected tracks onto an editable local playlist in
   their displayed order, and reorder playlists in the sidebar with persistent ordering.
 - **Chromecast IPv6** — Discover receivers and publish media over routable IPv6, choosing
@@ -128,6 +128,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Library folders that come and go** — A library folder on a drive or network share that
+  connects after Tributary starts, or is remounted, is now watched and scanned within about
+  half a minute, and the folder browser shows it as unavailable while it is away and keeps
+  up with added, removed and renamed folders. The main menu also has a Rescan Library item.
+- **Local library edge cases** — Changing only the letter case of a file name no longer
+  duplicates the track, files left hidden by an interrupted tag save are put back, tag
+  editing is reported as unavailable on Windows FAT and exFAT drives instead of failing on
+  save, and a folder that used to be a separate drive is scanned again once it is not.
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.
