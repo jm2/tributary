@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **License notices in Windows and macOS downloads** — Each download now includes a
+  `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
+  offer of their source code.
 - **Equalizer** — A ten-band equalizer in Preferences for playback on this computer, with
   Flat, Pop, Rock, Jazz, and Classical presets, a preamp, and optional soft clip protection.
   Changes apply to the playing track immediately and are remembered between sessions.
@@ -82,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Smaller Windows and macOS downloads** — The downloads now contain only the audio plugins
+  Tributary uses, leaving out video, streaming, and encoder plugins and the FDK AAC library,
+  whose license does not allow it to ship with Tributary.
 - **AirPlay outputs need a sender** — AirPlay receivers are listed in the output selector only
   when the installed GStreamer provides `raopsink`, so builds without it no longer offer rows that
   fail on play. The README describes routing to AirPlay through the operating system meanwhile.
@@ -128,6 +134,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Single instance on Windows** — Starting Tributary again, or opening a file with it, while
+  it is already running now hands off to the running window instead of starting a second copy.
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.
