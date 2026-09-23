@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **AirPlay outputs need a sender** — AirPlay receivers are listed in the output selector only
+  when the installed GStreamer provides `raopsink`, so builds without it no longer offer rows that
+  fail on play. The README describes routing to AirPlay through the operating system meanwhile.
 - **Implementation backlog** — Reconcile completed slices and Gas City dependencies, add eleven
   corrective and seven engineering records, and expose operator/release acceptance separately.
   Preserve the prior detailed contracts and delivery history in an archive; no feature is marked

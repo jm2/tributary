@@ -3344,6 +3344,7 @@ mod tests {
                 crate::ui::album_pane_art::widget_tests::album_art_row_zero_count_announces_bare_label();
                 crate::ui::discovery_handler::widget_tests::discovered_rows_are_keyed_by_identity_not_display_name();
                 crate::ui::discovery_handler::widget_tests::airplay_loss_removes_only_that_receivers_row();
+                crate::ui::discovery_handler::widget_tests::airplay_rows_are_hidden_without_a_sender();
                 q4_publication_contract_and_bench();
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();

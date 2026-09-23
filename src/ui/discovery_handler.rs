@@ -35,6 +35,7 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
     let source_registry = state.source_registry.clone();
     let remote_provenance = state.remote_provenance.clone();
     let output_list = output_list.clone();
+    let mut airplay_sender = None;
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(event) = discovery_rx.recv().await {
@@ -42,7 +43,8 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                 crate::discovery::DiscoveryEvent::Found(server) => {
                     // ── AirPlay devices go to the output selector, not sidebar ──
                     if server.service_type == "airplay" {
-                        handle_airplay_found(&output_list, &server);
+                        let sender_available = airplay_sender_available(&mut airplay_sender);
+                        handle_airplay_found(&output_list, &server, sender_available);
                         continue;
                     }
 
@@ -281,12 +283,34 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
 // AirPlay / Chromecast handlers
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Add a discovered AirPlay device to the output selector.
+/// Whether any AirPlay row could play, resolved once into `cached` on first
+/// use. The first AirPlay publication arrives after window setup has
+/// initialized GStreamer.
+fn airplay_sender_available(cached: &mut Option<bool>) -> bool {
+    *cached.get_or_insert_with(|| {
+        let available = crate::audio::airplay_output::AirPlayOutput::sender_available();
+        if !available {
+            info!("GStreamer has no raopsink: AirPlay receivers are not listed as outputs");
+        }
+        available
+    })
+}
+
+/// Add a discovered AirPlay device to the output selector, unless no sender
+/// in this build could play it.
 ///
 /// Rows are keyed by endpoint plus device identifier, never by display name,
 /// and only against other AirPlay rows: receivers sharing a name, or a
 /// Chromecast sharing the name or endpoint, each keep their own row.
-fn handle_airplay_found(output_list: &gtk::ListBox, server: &crate::discovery::DiscoveredServer) {
+fn handle_airplay_found(
+    output_list: &gtk::ListBox,
+    server: &crate::discovery::DiscoveredServer,
+    sender_available: bool,
+) {
+    if !sender_available {
+        tracing::debug!(name = %server.name, "AirPlay receiver not listed: no raopsink sender");
+        return;
+    }
     let Some(endpoint) = airplay_endpoint(&server.url) else {
         tracing::warn!(url = %server.url, "Ignoring AirPlay receiver without a host:port endpoint");
         return;
@@ -573,9 +597,9 @@ pub mod widget_tests {
         );
         let den_cast = server("Den", "cast://10.0.0.5:7000", "chromecast", None);
         for _ in 0..2 {
-            handle_airplay_found(&output_list, &den_a);
+            handle_airplay_found(&output_list, &den_a, true);
             handle_chromecast_found(&output_list, &den_cast);
-            handle_airplay_found(&output_list, &den_b);
+            handle_airplay_found(&output_list, &den_b, true);
         }
         output_list
     }
@@ -610,6 +634,22 @@ pub mod widget_tests {
         handle_airplay_lost(&output_list, "http://10.0.0.6:7000");
         handle_chromecast_lost(&output_list, "cast://10.0.0.5:7000");
         assert_eq!(row_names(&output_list), ["My Computer"]);
+    }
+
+    /// Without a `raopsink` sender no AirPlay row is listed, since every
+    /// load on it would fail; Chromecast rows are unaffected.
+    pub fn airplay_rows_are_hidden_without_a_sender() {
+        let output_list = gtk::ListBox::new();
+        handle_airplay_found(
+            &output_list,
+            &server("Den", "http://10.0.0.5:7000", "airplay", None),
+            false,
+        );
+        handle_chromecast_found(
+            &output_list,
+            &server("Den", "cast://10.0.0.5:8009", "chromecast", None),
+        );
+        assert_eq!(row_names(&output_list), ["10.0.0.5:8009"]);
     }
 }
 
