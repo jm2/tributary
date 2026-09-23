@@ -113,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Playlist edits during a library scan** — Creating, renaming, deleting, importing, or
+  editing playlists (and other library changes) while a scan is running now waits
+  briefly for the scan instead of failing at once with "database is locked".
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

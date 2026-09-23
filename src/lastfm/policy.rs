@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -484,8 +484,7 @@ pub async fn commit_policy_update(
     update: LastFmPolicyUpdate,
 ) -> Result<LastFmPolicyGeneration, LastFmPolicyStoreError> {
     update.validate()?;
-    let transaction = db
-        .begin()
+    let transaction = crate::db::begin_write(db)
         .await
         .map_err(|_| LastFmPolicyStoreError::Storage)?;
 
@@ -582,7 +581,7 @@ fn parse_enabled_sources(serialized: &str) -> Result<HashSet<SourceId>, LastFmPo
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
     use sea_orm_migration::MigratorTrait;
 
     use super::*;

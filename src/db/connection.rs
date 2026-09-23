@@ -197,6 +197,53 @@ mod tests {
         }
     }
 
+    /// A playlist rename reads before it writes. While another pooled
+    /// connection holds the write lock it must wait for that writer and then
+    /// succeed, instead of failing with "database is locked" the moment its
+    /// read transaction tries to become a writer.
+    #[tokio::test]
+    async fn read_then_write_playlist_mutation_waits_for_a_concurrent_writer() {
+        let file = TestDatabase::new("write-lock");
+        let db = connect_and_migrate(file.path())
+            .await
+            .expect("open database");
+        let manager = crate::local::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Before")
+            .await
+            .expect("create playlist");
+
+        let writer = crate::db::begin_write(&db)
+            .await
+            .expect("begin competing write");
+        a_track("track-1", "/music/one.flac")
+            .insert(&writer)
+            .await
+            .expect("stage competing write");
+
+        let rename = tokio::spawn({
+            let id = playlist.id.clone();
+            async move { manager.rename_playlist(&id, "After").await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !rename.is_finished(),
+            "the rename must still be waiting for the write lock"
+        );
+        writer.commit().await.expect("commit competing write");
+
+        rename
+            .await
+            .expect("rename task")
+            .expect("rename succeeds once the competing writer commits");
+        let renamed = playlist::Entity::find_by_id(playlist.id)
+            .one(&db)
+            .await
+            .expect("load playlist")
+            .expect("playlist exists");
+        assert_eq!(renamed.name, "After");
+    }
+
     /// A current migration ledger is not proof that mutable critical SQLite
     /// objects still exist. Every process startup must validate them after
     /// the migrator's otherwise-no-op ledger check.

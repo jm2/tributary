@@ -464,7 +464,9 @@ async fn enqueue_with_cap(
     if cap == 0 || cap > i64::MAX as u64 {
         return Err(LastFmQueueError::InvalidInput);
     }
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     match enqueue_in_transaction(&transaction, input, cap).await {
         Ok(outcome) => {
             transaction
@@ -632,7 +634,9 @@ pub async fn settle_terminal(
     db: &DatabaseConnection,
     receipt: &LastFmBatchReceipt,
 ) -> Result<(), LastFmQueueError> {
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     if let Err(error) = validate_receipt(&transaction, receipt).await {
         let _ = transaction.rollback().await;
         return Err(error);
@@ -678,7 +682,9 @@ pub async fn reschedule_batch(
     if !(0..=MAX_LASTFM_RETRY_AT_MS).contains(&next_attempt_at_ms) {
         return Err(LastFmQueueError::InvalidBatch);
     }
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     if let Err(error) = validate_receipt(&transaction, receipt).await {
         let _ = transaction.rollback().await;
         return Err(error);
@@ -727,7 +733,9 @@ pub(super) async fn persist_pause_for_receipt(
     if pause == LastFmDurablePause::CredentialCleanupRequired {
         return Err(LastFmQueueError::InvalidInput);
     }
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     let result = async {
         validate_receipt(&transaction, receipt).await?;
         persist_pause_in_transaction(&transaction, receipt.account_binding, pause).await
@@ -745,7 +753,9 @@ pub(super) async fn persist_pause_for_account(
     if pause == LastFmDurablePause::CredentialCleanupRequired {
         return Err(LastFmQueueError::InvalidInput);
     }
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     let result = async {
         if account_state_has_other_binding(&transaction, account_binding).await? {
             return Err(LastFmQueueError::AccountMismatch);
@@ -770,7 +780,9 @@ pub(super) async fn replace_exact_pause(
     {
         return Err(LastFmQueueError::InvalidInput);
     }
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     let result = async {
         if account_state_has_other_binding(&transaction, account_binding).await? {
             return Err(LastFmQueueError::AccountMismatch);
@@ -819,7 +831,9 @@ pub(super) async fn clear_exact_pause(
     account_binding: LastFmAccountBinding,
     expected: LastFmDurablePause,
 ) -> Result<(), LastFmQueueError> {
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     let result = async {
         if account_state_has_other_binding(&transaction, account_binding).await? {
             return Err(LastFmQueueError::AccountMismatch);
@@ -856,7 +870,9 @@ pub async fn purge_account(
     db: &DatabaseConnection,
     account_binding: LastFmAccountBinding,
 ) -> Result<u64, LastFmQueueError> {
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     match account_state_has_other_binding(&transaction, account_binding).await {
         Ok(false) => {}
         Ok(true) => {
@@ -915,7 +931,9 @@ pub async fn purge_quarantined_after_admission_closed(
     db: &DatabaseConnection,
     _authority: &LastFmClosedAndDrainedQueue,
 ) -> Result<u64, LastFmQueueError> {
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     let cutoff = lastfm_scrobble::Entity::find()
         .select_only()
         .column(lastfm_scrobble::Column::Id)
@@ -1086,7 +1104,9 @@ pub(super) async fn clear_empty_cleanup_after_missing_vault(
     expected_binding: [u8; 32],
     _authority: &LastFmClosedAndDrainedQueue,
 ) -> Result<(), LastFmQueueError> {
-    let transaction = db.begin().await.map_err(|_| LastFmQueueError::Storage)?;
+    let transaction = crate::db::begin_write(db)
+        .await
+        .map_err(|_| LastFmQueueError::Storage)?;
     let result = async {
         let count = lastfm_scrobble::Entity::find()
             .count(&transaction)
