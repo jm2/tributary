@@ -397,6 +397,11 @@ not a session minted by Tributary, so its constructor is abortable and disconnec
 that durable credential. Plex's legacy token is likewise treated as a durable credential: the
 available revocation mechanisms are broader than one adapter session, so retirement revokes local
 media/adapter authority without attempting an account- or device-wide server-side revocation.
+A Plex row that only discovery vouches for never receives the account-wide plex.tv token. After
+sign-in, its unauthenticated `/identity` machine identifier must match a server in the account's
+plex.tv resources; the session then uses that server's own access token over an HTTPS connection
+plex.tv publishes for it, and a server with no HTTPS connection is refused. Saved and Environment
+Plex rows keep signing in to the URL the user configured.
 
 There is one earlier Jellyfin cleanup boundary before registry staging is possible. Once
 `AuthenticateByName` returns a token that can be represented exactly as a sensitive
