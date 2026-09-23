@@ -25,6 +25,14 @@ use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track}
 /// snapshot ordering.
 const SIDEBAR_ORDER_TABLE: &str = "playlist_sidebar_order";
 
+/// Most IDs bound into one `IN (...)` list. Selections are user-sized, and
+/// SQLite rejects any statement with more than 32,766 host parameters.
+const ID_BATCH_SIZE: usize = 500;
+
+/// Playlist entry rows per multi-row `INSERT`, keeping each statement's host
+/// parameters (one per column) far below SQLite's limit.
+const ENTRY_INSERT_BATCH_SIZE: usize = 256;
+
 mod server_playlist_sync;
 
 // Record E is the first production consumer of this complete engine surface.
@@ -661,17 +669,16 @@ impl PlaylistManager {
             .filter(|input| input.media_key.source_id == SourceId::local())
             .map(|input| input.media_key.track_id.as_str())
             .collect();
-        let local_tracks: HashMap<String, track::Model> = if local_ids.is_empty() {
-            HashMap::new()
-        } else {
-            track::Entity::find()
-                .filter(track::Column::Id.is_in(local_ids.iter().copied()))
+        let local_id_list: Vec<&str> = local_ids.iter().copied().collect();
+        let mut local_tracks: HashMap<String, track::Model> =
+            HashMap::with_capacity(local_ids.len());
+        for chunk in local_id_list.chunks(ID_BATCH_SIZE) {
+            let found = track::Entity::find()
+                .filter(track::Column::Id.is_in(chunk.iter().copied()))
                 .all(&txn)
-                .await?
-                .into_iter()
-                .map(|track| (track.id.clone(), track))
-                .collect()
-        };
+                .await?;
+            local_tracks.extend(found.into_iter().map(|track| (track.id.clone(), track)));
+        }
         if local_ids
             .iter()
             .any(|track_id| !local_tracks.contains_key(*track_id))
@@ -681,7 +688,7 @@ impl PlaylistManager {
             ));
         }
 
-        let mut inserted = Vec::with_capacity(inputs.len());
+        let mut rows = Vec::with_capacity(inputs.len());
         for (offset, input) in inputs.iter().enumerate() {
             let offset = i32::try_from(offset)
                 .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
@@ -710,25 +717,39 @@ impl PlaylistManager {
                 None => (&input.title, &input.artist, &input.album),
             };
             let track_id = input.media_key.track_id.as_str().to_string();
-            let model = playlist_entry::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
-                playlist_id: Set(playlist_id.to_string()),
-                position: Set(position),
-                source_id: Set(input.media_key.source_id.to_string()),
-                track_id: Set(Some(track_id.clone())),
-                local_track_id: Set(is_local.then_some(track_id)),
+            rows.push(playlist_entry::Model {
+                id: Uuid::new_v4().to_string(),
+                playlist_id: playlist_id.to_string(),
+                position,
+                source_id: input.media_key.source_id.to_string(),
+                track_id: Some(track_id.clone()),
+                local_track_id: is_local.then_some(track_id),
                 // A path is authoritative only when an imported local
                 // playlist supplied it as durable location evidence.
-                match_file_path: Set(None),
-                match_title: Set(normalize_fingerprint(title)),
-                match_artist: Set(normalize_fingerprint(artist)),
-                match_album: Set(normalize_fingerprint(album)),
-                match_duration_secs: Set(duration),
-            }
-            .insert(&txn)
-            .await?;
-            inserted.push(StoredPlaylistEntry::from_model(model)?);
+                match_file_path: None,
+                match_title: normalize_fingerprint(title),
+                match_artist: normalize_fingerprint(artist),
+                match_album: normalize_fingerprint(album),
+                match_duration_secs: duration,
+            });
         }
+
+        for chunk in rows.chunks(ENTRY_INSERT_BATCH_SIZE) {
+            let written = playlist_entry::Entity::insert_many(
+                chunk.iter().cloned().map(playlist_entry::ActiveModel::from),
+            )
+            .exec_without_returning(&txn)
+            .await?;
+            if usize::try_from(written).ok() != Some(chunk.len()) {
+                return Err(DbErr::Custom(
+                    "Playlist entry batch was not inserted completely".to_string(),
+                ));
+            }
+        }
+        let inserted = rows
+            .into_iter()
+            .map(StoredPlaylistEntry::from_model)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let Some(authority) = authorize() else {
             return Ok(PlaylistEntryAddOutcome::Rejected);
@@ -781,19 +802,21 @@ impl PlaylistManager {
             )));
         }
 
-        if !entry_ids.is_empty() {
-            let deleted = playlist_entry::Entity::delete_many()
+        let mut deleted = 0u64;
+        for chunk in entry_ids.chunks(ID_BATCH_SIZE) {
+            deleted += playlist_entry::Entity::delete_many()
                 .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                .filter(playlist_entry::Column::Id.is_in(entry_ids.iter().map(String::as_str)))
+                .filter(playlist_entry::Column::Id.is_in(chunk.iter().map(String::as_str)))
                 .exec(&txn)
-                .await?;
-            let expected = u64::try_from(entry_ids.len())
-                .map_err(|_| DbErr::Custom("Too many playlist entries selected".to_string()))?;
-            if deleted.rows_affected != expected {
-                return Err(DbErr::Custom(
-                    "Playlist changed while entries were being removed".to_string(),
-                ));
-            }
+                .await?
+                .rows_affected;
+        }
+        let expected = u64::try_from(entry_ids.len())
+            .map_err(|_| DbErr::Custom("Too many playlist entries selected".to_string()))?;
+        if deleted != expected {
+            return Err(DbErr::Custom(
+                "Playlist changed while entries were being removed".to_string(),
+            ));
         }
 
         let remaining_ids: Vec<String> = current
@@ -2945,6 +2968,108 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "maximum-position");
         assert_eq!(entries[0].position, i32::MAX);
+    }
+
+    /// More IDs than SQLite binds in one statement (32,766 host parameters).
+    const MORE_THAN_BIND_LIMIT: usize = 32_767;
+
+    /// Insert `count` minimal rows with one set-based statement.
+    async fn insert_bulk_rows(db: &DatabaseConnection, count: usize, insert_select: &str) {
+        db.execute_unprepared(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < {count})
+             {insert_select} FROM n"
+        ))
+        .await
+        .expect("insert bulk rows");
+    }
+
+    #[tokio::test]
+    async fn add_resolves_more_local_tracks_than_sqlite_binds_in_one_statement() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Everything")
+            .await
+            .expect("create playlist");
+        insert_bulk_rows(
+            &db,
+            MORE_THAN_BIND_LIMIT,
+            "INSERT INTO tracks (id, file_path, title, artist_name, album_title,
+                                 date_added, date_modified)
+             SELECT 'bulk-' || i, '/music/bulk-' || i || '.flac', 'Song', 'Artist', 'Album',
+                    '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z'",
+        )
+        .await;
+        let inputs: Vec<PlaylistEntryInput> = (0..MORE_THAN_BIND_LIMIT)
+            .map(|index| {
+                PlaylistEntryInput::new(
+                    MediaKey::new(
+                        SourceId::local(),
+                        TrackId::new(format!("bulk-{index}")).expect("local track ID"),
+                    ),
+                    "",
+                    "",
+                    "",
+                    None,
+                )
+            })
+            .collect();
+
+        let inserted = manager
+            .add_entries(&playlist.id, &inputs)
+            .await
+            .expect("add a selection larger than the bind limit");
+
+        assert_eq!(inserted.len(), MORE_THAN_BIND_LIMIT);
+        let entries = playlist_entries(&db, &playlist.id).await;
+        assert_eq!(entries.len(), MORE_THAN_BIND_LIMIT);
+        assert_eq!(entries[0].local_track_id.as_deref(), Some("bulk-0"));
+        assert_eq!(entries[0].match_title, "song");
+        let last = entries.last().expect("last entry");
+        assert_eq!(
+            last.local_track_id,
+            Some(format!("bulk-{}", MORE_THAN_BIND_LIMIT - 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_more_entries_than_sqlite_binds_in_one_statement() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Large")
+            .await
+            .expect("create playlist");
+        insert_bulk_rows(
+            &db,
+            MORE_THAN_BIND_LIMIT + 2,
+            &format!(
+                "INSERT INTO playlist_entries (id, playlist_id, position, source_id,
+                                               match_title, match_artist, match_album)
+                 SELECT 'entry-' || i, '{}', i, '{}', 'song', 'artist', ''",
+                playlist.id,
+                SourceId::local()
+            ),
+        )
+        .await;
+        let kept = ["entry-5".to_string(), "entry-32000".to_string()];
+        let removed: Vec<String> = (0..MORE_THAN_BIND_LIMIT + 2)
+            .map(|index| format!("entry-{index}"))
+            .filter(|id| !kept.contains(id))
+            .collect();
+        assert_eq!(removed.len(), MORE_THAN_BIND_LIMIT);
+
+        manager
+            .remove_entries(&playlist.id, &removed)
+            .await
+            .expect("remove a selection larger than the bind limit");
+
+        let entries = playlist_entries(&db, &playlist.id).await;
+        let remaining: Vec<(&str, i32)> = entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.position))
+            .collect();
+        assert_eq!(remaining, [("entry-5", 0), ("entry-32000", 1)]);
     }
 
     #[tokio::test]
