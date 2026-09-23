@@ -327,6 +327,8 @@ errors:
     heading: "Biblioteca indisponível"
     open_failed: "O Tributary não conseguiu abrir o banco de dados da biblioteca, por isso sua biblioteca e suas listas de reprodução não podem ser exibidas. Consulte o registro para ver os detalhes."
     upgrade_failed: "O Tributary não conseguiu atualizar o banco de dados da biblioteca para esta versão, por isso sua biblioteca e suas listas de reprodução não podem ser exibidas. Consulte o registro para ver os detalhes."
+    backup_saved: "Uma cópia da sua biblioteca anterior à atualização foi salva em %{path}."
+    newer_version: "Este banco de dados da biblioteca foi criado por uma versão mais recente do Tributary e não pode ser aberto por esta versão. Reinstale a versão mais recente ou feche o Tributary e substitua library.db por uma cópia anterior de %{path}."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

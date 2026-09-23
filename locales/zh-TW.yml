@@ -327,6 +327,8 @@ errors:
     heading: "音樂庫無法使用"
     open_failed: "Tributary 無法開啟音樂庫資料庫，因此無法顯示您的音樂庫和播放清單。詳細資訊請查看記錄檔。"
     upgrade_failed: "Tributary 無法為此版本升級音樂庫資料庫，因此無法顯示您的音樂庫和播放清單。詳細資訊請查看記錄檔。"
+    backup_saved: "升級前的音樂庫副本已儲存至 %{path}。"
+    newer_version: "此音樂庫資料庫由較新版本的 Tributary 建立，此版本無法開啟。請重新安裝較新的版本，或結束 Tributary 並以 %{path} 中較早的副本取代 library.db。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

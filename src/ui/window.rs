@@ -2092,7 +2092,7 @@ pub(crate) fn build_window(
     let engine_lastfm_policy = lastfm_policy.clone();
     let engine_lastfm_settings = lastfm_settings.clone();
     rt_handle.spawn(async move {
-        match crate::db::connection::init_db().await {
+        match crate::db::connection::get_or_init_db().await {
             Ok(db) => {
                 // Publish the persisted policy generation before anything can
                 // capture a playback queue. A load failure keeps the closed
@@ -2176,9 +2176,8 @@ pub(crate) fn build_window(
                     warn!(%error, "Server playlist coordinator owner failed after database error");
                 }
                 tracing::error!(error = %e, "Failed to initialise database");
-                let failure = crate::db::connection::DatabaseInitFailure::of(&e);
                 let _ = engine_tx_clone
-                    .send(LibraryEvent::DatabaseUnavailable(failure))
+                    .send(LibraryEvent::DatabaseUnavailable(e.failure().clone()))
                     .await;
             }
         }
@@ -4722,12 +4721,24 @@ fn show_database_unavailable(
     use crate::db::connection::DatabaseInitFailure;
 
     let body = match failure {
-        DatabaseInitFailure::Open => rust_i18n::t!("errors.database.open_failed"),
-        DatabaseInitFailure::Upgrade => rust_i18n::t!("errors.database.upgrade_failed"),
+        DatabaseInitFailure::Open => rust_i18n::t!("errors.database.open_failed").into_owned(),
+        DatabaseInitFailure::Upgrade { backup: None } => {
+            rust_i18n::t!("errors.database.upgrade_failed").into_owned()
+        }
+        DatabaseInitFailure::Upgrade {
+            backup: Some(backup),
+        } => format!(
+            "{}\n\n{}",
+            rust_i18n::t!("errors.database.upgrade_failed"),
+            rust_i18n::t!("errors.database.backup_saved", path = backup.display())
+        ),
+        DatabaseInitFailure::NewerVersion { backups } => {
+            rust_i18n::t!("errors.database.newer_version", path = backups.display()).into_owned()
+        }
     };
     let dialog = adw::AlertDialog::builder()
         .heading(rust_i18n::t!("errors.database.heading").as_ref())
-        .body(body.as_ref())
+        .body(&body)
         .close_response("ok")
         .default_response("ok")
         .build();

@@ -327,6 +327,8 @@ errors:
     heading: "音乐库不可用"
     open_failed: "Tributary 无法打开音乐库数据库，因此无法显示您的音乐库和播放列表。详情请查看日志。"
     upgrade_failed: "Tributary 无法为此版本升级音乐库数据库，因此无法显示您的音乐库和播放列表。详情请查看日志。"
+    backup_saved: "升级前的音乐库副本已保存到 %{path}。"
+    newer_version: "此音乐库数据库由更新版本的 Tributary 创建，此版本无法打开。请重新安装更新的版本，或退出 Tributary 并用 %{path} 中较早的副本替换 library.db。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

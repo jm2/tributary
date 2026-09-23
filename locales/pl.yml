@@ -329,6 +329,8 @@ errors:
     heading: "Biblioteka niedostępna"
     open_failed: "Tributary nie może otworzyć bazy danych biblioteki, więc biblioteka i listy odtwarzania nie mogą zostać wyświetlone. Szczegóły znajdują się w dzienniku."
     upgrade_failed: "Tributary nie może zaktualizować bazy danych biblioteki do tej wersji, więc biblioteka i listy odtwarzania nie mogą zostać wyświetlone. Szczegóły znajdują się w dzienniku."
+    backup_saved: "Kopię biblioteki sprzed aktualizacji zapisano w %{path}."
+    newer_version: "Ta baza danych biblioteki została utworzona przez nowszą wersję Tributary i ta wersja nie może jej otworzyć. Zainstaluj ponownie nowszą wersję albo zamknij Tributary i zastąp plik library.db wcześniejszą kopią z %{path}."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

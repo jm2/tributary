@@ -327,6 +327,8 @@ errors:
     heading: "Libreria non disponibile"
     open_failed: "Tributary non è riuscito ad aprire il database della libreria, quindi la libreria e le playlist non possono essere mostrate. Consulta il registro per i dettagli."
     upgrade_failed: "Tributary non è riuscito ad aggiornare il database della libreria per questa versione, quindi la libreria e le playlist non possono essere mostrate. Consulta il registro per i dettagli."
+    backup_saved: "Una copia della libreria precedente all’aggiornamento è stata salvata in %{path}."
+    newer_version: "Questo database della libreria è stato creato da una versione più recente di Tributary, che questa versione non può aprire. Reinstalla la versione più recente, oppure esci da Tributary e sostituisci library.db con una copia precedente da %{path}."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
