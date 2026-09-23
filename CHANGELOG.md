@@ -92,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Last.fm preparation** — Persist consent and per-source policy generations for future
   scrobbling activation, with transactional updates and validation. Scrobbling remains disabled.
 - **Dependency maintenance** — Refresh Rust dependencies and the release-upload action.
+- **Stricter dependency auto-merge and leaner CI** — Dependabot pull requests auto-merge only
+  for patch updates, and a push by anyone else turns auto-merge off until a maintainer reviews
+  it. The Security Audit check now runs only the advisory audit, and documentation-only changes
+  skip the native build matrix.
 - **Single dependency lockfile** — The fuzz harness now shares the application's Cargo
   workspace and lockfile, so Dependabot updates no longer need a manual fuzz-lock repair and
   the security audit covers one lock.
