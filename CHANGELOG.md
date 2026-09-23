@@ -116,6 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Year edits** — Changing or clearing the year in Properties now takes effect for MP3
   and M4A files, and replaces the existing date on FLAC and Ogg files instead of being
   hidden by it.
+- **Legacy ID3v1 tags** — Editing an MP3 that only has an ID3v1 tag keeps its title,
+  artist and album. Blank ID3v1 fields now fall back to the file name and "Unknown"
+  names, so these files are no longer rejected on removable devices or when opened from
+  the file manager.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use lofty::config::WriteOptions;
 use lofty::file::{TaggedFile, TaggedFileExt};
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 use uuid::Uuid;
 
 use super::root_authority::{
@@ -2301,13 +2301,49 @@ fn ensure_primary_tag<'a>(
     target_label: &str,
 ) -> Result<&'a mut Tag> {
     if tagged_file.primary_tag_mut().is_none() {
-        let tag_type = tagged_file.primary_tag_type();
-        tagged_file.insert_tag(Tag::new(tag_type));
+        let seeded = seed_primary_tag(tagged_file.primary_tag_type(), tagged_file.first_tag());
+        tagged_file.insert_tag(seeded);
     }
 
     tagged_file.primary_tag_mut().ok_or_else(|| {
         anyhow::anyhow!("No primary tag found and cannot create one for {target_label}")
     })
+}
+
+/// Build a new primary tag of `tag_type` as a copy of the tag the file
+/// already carries, if any. The parser prefers the primary tag, so a new
+/// primary tag holding only the edited field would hide every other field of
+/// an ID3v1- or APE-only file.
+fn seed_primary_tag(tag_type: TagType, existing: Option<&Tag>) -> Tag {
+    let Some(existing) = existing else {
+        return Tag::new(tag_type);
+    };
+    let mut seeded = existing.clone();
+    // ID3v1 stores the year under `Year`, which ID3v2 and MP4 cannot hold;
+    // move it to the recording date before remapping would drop it.
+    if let Some(date) = seeded.date() {
+        seeded.set_date(date);
+    }
+    if existing.tag_type() == TagType::Id3v1 {
+        // ID3v1 text fields are fixed-width and space-padded. Copy the
+        // values, not the padding, and drop fields that were only padding.
+        for key in [
+            ItemKey::TrackTitle,
+            ItemKey::TrackArtist,
+            ItemKey::AlbumTitle,
+            ItemKey::Comment,
+        ] {
+            if let Some(value) = seeded.get_string(key).map(|v| v.trim_end().to_owned()) {
+                if value.is_empty() {
+                    seeded.remove_key(key);
+                } else {
+                    seeded.insert_text(key, value);
+                }
+            }
+        }
+    }
+    seeded.re_map(tag_type);
+    seeded
 }
 
 /// Apply every requested edit to `tag` — only touch fields that are Some —
@@ -2991,6 +3027,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/audio/ogg_date_2007.ogg"
     ));
+    const ID3V1_PADDED_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/id3v1_padded.mp3"
+    ));
 
     fn parse(track: &Path) -> crate::local::tag_parser::ParsedTrack {
         crate::local::tag_parser::parse_audio_file(track).expect("parse the written file")
@@ -3056,11 +3096,54 @@ mod tests {
 
     #[test]
     fn a_year_edit_fails_when_the_tag_has_no_date_field() {
-        let mut tag = Tag::new(lofty::tag::TagType::AiffText);
+        let mut tag = Tag::new(TagType::AiffText);
 
         let error = apply_tag_edits(&mut tag, &year("2020"))
             .expect_err("AIFF text chunks cannot store a date");
         assert!(error.to_string().contains("cannot store a year"), "{error}");
+    }
+
+    /// Editing an ID3v1-only MP3 creates its ID3v2 tag, which the parser then
+    /// prefers. The new tag starts as a copy of the ID3v1 values, without
+    /// their padding, so the edit never hides the other fields.
+    #[test]
+    fn an_id3v1_only_mp3_keeps_its_fields_after_an_edit() {
+        let directory = TestDirectory::new("id3v1-seed");
+        let genre = TagEdits {
+            genre: Some("Jazz".to_string()),
+            ..Default::default()
+        };
+        let track = directory.audio_file("legacy.mp3", ID3V1_PADDED_FIXTURE);
+
+        write_tags(&track, &genre).expect("edit an ID3v1-only MP3");
+
+        let parsed = parse(&track);
+        assert_eq!(parsed.title, "Pad Title");
+        assert_eq!(parsed.artist_name, "Pad Artist");
+        assert_eq!(parsed.album_title, "Pad Album");
+        assert_eq!(parsed.year, Some(2007));
+        assert_eq!(parsed.genre.as_deref(), Some("Jazz"));
+        let tagged_file = lofty::read_from_path(&track).expect("reopen the MP3");
+        let id3v2 = tagged_file
+            .tag(TagType::Id3v2)
+            .expect("the edit adds ID3v2");
+        assert_eq!(id3v2.title().as_deref(), Some("Pad Title"));
+        assert_eq!(id3v2.comment().as_deref(), Some("Pad Comment"));
+
+        // Blank ID3v1 fields are only padding and are not copied at all.
+        let blank = directory.audio_file(
+            "blank.mp3",
+            &crate::local::tag_parser::blank_id3v1_fixture(),
+        );
+        write_tags(&blank, &genre).expect("edit a blank ID3v1-only MP3");
+        let tagged_file = lofty::read_from_path(&blank).expect("reopen the MP3");
+        let id3v2 = tagged_file
+            .tag(TagType::Id3v2)
+            .expect("the edit adds ID3v2");
+        assert_eq!(id3v2.title(), None);
+        assert_eq!(id3v2.artist(), None);
+        assert_eq!(id3v2.album(), None);
+        assert_eq!(id3v2.genre().as_deref(), Some("Jazz"));
     }
 
     /// A removable-media write through a retained mutation target must
