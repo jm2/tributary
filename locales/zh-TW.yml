@@ -250,6 +250,12 @@ properties:
   save_conflict_all: "自開啟屬性以來，%{total} 個檔案中有 %{conflicts} 個已在磁碟上變更。發生衝突的檔案保持不變——請重新開啟屬性以編輯目前的檔案。"
   save_conflict_mixed: "%{total} 個檔案中有 %{conflicts} 個已在磁碟上變更，另有 %{other} 個檔案無法儲存；所有檔案均保持不變。請為已變更的檔案重新開啟屬性。"
   save_failure: "%{total} 個檔案中有 %{failed} 個無法儲存，均已保持不變。"
+  refused_heading: "無法開啟屬性"
+  refused_unavailable: "在屬性開啟之前，某個所選檔案已變更或變得無法使用。未進行任何變更。"
+  refused_selection_changed: "在屬性開啟之前，所選內容已變更。未進行任何變更。請重新選取曲目以進行編輯。"
+  mixed_cleared: "將在所有曲目中清除"
+  musicbrainz_applied: "已根據 MusicBrainz 發行版「%{release}」填入。儲存前請檢查各欄位。"
+  musicbrainz_title_only: "沒有與該專輯相符的 MusicBrainz 發行版，因此只填入了標題和藝人。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

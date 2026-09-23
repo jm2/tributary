@@ -291,6 +291,12 @@ properties:
   save_conflict_all: "%{conflicts} of %{total} file(s) changed on disk since Properties opened. The competing files were left untouched — reopen Properties to edit the current files."
   save_conflict_mixed: "%{conflicts} of %{total} file(s) changed on disk and %{other} other file(s) could not be saved; all were left unchanged. Reopen Properties for the changed files."
   save_failure: "%{failed} of %{total} file(s) could not be saved and were left unchanged."
+  refused_heading: "Properties Couldn’t Open"
+  refused_unavailable: "A selected file changed or became unavailable before Properties could open. Nothing was changed."
+  refused_selection_changed: "The selection changed before Properties could open. Nothing was changed. Select the tracks again to edit them."
+  mixed_cleared: "Will be cleared on all tracks"
+  musicbrainz_applied: "Filled in from the MusicBrainz release “%{release}”. Check the fields before saving."
+  musicbrainz_title_only: "No MusicBrainz release matched the album, so only the title and artist were filled in."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

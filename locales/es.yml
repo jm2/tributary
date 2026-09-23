@@ -250,6 +250,12 @@ properties:
   save_conflict_all: "%{conflicts} de %{total} archivo(s) cambiaron en el disco desde que se abrió Propiedades. Los archivos en conflicto quedaron intactos: vuelve a abrir Propiedades para editar los archivos actuales."
   save_conflict_mixed: "%{conflicts} de %{total} archivo(s) cambiaron en el disco y %{other} archivo(s) más no se pudieron guardar; todos quedaron sin cambios. Vuelve a abrir Propiedades para los archivos cambiados."
   save_failure: "%{failed} de %{total} archivo(s) no se pudieron guardar y quedaron sin cambios."
+  refused_heading: "No se pudo abrir Propiedades"
+  refused_unavailable: "Un archivo seleccionado cambió o dejó de estar disponible antes de que se pudiera abrir Propiedades. No se cambió nada."
+  refused_selection_changed: "La selección cambió antes de que se pudiera abrir Propiedades. No se cambió nada. Vuelve a seleccionar las pistas para editarlas."
+  mixed_cleared: "Se borrará en todas las pistas"
+  musicbrainz_applied: "Completado con la publicación de MusicBrainz «%{release}». Revisa los campos antes de guardar."
+  musicbrainz_title_only: "Ninguna publicación de MusicBrainz coincidió con el álbum, así que solo se completaron el título y el artista."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

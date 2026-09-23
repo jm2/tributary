@@ -252,6 +252,12 @@ properties:
   save_conflict_all: "Od otwarcia okna Właściwości %{conflicts} z %{total} plików zmieniło się na dysku. Pliki konkurencyjne pozostawiono bez zmian — otwórz Właściwości ponownie, aby edytować bieżące pliki."
   save_conflict_mixed: "%{conflicts} z %{total} plików zmieniło się na dysku, a %{other} innych plików nie udało się zapisać; wszystkie pozostawiono bez zmian. Otwórz Właściwości ponownie dla zmienionych plików."
   save_failure: "%{failed} z %{total} plików nie udało się zapisać i pozostawiono je bez zmian."
+  refused_heading: "Nie udało się otworzyć okna Właściwości"
+  refused_unavailable: "Wybrany plik zmienił się lub stał się niedostępny, zanim okno Właściwości mogło się otworzyć. Niczego nie zmieniono."
+  refused_selection_changed: "Zaznaczenie zmieniło się, zanim okno Właściwości mogło się otworzyć. Niczego nie zmieniono. Zaznacz utwory ponownie, aby je edytować."
+  mixed_cleared: "Zostanie wyczyszczone we wszystkich utworach"
+  musicbrainz_applied: "Uzupełniono na podstawie wydania MusicBrainz „%{release}”. Sprawdź pola przed zapisaniem."
+  musicbrainz_title_only: "Żadne wydanie MusicBrainz nie pasowało do albumu, więc uzupełniono tylko tytuł i wykonawcę."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:

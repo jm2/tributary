@@ -250,6 +250,12 @@ properties:
   save_conflict_all: "속성 창을 연 뒤 %{total}개 중 %{conflicts}개 파일이 디스크에서 변경되었습니다. 충돌한 파일은 그대로 보존되었습니다. 현재 파일을 편집하려면 속성을 다시 여십시오."
   save_conflict_mixed: "%{total}개 중 %{conflicts}개 파일이 디스크에서 변경되었고 나머지 %{other}개 파일은 저장할 수 없었습니다. 모두 변경되지 않고 남아 있습니다. 변경된 파일은 속성을 다시 여십시오."
   save_failure: "%{total}개 중 %{failed}개 파일을 저장할 수 없었으며 변경되지 않고 남아 있습니다."
+  refused_heading: "속성을 열 수 없음"
+  refused_unavailable: "속성을 열기 전에 선택한 파일이 변경되었거나 사용할 수 없게 되었습니다. 변경된 내용이 없습니다."
+  refused_selection_changed: "속성을 열기 전에 선택 항목이 변경되었습니다. 변경된 내용이 없습니다. 편집하려면 트랙을 다시 선택하세요."
+  mixed_cleared: "모든 트랙에서 지워집니다"
+  musicbrainz_applied: "MusicBrainz 릴리스 “%{release}”에서 채웠습니다. 저장하기 전에 필드를 확인하세요."
+  musicbrainz_title_only: "앨범과 일치하는 MusicBrainz 릴리스가 없어 제목과 아티스트만 채웠습니다."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
