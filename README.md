@@ -23,6 +23,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | GStreamer audio playback (`playbin3`) | ✅ |
 | MPRIS / SMTC / macOS Now Playing integration (`souvlaki`) | ✅ |
 | Playback controls (play/pause, next/prev, seek, volume) | ✅ |
+| Ten-band equalizer with presets, preamp, and clip protection | ✅ Local output only |
 | Shuffle & repeat (off / all / one) with persistence | ✅ |
 | Column sort persistence | ✅ |
 | Subsonic / Navidrome / Nextcloud Music backend | ✅ |
