@@ -261,6 +261,10 @@ smart_playlist:
   add_rule: "添加规则"
   remove_rule: "删除规则"
   limit_to: "限制为"
+  rule_not_integer: "请输入整数。"
+  rule_reversed_range: "第一个值不得大于第二个值。"
+  rule_not_positive: "请输入大于或等于 1 的整数。"
+  rule_invalid_date: "请按 YYYY-MM-DD 格式输入日期，例如 2024-01-15。"
 
 # ── 服务器播放列表 ──────────────────────────────────────────────────
 server_playlists:

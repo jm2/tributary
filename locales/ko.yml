@@ -261,6 +261,10 @@ smart_playlist:
   add_rule: "규칙 추가"
   remove_rule: "규칙 제거"
   limit_to: "제한"
+  rule_not_integer: "정수를 입력하세요."
+  rule_reversed_range: "첫 번째 값은 두 번째 값보다 클 수 없습니다."
+  rule_not_positive: "1 이상의 정수를 입력하세요."
+  rule_invalid_date: "날짜를 YYYY-MM-DD 형식으로 입력하세요(예: 2024-01-15)."
 
 # ── 서버 재생목록 ──────────────────────────────────────────────────
 server_playlists:

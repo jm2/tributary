@@ -128,6 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Smart playlist rules** — The smart playlist editor now refuses numbers and dates it can't
+  read, explaining why and keeping OK disabled, instead of silently saving 0 or 30 or a date
+  that never matches. Dates are entered as YYYY-MM-DD and match your local calendar day.
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.

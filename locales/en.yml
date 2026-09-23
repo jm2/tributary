@@ -302,6 +302,10 @@ smart_playlist:
   add_rule: "Add rule"
   remove_rule: "Remove rule"
   limit_to: "Limit to"
+  rule_not_integer: "Enter a whole number."
+  rule_reversed_range: "The first value must not exceed the second."
+  rule_not_positive: "Enter a whole number of 1 or more."
+  rule_invalid_date: "Enter a date as YYYY-MM-DD, for example 2024-01-15."
 
 # ── Server playlists ───────────────────────────────────────────────
 server_playlists:

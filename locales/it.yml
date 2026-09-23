@@ -261,6 +261,10 @@ smart_playlist:
   add_rule: "Aggiungi regola"
   remove_rule: "Rimuovi regola"
   limit_to: "Limita a"
+  rule_not_integer: "Inserisci un numero intero."
+  rule_reversed_range: "Il primo valore non deve superare il secondo."
+  rule_not_positive: "Inserisci un numero intero pari o superiore a 1."
+  rule_invalid_date: "Inserisci una data nel formato YYYY-MM-DD, ad esempio 2024-01-15."
 
 # ── Playlist del server ────────────────────────────────────────────
 server_playlists:

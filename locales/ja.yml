@@ -261,6 +261,10 @@ smart_playlist:
   add_rule: "ルールを追加"
   remove_rule: "ルールを削除"
   limit_to: "制限"
+  rule_not_integer: "整数を入力してください。"
+  rule_reversed_range: "最初の値は2番目の値以下にしてください。"
+  rule_not_positive: "1以上の整数を入力してください。"
+  rule_invalid_date: "日付を YYYY-MM-DD 形式で入力してください（例: 2024-01-15）。"
 
 # ── サーバープレイリスト ──────────────────────────────────────────
 server_playlists:
