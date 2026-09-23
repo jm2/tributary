@@ -1,7 +1,12 @@
 # Source-scoped offline media contracts
 
+> **Status (2026-09-23): superseded.** The download and cache stack built toward this contract
+> (PRs #228, #230, and #231) was closed without merging in favour of a simple Download action that
+> saves files into a library folder; see [#11](https://github.com/jm2/tributary/issues/11). This
+> document is kept as background.
+
 This document is the design-first contract for
-[P3.1](task.md#p31--offline-remote-media) and
+[P3.1](task-implementation-history-2026-09-09.md#p31--offline-remote-media) and
 [#11](https://github.com/jm2/tributary/issues/11). It binds the persisted
 identity, authenticated/resumable download jobs, atomic storage, server
 capability, credential, licensing, and reconciliation behaviour that a download
@@ -30,7 +35,7 @@ The central rules are:
 
 This contract is the precursor to the bounded download/cache engine and the
 download/progress/storage UI listed under
-[P3.1](task.md#p31--offline-remote-media) in `task.md`. It is also a
+[P3.1](task-implementation-history-2026-09-09.md#p31--offline-remote-media). It is also a
 companion to the
 [source-scoped regular-playlist storage](source-scoped-playlists.md) contract,
 the [Subsonic playlist](subsonic-playlist-sync.md) contract, the
@@ -1717,7 +1722,7 @@ own:
 2. **Licence clearing.** Third-party licence clearing and payment flows belong
    to the source adapter, not the cache engine.
 3. **Cross-device sync.** Pushing a cached snapshot to another device is a
-   separate ADR — see [P3.2](task.md#p32--android-and-device-synchronization).
+   separate ADR — see [P3.2](task-implementation-history-2026-09-09.md#p32--android-and-device-synchronization).
 4. **Distributed quota.** Cross-process quota enforcement is out of scope.
 5. **DAAP-only authorization refresh.** DAAP's particular reauthorization flow
    remains under `task-remediation-2026-07.md` P1.5; offline extends it without

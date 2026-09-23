@@ -1,5 +1,9 @@
 # AirPlay sender design investigation
 
+> **Status (2026-09-23): superseded.** The OwnTone sender built from this design (PR #270) was
+> closed without merging, and no AirPlay sender is planned. AirPlay speakers are reached through
+> the operating system (see the README); this document is kept as background research.
+
 Status: design record, no implementation in this bead.
 
 Revision 18 (2026-09-14, corrective pass). This revision answers the

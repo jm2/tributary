@@ -95,9 +95,9 @@ jobs:
         run: cargo audit
 
   # ── Repository policy ─────────────────────────────────────────────────────
-  # Packaging, dependency-update, toolchain, and backlog policy scripts. Keep
-  # this out of the required checks: a broken docs anchor must not block a
-  # security fix. It runs for documentation-only changes too.
+  # Packaging, dependency-update, and toolchain policy scripts. Keep this out
+  # of the required checks: a policy-script failure must not block a security
+  # fix. It runs for documentation-only changes too.
   repository-policy:
     name: Repository Policy
     runs-on: ubuntu-24.04
@@ -118,16 +118,6 @@ jobs:
         run: |
           python3 scripts/test_dependency_update_policy.py
           python3 scripts/sync_rust_toolchain.py --check
-
-      - name: Check backlog consistency
-        # Read-only: unique record IDs, literal completion counters, internal
-        # links/anchors. Never closes a parent record or assigns a worker.
-        run: |
-          python3 scripts/check_backlog_consistency.py
-          python3 scripts/test_check_backlog_consistency.py
-          python3 scripts/test_check_backlog_consistency_rework.py
-          python3 scripts/test_check_backlog_consistency_rework2.py
-          python3 scripts/test_check_backlog_consistency_rework3.py
 
   # ── MSRV (minimum supported Rust version) ─────────────────────────────────
   # Compile-proof for the `rust-version` declared in Cargo.toml. Keep the

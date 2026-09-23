@@ -304,9 +304,10 @@ registry snapshot should be rendered. It does not own authentication, session li
 failure, or cache authority. Conversely, changing views does not disconnect or cancel a healthy
 source refresh merely because its rows are no longer visible.
 
-The registry publishes typed state changes and immutable snapshots. The UI observes those events
-and renders fixed translated failure messages. It does not reconstruct lifecycle from spinners,
-sidebar row booleans, channel closure, or the currently selected URL.
+The registry publishes immutable snapshots and an invalidation revision. The UI watches that
+revision, re-reads the snapshots when it advances, and renders fixed translated failure messages.
+It does not reconstruct lifecycle from spinners, sidebar row booleans, channel closure, or the
+currently selected URL.
 
 The closed retained categories are authentication rejection, connection failure, timeout, invalid
 response, unsupported authentication, unavailable/permission, and other backend failure, paired
@@ -759,8 +760,7 @@ retirement. Independent review covers the complete intent/terminal wiring and po
 handoff. Removable regressions additionally cover lossless native identity, unsafe-component
 rejection, no-follow and same-filesystem mount authority, exact accepted-membership enforcement,
 reconnect epoch/lease isolation, queued-scan cancellation, shutdown joining, lifecycle/UI
-invalidation ownership, and pathless playback/artwork. The focused lifecycle module passes all 53
-tests.
+invalidation ownership, and pathless playback/artwork.
 
 The authenticated-remote, Radio-Browser, external-file, and mounted-removable cutovers complete the
 P3.1 adapter boundary. Local and playlist GTK rows may retain paths for non-playback UI operations,
@@ -937,54 +937,9 @@ E. Mixed-source XSPF metadata export remains a separate deferred policy.
     virtualization, accessible busy/focus state, and deterministic teardown. This remains pull-only:
     it adds no server create, update, or delete operation and grants no catalogue/playback authority.
 
-Both debug and release validation pass 92 focused server-playlist/browser/recovery tests, including
-real empty-, one-, and nine-mirror coordinator/registry/database/sidebar integrations.
-Deterministic coverage pins atomic direct-request ordering against delayed fan-out, same-key
-admitted drain, displaced pending completion, zero-list behavior with no links, exact-session
-presence/detail-failure/absence handling, one shared listing, the measured eight-operation limit,
-opaque-token revocation/consumption/capacity, same-name exact-ID isolation, stale GTK results,
-reconciled lifecycle presentation, visible recovery sensitivity, and shutdown drain. Locked debug
-and release suites each pass 1,300 tests. Strict all-target/all-feature Clippy passes in both
-profiles; Rust 1.92 all-target checking, formatting, whitespace, and independent
-code/privacy/accessibility/documentation review are also green.
-
-The authenticated-remote cutover's locked debug and release suites each passed 20 library, 865
-application, and 10 repository-metadata tests (895 total), with locked all-target/all-feature
-compile, strict warning-free Clippy, formatting, and diff checks green.
-
-PR #125 validation for the retained embedded-art slice passes all 9 focused album-art
-tests, the locked all-target/all-feature check, strict Clippy in debug and release, formatting, and
-the whitespace check. Locked debug and release suites each pass 20 library, 872 application, and
-10 repository-metadata tests (902 total).
-
-The Radio-Browser cutover passes the locked all-target/all-feature check, strict Clippy in debug and
-release, formatting, and whitespace checks. Complete locked debug and release suites each pass 20
-library, 895 application, and 10 repository-metadata tests (925 total). Focused lifecycle,
-source-registry, media, radio-client/adapter, reducer, consent, queue, and playback tests cover
-cancellation, empty/failure distinction, cross-view winner ordering, final-use revocation,
-last-registry-drop, partial Near Me tiers, deduplication/distance ordering, pathless capture,
-pre-publication source loss, exact failure ownership, the generation-owned consent prerequisite,
-and complete restoration of Local presentation after automatic fallback.
-
-The external-file adapter cutover passes the locked all-target/all-feature check, strict Clippy in
-debug and release, formatting, and whitespace checks. Complete locked debug and release suites each
-pass 940 tests. An independent integrated review is clean after its findings were resolved. Focused
-coverage proves delivery-order and exact-generation state, shutdown/adoption serialization, random
-pathless identity, epoch isolation, retained-handle path-replacement resistance, lease checks,
-serialized cursor-based consumers, hidden-baseline behavior, and explicit idempotent retirement;
-integrated review covers sequential first-accepted candidate handling, the same-output boundary,
-and post-accept artwork wiring.
-
-The mounted-removable cutover passes the locked all-target/all-feature check, strict debug Clippy,
-formatting, and whitespace checks. The complete locked debug suite passes 20 library, 926
-application, and 10 repository-metadata tests (956 total). Focused identity, mounted-authority,
-adapter, registry, navigation, reducer, context-menu, and playback regressions cover pathless
-catalogues, exact membership, retained-handle resolution, cancellation, reconnect epoch isolation,
-shutdown settlement, relocation/removal ownership, retained failure replay on later selection, and
-safe omission of path-based mutation. The
-three remaining tracker tasks require physical removable hardware, an installed interactive
-Flatpak environment, or packaged Windows DAAP/Subsonic servers and are not unimplemented P3.1
-lifecycle work.
+Validation evidence for each cutover (test runs, review results) is recorded in its pull request.
+Physical-environment checks — removable hardware, an installed interactive Flatpak, and packaged
+Windows DAAP/Subsonic playback — remain release validation, not unimplemented lifecycle work.
 
 Each step must keep existing credential-isolation, exact-origin, root-authority, receiver-ticket,
 and generation-supersession tests green. Compatibility code is removed in the same milestone; two
