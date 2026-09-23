@@ -24,7 +24,32 @@ const MACOS_AUDIO: &str = include_str!("../src/audio/macos_audio.rs");
 const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.rs");
 const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
-const RUST_TOOLCHAIN_ACTION_SHA: &str = "6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
+/// The immutable `dtolnay/rust-toolchain` commit the release-pinned CI jobs
+/// use (`@<sha> # master`). Read from the workflow, where Dependabot updates
+/// it, and required to be one full commit SHA shared by every pinned use.
+fn rust_toolchain_action_sha() -> &'static str {
+    let prefix = "uses: dtolnay/rust-toolchain@";
+    let pins: Vec<&str> = CI_WORKFLOW
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(prefix))
+        .filter_map(|rest| rest.strip_suffix(" # master"))
+        .collect();
+    let sha = *pins
+        .first()
+        .expect("CI pins dtolnay/rust-toolchain to a commit for the declared release");
+    assert!(
+        sha.len() == 40
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "the rust-toolchain action must be pinned to a full commit SHA, got {sha}"
+    );
+    assert!(
+        pins.iter().all(|pin| *pin == sha),
+        "every pinned rust-toolchain use must share one commit: {pins:?}"
+    );
+    sha
+}
 const FLATPAK_BUILDER_ACTION_SHA: &str = "79327416609af08178ad73b352877e51450790b3";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
@@ -1242,7 +1267,8 @@ fn ci_compile_proves_the_exact_declared_msrv() {
     assert!(
         toolchain_manifest["toolchain"]["channel"].as_str() == Some(&rust_release)
             && msrv_job.contains(&format!(
-                "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # master"
+                "uses: dtolnay/rust-toolchain@{} # master",
+                rust_toolchain_action_sha()
             ))
             && msrv_job.contains(&format!("toolchain: {rust_release}")),
         "the compiler manifest and CI must install the declared release through one immutable action commit"
@@ -1662,7 +1688,8 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
     );
     assert!(
         coverage_job.contains(&format!(
-            "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # master"
+            "uses: dtolnay/rust-toolchain@{} # master",
+            rust_toolchain_action_sha()
         )) && coverage_job.contains(&format!("toolchain: {rust_version}.0")),
         "coverage must use the declared Rust release through the immutable action commit"
     );
