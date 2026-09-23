@@ -137,8 +137,10 @@ pub fn control_plan(exclusive_control: bool, detection_enabled: bool) -> MpdCont
 /// - a foreign current song (another controller owns partition playback),
 /// - any of repeat/random/single/consume drifting away from the enforced
 ///   defaults (another controller mutated partition options),
-/// - an observation gap beyond [`MAX_SUPERVISION_GAP`] (a window in which
-///   another controller could have acted unseen).
+/// - an observation gap beyond [`MAX_SUPERVISION_GAP`] while a
+///   Tributary-owned song is active (a window in which another controller
+///   could have acted unseen). Idle time never counts: the gap clock runs
+///   only while the worker is polling an owned song.
 ///
 /// Once `Lapsed`, the supervisor stays lapsed for the lifetime of this
 /// output instance: quiet polling cannot restore it, and no worker action
@@ -156,9 +158,11 @@ enum SupervisionPhase {
 #[derive(Debug)]
 struct SupervisionState {
     phase: SupervisionPhase,
-    /// Last instant at which the worker observed a clean status. Used to
-    /// lapse the supervisor when too long passes without fresh evidence of
-    /// an uncontended partition.
+    /// Last instant at which the worker observed a clean status while a
+    /// Tributary-owned song was active, or `None` while no owned song is
+    /// active and the gap clock is stopped. Used to lapse the supervisor
+    /// when too long passes without fresh evidence of an uncontended
+    /// partition.
     last_observation: Option<Instant>,
 }
 
@@ -179,12 +183,22 @@ impl SupervisionState {
     fn new() -> Self {
         Self {
             phase: SupervisionPhase::Armed,
-            // The construction instant is the fresh explicit user
-            // confirmation that armed this supervisor: re-selecting the
-            // output IS the reconfirmation, so authority starts live and
-            // stays live only while clean observations keep it within
-            // [`MAX_SUPERVISION_GAP`].
-            last_observation: Some(Instant::now()),
+            // Armed by the explicit user confirmation; the gap clock starts
+            // when an owned song becomes active.
+            last_observation: None,
+        }
+    }
+
+    /// Start the gap clock when an owned song becomes active and stop it
+    /// when none is. Never changes the phase.
+    fn watch(&mut self, owned_song_active: bool, now: Instant) {
+        if self.phase == SupervisionPhase::Lapsed {
+            return;
+        }
+        if !owned_song_active {
+            self.last_observation = None;
+        } else if self.last_observation.is_none() {
+            self.last_observation = Some(now);
         }
     }
 
@@ -208,14 +222,13 @@ impl SupervisionState {
     }
 
     /// The eager authority gate: whether this supervisor authorises an
-    /// authority-requiring action RIGHT NOW — `Armed` with a clean
-    /// observation (or the construction-time confirmation) no older than
-    /// [`MAX_SUPERVISION_GAP`]. An armed supervisor whose evidence has gone
-    /// stale lapses permanently — the unsupervised window is itself
-    /// disqualifying evidence — and returns `false`. Authority-requiring
-    /// paths call this BEFORE acting instead of waiting for the next status
-    /// poll to observe the gap, so a stale confirmation can never exercise
-    /// or renew itself.
+    /// authority-requiring action RIGHT NOW — `Armed`, and either idle or
+    /// with a clean observation no older than [`MAX_SUPERVISION_GAP`]. An
+    /// armed supervisor whose evidence has gone stale lapses permanently —
+    /// the unsupervised window is itself disqualifying evidence — and
+    /// returns `false`. Authority-requiring paths call this BEFORE acting
+    /// instead of waiting for the next status poll to observe the gap, so a
+    /// stale confirmation can never exercise or renew itself.
     fn authority_current(&mut self, now: Instant) -> bool {
         if self.phase == SupervisionPhase::Lapsed {
             return false;
@@ -2036,6 +2049,19 @@ struct WorkerSession<T> {
     last_position_ms: Option<u64>,
     duration_ms: u64,
     last_poll: Instant,
+    /// The connection failed (or ownership could not be confirmed) while
+    /// this session owned a song. The connection is never used again; the
+    /// song id is kept so the next Stop or shutdown can reconnect and run
+    /// the normal ownership-checked cleanup.
+    stranded: bool,
+}
+
+impl<T> WorkerSession<T> {
+    /// Whether the worker polls (and supervises) this session: it owns a
+    /// song on a usable connection.
+    const fn is_polled(&self) -> bool {
+        self.song_id.is_some() && !self.stranded
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2122,7 +2148,14 @@ fn run_mpd_worker<C>(
 {
     let mut active: Option<WorkerSession<C::Connection>> = None;
     loop {
-        let wait = if active.is_some() {
+        let polled = active.as_ref().is_some_and(WorkerSession::is_polled);
+        // The supervision gap is measured only while an owned song is being
+        // polled; idle time between sessions never lapses the supervisor.
+        supervision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .watch(polled, Instant::now());
+        let wait = if polled {
             timing.tick
         } else {
             Duration::from_hours(1)
@@ -2233,15 +2266,27 @@ fn run_mpd_worker<C>(
                         true
                     }
                     CommandKind::Stop => {
-                        match cleanup_session(
+                        let cleanup = match reconnect_stranded(
+                            &mut connector,
                             &mut active,
-                            command.owner,
-                            CleanupKind::StopOwned,
+                            command.owner.epoch,
                             &intent_epoch,
                             timing,
-                            plan,
-                            &supervision,
                         ) {
+                            Ok(()) => cleanup_session(
+                                &mut active,
+                                command.owner,
+                                CleanupKind::StopOwned,
+                                &intent_epoch,
+                                timing,
+                                plan,
+                                &supervision,
+                            ),
+                            // The stranded session is kept so another Stop
+                            // (or shutdown) can retry once MPD is reachable.
+                            Err(failure) => CleanupOutcome::Failed(failure),
+                        };
+                        match cleanup {
                             CleanupOutcome::Completed => {
                                 let _ = publish_state(
                                     command.owner,
@@ -2281,6 +2326,13 @@ fn run_mpd_worker<C>(
                         true
                     }
                     CommandKind::Shutdown => {
+                        let _ = reconnect_stranded(
+                            &mut connector,
+                            &mut active,
+                            command.owner.epoch,
+                            &intent_epoch,
+                            timing,
+                        );
                         cleanup_unconditionally(&mut active, timing, plan, &supervision);
                         break;
                     }
@@ -2344,6 +2396,13 @@ fn run_mpd_worker<C>(
                 );
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = reconnect_stranded(
+                    &mut connector,
+                    &mut active,
+                    intent_epoch.load(Ordering::SeqCst),
+                    &intent_epoch,
+                    timing,
+                );
                 cleanup_unconditionally(&mut active, timing, plan, &supervision);
                 break;
             }
@@ -2432,6 +2491,7 @@ fn handle_load<C>(
         last_position_ms: None,
         duration_ms: 0,
         last_poll: Instant::now(),
+        stranded: false,
     });
     if !is_current(owner, intent_epoch) {
         return;
@@ -2773,7 +2833,7 @@ fn retire_poisoned_if_stale<T, C>(
         return false;
     }
     if matches!(result, Err(failure) if !failure.connection_usable) {
-        active.take();
+        strand_session(active);
     }
     true
 }
@@ -2929,8 +2989,10 @@ fn retire_status_if_stale<C>(
             .and_then(|session| session.song_id)
             .is_some_and(|song_id| status_observes_foreign_song(status, song_id))
     });
-    if observed_foreign || matches!(result, Err(failure) if !failure.connection_usable) {
+    if observed_foreign {
         active.take();
+    } else if matches!(result, Err(failure) if !failure.connection_usable) {
+        strand_session(active);
     }
     true
 }
@@ -2961,13 +3023,49 @@ fn cleanup_then_fail<C>(
         );
     } else {
         // An I/O timeout, partial write, truncated response, or parser failure
-        // may leave unread bytes or a half-command on the stream. Drop it
-        // immediately instead of issuing cleanup on a poisoned protocol state.
-        active.take();
+        // may leave unread bytes or a half-command on the stream. Never issue
+        // cleanup on that poisoned protocol state; strand the session so a
+        // later Stop or shutdown reconnects and cleans up the owned song.
+        strand_session(active);
     }
     if is_current(owner, intent_epoch) {
         fail_current(owner, failure, intent_epoch, cache, event_tx);
     }
+}
+
+/// Stop using a session whose connection became unusable. A session that
+/// owns a song keeps its song id (see [`WorkerSession::stranded`]); one that
+/// owns nothing is dropped.
+fn strand_session<C>(active: &mut Option<WorkerSession<C>>) {
+    match active.as_mut() {
+        Some(session) if session.song_id.is_some() => {
+            session.stranded = true;
+            session.ticket = None;
+        }
+        _ => {
+            active.take();
+        }
+    }
+}
+
+/// Give a stranded session a fresh connection so the normal ownership-checked
+/// cleanup can run on it. On failure the session stays stranded.
+fn reconnect_stranded<C>(
+    connector: &mut C,
+    active: &mut Option<WorkerSession<C::Connection>>,
+    owner_epoch: u64,
+    intent_epoch: &AtomicU64,
+    timing: WorkerTiming,
+) -> MpdResult<()>
+where
+    C: MpdConnector,
+{
+    let Some(session) = active.as_mut().filter(|session| session.stranded) else {
+        return Ok(());
+    };
+    session.connection = connector.connect(owner_epoch, intent_epoch, timing.deadline())?;
+    session.stranded = false;
+    Ok(())
 }
 
 fn relinquish_then_fail<C>(
@@ -3078,7 +3176,7 @@ fn handle_control<C>(
     if session.owner.epoch != owner.epoch {
         return;
     }
-    if session.song_id.is_none() {
+    if !session.is_polled() {
         return;
     }
     let deadline = timing.deadline();
@@ -3110,12 +3208,12 @@ fn handle_control<C>(
         }
         Err(failure) => {
             // A failed ownership query cannot authorize even a global pause.
-            // Drop the session without sending any cleanup command, and —
+            // Strand the session without sending any cleanup command, and —
             // on a supervised output — revoke authority: the unreadable
             // reply is a blind window over the partition, and a queued
             // newer load must not mutate inside the window it leaves.
             lapse_on_unreadable_status(plan, supervision);
-            active.take();
+            strand_session(active);
             fail_current(owner, failure, intent_epoch, cache, event_tx);
             return;
         }
@@ -3253,7 +3351,7 @@ fn poll_active<C>(
         return;
     };
     let owner = session.owner;
-    if session.song_id.is_none() {
+    if !session.is_polled() {
         return;
     }
     if !is_current(owner, intent_epoch) || (!force && session.last_poll.elapsed() < timing.poll) {
@@ -3602,7 +3700,9 @@ where
         *active = Some(session);
         return CleanupOutcome::Stale;
     }
-    let Some(song_id) = session.song_id else {
+    // A stranded session is dropped here: its connection is unusable, and
+    // only Stop and shutdown reconnect it first (a load replaces it anyway).
+    let Some(song_id) = session.song_id.filter(|_| !session.stranded) else {
         return CleanupOutcome::Completed;
     };
 
@@ -3622,12 +3722,15 @@ where
                 }
                 Err(_) => lapse_on_unreadable_status(plan, supervision),
             }
-            let can_restore = match &status {
-                Ok(status) => !status_observes_foreign_song(status, song_id),
-                Err(failure) => failure.connection_usable,
-            };
-            if can_restore {
-                *active = Some(session);
+            match &status {
+                Ok(status) if status_observes_foreign_song(status, song_id) => {}
+                Ok(_) => *active = Some(session),
+                Err(failure) => {
+                    *active = Some(session);
+                    if !failure.connection_usable {
+                        strand_session(active);
+                    }
+                }
             }
             return CleanupOutcome::Stale;
         }
@@ -3663,12 +3766,12 @@ where
                     }
                     let stopped = session.connection.stop(deadline);
                     if !is_current(owner, intent_epoch) {
+                        *active = Some(session);
                         if stopped
                             .as_ref()
-                            .err()
-                            .is_none_or(|failure| failure.connection_usable)
+                            .is_err_and(|failure| !failure.connection_usable)
                         {
-                            *active = Some(session);
+                            strand_session(active);
                         }
                         return CleanupOutcome::Stale;
                     }
@@ -3677,7 +3780,11 @@ where
                         Err(stop_failure) if stop_failure.connection_usable => {
                             failure = Some(stop_failure);
                         }
-                        Err(stop_failure) => return CleanupOutcome::Failed(stop_failure),
+                        Err(stop_failure) => {
+                            *active = Some(session);
+                            strand_session(active);
+                            return CleanupOutcome::Failed(stop_failure);
+                        }
                     }
                 }
             }
@@ -3698,7 +3805,11 @@ where
                 // but ownership was indeterminate and the Stop itself failed.
                 failure = Some(status_failure);
             }
-            Err(status_failure) => return CleanupOutcome::Failed(status_failure),
+            Err(status_failure) => {
+                *active = Some(session);
+                strand_session(active);
+                return CleanupOutcome::Failed(status_failure);
+            }
         }
     }
 
@@ -3757,7 +3868,7 @@ fn cleanup_unconditionally<C>(
     C: MpdTransport,
 {
     if let Some(mut session) = active.take() {
-        let Some(song_id) = session.song_id else {
+        let Some(song_id) = session.song_id.filter(|_| !session.stranded) else {
             return;
         };
         // Gate EVERY authority-requiring mutation before the first one —
@@ -4051,7 +4162,7 @@ impl AudioOutput for MpdOutput {
     fn supervision_lapsed(&self) -> bool {
         // EAGER, mirroring the worker's authority gate (`SupervisionState::
         // authority_current`): an armed supervisor whose last clean
-        // observation (or construction-time confirmation) is older than
+        // observation of an active owned song is older than
         // MAX_SUPERVISION_GAP is exactly as disqualified as an explicitly
         // lapsed one — the next authority-requiring command would be
         // refused by that same eager rule. Consulting only the stored
@@ -4935,10 +5046,9 @@ mod tests {
 
     #[test]
     fn supervision_eager_gate_keeps_fresh_confirmation_authoritative() {
-        // The construction instant IS the explicit user confirmation, so a
-        // freshly re-selected output is authoritative immediately — no poll
-        // is needed to prove what the user just confirmed — and it stays
-        // authoritative up to and including the exact gap boundary.
+        // The explicit user confirmation authorises immediately — no poll is
+        // needed to prove what the user just confirmed — and a watched
+        // supervisor stays authoritative up to the exact gap boundary.
         let mut state = SupervisionState::new();
         assert!(
             state.authority_current(Instant::now()),
@@ -4962,6 +5072,127 @@ mod tests {
             reconfirmed.authority_current(Instant::now()),
             "only an explicit reconfirmation re-arms a lapsed supervisor"
         );
+    }
+
+    #[test]
+    fn supervision_gap_clock_runs_only_while_an_owned_song_is_active() {
+        let t0 = Instant::now();
+        let hour = Duration::from_hours(1);
+        let mut state = SupervisionState::new();
+        assert!(
+            state.authority_current(t0 + hour),
+            "idle time after construction never lapses the supervisor"
+        );
+
+        state.watch(true, t0);
+        state.watch(true, t0 + Duration::from_secs(1));
+        assert_eq!(
+            state.last_observation,
+            Some(t0),
+            "an already running clock is not restarted"
+        );
+        state.observe(t0 + Duration::from_secs(1));
+        state.watch(false, t0 + Duration::from_secs(2));
+        assert!(
+            state.authority_current(t0 + hour),
+            "idle time after a session ends never lapses the supervisor"
+        );
+
+        state.watch(true, t0 + hour);
+        assert!(
+            !state.authority_current(t0 + hour + MAX_SUPERVISION_GAP + Duration::from_millis(1)),
+            "an unobserved gap while an owned song is active still lapses"
+        );
+        state.watch(false, t0 + hour + hour);
+        state.watch(true, t0 + hour + hour);
+        assert!(
+            state.is_lapsed() && !state.authority_current(t0 + hour + hour),
+            "stopping or restarting the clock never re-arms a lapsed supervisor"
+        );
+    }
+
+    #[test]
+    fn supervised_output_stays_authoritative_while_idle_between_sessions() {
+        let shared = FakeShared::new();
+        let proxy_shared = FakeProxyShared::new();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let proxy = fake_proxy_services(Arc::clone(&proxy_shared), &runtime);
+        let harness = Harness::new_supervised_with_proxy(
+            Arc::clone(&shared),
+            proxy,
+            Duration::from_hours(1),
+            Duration::from_millis(1),
+        );
+        // Evaluating the gate an hour ahead stands in for the user waiting:
+        // while idle the gap clock is stopped, so that must still authorise.
+        let idle_hour_later_is_authoritative = |harness: &Harness| {
+            let mut supervisor = harness.supervision.lock().expect("supervision lock");
+            supervisor.last_observation.is_none()
+                && supervisor.authority_current(Instant::now() + Duration::from_hours(1))
+        };
+        let load = |harness: &Harness, generation: u64, uri: &str| {
+            let owner = harness.next_owner(generation);
+            harness.send(
+                owner,
+                CommandKind::Load {
+                    uri: uri.to_string(),
+                },
+            );
+            harness.fence(owner);
+            owner
+        };
+
+        let idle = harness.next_owner(1);
+        harness.fence(idle);
+        assert!(idle_hour_later_is_authoritative(&harness));
+
+        load(&harness, 2, "https://music.test/a");
+        assert!(
+            harness
+                .supervision
+                .lock()
+                .expect("supervision lock")
+                .last_observation
+                .is_some(),
+            "the gap clock runs while the owned song plays"
+        );
+        let stop = harness.next_owner(3);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+        assert!(idle_hour_later_is_authoritative(&harness));
+
+        let playing = load(&harness, 4, "https://music.test/b");
+        let mut completed = stopped_status(10_000, 10_000);
+        completed.song_id = None;
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(completed);
+        harness.send(playing, CommandKind::PollNow);
+        harness.fence(playing);
+        assert!(idle_hour_later_is_authoritative(&harness));
+
+        load(&harness, 5, "https://music.test/c");
+        assert_eq!(
+            shared.added_uris(),
+            vec![
+                "https://music.test/a".to_string(),
+                "https://music.test/b".to_string(),
+                "https://music.test/c".to_string(),
+            ]
+        );
+        assert!(!harness
+            .supervision
+            .lock()
+            .expect("supervision lock")
+            .is_lapsed());
+        assert!(!harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::Error { message, .. }
+                if message == &mpd_exclusive_control_required_message(&rust_i18n::locale())
+        )));
+        harness.shutdown();
     }
 
     #[test]
@@ -6874,9 +7105,8 @@ mod tests {
             "a freshly confirmed supervisor reports healthy"
         );
 
-        // The evidence goes stale without any poll observing it — exactly
-        // the "newly selected or naturally completed output" shape from the
-        // finding: phase still Armed, but the eager age rule already
+        // The evidence for an active owned song goes stale without any poll
+        // observing it: phase still Armed, but the eager age rule already
         // disqualifies it.
         let stale = Instant::now()
             .checked_sub(MAX_SUPERVISION_GAP + Duration::from_secs(1))
@@ -8714,6 +8944,98 @@ mod tests {
             ]
         ));
         harness.shutdown();
+    }
+
+    /// Load one owned song, then fail its next status poll with an I/O-level
+    /// error so the session is stranded. Returns the load owner.
+    fn strand_after_stalled_poll(harness: &Harness, shared: &FakeShared) -> CommandOwner {
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(load);
+        shared.clear_actions();
+        *shared.poison_at.lock().expect("poison lock") = Some(Point::Status);
+        harness.send(load, CommandKind::PollNow);
+        harness.fence(load);
+        let _ = harness.events();
+        load
+    }
+
+    #[test]
+    fn stop_after_a_stalled_poll_reconnects_and_stops_the_owned_song() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let load = strand_after_stalled_poll(&harness, &shared);
+
+        // The stranded connection is never used again.
+        harness.send(load, CommandKind::Pause);
+        harness.send(load, CommandKind::PollNow);
+        harness.fence(load);
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
+
+        // MPD is still unreachable: Stop reports the failure and keeps the
+        // owned song for a retry.
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Connect);
+        let first_stop = harness.next_owner(1);
+        harness.send(first_stop, CommandKind::Stop);
+        harness.fence(first_stop);
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+
+        *shared.fail_at.lock().expect("failure lock") = None;
+        shared.clear_actions();
+        let second_stop = harness.next_owner(1);
+        harness.send(second_stop, CommandKind::Stop);
+        harness.fence(second_stop);
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Connect),
+                Action::Point(Point::Status),
+                Action::Point(Point::Stop),
+                Action::Delete(42),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [PlayerEvent::StateChanged {
+                state: PlayerState::Stopped,
+                ..
+            }]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn shutdown_after_a_stalled_poll_reconnects_and_stops_the_owned_song() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        strand_after_stalled_poll(&harness, &shared);
+        shared.clear_actions();
+
+        harness.shutdown();
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Connect),
+                Action::Point(Point::Status),
+                Action::Point(Point::Stop),
+                Action::Delete(42),
+            ]
+        );
     }
 
     #[test]

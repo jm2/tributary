@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, Statement,
+    QuerySelect, Set, Statement, TransactionTrait,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -52,21 +52,15 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 // LibraryEvent — messages sent to GTK main thread
 // ---------------------------------------------------------------------------
 
-/// Seed an empty playlist table when possible, then always attempt one
-/// versioned publication through the engine-owned publisher.
+/// Seed the default playlists if this database has never held one, then
+/// always attempt one versioned publication through the engine-owned
+/// publisher.
 async fn seed_default_playlists_and_request(
     playlist_manager: &super::playlist_manager::PlaylistManager,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) {
-    match playlist_manager.list_playlists().await {
-        Ok(playlists) if playlists.is_empty() => {
-            info!("No playlists found — seeding defaults");
-            if let Err(error) = playlist_manager.seed_defaults().await {
-                warn!(%error, "Failed to seed default playlists");
-            }
-        }
-        Ok(_) => {}
-        Err(error) => warn!(%error, "Failed to load playlists before default seeding"),
+    if let Err(error) = playlist_manager.seed_defaults().await {
+        warn!(%error, "Failed to seed default playlists");
     }
 
     if matches!(
@@ -347,6 +341,11 @@ pub struct LibraryEngine {
     db: DatabaseConnection,
     music_dirs: Vec<PathBuf>,
     pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
+    /// Whether `music_dirs` is the user's saved folder list, so tracks under
+    /// no configured folder may be forgotten at startup. False when the list
+    /// is only a default, so a missing or unreadable config never discards
+    /// a library.
+    forget_unconfigured_tracks: bool,
     tx: async_channel::Sender<LibraryEvent>,
     command_rx: async_channel::Receiver<LibraryCommand>,
     services: LibraryEngineServices,
@@ -399,6 +398,7 @@ impl LibraryEngine {
         db: DatabaseConnection,
         music_dirs: Vec<PathBuf>,
         pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
+        forget_unconfigured_tracks: bool,
         tx: async_channel::Sender<LibraryEvent>,
         command_rx: async_channel::Receiver<LibraryCommand>,
         services: LibraryEngineServices,
@@ -408,6 +408,7 @@ impl LibraryEngine {
             db,
             music_dirs,
             pending_root_reauthorizations,
+            forget_unconfigured_tracks,
             tx,
             command_rx,
             services,
@@ -422,6 +423,7 @@ impl LibraryEngine {
             db,
             music_dirs,
             pending_root_reauthorizations,
+            forget_unconfigured_tracks,
             tx,
             command_rx,
             services,
@@ -501,6 +503,7 @@ impl LibraryEngine {
         // Resolve explicit old→new identity transfers before either path can
         // be watched or scanned. A rejected request keeps only the old path;
         // an inconsistent durable receipt removes both paths fail-closed.
+        let configured_roots = music_dirs.clone();
         let music_dirs = resolve_pending_root_reauthorizations(
             db.as_ref(),
             music_dirs,
@@ -509,33 +512,67 @@ impl LibraryEngine {
         )
         .await;
 
-        // Install before traversing so changes observed during the initial
-        // scan are retained for replay after its snapshot is published.
-        // Construction remains best-effort: a watcher backend failure must
-        // not suppress the useful one-shot scan.
-        let (mut watcher, watcher_error) = match install_directory_watcher(&music_dirs) {
-            Ok(watcher) => (Some(watcher), None),
-            Err(error) => {
-                error!(%error, "Filesystem watcher could not be installed");
-                (None, Some(error.to_string()))
+        // A folder removed in Preferences is forgotten here, before the scan
+        // publishes the library snapshot.
+        if forget_unconfigured_tracks && admit_scan_mutation(&scan_cancellation) {
+            match forget_tracks_outside_library_roots(
+                db.as_ref(),
+                &configured_roots,
+                &music_dirs,
+                &pending_root_reauthorizations,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(forgotten) => {
+                    info!(
+                        forgotten,
+                        "Forgot tracks outside every configured library folder"
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "Could not forget tracks outside the configured library folders");
+                }
             }
-        };
-
-        // ── Initial scan (all directories) ───────────────────────────
-        for dir in &music_dirs {
-            info!(dir = %dir.display(), "Starting initial library scan");
         }
-        // Commands are serviced *while* the scan runs. The scan's read-only
-        // traversal/parsing cannot be cancelled while the window is open, so
-        // awaiting it before this loop would let a held discovery step delay
-        // every admitted rating/history edit until close (R9/R1). Both share
-        // one engine task, so catalogue mutations stay serialized — except
-        // while the scan has a write transaction open across an await point,
-        // when the shared gate defers commands to the transaction boundary.
+
+        // Commands are serviced *while* the watcher is installed and the scan
+        // runs. Neither notify's recursive registration nor the scan's
+        // read-only traversal/parsing can be cancelled while the window is
+        // open, so awaiting them before this loop would let slow storage delay
+        // every admitted rating/history edit until close. Both share one
+        // engine task, so catalogue mutations stay serialized — except while
+        // the scan has a write transaction open across an await point, when
+        // the shared gate defers commands to the transaction boundary.
+        let mut watcher = None;
+        let mut watcher_error = None;
         let mut completed_commands = HashMap::new();
         let scan_write_txn = ScanWriteTxnGate::default();
-        let scan_result = service_commands_while_scanning(
-            initial_scan_shutdown_aware(
+        let startup = async {
+            // Install before traversing so changes observed during the initial
+            // scan are retained for replay after its snapshot is published.
+            // Construction remains best-effort: a watcher backend failure must
+            // not suppress the useful one-shot scan.
+            let install_dirs = music_dirs.clone();
+            let install =
+                tokio::task::spawn_blocking(move || install_directory_watcher(&install_dirs));
+            match await_readonly_blocking(&scan_cancellation, install).await {
+                Some(Ok(Ok(installed))) => watcher = Some(installed),
+                Some(Ok(Err(error))) => {
+                    error!(%error, "Filesystem watcher could not be installed");
+                    watcher_error = Some(error.to_string());
+                }
+                Some(Err(error)) => {
+                    error!(%error, "Filesystem watcher installation task failed");
+                    watcher_error = Some(error.to_string());
+                }
+                None => info!("Filesystem watcher installation abandoned at shutdown"),
+            }
+
+            for dir in &music_dirs {
+                info!(dir = %dir.display(), "Starting initial library scan");
+            }
+            let scan_result = initial_scan_shutdown_aware(
                 &db,
                 &music_dirs,
                 &tx,
@@ -543,7 +580,33 @@ impl LibraryEngine {
                 &scan_cancellation,
                 &ScanDiscoveryHold::none(),
                 &scan_write_txn,
-            ),
+            )
+            .await;
+
+            // A missing or temporarily unwatchable root can become available
+            // while another root is being enumerated. Retain every successful
+            // pre-scan registration, then retry only the gaps at the handoff so
+            // a root the scan just indexed is never left unwatched until
+            // restart.
+            if let Some(mut installed) = watcher.take() {
+                let retry_dirs = music_dirs.clone();
+                let retry = tokio::task::spawn_blocking(move || {
+                    installed.watch_available_directories(&retry_dirs);
+                    installed
+                });
+                watcher = match await_readonly_blocking(&scan_cancellation, retry).await {
+                    Some(Ok(installed)) => Some(installed),
+                    Some(Err(error)) => {
+                        error!(%error, "Filesystem watcher registration task failed");
+                        None
+                    }
+                    None => None,
+                };
+            }
+            scan_result
+        };
+        let scan_result = service_commands_while_scanning(
+            startup,
             &scan_write_txn,
             &db,
             &music_dirs,
@@ -556,14 +619,6 @@ impl LibraryEngine {
         if let Err(e) = scan_result {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
-        }
-
-        // A missing or temporarily unwatchable root can become available
-        // while another root is being enumerated. Retain every successful
-        // pre-scan registration, then retry only the gaps at the handoff so a
-        // root the scan just indexed is never left unwatched until restart.
-        if let Some(watcher) = watcher.as_mut() {
-            watcher.watch_available_directories(&music_dirs);
         }
 
         if let Some(error) = watcher_error {
@@ -580,6 +635,7 @@ impl LibraryEngine {
                 &mut completed_commands,
                 watcher,
                 &playlist_sidebar_refresh,
+                &scan_cancellation,
             )
             .await
             {
@@ -839,6 +895,59 @@ async fn resolve_pending_root_reauthorizations(
     }
 
     effective_roots
+}
+
+/// Delete the local tracks that lie under no library root, in one transaction.
+///
+/// Removing a folder in Preferences only edits the configuration, so its rows
+/// are deleted at the next startup. Rows under a configured root, an
+/// effective root, or either endpoint of a pending reauthorization are kept
+/// whether or not that root is currently available, so an unmounted volume
+/// or a relocation awaiting its receipt never loses metadata. A deleted row
+/// takes its play count and rating with it, and its playlist entries become
+/// unmatched (`local_track_id` is `ON DELETE SET NULL`), exactly as when a
+/// scan removes a track that left the disk.
+async fn forget_tracks_outside_library_roots(
+    db: &DatabaseConnection,
+    configured_roots: &[PathBuf],
+    effective_roots: &[PathBuf],
+    reauthorizations: &[RootReauthorizationRequest],
+) -> anyhow::Result<usize> {
+    let kept_roots: Vec<&Path> = configured_roots
+        .iter()
+        .chain(effective_roots)
+        .map(PathBuf::as_path)
+        .chain(
+            reauthorizations
+                .iter()
+                .flat_map(|request| [request.old_path(), request.new_path()]),
+        )
+        .collect();
+    let transaction = db.begin().await?;
+    let forgotten: Vec<String> = track::Entity::find()
+        .select_only()
+        .column(track::Column::Id)
+        .column(track::Column::FilePath)
+        .into_tuple::<(String, String)>()
+        .all(&transaction)
+        .await?
+        .into_iter()
+        .filter(|(_, path)| {
+            !kept_roots
+                .iter()
+                .any(|root| Path::new(path).starts_with(root))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    // Bounded statements keep each delete below SQLite's parameter limit.
+    for ids in forgotten.chunks(500) {
+        track::Entity::delete_many()
+            .filter(track::Column::Id.is_in(ids.iter().cloned()))
+            .exec(&transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(forgotten.len())
 }
 
 async fn resolve_root_reauthorization(
@@ -1338,7 +1447,9 @@ where
 #[derive(Debug)]
 struct RootScan {
     root: PathBuf,
-    audio_files: Vec<PathBuf>,
+    /// Each discovered audio file with its RFC 3339 mtime, read by the
+    /// traversal worker so the scan loop never stats files on the engine task.
+    audio_files: Vec<(PathBuf, String)>,
     errors: Vec<String>,
     device_id: Option<String>,
     mount_generation: Option<u64>,
@@ -2381,6 +2492,13 @@ where
 
     let (audio_files, traversal_errors) = enumerate_audio_files(&root, root_boundary, exclusions);
     errors.extend(traversal_errors);
+    let audio_files = audio_files
+        .into_iter()
+        .map(|path| {
+            let mtime = get_mtime(&path);
+            (path, mtime)
+        })
+        .collect();
 
     match mount_generation_probe(&root) {
         Ok(generation) if generation == mount_generation => {}
@@ -2680,8 +2798,8 @@ fn directory_identity_destinations(
         .collect()
 }
 
-fn collect_audio_files(root_scans: &[RootScan]) -> Vec<PathBuf> {
-    let mut audio_files: Vec<PathBuf> = root_scans
+fn collect_audio_files(root_scans: &[RootScan]) -> Vec<(PathBuf, String)> {
+    let mut audio_files: Vec<(PathBuf, String)> = root_scans
         .iter()
         .filter(|scan| scan.content_authorized)
         .flat_map(|scan| scan.audio_files.iter().cloned())
@@ -2689,8 +2807,8 @@ fn collect_audio_files(root_scans: &[RootScan]) -> Vec<PathBuf> {
 
     // The same file is visible through every configured ancestor root. Scan
     // it once even if the user's configuration contains overlapping roots.
-    audio_files.sort_unstable();
-    audio_files.dedup();
+    audio_files.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    audio_files.dedup_by(|(left, _), (right, _)| left == right);
     audio_files
 }
 
@@ -3119,6 +3237,14 @@ fn prepare_durable_root_identity(
     {
         scan.errors.push(format!(
             "library root identity or mount changed before marker creation: {}",
+            scan.root.display()
+        ));
+        return RootIdentityPreparation::Unchanged;
+    }
+
+    if let Err(error) = RootAuthorityLease::check_root_retainable(&scan.root) {
+        scan.errors.push(format!(
+            "library root cannot be retained, so no durable identity was written {}: {error}",
             scan.root.display()
         ));
         return RootIdentityPreparation::Unchanged;
@@ -4706,7 +4832,7 @@ async fn initial_scan_with_control(
     let mut scanned: u64 = 0;
     let mut on_disk_paths = HashSet::new();
 
-    for path in &audio_files {
+    for (path, mtime) in &audio_files {
         // Check the shutdown boundary before admitting the next parse/upsert.
         // Everything already committed above stands; nothing new is admitted,
         // and the no-deletion phase below is skipped entirely.
@@ -4729,8 +4855,8 @@ async fn initial_scan_with_control(
         let existing = existing_by_path.get(path_str.as_str()).copied();
 
         let needs_update = match existing {
-            // Compare FS mtime with stored date_modified.
-            Some(row) => get_mtime(path) != row.date_modified,
+            // Compare the traversal's mtime with the stored date_modified.
+            Some(row) => *mtime != row.date_modified,
             None => true,
         };
 
@@ -5703,6 +5829,13 @@ fn same_audio_extension(from: &Path, to: &Path) -> bool {
             .is_some_and(|(from, to)| from.eq_ignore_ascii_case(to))
 }
 
+/// Tributary's own tag-write siblings: the staged copy and the quarantined
+/// original. They are never library content; the watcher only uses them to
+/// learn that the public path next to them changed.
+fn is_private_write_sibling(path: &Path) -> bool {
+    tag_writer::is_tag_write_temp_file(path) || super::root_authority::is_quarantine_file(path)
+}
+
 async fn prepare_watcher_rename_guard(
     db: &DatabaseConnection,
     roots: &mut WatcherRootCache,
@@ -6042,10 +6175,20 @@ impl WatcherBatch {
                 }
             }
             EventKind::Modify(ModifyKind::Name(_)) => {
-                // FSEvents and kqueue cannot associate the old and new sides.
-                // Never infer identity from metadata; a guarded scan performs
-                // the conservative delete/upsert fallback.
-                self.reconciliation_required = true;
+                // FSEvents and kqueue cannot associate the old and new sides,
+                // so identity is never inferred. An audio path still names one
+                // file: refresh or remove it by path. Any other name may be a
+                // directory, which needs the guarded reconciliation scan.
+                for path in event.paths {
+                    if is_private_write_sibling(&path) {
+                        continue;
+                    }
+                    if tag_parser::is_audio_file(&path) {
+                        self.record_upsert(path);
+                    } else {
+                        self.reconciliation_required = true;
+                    }
+                }
             }
             EventKind::Create(kind) => {
                 let folder = matches!(kind, CreateKind::Folder);
@@ -6068,7 +6211,7 @@ impl WatcherBatch {
     }
 
     fn record_remove(&mut self, path: PathBuf) {
-        if tag_writer::is_tag_write_temp_file(&path) {
+        if is_private_write_sibling(&path) {
             return;
         }
         if self.paired_paths.contains(&path) {
@@ -6085,7 +6228,7 @@ impl WatcherBatch {
     }
 
     fn record_upsert(&mut self, path: PathBuf) {
-        if tag_writer::is_tag_write_temp_file(&path) {
+        if is_private_write_sibling(&path) {
             return;
         }
         let paired = self.paired_paths.contains(&path);
@@ -6119,19 +6262,21 @@ impl WatcherBatch {
 
     fn record_rename_pair(&mut self, from: PathBuf, to: PathBuf) {
         match (
-            tag_writer::is_tag_write_temp_file(&from),
-            tag_writer::is_tag_write_temp_file(&to),
+            is_private_write_sibling(&from),
+            is_private_write_sibling(&to),
         ) {
             (true, true) => return,
+            // A tag write moves the original aside, publishes the staged copy
+            // under its name, and (after a failed commit) moves the original
+            // back. Each step only means the public path changed: refresh it
+            // in place without transferring identity from a private name that
+            // was never indexed.
             (true, false) => {
-                // Atomic tag replacement is a private sibling becoming the
-                // original track. Refresh metadata at the public path without
-                // transferring identity from a path that was never indexed.
                 self.record_upsert(to);
                 return;
             }
             (false, true) => {
-                self.record_remove(from);
+                self.record_upsert(from);
                 return;
             }
             (false, false) => {}
@@ -6139,6 +6284,25 @@ impl WatcherBatch {
 
         let pair = WatcherRenamePair { from, to };
         if pair.from == pair.to {
+            self.record_upsert(pair.to);
+            return;
+        }
+        // Only a same-extension audio file or a directory carries an indexed
+        // identity across a rename. A file renamed across extensions (a sync
+        // tool publishing its hidden download, or a track renamed to a
+        // non-audio name) is a removal of the source plus an upsert of the
+        // destination. A rename keeps the object's type, so the source was a
+        // file as well and its deferred observation is not a directory.
+        if !same_audio_extension(&pair.from, &pair.to)
+            && matches!(
+                watcher_upsert_path_kind(&pair.to),
+                Ok(WatcherUpsertPathKind::RegularFile)
+            )
+        {
+            self.deferred_paths.remove(&pair.from);
+            if tag_parser::is_audio_file(&pair.from) {
+                self.record_remove(pair.from);
+            }
             self.record_upsert(pair.to);
             return;
         }
@@ -6214,30 +6378,21 @@ fn rename_pairs_overlap(left: &WatcherRenamePair, right: &WatcherRenamePair) -> 
     })
 }
 
-async fn reconcile_playlists_after_watcher_batch(
-    db: &DatabaseConnection,
-    upsert_committed: bool,
-) -> Result<u32, sea_orm::DbErr> {
-    if !upsert_committed {
-        return Ok(0);
-    }
-
-    super::playlist_manager::PlaylistManager::new(db.clone())
-        .reconcile_all()
-        .await
-}
-
 /// Finish the playlist work caused by one watcher batch, then tell the UI to
-/// rebuild any active projection. The notification is deliberately emitted
-/// even when reconciliation fails: the committed track mutation still needs
-/// to become visible, and a later batch or scan can retry orphan relinking.
+/// rebuild any active projection. `upserted` holds every row the batch
+/// inserted, updated, or relocated; only those can newly resolve an orphaned
+/// entry. The notification is deliberately emitted even when reconciliation
+/// fails: the committed track mutation still needs to become visible, and a
+/// later batch or scan can retry orphan relinking.
 async fn settle_playlist_projections_after_watcher_batch(
     db: &DatabaseConnection,
     tx: &async_channel::Sender<LibraryEvent>,
-    upsert_committed: bool,
+    upserted: &[track::Model],
     track_mutation_committed: bool,
 ) -> Result<u32, sea_orm::DbErr> {
-    let result = reconcile_playlists_after_watcher_batch(db, upsert_committed).await;
+    let result = super::playlist_manager::PlaylistManager::new(db.clone())
+        .reconcile_changed_tracks(upserted)
+        .await;
     if track_mutation_committed {
         let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
     }
@@ -6332,9 +6487,14 @@ fn install_directory_watcher(music_dirs: &[PathBuf]) -> notify::Result<Directory
     Ok(installed)
 }
 
+/// One debounce window of watcher events, kept raw and in order.
+///
+/// Classifying an event stats its paths, which can block on slow storage, so
+/// [`WatcherDebounceBatch::finish`] runs on a blocking worker once the window
+/// closes rather than on the engine task as each event arrives.
 #[derive(Debug, Default)]
 struct WatcherDebounceBatch {
-    batch: WatcherBatch,
+    events: Vec<notify::Event>,
     stream_unreliable: bool,
 }
 
@@ -6348,23 +6508,27 @@ impl WatcherDebounceBatch {
             Ok(event) if event.need_rescan() => {
                 warn!("Filesystem watcher requested an authoritative rescan");
                 self.stream_unreliable = true;
-                self.batch = WatcherBatch::default();
+                self.events.clear();
             }
-            Ok(event) => self.batch.collect(event),
+            Ok(event) => self.events.push(event),
             Err(error) => {
                 warn!(%error, "Filesystem watcher reported an unreliable stream");
                 self.stream_unreliable = true;
-                self.batch = WatcherBatch::default();
+                self.events.clear();
             }
         }
     }
 
-    fn finish(mut self) -> Option<WatcherBatch> {
+    fn finish(self) -> Option<WatcherBatch> {
         if self.stream_unreliable {
             return None;
         }
-        self.batch.finish();
-        Some(self.batch)
+        let mut batch = WatcherBatch::default();
+        for event in self.events {
+            batch.collect(event);
+        }
+        batch.finish();
+        Some(batch)
     }
 }
 
@@ -6372,11 +6536,34 @@ fn discard_watcher_backlog(rx: &mut mpsc::Receiver<notify::Result<notify::Event>
     while rx.try_recv().is_ok() {}
 }
 
+/// The watcher's authoritative fallback: an ordinary library scan, bounded by
+/// the window-close cancellation like the startup scan so closing the window
+/// never waits for a whole-library rescan.
+async fn reconcile_watched_library(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<()> {
+    initial_scan_shutdown_aware(
+        db,
+        music_dirs,
+        tx,
+        playlist_sidebar_refresh,
+        cancellation,
+        &ScanDiscoveryHold::none(),
+        &ScanWriteTxnGate::default(),
+    )
+    .await
+}
+
 async fn reconcile_unreliable_watcher_stream(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
     rx: &mut mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> bool {
     // The queued backlog belongs to the same stream gap and cannot be applied
@@ -6386,7 +6573,9 @@ async fn reconcile_unreliable_watcher_stream(
     // loop iteration.
     discard_watcher_backlog(rx);
     info!("Reconciling library after filesystem watcher stream loss");
-    match initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
+    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
+        .await
+    {
         Ok(()) => true,
         Err(error) => {
             warn!(%error, "Watcher stream reconciliation failed; retry remains pending");
@@ -6400,6 +6589,7 @@ async fn reconcile_root_marker_mutations(
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
     roots: &HashSet<PathBuf>,
 ) -> bool {
     // Invalidate persisted authorization before any asynchronous traversal.
@@ -6409,7 +6599,9 @@ async fn reconcile_root_marker_mutations(
         mark_root_path_unavailable(db, root).await;
     }
     info!("Reconciling library after library root marker mutation");
-    match initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
+    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
+        .await
+    {
         Ok(()) => true,
         Err(error) => {
             warn!(%error, "Library root marker reconciliation failed; retry remains pending");
@@ -6418,6 +6610,7 @@ async fn reconcile_root_marker_mutations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_directory_events(
     db: &Arc<DatabaseConnection>,
     music_dirs: &[PathBuf],
@@ -6426,6 +6619,7 @@ async fn process_directory_events(
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     mut watcher: DirectoryWatcher,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    scan_cancellation: &CancellationToken,
 ) -> anyhow::Result<()> {
     // ── Debounced event processing ──────────────────────────────
     // Collect filesystem events for a short window, deduplicate by
@@ -6485,6 +6679,7 @@ async fn process_directory_events(
                 music_dirs,
                 tx,
                 playlist_sidebar_refresh,
+                scan_cancellation,
                 &mut watcher.rx,
             )
             .await;
@@ -6542,7 +6737,11 @@ async fn process_directory_events(
         // callback racing with the scan stores a fresh `true` value, which is
         // intentionally left for the next loop iteration.
         let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
-        let Some(mut batch) = ingress.finish() else {
+        let finished = tokio::task::spawn_blocking(move || ingress.finish()).await;
+        if let Err(error) = &finished {
+            warn!(%error, "Watcher batch classification task failed");
+        }
+        let Ok(Some(mut batch)) = finished else {
             reconciliation_pending = true;
             continue;
         };
@@ -6566,6 +6765,7 @@ async fn process_directory_events(
                 music_dirs,
                 tx,
                 playlist_sidebar_refresh,
+                scan_cancellation,
                 &batch.identity_changed_roots,
             )
             .await;
@@ -6588,7 +6788,9 @@ async fn process_directory_events(
         };
 
         let mut reconciliation_required = batch.reconciliation_required;
-        let mut upsert_committed = false;
+        // Rows this batch inserted, updated, or relocated: the only tracks
+        // that can newly resolve an orphaned playlist entry.
+        let mut upserted_tracks: Vec<track::Model> = Vec::new();
         let mut track_mutation_committed = false;
         let mut library_snapshot_dirty = false;
 
@@ -6755,9 +6957,9 @@ async fn process_directory_events(
                                     &model,
                                 ))))
                                 .await;
-                            upsert_committed = true;
                             track_mutation_committed = true;
                             info!(from = %pair.from.display(), to = %pair.to.display(), id = %model.id, "Preserved track identity across filesystem rename");
+                            upserted_tracks.push(*model);
                         }
                         Ok(RenameTrackOutcome::SourceMissing) => {
                             debug!(from = %pair.from.display(), to = %pair.to.display(), "Rename source was not indexed; falling back to reconciliation");
@@ -6936,10 +7138,9 @@ async fn process_directory_events(
                                 track_mutation_committed = true;
                             }
                             // Displacing a row nulls its playlist links through
-                            // the foreign key; the surviving row can reclaim them.
-                            if displaced > 0 {
-                                upsert_committed = true;
-                            }
+                            // the foreign key; the surviving row can reclaim them,
+                            // and a relocated row can satisfy retained path evidence.
+                            upserted_tracks.extend(moved.iter().map(|(_, model)| model.clone()));
 
                             // Files the rename carried along that were never
                             // indexed — added while the app was closed, or created
@@ -7198,10 +7399,10 @@ async fn process_directory_events(
                         .await;
                         match outcome {
                             Ok(GuardedTrackUpsertOutcome::Committed(model)) => {
-                                upsert_committed = true;
                                 track_mutation_committed = true;
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
+                                upserted_tracks.push(*model);
                             }
                             Ok(GuardedTrackUpsertOutcome::GuardRejected) => {
                                 if !authority_task_failed && !authority_stable_at_commit {
@@ -7237,8 +7438,14 @@ async fn process_directory_events(
         reconciliation_required |= root_cache.authority_was_lost();
         if reconciliation_required {
             info!("Reconciling library after unpaired or unclaimed watcher changes");
-            if let Err(error) =
-                initial_scan(db.as_ref(), music_dirs, tx, playlist_sidebar_refresh).await
+            if let Err(error) = reconcile_watched_library(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                scan_cancellation,
+            )
+            .await
             {
                 warn!(%error, "Watcher-triggered library reconciliation failed");
             }
@@ -7259,7 +7466,7 @@ async fn process_directory_events(
         match settle_playlist_projections_after_watcher_batch(
             db.as_ref(),
             tx,
-            upsert_committed,
+            &upserted_tracks,
             track_mutation_committed,
         )
         .await
@@ -8657,6 +8864,10 @@ mod tests {
         event
     }
 
+    fn scanned_paths(audio_files: &[(PathBuf, String)]) -> Vec<PathBuf> {
+        audio_files.iter().map(|(path, _)| path.clone()).collect()
+    }
+
     #[test]
     fn watcher_ingress_filters_access_noise_before_the_bounded_queue() {
         use notify::event::{AccessKind, AccessMode, Flag, MetadataKind, ModifyKind};
@@ -9142,7 +9353,7 @@ mod tests {
         ))
         .add_path(PathBuf::from("/music/must-not-remove.flac"))));
 
-        assert!(ingress.batch.is_empty());
+        assert!(ingress.events.is_empty());
         assert!(ingress.finish().is_none());
 
         let (tx, mut rx) = mpsc::channel(2);
@@ -9294,6 +9505,7 @@ mod tests {
             drop(event_tx);
         };
 
+        let never_cancelled = CancellationToken::new();
         let (loop_result, ()) = tokio::join!(
             process_directory_events(
                 &db,
@@ -9303,6 +9515,7 @@ mod tests {
                 &mut completed_commands,
                 watcher,
                 &playlist_sidebar_refresh,
+                &never_cancelled,
             ),
             driver,
         );
@@ -9609,6 +9822,262 @@ mod tests {
         assert_eq!(adjacent_split.upsert_paths, HashSet::from([track]));
         assert!(adjacent_split.rename_pairs.is_empty());
         assert!(adjacent_split.deferred_paths.is_empty());
+    }
+
+    const TEST_TAG_STAGING_NAME: &str = ".tributary-tag-00000000-0000-4000-8000-000000000000.flac";
+    const TEST_QUARANTINE_NAME: &str =
+        ".track.flac.tributary-replaced-0123456789abcdef0123456789abcdef";
+
+    fn path_str(path: &Path) -> &str {
+        path.to_str().expect("test paths are UTF-8")
+    }
+
+    /// Rename halves as a backend reports them: inotify tags both halves with
+    /// one cookie and adds a `Both` event; Windows reports adjacent untracked
+    /// halves only.
+    fn rename_halves(from: &Path, to: &Path, tracker: Option<usize>) -> Vec<notify::Event> {
+        use notify::event::RenameMode;
+
+        let mut events = vec![
+            rename_event(RenameMode::From, &[path_str(from)], tracker),
+            rename_event(RenameMode::To, &[path_str(to)], tracker),
+        ];
+        if tracker.is_some() {
+            events.push(rename_event(
+                RenameMode::Both,
+                &[path_str(from), path_str(to)],
+                tracker,
+            ));
+        }
+        events
+    }
+
+    /// The events of one tag save: the staged copy is written, the original
+    /// moves to a quarantine sibling, the staged copy is renamed onto the
+    /// public name, and the quarantine is unlinked.
+    fn tag_commit_events(
+        track: &Path,
+        staged: &Path,
+        quarantine: &Path,
+        trackers: Option<(usize, usize)>,
+    ) -> Vec<notify::Event> {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+        use notify::{Event, EventKind};
+
+        let mut events = vec![
+            Event::new(EventKind::Create(CreateKind::File)).add_path(staged.to_path_buf()),
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
+                .add_path(staged.to_path_buf()),
+        ];
+        events.extend(rename_halves(
+            track,
+            quarantine,
+            trackers.map(|(first, _)| first),
+        ));
+        events.extend(rename_halves(
+            staged,
+            track,
+            trackers.map(|(_, second)| second),
+        ));
+        events.push(
+            Event::new(EventKind::Remove(RemoveKind::File)).add_path(quarantine.to_path_buf()),
+        );
+        events
+    }
+
+    fn debounced_batch(events: Vec<notify::Event>) -> WatcherBatch {
+        let mut ingress = WatcherDebounceBatch::default();
+        for event in events {
+            ingress.collect(Ok(event));
+        }
+        ingress.finish().expect("ordinary event stream is reliable")
+    }
+
+    #[test]
+    fn watcher_batch_turns_a_quarantine_tag_commit_into_one_public_upsert() {
+        let library = TestDirectory::new("tag-commit-quarantine");
+        let track = library.path().join("track.flac");
+        let staged = library.path().join(TEST_TAG_STAGING_NAME);
+        let quarantine = library.path().join(TEST_QUARANTINE_NAME);
+        // When the debounce window closes only the committed track remains.
+        std::fs::write(&track, b"tagged audio").expect("publish tagged track");
+
+        for trackers in [Some((11, 12)), None] {
+            let batch = debounced_batch(tag_commit_events(&track, &staged, &quarantine, trackers));
+
+            assert_eq!(
+                batch.upsert_paths,
+                HashSet::from([track.clone()]),
+                "{trackers:?}"
+            );
+            assert!(batch.remove_paths.is_empty(), "{trackers:?}");
+            assert!(batch.rename_pairs.is_empty(), "{trackers:?}");
+            assert!(batch.deferred_paths.is_empty(), "{trackers:?}");
+            assert!(!batch.reconciliation_required, "{trackers:?}");
+        }
+    }
+
+    #[test]
+    fn watcher_batch_resolves_unassociated_audio_renames_by_path() {
+        use notify::event::RenameMode;
+
+        // FSEvents reports each side of a tag save as its own Name::Any.
+        let library = TestDirectory::new("tag-commit-name-any");
+        let track = library.path().join("track.flac");
+        let staged = library.path().join(TEST_TAG_STAGING_NAME);
+        let quarantine = library.path().join(TEST_QUARANTINE_NAME);
+        std::fs::write(&track, b"tagged audio").expect("publish tagged track");
+
+        let batch = debounced_batch(
+            [&track, &quarantine, &staged, &track]
+                .into_iter()
+                .map(|path| rename_event(RenameMode::Any, &[path_str(path)], None))
+                .collect(),
+        );
+
+        assert_eq!(batch.upsert_paths, HashSet::from([track]));
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+    }
+
+    #[test]
+    fn watcher_batch_turns_cross_extension_file_renames_into_path_changes() {
+        let library = TestDirectory::new("cross-extension-renames");
+        let root = library.path();
+
+        // rsync, Syncthing, and browsers publish a finished download by
+        // renaming a hidden temporary file onto the final audio name.
+        let published = root.join("song.flac");
+        std::fs::write(&published, b"audio").expect("publish synced track");
+        let batch = debounced_batch(rename_halves(
+            &root.join(".song.flac.XyZ123"),
+            &published,
+            Some(21),
+        ));
+        assert_eq!(batch.upsert_paths, HashSet::from([published]));
+        assert!(batch.remove_paths.is_empty());
+        assert!(batch.rename_pairs.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+
+        // A track renamed to a non-audio name is a removal of the track.
+        let original = root.join("old.flac");
+        let backup = root.join("old.flac.bak");
+        std::fs::write(&backup, b"audio").expect("rename track to backup");
+        let batch = debounced_batch(rename_halves(&original, &backup, None));
+        assert_eq!(batch.remove_paths, HashSet::from([original]));
+        assert!(batch.upsert_paths.is_empty());
+        assert!(batch.rename_pairs.is_empty());
+        assert!(batch.deferred_paths.is_empty());
+        assert!(!batch.reconciliation_required);
+
+        // A directory keeps its pair so its tracks keep their identities.
+        let old_album = root.join("Album");
+        let new_album = root.join("Album (2020)");
+        std::fs::create_dir(&new_album).expect("rename album folder");
+        let batch = debounced_batch(rename_halves(&old_album, &new_album, Some(22)));
+        assert_eq!(
+            batch.rename_pairs,
+            HashSet::from([WatcherRenamePair {
+                from: old_album,
+                to: new_album,
+            }])
+        );
+        assert!(!batch.reconciliation_required);
+    }
+
+    #[tokio::test]
+    async fn tag_commit_refreshes_the_track_in_place_without_a_library_rescan() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("watcher-tag-commit-end-to-end");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+
+        let track_path = root.join("track.flac");
+        std::fs::write(
+            &track_path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write committed track");
+        let track_key = track_path.to_string_lossy().into_owned();
+        insert_rename_test_track(&db, "tagged-track", &track_key, "Before Tag Save", 3).await;
+
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(idle_backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: event_rx,
+            ingress_overflowed: Arc::new(AtomicBool::new(false)),
+            watched_directories: HashSet::new(),
+        };
+        for event in tag_commit_events(
+            &track_path,
+            &root.join(TEST_TAG_STAGING_NAME),
+            &root.join(TEST_QUARANTINE_NAME),
+            Some((31, 32)),
+        ) {
+            event_tx
+                .send(Ok(event))
+                .await
+                .expect("queue tag commit event");
+        }
+        drop(event_tx);
+
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let mut completed_commands = HashMap::new();
+        process_directory_events(
+            &db,
+            std::slice::from_ref(&root),
+            &library_events,
+            &command_rx,
+            &mut completed_commands,
+            watcher,
+            &test_playlist_sidebar_refresh(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("watcher loop exits cleanly");
+
+        let events: Vec<LibraryEvent> =
+            std::iter::from_fn(|| library_event_rx.try_recv().ok()).collect();
+        let upserted: Vec<&Track> = events
+            .iter()
+            .filter_map(|event| match event {
+                LibraryEvent::TrackUpserted(track) => Some(track.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(upserted.len(), 1, "{events:?}");
+        assert_eq!(upserted[0].file_path.as_deref(), Some(track_key.as_str()));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                LibraryEvent::FullSync(_)
+                    | LibraryEvent::ScanComplete
+                    | LibraryEvent::TrackRemoved(_)
+            )),
+            "a tag save must not reconcile the library: {events:?}"
+        );
+
+        let row = track::Entity::find()
+            .filter(track::Column::FilePath.eq(&track_key))
+            .one(db.as_ref())
+            .await
+            .expect("query tagged track")
+            .expect("tagged track keeps its row");
+        assert_eq!(row.id, "tagged-track");
+        assert_eq!(row.play_count, 3);
+        assert_ne!(row.title, "Before Tag Save", "the new tags were read");
     }
 
     #[cfg(unix)]
@@ -10830,10 +11299,21 @@ mod tests {
         ))
         .await
         .expect("insert orphaned playlist entry");
+        let watcher_track = track::Entity::find_by_id("watcher-track")
+            .one(&db)
+            .await
+            .expect("query watcher track")
+            .expect("watcher track exists");
+        let unrelated_track = track::Model {
+            id: "unrelated-track".to_string(),
+            file_path: "/music/unrelated.flac".to_string(),
+            title: "Unrelated Song".to_string(),
+            ..watcher_track.clone()
+        };
         let (event_tx, event_rx) = async_channel::unbounded();
 
         assert_eq!(
-            settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, false)
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, &[], false)
                 .await
                 .expect("skip unchanged watcher batch"),
             0
@@ -10851,7 +11331,7 @@ mod tests {
         assert_eq!(still_orphaned.local_track_id, None);
 
         assert_eq!(
-            settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, true)
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, &[], true)
                 .await
                 .expect("settle removal-only watcher batch"),
             0
@@ -10868,6 +11348,30 @@ mod tests {
         assert_eq!(still_orphaned.track_id, None);
         assert_eq!(still_orphaned.local_track_id, None);
 
+        // An upsert that cannot match any orphan skips reconciliation, even
+        // though an unchanged track would match.
+        assert_eq!(
+            settle_playlist_projections_after_watcher_batch(
+                &db,
+                &event_tx,
+                std::slice::from_ref(&unrelated_track),
+                true,
+            )
+            .await
+            .expect("settle unrelated upsert batch"),
+            0
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(LibraryEvent::PlaylistProjectionsInvalidated)
+        ));
+        let still_orphaned = playlist_entry::Entity::find_by_id("watcher-entry")
+            .one(&db)
+            .await
+            .expect("query unrelated-upsert reconciliation")
+            .expect("playlist entry remains");
+        assert_eq!(still_orphaned.local_track_id, None);
+
         db.execute_unprepared(
             "CREATE TRIGGER fail_watcher_playlist_reconciliation
              BEFORE UPDATE OF track_id ON playlist_entries
@@ -10877,9 +11381,14 @@ mod tests {
         )
         .await
         .expect("install reconciliation failure trigger");
-        settle_playlist_projections_after_watcher_batch(&db, &event_tx, true, true)
-            .await
-            .expect_err("surface watcher reconciliation failure");
+        settle_playlist_projections_after_watcher_batch(
+            &db,
+            &event_tx,
+            std::slice::from_ref(&watcher_track),
+            true,
+        )
+        .await
+        .expect_err("surface watcher reconciliation failure");
         assert!(matches!(
             event_rx.try_recv(),
             Ok(LibraryEvent::PlaylistProjectionsInvalidated)
@@ -10889,9 +11398,14 @@ mod tests {
             .expect("remove reconciliation failure trigger");
 
         assert_eq!(
-            settle_playlist_projections_after_watcher_batch(&db, &event_tx, true, true)
-                .await
-                .expect("run watcher reconciliation"),
+            settle_playlist_projections_after_watcher_batch(
+                &db,
+                &event_tx,
+                std::slice::from_ref(&watcher_track),
+                true,
+            )
+            .await
+            .expect("run watcher reconciliation"),
             1
         );
         assert!(matches!(
@@ -13674,6 +14188,7 @@ mod tests {
         };
 
         let mut completed_commands = HashMap::new();
+        let never_cancelled = CancellationToken::new();
         // Bound the join so the exact regressions this test exists to report
         // fail fast instead of hanging the suite until the CI job timeout.
         // 60s is orders of magnitude above this harness's normal sub-second
@@ -13697,6 +14212,7 @@ mod tests {
                         &mut completed_commands,
                         watcher,
                         &playlist_sidebar_refresh,
+                        &never_cancelled,
                     ),
                     driver,
                 )
@@ -14933,7 +15449,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_outside_configured_roots_are_not_removed() {
+    fn stale_deletion_ignores_rows_outside_scanned_roots() {
         let configured = TestDirectory::new("configured");
         let unrelated = TestDirectory::new("unrelated");
         let mut scan = scan_root(configured.path().to_path_buf());
@@ -14962,7 +15478,10 @@ mod tests {
             scan.content_authorized = true;
         }
 
-        assert_eq!(collect_audio_files(&scans), vec![audio_path]);
+        assert_eq!(
+            scanned_paths(&collect_audio_files(&scans)),
+            vec![audio_path]
+        );
     }
 
     #[test]
@@ -14978,7 +15497,7 @@ mod tests {
         let child_scan = scan_root_with_exclusions(child, &roots);
 
         assert!(parent_scan.audio_files.is_empty());
-        assert_eq!(child_scan.audio_files, vec![audio_path]);
+        assert_eq!(scanned_paths(&child_scan.audio_files), vec![audio_path]);
     }
 
     #[cfg(target_os = "linux")]
@@ -15131,7 +15650,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
             .expect("restore nested permissions");
         assert!(!scan.is_complete());
-        assert_eq!(scan.audio_files, vec![readable_audio]);
+        assert_eq!(scanned_paths(&scan.audio_files), vec![readable_audio]);
     }
 
     fn persisted_root_state(scan: &RootScan, device_id: Option<String>) -> library_root::Model {
@@ -15257,7 +15776,7 @@ mod tests {
         };
         let mounted_volume = RootScan {
             root: root.clone(),
-            audio_files: vec![root.join("song.mp3")],
+            audio_files: vec![(root.join("song.mp3"), String::new())],
             errors: Vec::new(),
             device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
             mount_generation: Some(0),
@@ -15479,6 +15998,196 @@ mod tests {
         assert_eq!(updated.device_id, stored.device_id);
         assert!(!updated.is_available);
         assert!(!updated.last_scan_complete);
+    }
+
+    async fn tracks_by_path(db: &DatabaseConnection) -> Vec<track::Model> {
+        track::Entity::find()
+            .order_by_asc(track::Column::FilePath)
+            .all(db)
+            .await
+            .expect("query tracks")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_configured_root_is_indexed_and_rescans_stably() {
+        let container = TestDirectory::new("symlinked-root");
+        let target = container.path().join("data-music");
+        std::fs::create_dir_all(target.join("album")).expect("create symlink target");
+        write_minimal_wav(&target.join("album").join("nested.wav"));
+        write_minimal_wav(&target.join("top.wav"));
+        let root = container.path().join("Music");
+        std::os::unix::fs::symlink(&target, &root).expect("link the configured root");
+        let db = rename_test_database().await;
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let roots = [root.clone()];
+
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("first scan");
+        let first = tracks_by_path(&db).await;
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| PathBuf::from(&row.file_path))
+                .collect::<Vec<_>>(),
+            [root.join("album").join("nested.wav"), root.join("top.wav")],
+            "rows are keyed under the configured spelling of the root"
+        );
+        let state = library_root::Entity::find_by_id(root.to_string_lossy().into_owned())
+            .one(&db)
+            .await
+            .expect("query root state")
+            .expect("root state exists");
+        assert!(state.identity_confirmed && state.is_available);
+
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("rescan");
+        assert_eq!(
+            tracks_by_path(&db).await,
+            first,
+            "a rescan keeps every row, ID and path"
+        );
+
+        std::fs::remove_file(target.join("top.wav")).expect("delete a track on disk");
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("reconciling scan");
+        assert_eq!(
+            tracks_by_path(&db).await,
+            first[..1],
+            "reconciliation through the symlinked root removes only the deleted track"
+        );
+    }
+
+    /// Run one production engine startup through its initial scan, then tear
+    /// it down the way the application does at close.
+    async fn run_engine_startup(
+        db: &DatabaseConnection,
+        roots: Vec<PathBuf>,
+        pending_root_reauthorizations: Vec<RootReauthorizationRequest>,
+        forget_unconfigured_tracks: bool,
+    ) {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let (refresh, refresh_rx) =
+            super::super::playlist_sidebar::playlist_sidebar_refresh_channel();
+        let (coordinator, coordinator_shutdown) =
+            crate::server_playlist_coordinator::spawn_server_playlist_coordinator();
+        let source_registry =
+            crate::source_registry::SourceRegistry::new(tokio::runtime::Handle::current());
+        let invalidations = source_registry.subscribe_invalidations();
+        let services = LibraryEngineServices::new(
+            refresh,
+            refresh_rx,
+            coordinator,
+            coordinator_shutdown,
+            source_registry,
+            invalidations,
+        );
+        let engine = LibraryEngine::new(
+            db.clone(),
+            roots,
+            pending_root_reauthorizations,
+            forget_unconfigured_tracks,
+            event_tx,
+            command_rx,
+            services,
+            CancellationToken::new(),
+        );
+        let engine_task = tokio::spawn(engine.run());
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Ok(event) = event_rx.recv().await {
+                if matches!(event, LibraryEvent::ScanComplete) {
+                    return;
+                }
+            }
+            panic!("engine stopped before its initial scan completed");
+        })
+        .await
+        .expect("engine startup completes its initial scan");
+        engine_task.abort();
+        drop(command_tx);
+    }
+
+    #[tokio::test]
+    async fn startup_forgets_tracks_of_removed_roots_only() {
+        let container = TestDirectory::new("removed-root");
+        let [removed, offline, reauthorizing] =
+            ["removed", "offline", "reauthorizing"].map(|name| container.path().join(name));
+        for root in [&removed, &offline, &reauthorizing] {
+            std::fs::create_dir(root).expect("create library root");
+            write_minimal_wav(&root.join("song.wav"));
+        }
+        let db = rename_test_database().await;
+        run_engine_startup(
+            &db,
+            vec![removed.clone(), offline.clone(), reauthorizing.clone()],
+            Vec::new(),
+            true,
+        )
+        .await;
+        let indexed = tracks_by_path(&db).await;
+        assert_eq!(indexed.len(), 3, "every root is indexed: {indexed:?}");
+        let removed_track = indexed
+            .iter()
+            .find(|row| Path::new(&row.file_path).starts_with(&removed))
+            .expect("removed root was indexed")
+            .clone();
+        let manager = super::super::playlist_manager::PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Removed root")
+            .await
+            .expect("create playlist");
+        manager
+            .add_track(&playlist.id, &removed_track)
+            .await
+            .expect("link removed-root track to playlist");
+
+        // `removed` leaves the configuration, `offline` stays configured but
+        // is unmounted, and `reauthorizing` is only named by a pending
+        // reauthorization (as after a manual config edit).
+        std::fs::rename(&offline, container.path().join("offline-unmounted"))
+            .expect("take the offline root away");
+        let pending = vec![RootReauthorizationRequest::new(
+            Uuid::new_v4(),
+            reauthorizing.clone(),
+            container.path().join("reauthorized"),
+        )];
+
+        run_engine_startup(&db, vec![offline.clone()], pending.clone(), false).await;
+        assert_eq!(
+            tracks_by_path(&db).await.len(),
+            3,
+            "a defaulted configuration never forgets tracks"
+        );
+
+        run_engine_startup(&db, vec![offline.clone()], pending, true).await;
+        let remaining = tracks_by_path(&db).await;
+        assert!(
+            remaining
+                .iter()
+                .all(|row| !Path::new(&row.file_path).starts_with(&removed)),
+            "the removed root's tracks are forgotten: {remaining:?}"
+        );
+        assert_eq!(
+            indexed
+                .iter()
+                .filter(|row| row.id != removed_track.id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            remaining,
+            "the unavailable and reauthorizing roots keep their rows unchanged"
+        );
+        let entry = playlist_entry::Entity::find()
+            .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
+            .one(&db)
+            .await
+            .expect("query playlist entry")
+            .expect("the playlist entry survives as an unmatched entry");
+        assert_eq!(entry.local_track_id, None);
     }
 
     #[tokio::test]
@@ -16196,6 +16905,8 @@ mod tests {
             db.clone(),
             vec![root.clone()],
             Vec::new(),
+            // The command track lives outside the fixture root.
+            false,
             event_tx,
             command_rx,
             services,

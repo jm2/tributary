@@ -407,7 +407,9 @@ CI automatically runs on every push/PR:
 - **Pedantic Clippy** — `clippy::pedantic` + `clippy::nursery` with `-D warnings`
 - **Code coverage** — pinned `cargo-llvm-cov` Linux x86_64 line-floor gate, plus an HTML report
   uploaded as a CI artifact
-- **Weekly fuzzing** — `cargo-fuzz` target for the DMAP binary parser (5 min, Sundays)
+- **Weekly fuzzing** — `cargo-fuzz` targets for the DMAP, XSPF, Rhythmbox XML, Last.fm
+  auth-response, and cast URL/`Range` parsers, each bounded to 60 s from committed seeds in
+  `fuzz/seeds/` (Sundays; `.github/workflows/fuzz.yml` has the exact invocation)
 
 ---
 
@@ -690,7 +692,10 @@ Tributary. Remote, radio, and removable tracks are not counted.
 ### Preferences
 
 Open **Preferences** from the hamburger menu (☰) to:
-- Change the local music library folders (supports multiple directories)
+- Change the local music library folders (supports multiple directories). On Linux and macOS a
+  folder may be a symbolic link to another location; its tracks keep the path you added. Symbolic
+  links inside a library folder are not followed. Removing a folder forgets its tracks, with their
+  play counts and ratings, at the next start; playlists keep those entries as unmatched items.
 - Reauthorize a library folder or import from Rhythmbox
 - Toggle browser filter panes (Genre, Artist, Album)
 - Show/hide tracklist columns

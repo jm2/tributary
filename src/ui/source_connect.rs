@@ -27,7 +27,9 @@ use super::source_navigation::{
     CompletionDisposition, ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
 };
 use super::tracklist;
-use super::window::{arch_track_to_object, display_local_tracks, display_tracks};
+use super::window::{
+    arch_track_to_object, display_local_tracks, display_tracks, refresh_displayed_tracks,
+};
 use super::window_state::WindowState;
 
 enum PlaylistLoadOutcome {
@@ -229,6 +231,50 @@ impl PlaylistLoadKind {
             Self::EditableSmart => PlaylistProjection::SmartRules,
         }
     }
+}
+
+/// A committed change that can leave loaded playlist projections stale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PlaylistChange {
+    /// A local track's play count, last-played time or rating.
+    PlayStatistics,
+    /// Remote catalogue authority: a server's tracks appeared, changed or
+    /// went away.
+    RemoteCatalogue,
+    /// Library tracks or playlist entries.
+    Library,
+}
+
+impl PlaylistChange {
+    /// Whether this change can alter which tracks the sidebar playlist
+    /// `source` shows, or their order. Displayed play counts and ratings
+    /// are updated in place instead, so they never require a reload.
+    pub(super) fn affects(self, source: &SourceObject) -> bool {
+        let Some(kind) = source.playlist_kind() else {
+            return false;
+        };
+        let projection = PlaylistLoadKind::from_sidebar_kind(kind).projection();
+        match self {
+            Self::Library => true,
+            // Smart playlists evaluate the local library only.
+            Self::RemoteCatalogue => projection == PlaylistProjection::StoredEntries,
+            Self::PlayStatistics => {
+                projection == PlaylistProjection::SmartRules
+                    && source.playlist_reads_play_statistics()
+            }
+        }
+    }
+}
+
+/// How a completed playlist load replaces the rows on screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PlaylistPublication {
+    /// The user opened the playlist: a new view, so browser filters reset
+    /// and the list starts at the top.
+    Open,
+    /// The playlist on screen changed underneath the user: still-valid
+    /// filters, the search text and the scroll position survive.
+    Refresh,
 }
 
 fn playlist_load_kind_for_id(
@@ -471,6 +517,7 @@ pub(super) fn load_playlist_source(
     sidebar_store: gtk::gio::ListStore,
     playlist_id: String,
     request: SourceRequest,
+    publication: PlaylistPublication,
     navigation: Rc<RefCell<SourceNavigation>>,
     source_tracks: Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     active_source_key: Rc<RefCell<String>>,
@@ -639,15 +686,23 @@ pub(super) fn load_playlist_source(
             &active_source_key,
         );
         if should_render {
-            display_tracks(
-                &objects,
-                &track_store,
-                &master_tracks,
-                &browser_widget,
-                &browser_state,
-                &status_label,
-                &column_view,
-            );
+            match publication {
+                PlaylistPublication::Open => display_tracks(
+                    &objects,
+                    &track_store,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                    &status_label,
+                    &column_view,
+                ),
+                PlaylistPublication::Refresh => refresh_displayed_tracks(
+                    &objects,
+                    &master_tracks,
+                    &browser_widget,
+                    &browser_state,
+                ),
+            }
         } else {
             tracing::debug!(
                 playlist_id_byte_len = playlist_id.len(),
@@ -819,6 +874,7 @@ pub fn setup_source_connect(state: &WindowState) {
                 sidebar_store.clone(),
                 playlist_id,
                 request,
+                PlaylistPublication::Open,
                 source_navigation.clone(),
                 source_tracks.clone(),
                 active_source_key.clone(),
@@ -1216,21 +1272,40 @@ pub fn setup_source_connect(state: &WindowState) {
                             ))
                         },
                     ),
-                    "plex" => source_registry_for_auth.connect_standard(
-                        source_id,
-                        on_generation,
-                        move || async move {
-                            info!("Authenticating with Plex...");
-                            let client = crate::plex::client::PlexClient::authenticate_with_route(
-                                &server_url,
-                                &user,
-                                &pass,
-                                advertised_route,
-                            )
-                            .await?;
-                            crate::plex::PlexBackend::from_client(&server_name, client).await
-                        },
-                    ),
+                    "plex" => {
+                        // A purely discovered host is unverified: it gets no
+                        // plex.tv token until plex.tv vouches for it.
+                        let discovered = !super::discovery_handler::is_configured_source(
+                            &source_registry_for_auth,
+                            source_id,
+                        );
+                        source_registry_for_auth.connect_standard(
+                            source_id,
+                            on_generation,
+                            move || async move {
+                                use crate::plex::client::PlexClient;
+                                info!("Authenticating with Plex...");
+                                let client = if discovered {
+                                    PlexClient::authenticate_discovered(
+                                        &server_url,
+                                        &user,
+                                        &pass,
+                                        advertised_route,
+                                    )
+                                    .await?
+                                } else {
+                                    PlexClient::authenticate_with_route(
+                                        &server_url,
+                                        &user,
+                                        &pass,
+                                        advertised_route,
+                                    )
+                                    .await?
+                                };
+                                crate::plex::PlexBackend::from_client(&server_name, client).await
+                            },
+                        )
+                    }
                     "daap" => source_registry_for_auth.connect_daap(
                         source_id,
                         on_generation,

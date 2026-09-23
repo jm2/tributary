@@ -397,6 +397,11 @@ not a session minted by Tributary, so its constructor is abortable and disconnec
 that durable credential. Plex's legacy token is likewise treated as a durable credential: the
 available revocation mechanisms are broader than one adapter session, so retirement revokes local
 media/adapter authority without attempting an account- or device-wide server-side revocation.
+A Plex row that only discovery vouches for never receives the account-wide plex.tv token. After
+sign-in, its unauthenticated `/identity` machine identifier must match a server in the account's
+plex.tv resources; the session then uses that server's own access token over an HTTPS connection
+plex.tv publishes for it, and a server with no HTTPS connection is refused. Saved and Environment
+Plex rows keep signing in to the URL the user configured.
 
 There is one earlier Jellyfin cleanup boundary before registry staging is possible. Once
 `AuthenticateByName` returns a token that can be represented exactly as a sensitive
@@ -549,10 +554,9 @@ queue can extend the same ephemeral-source rule explicitly.
   UUIDv5, and endpoint/ID conflicts quarantine the complete unchanged file. Repeated manual Add
   reuses the saved owner; discovered-to-saved promotion persists the row's already-published ID
   before changing its presentation; and saved-plus-env startup authenticates under the stored ID.
-  Promotion also retains the live row's ephemeral advertised route and passes it into the
-  immediate route-aware authentication/connection attempt; persistence never stores that route.
-  Each path therefore keeps one canonical `(backend, endpoint)` owner without transferring live
-  ownership between IDs or discarding discovery-only reachability during Add.
+  Promotion clears the row's ephemeral advertised route: a saved row connects through the URL the
+  user entered, and persistence never stores a route. Each path therefore keeps one canonical
+  `(backend, endpoint)` owner without transferring live ownership between IDs.
 - Brand-new manually saved remote rows receive random persisted `SourceId` values. Legacy,
   discovered, environment, and unsaved remote endpoints use deterministic
   backend-plus-canonical-base-URL identity; promoting a discovered/environment row persists that
@@ -730,10 +734,16 @@ current retirement to finish without issuing another mutating disconnect.
 Saved, Environment, and Discovery publishers own independent opaque keyed claims. Duplicate
 publishers are reference-counted, and a new claim during close reactivates the logical source while
 the old retirement remains joined but cannot mutate a successor. Removing Saved demotes a row that
-still has Discovery instead of deleting it. Removing Discovery clears the advertised route and
-revokes the active adapter or pending constructor that may have captured that route, even when
-Saved or Environment keeps the logical row visible. Route withdrawal therefore retires live media,
-cache, and active projection without incorrectly deleting a still-claimed row. The reducer derives
+still has Discovery instead of deleting it. Discovery events are unauthenticated, so a Saved or
+Environment row never takes an advertised route: a publication at its endpoint adds only the
+Discovery claim, and its connections keep using the configured URL. On a purely discovered row, a
+publication that adds addresses refreshes the route without touching existing work, while one that
+withdraws any previously advertised address revokes the active adapter or pending constructor that
+may have captured it. Removing Discovery clears the row's route and revokes route-bound work only
+when the row carried one; a routeless row (a Saved or Environment row, or a Jellyfin UDP discovery)
+keeps its session, and releasing a purely discovered row's last claim retires it through the
+lifecycle. Route withdrawal therefore retires live media, cache, and active projection without
+incorrectly deleting a still-claimed row. The reducer derives
 the presentation-only `manually_added` value from the live Saved claim rather than treating that row
 flag as provenance authority.
 

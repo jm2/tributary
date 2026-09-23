@@ -9,6 +9,7 @@ app:
 header:
   previous: "上一首"
   play: "播放"
+  pause: "暂停"
   next: "下一首"
   repeat_off: "重复：关闭"
   repeat_all: "重复：全部"
@@ -318,6 +319,8 @@ errors:
     decoder_failed: "音频解码器发生错误"
     audio_output_failed: "音频输出失败"
     playback_failed: "音频播放失败"
+    track_unavailable: "无法打开“%{title}”"
+    skip_limit: "由于连续多首歌曲无法播放，播放已停止"
     airplay_raopsink_missing: "AirPlay 1 播放不可用：此版本不包含兼容的 GStreamer raopsink 发送器"
     mpd_exclusive_control_required: "请重新添加此 MPD 输出，确认对分区的独占控制，然后在播放前再次选择它"
   database:

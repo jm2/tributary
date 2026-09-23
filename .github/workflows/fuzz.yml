@@ -15,7 +15,7 @@ jobs:
     # The fuzz crate depends on the full `tributary` library, so this builds
     # and ASAN-instruments the entire dependency tree (GTK4, GStreamer,
     # SeaORM, aws-lc-sys, ...) with codegen-units=1 from a cold cache before
-    # the 5-minute fuzz run. Allow generous headroom for that compile.
+    # the bounded fuzz runs. Allow generous headroom for that compile.
     timeout-minutes: 60
     container:
       image: fedora:44
@@ -48,14 +48,32 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
-      - name: Fuzz DMAP parser (5 minutes)
+      - name: Fuzz every target (bounded)
         env:
           # The fuzz crate shares the root release profile, whose LTO and
           # symbol stripping are for shipped binaries; turn both off so
           # sanitizer reports stay symbolized.
           CARGO_PROFILE_RELEASE_LTO: "false"
           CARGO_PROFILE_RELEASE_STRIP: "false"
-        run: cargo fuzz run fuzz_dmap -- -max_total_time=300
+        # Each target starts from its committed seeds plus the cached corpus
+        # and stops at the first of its run or time bounds; a target never
+        # runs unbounded. Every target runs even after another crashes, and
+        # the step fails if any did (its reproducer is in fuzz/artifacts/).
+        run: |
+          failed=0
+          for source in fuzz/fuzz_targets/*.rs; do
+            target="$(basename "$source" .rs)"
+            mkdir -p "fuzz/corpus/$target"
+            echo "::group::$target"
+            if ! cargo fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+                -runs=2000000 -max_total_time=60 -timeout=10 \
+                -rss_limit_mb=2048 -max_len=65536; then
+              echo "::error::$target crashed; the reproducer is in the fuzz-artifacts upload"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
       - name: Upload crash artifacts
         if: always()
         uses: actions/upload-artifact@v7

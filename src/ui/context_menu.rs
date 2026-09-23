@@ -282,6 +282,7 @@ impl PlaylistMutationContext {
             self.sidebar_store.clone(),
             playlist_id.to_string(),
             request,
+            super::source_connect::PlaylistPublication::Open,
             self.source_navigation.clone(),
             self.source_tracks.clone(),
             self.active_source_key.clone(),

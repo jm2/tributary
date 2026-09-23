@@ -107,6 +107,19 @@ impl AdvertisedHttpRoute {
         })
     }
 
+    /// Whether `other` routes the same origin and still offers every address
+    /// this route offered, so nothing connected through this route lost its
+    /// address.
+    pub(crate) fn is_covered_by(&self, other: &Self) -> bool {
+        self.scheme == other.scheme
+            && self.hostname == other.hostname
+            && self.port == other.port
+            && self
+                .addresses
+                .iter()
+                .all(|address| other.addresses.contains(address))
+    }
+
     /// Domain key passed to reqwest's resolver override.
     pub(crate) fn hostname(&self) -> &str {
         &self.hostname
@@ -1205,6 +1218,24 @@ mod tests {
         )
         .unwrap();
         assert!(first.merged_same_origin(&http).is_none());
+    }
+
+    #[test]
+    fn route_coverage_requires_the_same_origin_and_every_address() {
+        let origin = Url::parse("http://music.local:4533").unwrap();
+        let ipv4 = SocketAddr::from(([192, 0, 2, 1], 4533));
+        let ipv6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 4533));
+        let route = |addresses: &[SocketAddr]| {
+            AdvertisedHttpRoute::new(&origin, addresses.iter().copied()).unwrap()
+        };
+
+        assert!(route(&[ipv4]).is_covered_by(&route(&[ipv4, ipv6])));
+        assert!(route(&[ipv4, ipv6]).is_covered_by(&route(&[ipv4, ipv6])));
+        assert!(!route(&[ipv4, ipv6]).is_covered_by(&route(&[ipv4])));
+        let other_origin =
+            AdvertisedHttpRoute::new(&Url::parse("https://music.local:4533").unwrap(), [ipv4])
+                .unwrap();
+        assert!(!route(&[ipv4]).is_covered_by(&other_origin));
     }
 
     #[test]

@@ -28,6 +28,43 @@ pub struct PlexSignInUser {
     pub title: Option<String>,
 }
 
+// ── GET https://plex.tv/api/v2/resources ────────────────────────────────
+
+/// One device or server the signed-in plex.tv account can reach.
+///
+/// Every field a non-server resource may omit or null is optional, so one
+/// unusual player entry cannot fail the whole listing.
+#[derive(Debug, Deserialize)]
+pub struct PlexResource {
+    /// The server's machine identifier, as its `/identity` reports it.
+    #[serde(rename = "clientIdentifier")]
+    pub client_identifier: String,
+    /// Comma-separated roles; servers include `server`.
+    #[serde(default)]
+    pub provides: Option<String>,
+    /// Token for this server alone (not the account token).
+    #[serde(rename = "accessToken", default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub connections: Option<Vec<PlexResourceConnection>>,
+}
+
+/// One way plex.tv publishes to reach a resource.
+#[derive(Debug, Deserialize)]
+pub struct PlexResourceConnection {
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// IP address the connection URI names.
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub local: bool,
+    #[serde(default)]
+    pub relay: bool,
+}
+
 // ── GET /library/sections ───────────────────────────────────────────────
 
 /// Top-level response from `/library/sections`.

@@ -100,9 +100,9 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
 
                     // Stable SourceId owns the logical source. Canonical
                     // `(backend, endpoint)` is only the discovery lookup key.
-                    // An updated publication refreshes this row's ephemeral
-                    // route; replacing or removing a prior advertised route
-                    // revokes work that captured the withdrawn address.
+                    // An updated publication refreshes a purely discovered
+                    // row's route; withdrawing an address from it revokes
+                    // work that may have captured that address.
                     let existing = remote_source_at(
                         &store,
                         &server.url,
@@ -110,30 +110,15 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                     )
                     .map(|(_, source)| source);
                     if let Some(source) = existing {
-                        let Some(source_id) = source.source_id() else {
-                            tracing::warn!("Ignoring discovered source without stable identity");
+                        let Some(route_changed) = publish_to_existing_row(
+                            &source,
+                            &source_registry,
+                            &remote_provenance,
+                            publisher,
+                            advertised_route.clone(),
+                        ) else {
                             continue;
                         };
-                        if !remote_provenance.ensure(
-                            &source_registry,
-                            source_id,
-                            crate::source_lifecycle::SourceProvenance::Discovery,
-                            publisher,
-                        ) {
-                            tracing::debug!("Ignoring discovery publication during shutdown");
-                            continue;
-                        }
-                        let route_changed = reconcile_discovery_route(
-                            &source,
-                            advertised_route.clone(),
-                            |source_id| {
-                                // A pending constructor or active adapter may
-                                // have captured the withdrawn address. Claims
-                                // and the logical row remain; only exact
-                                // lifecycle/session authority is revoked.
-                                let _ = source_registry.disconnect(source_id);
-                            },
-                        );
                         if let Some(requires_password) = server.requires_password {
                             source.set_requires_password(requires_password);
                         }
@@ -218,64 +203,106 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
                         continue;
                     }
 
-                    // Endpoint lookup includes the backend protocol. A Lost
-                    // event must retire only the exact row and stable owner
-                    // claimed by that `(backend, canonical endpoint)` pair.
-                    let Some((_, source)) =
-                        remote_source_at(&store, &url, &service_type)
-                    else {
-                        tracing::debug!(
-                            backend = %service_type,
-                            "Ignoring lost server event that does not own a sidebar source"
-                        );
-                        continue;
-                    };
-                    let Some(source_id) = source.source_id() else {
-                        tracing::warn!("Ignoring discovered source without stable identity");
-                        continue;
-                    };
-                    let Some(publisher) = discovery_publisher(&service_type, &url) else {
-                        tracing::warn!("Ignoring lost server without canonical publisher identity");
-                        continue;
-                    };
-                    if !remote_provenance.release(
+                    handle_remote_lost(
+                        &store,
                         &source_registry,
-                        source_id,
-                        crate::source_lifecycle::SourceProvenance::Discovery,
-                        &publisher,
-                    ) {
-                        tracing::debug!(
-                            backend = %service_type,
-                            "Ignoring lost event without a matching discovery claim"
-                        );
-                        continue;
-                    }
-
-                    let remaining_provenance = source_registry
-                        .snapshot(source_id)
-                        .map(|snapshot| snapshot.provenance)
-                        .unwrap_or_default();
-
-                    info!(
-                        backend = %service_type,
-                        "Handling lost server discovery event"
-                    );
-                    source.set_advertised_route(None);
-                    // Every constructor and resolver created from this row may
-                    // have captured the now-withdrawn advertised route. Revoke
-                    // that route-bound ownership even when Saved/Environment
-                    // keeps the logical row visible. The lifecycle reducer
-                    // owns pending/cache/playback/navigation cleanup and row
-                    // demotion/removal from the resulting baseline.
-                    let _ = source_registry.disconnect(source_id);
-                    tracing::debug!(
-                        backend = %service_type,
-                        retained = !remaining_provenance.is_empty(),
-                        "Withdrawn discovery route handed to lifecycle disconnect"
+                        &remote_provenance,
+                        &url,
+                        &service_type,
                     );
                 }
             }
         }
+    });
+}
+
+/// Record a repeat publication for an endpoint that already has a row: claim
+/// Discovery provenance and refresh the row's route. Returns whether the route
+/// changed, or `None` when the publication was ignored.
+fn publish_to_existing_row(
+    source: &SourceObject,
+    source_registry: &crate::source_registry::SourceRegistry,
+    remote_provenance: &crate::source_registry::ProvenanceClaims,
+    publisher: String,
+    advertised_route: Option<AdvertisedHttpRoute>,
+) -> Option<bool> {
+    let Some(source_id) = source.source_id() else {
+        tracing::warn!("Ignoring discovered source without stable identity");
+        return None;
+    };
+    if !remote_provenance.ensure(
+        source_registry,
+        source_id,
+        crate::source_lifecycle::SourceProvenance::Discovery,
+        publisher,
+    ) {
+        tracing::debug!("Ignoring discovery publication during shutdown");
+        return None;
+    }
+    Some(reconcile_discovery_route(
+        source,
+        is_configured_source(source_registry, source_id),
+        advertised_route,
+        |source_id| {
+            // A pending constructor or active adapter may have captured the
+            // withdrawn address. Claims and the logical row remain; only exact
+            // lifecycle/session authority is revoked.
+            let _ = source_registry.disconnect(source_id);
+        },
+    ))
+}
+
+/// Apply a lost remote-library publication to the row it claimed.
+fn handle_remote_lost(
+    store: &gtk::gio::ListStore,
+    source_registry: &crate::source_registry::SourceRegistry,
+    remote_provenance: &crate::source_registry::ProvenanceClaims,
+    url: &str,
+    service_type: &str,
+) {
+    // Endpoint lookup includes the backend protocol. A Lost event must retire
+    // only the exact row and stable owner claimed by that
+    // `(backend, canonical endpoint)` pair.
+    let Some((_, source)) = remote_source_at(store, url, service_type) else {
+        tracing::debug!(
+            backend = %service_type,
+            "Ignoring lost server event that does not own a sidebar source"
+        );
+        return;
+    };
+    let Some(source_id) = source.source_id() else {
+        tracing::warn!("Ignoring discovered source without stable identity");
+        return;
+    };
+    let Some(publisher) = discovery_publisher(service_type, url) else {
+        tracing::warn!("Ignoring lost server without canonical publisher identity");
+        return;
+    };
+    if !remote_provenance.release(
+        source_registry,
+        source_id,
+        crate::source_lifecycle::SourceProvenance::Discovery,
+        &publisher,
+    ) {
+        tracing::debug!(
+            backend = %service_type,
+            "Ignoring lost event without a matching discovery claim"
+        );
+        return;
+    }
+
+    info!(
+        backend = %service_type,
+        retained = is_configured_source(source_registry, source_id),
+        "Handling lost server discovery event"
+    );
+    // Releasing the last claim already retired a purely discovered source. A
+    // row that is still claimed keeps its session unless that session may have
+    // connected through the withdrawn advertised addresses. The lifecycle
+    // reducer owns pending/cache/playback/navigation cleanup and row
+    // demotion/removal from the resulting baseline.
+    withdraw_discovery_route(&source, |source_id| {
+        let _ = source_registry.disconnect(source_id);
     });
 }
 
@@ -412,6 +439,17 @@ fn airplay_endpoint(url: &str) -> Option<String> {
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Whether the user configured this source (Saved or Environment), so its
+/// endpoint must never be rerouted by unauthenticated discovery.
+pub(super) fn is_configured_source(
+    source_registry: &crate::source_registry::SourceRegistry,
+    source_id: crate::architecture::SourceId,
+) -> bool {
+    source_registry.snapshot(source_id).is_some_and(|snapshot| {
+        snapshot.provenance.retention() == crate::source_lifecycle::Retention::Retained
+    })
+}
+
 pub(super) fn remote_source_at(
     store: &gtk::gio::ListStore,
     server_url: &str,
@@ -496,24 +534,50 @@ fn accepts_daap_probe_result(
 }
 
 /// Replace the latest discovery route while revoking any operation or session
-/// that could still be bound to a withdrawn advertised address. Adding the
-/// first route does not withdraw the canonical endpoint used by existing
-/// work; replacing or removing an existing route does.
+/// that could still be bound to a withdrawn advertised address.
+///
+/// A configured (Saved or Environment) row never takes a discovery route: its
+/// connections use the endpoint the user configured, and discovery only marks
+/// it available. On a purely discovered row, adding the first route or more
+/// addresses leaves existing work alone; withdrawing any address the row
+/// offered revokes it. Returns whether the row's route changed.
 fn reconcile_discovery_route(
     source: &SourceObject,
+    configured: bool,
     advertised_route: Option<AdvertisedHttpRoute>,
     mut disconnect: impl FnMut(crate::architecture::SourceId),
 ) -> bool {
+    let advertised_route = advertised_route.filter(|_| !configured);
     let previous = source.advertised_route();
     let changed = previous != advertised_route;
-    let withdrew_route = previous.is_some() && changed;
+    let withdrew_address = previous.is_some_and(|previous| {
+        !advertised_route
+            .as_ref()
+            .is_some_and(|next| previous.is_covered_by(next))
+    });
     source.set_advertised_route(advertised_route);
-    if withdrew_route {
+    if withdrew_address {
         if let Some(source_id) = source.source_id() {
             disconnect(source_id);
         }
     }
     changed
+}
+
+/// Clear the route of a row whose discovery publication was lost. Only a row
+/// that carried advertised addresses can have work bound to them; a routeless
+/// row (a configured row, or a Jellyfin UDP discovery) keeps its session.
+fn withdraw_discovery_route(
+    source: &SourceObject,
+    disconnect: impl FnOnce(crate::architecture::SourceId),
+) {
+    if source.advertised_route().is_none() {
+        return;
+    }
+    source.set_advertised_route(None);
+    if let Some(source_id) = source.source_id() {
+        disconnect(source_id);
+    }
 }
 
 /// Probe whether a DAAP server requires a password, updating the sidebar item.
@@ -721,14 +785,50 @@ pub mod widget_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use crate::architecture::SourceId;
+    use crate::source_lifecycle::SourceProvenance;
+    use crate::source_registry::{ProvenanceClaims, SourceRegistry};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn advertised_route(address: SocketAddr) -> AdvertisedHttpRoute {
+        advertised_route_with(&[address])
+    }
+
+    fn advertised_route_with(addresses: &[SocketAddr]) -> AdvertisedHttpRoute {
         AdvertisedHttpRoute::new(
             &url::Url::parse("http://mini.local:3689").expect("origin"),
-            [address],
+            addresses.iter().copied(),
         )
         .expect("advertised route")
+    }
+
+    /// A saved row with a live connection attempt, published into `store`.
+    /// The attempt never completes, so it stays pending unless revoked.
+    fn saved_row_with_pending_connect(
+        store: &gtk::gio::ListStore,
+        registry: &SourceRegistry,
+        claims: &ProvenanceClaims,
+        backend_type: &str,
+        server_url: &str,
+    ) -> (SourceObject, SourceId) {
+        let source_id = SourceId::random();
+        let source = SourceObject::manual("Saved", backend_type, server_url, source_id);
+        store.append(&source);
+        assert!(claims.ensure(registry, source_id, SourceProvenance::Saved, "saved-config"));
+        assert!(registry
+            .connect_standard::<crate::subsonic::SubsonicBackend, _, _, _>(
+                source_id,
+                |_| {},
+                std::future::pending,
+            )
+            .is_some());
+        (source, source_id)
+    }
+
+    fn has_pending_connect(registry: &SourceRegistry, source_id: SourceId) -> bool {
+        registry
+            .snapshot(source_id)
+            .is_some_and(|snapshot| snapshot.pending_connect.is_some())
     }
 
     #[test]
@@ -795,6 +895,7 @@ mod tests {
 
         assert!(reconcile_discovery_route(
             &source,
+            false,
             Some(new_route.clone()),
             |id| disconnected.push(id),
         ));
@@ -817,7 +918,7 @@ mod tests {
         source.set_advertised_route(Some(old_route));
         let mut disconnected = Vec::new();
 
-        assert!(reconcile_discovery_route(&source, None, |id| {
+        assert!(reconcile_discovery_route(&source, false, None, |id| {
             disconnected.push(id);
         }));
 
@@ -836,6 +937,7 @@ mod tests {
 
         assert!(reconcile_discovery_route(
             &source,
+            false,
             Some(route.clone()),
             |_| {
                 disconnects += 1;
@@ -844,5 +946,116 @@ mod tests {
 
         assert_eq!(disconnects, 0);
         assert_eq!(source.advertised_route(), Some(route));
+    }
+
+    #[test]
+    fn address_superset_keeps_the_session_and_takes_the_new_route() {
+        let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        source.set_connected(true);
+        let ipv4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689));
+        let ipv6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 3_689));
+        source.set_advertised_route(Some(advertised_route(ipv4)));
+        let superset = advertised_route_with(&[ipv4, ipv6]);
+        let mut disconnects = 0;
+
+        assert!(reconcile_discovery_route(
+            &source,
+            false,
+            Some(superset.clone()),
+            |_| disconnects += 1
+        ));
+
+        assert_eq!(disconnects, 0);
+        assert_eq!(source.advertised_route(), Some(superset));
+    }
+
+    #[test]
+    fn lost_route_revokes_only_rows_that_carried_advertised_addresses() {
+        let routed = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        routed.set_advertised_route(Some(advertised_route(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            3_689,
+        )))));
+        let mut disconnected = Vec::new();
+        withdraw_discovery_route(&routed, |id| disconnected.push(id));
+        assert_eq!(
+            disconnected,
+            vec![routed.source_id().expect("stable source")]
+        );
+        assert_eq!(routed.advertised_route(), None);
+
+        let routeless = SourceObject::discovered("jellyfin", "jellyfin", "http://mini.local:8096");
+        withdraw_discovery_route(&routeless, |_| {
+            panic!("routeless row must keep its session")
+        });
+    }
+
+    #[tokio::test]
+    async fn spoofed_route_never_attaches_to_a_saved_row() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let claims = ProvenanceClaims::default();
+        let url = "http://mini.local:3689";
+        let (source, source_id) =
+            saved_row_with_pending_connect(&store, &registry, &claims, "daap", url);
+        let publisher = discovery_publisher("daap", url).expect("publisher");
+        let spoofed = advertised_route(SocketAddr::from(([192, 0, 2, 66], 3_689)));
+
+        let route_changed = publish_to_existing_row(
+            &source,
+            &registry,
+            &claims,
+            publisher.clone(),
+            Some(spoofed),
+        );
+
+        assert_eq!(route_changed, Some(false));
+        assert_eq!(source.advertised_route(), None);
+        assert!(claims.contains(source_id, SourceProvenance::Discovery, &publisher));
+        assert!(has_pending_connect(&registry, source_id));
+    }
+
+    #[tokio::test]
+    async fn lost_publication_keeps_a_saved_rows_session() {
+        // mDNS (DAAP) and Jellyfin's routeless UDP discovery alike.
+        for (backend_type, url) in [
+            ("daap", "http://mini.local:3689"),
+            ("jellyfin", "http://mini.local:8096"),
+        ] {
+            let store = gtk::gio::ListStore::new::<SourceObject>();
+            let registry = SourceRegistry::new(tokio::runtime::Handle::current());
+            let claims = ProvenanceClaims::default();
+            let (source, source_id) =
+                saved_row_with_pending_connect(&store, &registry, &claims, backend_type, url);
+            let publisher = discovery_publisher(backend_type, url).expect("publisher");
+            assert_eq!(
+                publish_to_existing_row(&source, &registry, &claims, publisher.clone(), None),
+                Some(false)
+            );
+
+            handle_remote_lost(&store, &registry, &claims, url, backend_type);
+
+            assert!(!claims.contains(source_id, SourceProvenance::Discovery, &publisher));
+            assert!(is_configured_source(&registry, source_id));
+            assert!(
+                has_pending_connect(&registry, source_id),
+                "{backend_type} session must survive a lost publication"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_saved_or_environment_provenance_configures_a_source() {
+        let registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let claims = ProvenanceClaims::default();
+        for (provenance, configured) in [
+            (SourceProvenance::Discovery, false),
+            (SourceProvenance::Saved, true),
+            (SourceProvenance::Environment, true),
+        ] {
+            let source_id = SourceId::random();
+            assert!(claims.ensure(&registry, source_id, provenance, "fixture"));
+            assert_eq!(is_configured_source(&registry, source_id), configured);
+        }
     }
 }

@@ -76,6 +76,26 @@ fn expose_slider_accessibility(progress: &gtk::Scale, volume: &gtk::Scale, local
     ]);
 }
 
+/// Show Play, or Pause while `playing`, as the play button's icon, tooltip,
+/// and accessible name. This also removes the buffering spinner.
+pub fn show_play_button_state(button: &gtk::Button, playing: bool) {
+    let (icon, name) = if playing {
+        (
+            "media-playback-pause-symbolic",
+            rust_i18n::t!("header.pause"),
+        )
+    } else {
+        (
+            "media-playback-start-symbolic",
+            rust_i18n::t!("header.play"),
+        )
+    };
+    button.set_child(Option::<&gtk::Widget>::None);
+    button.set_icon_name(icon);
+    button.set_tooltip_text(Some(&name));
+    button.update_property(&[gtk::accessible::Property::Label(&name)]);
+}
+
 /// Build the full header bar and return all interactive widgets.
 pub fn build_header_bar() -> HeaderBarWidgets {
     // ── Left: Playback Controls ──────────────────────────────────────
@@ -85,10 +105,9 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .build();
 
     let btn_play = gtk::Button::builder()
-        .icon_name("media-playback-start-symbolic")
-        .tooltip_text(rust_i18n::t!("header.play").as_ref())
         .css_classes(["suggested-action", "circular"])
         .build();
+    show_play_button_state(&btn_play, false);
 
     let btn_next = gtk::Button::builder()
         .icon_name("media-skip-forward-symbolic")
@@ -387,6 +406,32 @@ pub fn build_output_row(name: &str, icon_name: &str, active: bool) -> gtk::Box {
     row.append(&label);
     row.append(&check);
     row
+}
+
+/// GTK-touching contracts folded into the crate's single consolidated
+/// GTK-initializing test (browser.rs `gtk_widget_contracts_hold_on_one_session`);
+/// see `ui::widget_test_session`. Mirrors the caller's macOS gate so these
+/// helpers are never dead code there.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    use super::*;
+
+    /// The play button's tooltip follows its icon, so it never offers Play
+    /// while playing.
+    pub fn play_button_tooltip_follows_state() {
+        let button = gtk::Button::new();
+        for (playing, icon, key) in [
+            (true, "media-playback-pause-symbolic", "header.pause"),
+            (false, "media-playback-start-symbolic", "header.play"),
+        ] {
+            show_play_button_state(&button, playing);
+            assert_eq!(button.icon_name().as_deref(), Some(icon));
+            assert_eq!(
+                button.tooltip_text().as_deref(),
+                Some(rust_i18n::t!(key).as_ref())
+            );
+        }
+    }
 }
 
 #[cfg(test)]

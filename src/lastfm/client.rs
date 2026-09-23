@@ -1290,6 +1290,16 @@ impl AuthResponse for SessionEnvelope {
     }
 }
 
+/// Run `body` through both strict auth-response parsers as a 200 response.
+///
+/// Fuzzing entry point: the results are dropped here, so neither provider
+/// bytes nor parsed secrets leave the parser.
+#[doc(hidden)]
+pub fn fuzz_auth_responses(body: &[u8]) {
+    let _ = parse_auth_response::<TokenResponse>(StatusCode::OK, body);
+    let _ = parse_auth_response::<SessionEnvelope>(StatusCode::OK, body);
+}
+
 #[derive(Deserialize)]
 struct NowPlayingEnvelope {
     nowplaying: RawSubmission,

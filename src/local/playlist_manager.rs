@@ -25,6 +25,35 @@ use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track}
 /// snapshot ordering.
 const SIDEBAR_ORDER_TABLE: &str = "playlist_sidebar_order";
 
+/// Most IDs bound into one `IN (...)` list. Selections are user-sized, and
+/// SQLite rejects any statement with more than 32,766 host parameters.
+const ID_BATCH_SIZE: usize = 500;
+
+/// Playlist entry rows per multi-row `INSERT`, keeping each statement's host
+/// parameters (one per column) far below SQLite's limit.
+const ENTRY_INSERT_BATCH_SIZE: usize = 256;
+/// Seeds for random-limited smart playlists, keyed by playlist ID and kept
+/// for the life of the process. Re-evaluating a playlist — after a counted
+/// play, a rating, a library change, an export or when it is reopened — then
+/// keeps its random selection; saving new rules draws a new one.
+static RANDOM_LIMIT_SEEDS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn random_limit_seed(playlist_id: &str) -> u64 {
+    *RANDOM_LIMIT_SEEDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(playlist_id.to_string())
+        .or_insert_with(|| fastrand::u64(..))
+}
+
+fn forget_random_limit_seed(playlist_id: &str) {
+    RANDOM_LIMIT_SEEDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(playlist_id);
+}
+
 mod server_playlist_sync;
 
 // Record E is the first production consumer of this complete engine surface.
@@ -371,25 +400,8 @@ impl PlaylistManager {
         name: &str,
         rules: &SmartRules,
     ) -> Result<playlist::Model, DbErr> {
-        let storage = smart_rules_storage(rules)?;
-        let now = now_rfc3339();
         let txn = crate::db::begin_write(&self.db).await?;
-        let result = playlist::ActiveModel {
-            id: Set(Uuid::new_v4().to_string()),
-            name: Set(name.to_string()),
-            is_smart: Set(true),
-            smart_rules_json: Set(Some(storage.json)),
-            limit_enabled: Set(storage.limit_enabled),
-            limit_value: Set(storage.limit_value),
-            limit_unit: Set(storage.limit_unit),
-            limit_sort: Set(storage.limit_sort),
-            match_mode: Set(storage.match_mode),
-            live_updating: Set(true),
-            created_at: Set(now.clone()),
-            updated_at: Set(now),
-        }
-        .insert(&txn)
-        .await?;
+        let result = insert_smart_playlist(&txn, name, rules, now_rfc3339()).await?;
         txn.commit().await?;
         info!(id = %result.id, "Smart playlist created");
         Ok(result)
@@ -524,6 +536,7 @@ impl PlaylistManager {
             return Err(DbErr::RecordNotFound("Playlist not found".to_string()));
         }
         txn.commit().await?;
+        forget_random_limit_seed(id);
         info!(id = %id, "Playlist deleted");
         Ok(())
     }
@@ -661,17 +674,16 @@ impl PlaylistManager {
             .filter(|input| input.media_key.source_id == SourceId::local())
             .map(|input| input.media_key.track_id.as_str())
             .collect();
-        let local_tracks: HashMap<String, track::Model> = if local_ids.is_empty() {
-            HashMap::new()
-        } else {
-            track::Entity::find()
-                .filter(track::Column::Id.is_in(local_ids.iter().copied()))
+        let local_id_list: Vec<&str> = local_ids.iter().copied().collect();
+        let mut local_tracks: HashMap<String, track::Model> =
+            HashMap::with_capacity(local_ids.len());
+        for chunk in local_id_list.chunks(ID_BATCH_SIZE) {
+            let found = track::Entity::find()
+                .filter(track::Column::Id.is_in(chunk.iter().copied()))
                 .all(&txn)
-                .await?
-                .into_iter()
-                .map(|track| (track.id.clone(), track))
-                .collect()
-        };
+                .await?;
+            local_tracks.extend(found.into_iter().map(|track| (track.id.clone(), track)));
+        }
         if local_ids
             .iter()
             .any(|track_id| !local_tracks.contains_key(*track_id))
@@ -681,7 +693,7 @@ impl PlaylistManager {
             ));
         }
 
-        let mut inserted = Vec::with_capacity(inputs.len());
+        let mut rows = Vec::with_capacity(inputs.len());
         for (offset, input) in inputs.iter().enumerate() {
             let offset = i32::try_from(offset)
                 .map_err(|_| DbErr::Custom("Playlist has too many entries".to_string()))?;
@@ -710,25 +722,39 @@ impl PlaylistManager {
                 None => (&input.title, &input.artist, &input.album),
             };
             let track_id = input.media_key.track_id.as_str().to_string();
-            let model = playlist_entry::ActiveModel {
-                id: Set(Uuid::new_v4().to_string()),
-                playlist_id: Set(playlist_id.to_string()),
-                position: Set(position),
-                source_id: Set(input.media_key.source_id.to_string()),
-                track_id: Set(Some(track_id.clone())),
-                local_track_id: Set(is_local.then_some(track_id)),
+            rows.push(playlist_entry::Model {
+                id: Uuid::new_v4().to_string(),
+                playlist_id: playlist_id.to_string(),
+                position,
+                source_id: input.media_key.source_id.to_string(),
+                track_id: Some(track_id.clone()),
+                local_track_id: is_local.then_some(track_id),
                 // A path is authoritative only when an imported local
                 // playlist supplied it as durable location evidence.
-                match_file_path: Set(None),
-                match_title: Set(normalize_fingerprint(title)),
-                match_artist: Set(normalize_fingerprint(artist)),
-                match_album: Set(normalize_fingerprint(album)),
-                match_duration_secs: Set(duration),
-            }
-            .insert(&txn)
-            .await?;
-            inserted.push(StoredPlaylistEntry::from_model(model)?);
+                match_file_path: None,
+                match_title: normalize_fingerprint(title),
+                match_artist: normalize_fingerprint(artist),
+                match_album: normalize_fingerprint(album),
+                match_duration_secs: duration,
+            });
         }
+
+        for chunk in rows.chunks(ENTRY_INSERT_BATCH_SIZE) {
+            let written = playlist_entry::Entity::insert_many(
+                chunk.iter().cloned().map(playlist_entry::ActiveModel::from),
+            )
+            .exec_without_returning(&txn)
+            .await?;
+            if usize::try_from(written).ok() != Some(chunk.len()) {
+                return Err(DbErr::Custom(
+                    "Playlist entry batch was not inserted completely".to_string(),
+                ));
+            }
+        }
+        let inserted = rows
+            .into_iter()
+            .map(StoredPlaylistEntry::from_model)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let Some(authority) = authorize() else {
             return Ok(PlaylistEntryAddOutcome::Rejected);
@@ -781,19 +807,21 @@ impl PlaylistManager {
             )));
         }
 
-        if !entry_ids.is_empty() {
-            let deleted = playlist_entry::Entity::delete_many()
+        let mut deleted = 0u64;
+        for chunk in entry_ids.chunks(ID_BATCH_SIZE) {
+            deleted += playlist_entry::Entity::delete_many()
                 .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-                .filter(playlist_entry::Column::Id.is_in(entry_ids.iter().map(String::as_str)))
+                .filter(playlist_entry::Column::Id.is_in(chunk.iter().map(String::as_str)))
                 .exec(&txn)
-                .await?;
-            let expected = u64::try_from(entry_ids.len())
-                .map_err(|_| DbErr::Custom("Too many playlist entries selected".to_string()))?;
-            if deleted.rows_affected != expected {
-                return Err(DbErr::Custom(
-                    "Playlist changed while entries were being removed".to_string(),
-                ));
-            }
+                .await?
+                .rows_affected;
+        }
+        let expected = u64::try_from(entry_ids.len())
+            .map_err(|_| DbErr::Custom("Too many playlist entries selected".to_string()))?;
+        if deleted != expected {
+            return Err(DbErr::Custom(
+                "Playlist changed while entries were being removed".to_string(),
+            ));
         }
 
         let remaining_ids: Vec<String> = current
@@ -1015,6 +1043,7 @@ impl PlaylistManager {
         model.updated_at = Set(now_rfc3339());
         model.update(&txn).await?;
         txn.commit().await?;
+        forget_random_limit_seed(playlist_id);
         info!(id = %playlist_id, "Smart playlist rules updated");
         Ok(())
     }
@@ -1060,7 +1089,8 @@ impl PlaylistManager {
         // in `smart_rules::apply_compound_sort` (decorate-sort-undecorate).
         let all_tracks = track::Entity::find().all(&txn).await?;
         txn.commit().await?;
-        let results = smart_rules::evaluate(&rules, &all_tracks);
+        let results =
+            smart_rules::evaluate_seeded(&rules, &all_tracks, random_limit_seed(playlist_id));
         Ok(results)
     }
 
@@ -1077,10 +1107,36 @@ impl PlaylistManager {
     ///
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
+        self.reconcile(None).await
+    }
+
+    /// Re-link orphaned entries after `changed` tracks were inserted, updated,
+    /// or relocated.
+    ///
+    /// Unresolved entries are normal (unmatched imports, deleted files), so
+    /// the whole track table is loaded only when some orphan could match one
+    /// of `changed`; the full resolver then decides, keeping its ambiguity
+    /// rules exact. An orphan that could resolve only against unchanged
+    /// tracks waits for the next full [`Self::reconcile_all`].
+    pub async fn reconcile_changed_tracks(&self, changed: &[track::Model]) -> Result<u32, DbErr> {
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        self.reconcile(Some(changed)).await
+    }
+
+    async fn reconcile(&self, changed: Option<&[track::Model]>) -> Result<u32, DbErr> {
         let txn = crate::db::begin_write(&self.db).await?;
         let orphans = orphan_reconciliation_query().all(&txn).await?;
 
-        if orphans.is_empty() {
+        let nothing_to_relink = orphans.is_empty()
+            || changed.is_some_and(|changed| {
+                let changed_index = ImportedTrackMatchIndex::new(changed);
+                !orphans
+                    .iter()
+                    .any(|orphan| changed_index.has_candidate(&orphan_match_evidence(orphan)))
+            });
+        if nothing_to_relink {
             txn.commit().await?;
             return Ok(0);
         }
@@ -1099,26 +1155,14 @@ impl PlaylistManager {
         let mut relinked = 0u32;
 
         for orphan in orphans {
-            let duration_secs = match orphan.match_duration_secs {
-                Some(value) if value >= 0 => Some(value as u64),
-                Some(value) => {
-                    warn!(
-                        entry = %orphan.id,
-                        duration_secs = value,
-                        "Ignoring invalid negative playlist match duration"
-                    );
-                    None
-                }
-                None => None,
-            };
-            let imported = ImportedTrack {
-                title: orphan.match_title.clone(),
-                artist: orphan.match_artist.clone(),
-                album: orphan.match_album.clone(),
-                file_path: orphan.match_file_path.clone().unwrap_or_default(),
-                duration_secs,
-            };
-            let best = match_index.find(&imported);
+            if let Some(value) = orphan.match_duration_secs.filter(|value| *value < 0) {
+                warn!(
+                    entry = %orphan.id,
+                    duration_secs = value,
+                    "Ignoring invalid negative playlist match duration"
+                );
+            }
+            let best = match_index.find(&orphan_match_evidence(&orphan));
 
             if let Some(best) = best {
                 if TrackId::new(best.id.as_str()).is_err() {
@@ -1156,55 +1200,40 @@ impl PlaylistManager {
 
     // ── Default smart playlists ──────────────────────────────────────
 
-    /// Seed default smart playlists on first launch.
+    /// Seed the default smart playlists (Recently Added, Recently Played,
+    /// Top 25 Most Played) once per database.
     ///
-    /// Creates: Recently Added, Recently Played, Top 25 Most Played.
-    /// Called from the engine when the playlist table is empty.
+    /// Seeding happens only while the database has never held a playlist, so
+    /// deleting every playlist later does not bring the defaults back. The
+    /// playlist-sidebar revision advances on every playlist insert, update,
+    /// and delete and never decreases, so an empty table at revision zero
+    /// means no playlist was ever stored. The check and the inserts share one
+    /// write transaction.
+    ///
+    /// Returns the created playlists, or none when seeding was not needed.
     pub async fn seed_defaults(&self) -> Result<Vec<playlist::Model>, DbErr> {
-        let mut created = Vec::new();
+        let defaults = [
+            ("Recently Added", recently_added_default_rules()),
+            ("Recently Played", recently_played_default_rules()),
+            ("Top 25 Most Played", top_25_most_played_default_rules()),
+        ];
 
-        // 1. Recently Added — Date Added is in the last 30 days
-        let rules_recently_added = smart_rules::SmartRules {
-            match_mode: smart_rules::MatchMode::All,
-            rules: vec![smart_rules::SmartRule {
-                field: smart_rules::RuleField::DateAdded,
-                operator: smart_rules::RuleOperator::IsInTheLast {
-                    amount: 30,
-                    unit: smart_rules::DateUnit::Days,
-                },
-                value: smart_rules::RuleValue::Number(30),
-            }],
-            limit: None,
-            sort_order: vec![smart_rules::SortCriterion {
-                field: smart_rules::SortField::DateAdded,
-                direction: smart_rules::SortDirection::Descending,
-            }],
-        };
-        let pl = self
-            .create_smart_playlist("Recently Added", &rules_recently_added)
-            .await?;
-        info!(id = %pl.id, "Seeded: Recently Added");
-        created.push(pl);
+        let txn = crate::db::begin_write(&self.db).await?;
+        let never_held_playlists = playlist::Entity::find().one(&txn).await?.is_none()
+            && super::playlist_sidebar::query_revision(&txn).await?.value() == 0;
+        if !never_held_playlists {
+            txn.commit().await?;
+            return Ok(Vec::new());
+        }
 
-        // 2. Recently Played — authoritative playback time in the inclusive
-        // last-14-day window, newest first with stable TrackId ties.
-        let rules_recently_played = recently_played_default_rules();
-        let pl = self
-            .create_smart_playlist("Recently Played", &rules_recently_played)
-            .await?;
-        info!(id = %pl.id, "Seeded: Recently Played");
-        created.push(pl);
-
-        // 3. Top 25 Most Played — positive counts only, then count descending,
-        // playback time descending (unknown last), and stable TrackId ties.
-        let rules_top25 = top_25_most_played_default_rules();
-        let pl = self
-            .create_smart_playlist("Top 25 Most Played", &rules_top25)
-            .await?;
-        info!(id = %pl.id, "Seeded: Top 25 Most Played");
-        created.push(pl);
-
-        info!(count = created.len(), "Default smart playlists seeded");
+        let mut created = Vec::with_capacity(defaults.len());
+        let timestamps = sequential_creation_timestamps(chrono::Utc::now());
+        for ((name, rules), created_at) in defaults.iter().zip(timestamps) {
+            let playlist = insert_smart_playlist(&txn, name, rules, created_at).await?;
+            info!(id = %playlist.id, name, "Seeded default smart playlist");
+            created.push(playlist);
+        }
+        txn.commit().await?;
         Ok(created)
     }
 }
@@ -1267,6 +1296,20 @@ where
         .collect()
 }
 
+/// The retained path and fingerprint of an orphaned entry as matcher input.
+/// A negative stored duration is treated as absent.
+fn orphan_match_evidence(orphan: &playlist_entry::Model) -> ImportedTrack {
+    ImportedTrack {
+        title: orphan.match_title.clone(),
+        artist: orphan.match_artist.clone(),
+        album: orphan.match_album.clone(),
+        file_path: orphan.match_file_path.clone().unwrap_or_default(),
+        duration_secs: orphan
+            .match_duration_secs
+            .and_then(|value| u64::try_from(value).ok()),
+    }
+}
+
 fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
     playlist_entry::Entity::find()
         .filter(playlist_entry::Column::SourceId.eq(SourceId::local().to_string()))
@@ -1282,6 +1325,55 @@ fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
                     .to_owned(),
             ),
         )
+}
+
+/// Insert one fully configured smart playlist. Rules and every compatibility
+/// column are encoded before the row is written.
+async fn insert_smart_playlist<C>(
+    db: &C,
+    name: &str,
+    rules: &SmartRules,
+    created_at: String,
+) -> Result<playlist::Model, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let storage = smart_rules_storage(rules)?;
+    playlist::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        name: Set(name.to_string()),
+        is_smart: Set(true),
+        smart_rules_json: Set(Some(storage.json)),
+        limit_enabled: Set(storage.limit_enabled),
+        limit_value: Set(storage.limit_value),
+        limit_unit: Set(storage.limit_unit),
+        limit_sort: Set(storage.limit_sort),
+        match_mode: Set(storage.match_mode),
+        live_updating: Set(true),
+        created_at: Set(created_at.clone()),
+        updated_at: Set(created_at),
+    }
+    .insert(db)
+    .await
+}
+
+fn recently_added_default_rules() -> smart_rules::SmartRules {
+    smart_rules::SmartRules {
+        match_mode: smart_rules::MatchMode::All,
+        rules: vec![smart_rules::SmartRule {
+            field: smart_rules::RuleField::DateAdded,
+            operator: smart_rules::RuleOperator::IsInTheLast {
+                amount: 30,
+                unit: smart_rules::DateUnit::Days,
+            },
+            value: smart_rules::RuleValue::Number(30),
+        }],
+        limit: None,
+        sort_order: vec![smart_rules::SortCriterion {
+            field: smart_rules::SortField::DateAdded,
+            direction: smart_rules::SortDirection::Descending,
+        }],
+    }
 }
 
 fn recently_played_default_rules() -> smart_rules::SmartRules {
@@ -1553,6 +1645,19 @@ fn valid_track_match_duration(track: &track::Model) -> Option<i32> {
 /// Get current time as RFC3339 string.
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Creation timestamps for playlists created together, strictly increasing
+/// from `base` in creation order.
+///
+/// The sidebar orders playlists that have no explicit position by
+/// `created_at` and then by random ID, so playlists created in one
+/// transaction must not share a timestamp. RFC 3339 text with the `+00:00`
+/// offset sorts chronologically even when the fractional-second width varies.
+pub(super) fn sequential_creation_timestamps(
+    base: chrono::DateTime<chrono::Utc>,
+) -> impl Iterator<Item = String> {
+    (0_i64..).map(move |offset| (base + chrono::TimeDelta::microseconds(offset)).to_rfc3339())
 }
 
 #[cfg(test)]
@@ -1947,6 +2052,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn defaults_are_seeded_once_in_order_and_stay_deleted() {
+        use crate::local::playlist_sidebar::{
+            load_playlist_sidebar_snapshot, PlaylistSidebarState,
+        };
+
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let seeded = manager.seed_defaults().await.expect("seed fresh database");
+        let expected = ["Recently Added", "Recently Played", "Top 25 Most Played"];
+        let seeded_names: Vec<&str> = seeded
+            .iter()
+            .map(|playlist| playlist.name.as_str())
+            .collect();
+        assert_eq!(seeded_names, expected);
+
+        let snapshot = load_playlist_sidebar_snapshot(&db)
+            .await
+            .expect("load sidebar snapshot");
+        let PlaylistSidebarState::Ready(rows) = snapshot.state() else {
+            panic!("sidebar snapshot must be available");
+        };
+        let sidebar_names: Vec<&str> = rows.iter().map(|row| row.name()).collect();
+        assert_eq!(sidebar_names, expected);
+
+        assert!(manager
+            .seed_defaults()
+            .await
+            .expect("skip seeding a populated database")
+            .is_empty());
+        for playlist in &seeded {
+            manager
+                .delete_playlist(&playlist.id)
+                .await
+                .expect("delete default playlist");
+        }
+        assert!(manager
+            .seed_defaults()
+            .await
+            .expect("skip seeding after the user deleted everything")
+            .is_empty());
+        assert!(manager
+            .list_playlists()
+            .await
+            .expect("list playlists")
+            .is_empty());
+    }
+
+    #[test]
+    fn sequential_creation_timestamps_sort_in_creation_order_across_a_second() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-09-23T10:00:00.999998+00:00")
+            .expect("parse base timestamp")
+            .with_timezone(&chrono::Utc);
+        let timestamps: Vec<String> = super::sequential_creation_timestamps(base)
+            .take(4)
+            .collect();
+
+        let mut sorted = timestamps.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, timestamps);
+    }
+
+    #[tokio::test]
     async fn seeded_history_playlists_reflect_committed_history_rows() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
@@ -2109,6 +2277,76 @@ mod tests {
             .map(|track| track.id)
             .collect();
         assert_eq!(unrated_ids, ["none"]);
+    }
+
+    #[tokio::test]
+    async fn random_limited_smart_playlist_keeps_its_selection_across_a_rating() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let mut tracks = Vec::new();
+        for n in 0..40 {
+            let id = format!("track-{n:02}");
+            tracks.push(
+                insert_track(
+                    &db,
+                    &id,
+                    &format!("/music/{id}.flac"),
+                    &id,
+                    "Artist",
+                    "Album",
+                    Some(180),
+                )
+                .await,
+            );
+        }
+        let ten_random_unrated = smart_rules::SmartRules {
+            match_mode: smart_rules::MatchMode::All,
+            rules: vec![smart_rules::SmartRule {
+                field: smart_rules::RuleField::Rating,
+                operator: smart_rules::RuleOperator::IsUnrated,
+                value: smart_rules::RuleValue::Number(1),
+            }],
+            limit: Some(smart_rules::SmartLimit {
+                value: 10,
+                unit: smart_rules::LimitUnit::Items,
+                selected_by: smart_rules::LimitSort::Random,
+            }),
+            sort_order: Vec::new(),
+        };
+        let playlist = manager
+            .create_smart_playlist("Ten random unrated", &ten_random_unrated)
+            .await
+            .expect("create random-limited smart playlist");
+        let selection = |models: Vec<track::Model>| -> Vec<String> {
+            models.into_iter().map(|track| track.id).collect()
+        };
+        let before = selection(
+            manager
+                .evaluate_smart_playlist(&playlist.id)
+                .await
+                .expect("evaluate random selection"),
+        );
+        assert_eq!(before.len(), 10);
+
+        // Rating an unselected track removes it from the matched set.
+        let rated = tracks
+            .into_iter()
+            .find(|track| !before.contains(&track.id))
+            .expect("an unselected track");
+        let mut rated: track::ActiveModel = rated.into();
+        rated.rating = Set(Some(80));
+        rated.update(&db).await.expect("commit rating");
+
+        let after = selection(
+            manager
+                .evaluate_smart_playlist(&playlist.id)
+                .await
+                .expect("re-evaluate after rating"),
+        );
+        assert_eq!(
+            after, before,
+            "a rating must not reshuffle a random-limited selection"
+        );
     }
 
     #[tokio::test]
@@ -2947,6 +3185,108 @@ mod tests {
         assert_eq!(entries[0].position, i32::MAX);
     }
 
+    /// More IDs than SQLite binds in one statement (32,766 host parameters).
+    const MORE_THAN_BIND_LIMIT: usize = 32_767;
+
+    /// Insert `count` minimal rows with one set-based statement.
+    async fn insert_bulk_rows(db: &DatabaseConnection, count: usize, insert_select: &str) {
+        db.execute_unprepared(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < {count})
+             {insert_select} FROM n"
+        ))
+        .await
+        .expect("insert bulk rows");
+    }
+
+    #[tokio::test]
+    async fn add_resolves_more_local_tracks_than_sqlite_binds_in_one_statement() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Everything")
+            .await
+            .expect("create playlist");
+        insert_bulk_rows(
+            &db,
+            MORE_THAN_BIND_LIMIT,
+            "INSERT INTO tracks (id, file_path, title, artist_name, album_title,
+                                 date_added, date_modified)
+             SELECT 'bulk-' || i, '/music/bulk-' || i || '.flac', 'Song', 'Artist', 'Album',
+                    '2026-07-12T00:00:00Z', '2026-07-12T00:00:00Z'",
+        )
+        .await;
+        let inputs: Vec<PlaylistEntryInput> = (0..MORE_THAN_BIND_LIMIT)
+            .map(|index| {
+                PlaylistEntryInput::new(
+                    MediaKey::new(
+                        SourceId::local(),
+                        TrackId::new(format!("bulk-{index}")).expect("local track ID"),
+                    ),
+                    "",
+                    "",
+                    "",
+                    None,
+                )
+            })
+            .collect();
+
+        let inserted = manager
+            .add_entries(&playlist.id, &inputs)
+            .await
+            .expect("add a selection larger than the bind limit");
+
+        assert_eq!(inserted.len(), MORE_THAN_BIND_LIMIT);
+        let entries = playlist_entries(&db, &playlist.id).await;
+        assert_eq!(entries.len(), MORE_THAN_BIND_LIMIT);
+        assert_eq!(entries[0].local_track_id.as_deref(), Some("bulk-0"));
+        assert_eq!(entries[0].match_title, "song");
+        let last = entries.last().expect("last entry");
+        assert_eq!(
+            last.local_track_id,
+            Some(format!("bulk-{}", MORE_THAN_BIND_LIMIT - 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_more_entries_than_sqlite_binds_in_one_statement() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Large")
+            .await
+            .expect("create playlist");
+        insert_bulk_rows(
+            &db,
+            MORE_THAN_BIND_LIMIT + 2,
+            &format!(
+                "INSERT INTO playlist_entries (id, playlist_id, position, source_id,
+                                               match_title, match_artist, match_album)
+                 SELECT 'entry-' || i, '{}', i, '{}', 'song', 'artist', ''",
+                playlist.id,
+                SourceId::local()
+            ),
+        )
+        .await;
+        let kept = ["entry-5".to_string(), "entry-32000".to_string()];
+        let removed: Vec<String> = (0..MORE_THAN_BIND_LIMIT + 2)
+            .map(|index| format!("entry-{index}"))
+            .filter(|id| !kept.contains(id))
+            .collect();
+        assert_eq!(removed.len(), MORE_THAN_BIND_LIMIT);
+
+        manager
+            .remove_entries(&playlist.id, &removed)
+            .await
+            .expect("remove a selection larger than the bind limit");
+
+        let entries = playlist_entries(&db, &playlist.id).await;
+        let remaining: Vec<(&str, i32)> = entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.position))
+            .collect();
+        assert_eq!(remaining, [("entry-5", 0), ("entry-32000", 1)]);
+    }
+
     #[tokio::test]
     async fn reorder_yields_unique_contiguous_positions() {
         let db = in_memory_db().await;
@@ -3631,6 +3971,105 @@ mod tests {
             after[1].local_track_id.as_deref(),
             Some(second_new.id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn changed_track_reconciliation_skips_unrelated_changes_and_keeps_ambiguity() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Orphans")
+            .await
+            .expect("create playlist");
+        playlist_entry::ActiveModel {
+            id: Set("orphan".to_string()),
+            playlist_id: Set(playlist.id.clone()),
+            position: Set(0),
+            source_id: Set(SourceId::local().to_string()),
+            track_id: Set(None),
+            local_track_id: Set(None),
+            match_file_path: Set(None),
+            match_title: Set("song".to_string()),
+            match_artist: Set("artist".to_string()),
+            match_album: Set("album".to_string()),
+            match_duration_secs: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("insert orphan");
+        insert_track(
+            &db,
+            "unchanged",
+            "/music/a.flac",
+            "Song",
+            "Artist",
+            "Album",
+            None,
+        )
+        .await;
+        let unrelated = insert_track(
+            &db,
+            "unrelated",
+            "/music/u.flac",
+            "Other",
+            "Artist",
+            "Album",
+            None,
+        )
+        .await;
+        let orphan_link = || async {
+            playlist_entry::Entity::find_by_id("orphan")
+                .one(&db)
+                .await
+                .expect("query orphan")
+                .expect("orphan exists")
+                .local_track_id
+        };
+
+        // No orphan can match the changed track, so nothing is reconciled even
+        // though an unchanged track matches.
+        assert_eq!(
+            manager
+                .reconcile_changed_tracks(std::slice::from_ref(&unrelated))
+                .await
+                .expect("reconcile unrelated change"),
+            0
+        );
+        assert_eq!(orphan_link().await, None);
+
+        // The changed duplicate is a candidate, but the whole library makes the
+        // fingerprint ambiguous.
+        let duplicate = insert_track(
+            &db,
+            "duplicate",
+            "/music/b.flac",
+            "Song",
+            "Artist",
+            "Album",
+            None,
+        )
+        .await;
+        assert_eq!(
+            manager
+                .reconcile_changed_tracks(std::slice::from_ref(&duplicate))
+                .await
+                .expect("reconcile ambiguous change"),
+            0
+        );
+        assert_eq!(orphan_link().await, None);
+
+        track::Entity::delete_by_id("unchanged")
+            .exec(&db)
+            .await
+            .expect("delete unchanged duplicate");
+        assert_eq!(
+            manager
+                .reconcile_changed_tracks(std::slice::from_ref(&duplicate))
+                .await
+                .expect("reconcile unique change"),
+            1
+        );
+        assert_eq!(orphan_link().await.as_deref(), Some("duplicate"));
     }
 
     #[tokio::test]

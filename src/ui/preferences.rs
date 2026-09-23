@@ -137,6 +137,12 @@ pub struct AppConfig {
     /// second, unrelated root.
     #[serde(default)]
     pub pending_root_reauthorizations: Vec<PendingRootReauthorization>,
+    /// Whether `library_paths` was read from config.json rather than
+    /// defaulted. Startup forgets tracks outside the configured folders only
+    /// when it was, so a missing or unreadable config never discards a
+    /// library.
+    #[serde(skip)]
+    pub library_paths_loaded: bool,
     /// Whether the user has consented to IP-based geolocation for
     /// "Stations Near Me". `None` = not yet asked, `Some(true)` = accepted,
     /// `Some(false)` = declined.
@@ -375,6 +381,7 @@ impl Default for AppConfig {
             column_schema_version: CURRENT_COLUMN_SCHEMA_VERSION,
             library_paths: default_library_paths(),
             pending_root_reauthorizations: Vec::new(),
+            library_paths_loaded: false,
             location_enabled: None,
             group_by_album_artist: false,
             album_pane_artwork: false,
@@ -649,9 +656,12 @@ pub fn load_config() -> AppConfig {
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return AppConfig::default();
     };
+    parse_config(&raw)
+}
 
+fn parse_config(raw: &str) -> AppConfig {
     // Parse to a generic Value so we can rewrite the legacy key safely.
-    let mut value: serde_json::Value = match serde_json::from_str(&raw) {
+    let mut value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return AppConfig::default(),
     };
@@ -663,9 +673,13 @@ pub fn load_config() -> AppConfig {
             }
         }
     }
+    let library_paths_loaded = value
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("library_paths"));
 
-    match serde_json::from_value(value) {
+    match serde_json::from_value::<AppConfig>(value) {
         Ok(mut config) => {
+            config.library_paths_loaded = library_paths_loaded;
             migrate_column_schema(&mut config);
             config
         }
@@ -2005,6 +2019,18 @@ mod tests {
             round_trip["pending_root_reauthorizations"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn only_a_parsed_folder_list_counts_as_loaded() {
+        assert!(parse_config(r#"{"library_paths":[]}"#).library_paths_loaded);
+        let legacy = parse_config(r#"{"library_path":"/music"}"#);
+        assert_eq!(legacy.library_paths, ["/music"]);
+        assert!(legacy.library_paths_loaded);
+        assert!(!parse_config("{}").library_paths_loaded);
+        assert!(!parse_config("{not json").library_paths_loaded);
+        assert!(!parse_config(r#"{"library_paths":7}"#).library_paths_loaded);
+        assert!(!AppConfig::default().library_paths_loaded);
     }
 
     #[test]

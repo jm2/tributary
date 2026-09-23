@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job instead of skipping silently. The widget session now refuses to reuse an
   initialized GTK from a different thread, and recognizes Broadway as a display server
   for local headless runs.
+- **Broader parser fuzzing** — The weekly fuzz run now also covers the XSPF playlist,
+  Rhythmbox import, Last.fm sign-in response, and cast streaming URL and byte-range parsers,
+  each started from committed sample inputs and stopped at fixed time and iteration limits.
 - **Folder browsing** — Browse the local library by configured root and folder, with
   distinct identities for multiple roots, lazy navigation, and visible reasons when a root
   is unavailable or has changed identity.
@@ -92,6 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Last.fm preparation** — Persist consent and per-source policy generations for future
   scrobbling activation, with transactional updates and validation. Scrobbling remains disabled.
 - **Dependency maintenance** — Refresh Rust dependencies and the release-upload action.
+- **Stricter dependency auto-merge and leaner CI** — Dependabot pull requests auto-merge only
+  for patch updates, and a push by anyone else turns auto-merge off until a maintainer reviews
+  it. The Security Audit check now runs only the advisory audit, and documentation-only changes
+  skip the native build matrix.
 - **Single dependency lockfile** — The fuzz harness now shares the application's Cargo
   workspace and lockfile, so Dependabot updates no longer need a manual fuzz-lock repair and
   the security audit covers one lock.
@@ -121,6 +128,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Subsonic albums with several artists** — Songs on an album credited to more than one
+  album artist (common on Navidrome) no longer appear twice, and no longer make every
+  playlist entry from that server show as unavailable.
+- **Password-protected Rhythmbox shares** — Tributary can now load the library from a
+  Rhythmbox share that requires a password, instead of failing with a sign-in error right
+  after the password is accepted.
+- **Unplayable tracks no longer stop the queue** — When the next track can't be opened (for
+  example, its file was deleted or its drive is unplugged) or can't be decoded, Tributary now
+  says so and skips to the following track. It stops with a message after several failures in
+  a row; a track you pick yourself is reported but not skipped.
+- **Now-playing controls** — The time and scrubber reset as soon as a track changes, streams
+  whose length can't be measured show the library's track length instead of "LIVE", and only
+  live radio disables the scrubber. Track changes no longer replace your selection in the track
+  list, the play button's tooltip says Pause while playing, and Escape clears the search.
+- **Very large playlist selections** — Adding more than about 32,000 tracks to a playlist
+  at once, or removing that many entries, no longer fails.
+- **XSPF import and export** — Exports keep an existing file's permissions, new exports are
+  readable by other programs, and exporting over a symlink updates the file it points to. A
+  playlist with one bad duration still imports, and files over 64 MiB are refused with a clear
+  message.
+- **Playlist housekeeping** — The default smart playlists no longer come back after you delete
+  them, Rhythmbox imports keep their original playlist order, and file changes no longer re-read
+  the whole library whenever some playlist entries are unmatched.
+- **Views keep their place** — Counting a play, rating a track, or a change to the library
+  folders no longer empties the open playlist or library view, clears its search and filters,
+  or jumps back to the top. A smart playlist limited to random songs keeps the same songs
+  until you edit its rules or restart Tributary.
+- **MPD and Chromecast after a network stall** — If a brief stall ends playback with an
+  error while the device keeps playing, Stop (or quitting Tributary) now reconnects and stops
+  it. A supervised MPD output no longer refuses to play when you wait more than two seconds
+  after selecting it, or after a track or the queue ends.
 - **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
   12 servers, which by default reject the older authentication header Tributary used to
   send. Earlier Jellyfin versions keep working.
@@ -130,6 +168,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row from
   the output selector, and receivers or Chromecasts that share a display name no longer hide each
   other.
+- **Chromecast track changes** — Moving to the next track keeps the receiver's media app
+  open instead of closing and relaunching it, so TVs and displays no longer drop back to
+  their ambient screen between tracks. Tributary also stops resetting the speaker's own
+  volume on every track, and Previous now restarts a Chromecast track after three seconds.
 - **Year edits** — Changing or clearing the year in Properties now takes effect for MP3
   and M4A files, and replaces the existing date on FLAC and Ogg files instead of being
   hidden by it.
@@ -152,6 +194,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Confirm before deleting a playlist or removing a server** — Deleting a playlist or
   removing a saved server from the sidebar now asks for confirmation first, with Cancel
   as the default, so a misclick no longer discards it immediately.
+- **Library folders** — A library folder that is itself a symbolic link (for example
+  `~/Music` pointing to another disk) is now indexed instead of showing an empty library.
+  Removing a library folder now forgets its unplayable tracks at the next start, while a
+  folder that is only temporarily unavailable, such as an unmounted drive, keeps them.
+- **Library rescans after tag edits and syncs** — Saving a tag edit, or a sync tool such as
+  rsync or Syncthing finishing a download into your music folder, now updates just that
+  track instead of rescanning the whole library.
+- **Responsiveness on slow or network drives** — Starting Tributary no longer holds up
+  ratings and other edits while it sets up folder watching, and closing the window no
+  longer waits for a library rescan to finish.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album
@@ -304,6 +356,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drags from empty space or column headers from transferring the existing selection.
 - **Release verification** — Verify that manual releases build the requested tag and stop
   artifact publication when checksum generation fails.
+
+### Security
+
+- **Discovered Plex servers** — Signing in to a Plex server found on the network no longer
+  sends your Plex account token to it. Tributary first confirms through plex.tv that the server
+  is one of yours, then connects securely with that server's own access.
+- **Network discovery and saved servers** — Servers announced on the network can no longer
+  redirect a server you added yourself. Losing or updating an announcement no longer
+  disconnects a working session unless it was using an address that went away.
 
 ## [0.6.2] — 2026-09-01
 

@@ -43,7 +43,7 @@ pub struct BrowserState {
     /// Current search text for the realtime filter.
     search_text: Rc<RefCell<String>>,
     /// Generation counter invalidating pending search debounces when
-    /// the shared state is reset (source replacement / full sync).
+    /// the shared state is reset (source replacement).
     search_debounce_gen: Rc<Cell<u32>>,
     /// THE single composition rule: every filter change emits through
     /// [`BrowserState::emit`], which reads all five axes from this
@@ -134,7 +134,7 @@ impl BrowserState {
 
     /// Clear every shared filter axis and invalidate a pending search
     /// debounce. Used when the data the axes point into is replaced
-    /// wholesale (source replacement / full sync).
+    /// wholesale (source replacement).
     fn reset_selections(&self) {
         *self.selected_genre.borrow_mut() = None;
         *self.selected_artist.borrow_mut() = None;
@@ -396,6 +396,10 @@ pub fn build_browser(
             navigate_folder_row(&state, &selection, position);
         });
     }
+
+    // GtkSearchEntry turns Escape into `stop-search` and leaves the text in
+    // place; clearing it makes Escape clear the search.
+    search_entry.connect_stop_search(|entry| entry.set_text(""));
 
     // ── Search entry handler (debounced 100ms) ───────────────────────
     {
@@ -1236,8 +1240,8 @@ fn repopulate_panes(
 /// Replace the browser's data wholesale and reset every filter axis.
 ///
 /// This is the SOURCE-REPLACEMENT path (a different library became
-/// active, or a full sync replaced the data): the previous selections
-/// point at values that may no longer exist, so every axis — including
+/// active): the previous selections point at values that may no longer
+/// exist, so every axis — including
 /// the search text and any pending search debounce — resets to "All",
 /// and the panes repopulate unfiltered so the displayed selections
 /// agree with the reset state (issue #250: the panes used to show "All"
@@ -1255,15 +1259,10 @@ fn repopulate_panes(
 /// unfiltered track set themselves (see `window.rs` `display_tracks`),
 /// and the reset state composes to exactly that.
 pub fn reset_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks: &[TrackObject]) {
-    // The track set just changed (FullSync, source switch, snapshot
-    // refresh). Bump the album-art cache's content generation so covers
-    // changed by the new data are re-resolved within the SAME source
-    // session instead of serving the previous contents of
-    // `(source, epoch, album)` (2026-09-10 review finding — the key
-    // carried the source epoch but no artwork/content generation, so a
-    // same-session FullSync left changed covers stale). Old-generation
-    // entries become unqueryable and age out through the bounded
-    // eviction.
+    // The track set was replaced. Advance the album-art cache's content
+    // generation so covers are re-resolved instead of served from the
+    // previous contents of `(source, epoch, album)`; old-generation entries
+    // become unqueryable and age out through the bounded eviction.
     state.album_art_controller.cache().bump_content_generation();
 
     // Update the shared snapshot that selection handlers reference.
@@ -1349,6 +1348,41 @@ pub fn refresh_browser_data(browser_box: &gtk::Box, state: &BrowserState, tracks
     state.updating.set(false);
 
     state.emit();
+}
+
+/// Republish the whole snapshot of the library already on screen (a
+/// same-source full sync). As in [`refresh_browser_data`], selections that
+/// still exist and the search text survive. The folder pane keeps its
+/// location while that root is still configured, and album covers are
+/// re-resolved because a full sync can carry changed artwork.
+pub fn resync_browser_data(
+    browser_box: &gtk::Box,
+    state: &BrowserState,
+    tracks: &[TrackObject],
+    folder_model: FolderBrowser,
+) {
+    state.album_art_controller.cache().bump_content_generation();
+    let keeps_location = match &*state.folder_location.borrow() {
+        FolderLocation::Roots => true,
+        FolderLocation::Inside { root_id, .. } => folder_model
+            .roots()
+            .iter()
+            .any(|root| &root.root_id == root_id),
+    };
+    *state.folder_model.borrow_mut() = Some(folder_model);
+    if keeps_location {
+        state.updating.set(true);
+        let prefix = populate_folder_pane(
+            &state.folder_store,
+            state.folder_model.borrow().as_ref(),
+            &state.folder_location.borrow(),
+        );
+        state.updating.set(false);
+        *state.folder_prefix.borrow_mut() = prefix;
+    } else {
+        reset_folder_navigation(state);
+    }
+    refresh_browser_data(browser_box, state, tracks);
 }
 
 /// True when any track in `tracks` matches all three axes at once
@@ -1892,9 +1926,7 @@ mod tests {
         browser_box: gtk::Box,
         browser_state: BrowserState,
         track_store: gio::ListStore,
-        column_view: gtk::ColumnView,
         master_tracks: Rc<RefCell<Vec<TrackObject>>>,
-        status_label: gtk::Label,
         active_source_key: Rc<RefCell<String>>,
         playback_session: Rc<RefCell<crate::ui::playback::PlaybackSession>>,
         source_tracks: Rc<RefCell<std::collections::HashMap<String, Vec<TrackObject>>>>,
@@ -1903,11 +1935,8 @@ mod tests {
 
     impl Q4PublicationBench {
         fn new() -> Self {
-            let (browser_box, browser_state) =
-                build_browser(&[], false, false, 48, Box::new(|_, _, _, _, _| {}));
             let track_store = gio::ListStore::new::<TrackObject>();
-            let selection = gtk::SingleSelection::new(Some(track_store.clone()));
-            let column_view = gtk::ColumnView::new(Some(selection));
+            let master_tracks = Rc::new(RefCell::new(Vec::new()));
             // One configured library root covering every synthetic track
             // path, so the folder-model rebuild does real root matching
             // per row the way production does.
@@ -1915,13 +1944,25 @@ mod tests {
                 library_paths: vec!["/q4-bench".to_string()],
                 ..crate::ui::preferences::AppConfig::default()
             }));
+            // The production filter callback composes the visible rows, as
+            // it does for every same-source publication.
+            let (browser_box, browser_state) = build_browser(
+                &[],
+                false,
+                false,
+                48,
+                crate::ui::window::browser_filter(
+                    track_store.clone(),
+                    gtk::Label::default(),
+                    master_tracks.clone(),
+                    app_config.clone(),
+                ),
+            );
             Self {
                 browser_box,
                 browser_state,
                 track_store,
-                column_view,
-                master_tracks: Rc::new(RefCell::new(Vec::new())),
-                status_label: gtk::Label::default(),
+                master_tracks,
                 active_source_key: Rc::new(RefCell::new("local".to_string())),
                 playback_session: Rc::new(RefCell::new(
                     crate::ui::playback::PlaybackSession::default(),
@@ -1943,11 +1984,8 @@ mod tests {
                 &self.playback_session,
                 &self.source_tracks,
                 &self.master_tracks,
-                &self.track_store,
                 &self.browser_box,
                 &self.browser_state,
-                &self.status_label,
-                &self.column_view,
                 &self.app_config,
             );
         }
@@ -2013,8 +2051,8 @@ mod tests {
     /// full snapshot). Times the complete production publication unit
     /// ([`crate::ui::window::apply_full_sync_publication`]) — arch
     /// Track→TrackObject conversion, playlist/queue refresh, the
-    /// per-source clone, and `display_local_tracks` (display + folder
-    /// model rebuild), everything the main loop blocks on during a
+    /// per-source clone, and the same-source browser resync (folder model
+    /// rebuild + filtered splice), everything the main loop blocks on during a
     /// FullSync — alongside the display-only lower bound (`display_tracks`
     /// alone on a second empty browser at the same scale, objects
     /// preconverted outside the timer). Prints `Q4_UI_METRIC` lines.
@@ -2361,6 +2399,38 @@ mod tests {
         );
     }
 
+    /// Escape reaches a focused GtkSearchEntry as `stop-search`, which GTK
+    /// leaves to the application: it must clear the text, and the composed
+    /// filter must follow.
+    fn escape_clears_the_search() {
+        let context = session_context();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let tracks = vec![fixture_track("Jazz", "Alpha", "Album One", "T1")];
+        let (log, cb) = recorder();
+        let (browser_box, _state) = build_browser(&tracks, false, false, 48, cb);
+
+        type_search(&browser_box, "zzz");
+        pump_until(&context, deadline, || {
+            last_search(&log).as_deref() == Some("zzz")
+        });
+        assert_eq!(last_search(&log).as_deref(), Some("zzz"));
+
+        let entry = search_entry_of(&browser_box);
+        entry.emit_by_name::<()>("stop-search", &[]);
+        assert_eq!(entry.text(), "", "Escape must clear the search text");
+        // Deliver the search-changed that GTK's delay timer would (see
+        // `type_search`); a duplicate of GTK's own emission is ignored.
+        entry.emit_by_name::<()>("search-changed", &[]);
+        pump_until(&context, deadline, || {
+            last_search(&log).as_deref() == Some("")
+        });
+        assert_eq!(
+            last_search(&log).as_deref(),
+            Some(""),
+            "clearing the text must clear the search filter"
+        );
+    }
+
     /// Source replacement (A → B) resets every axis and the panes agree:
     /// the panes display "All" AND the composed filter carries no stale
     /// artist/album — the issue's exact probe (issue #250).
@@ -2519,10 +2589,10 @@ mod tests {
         );
     }
 
-    /// A full-sync-style replacement clears every axis AND the entry,
+    /// A source-switch replacement clears every axis AND the entry,
     /// emits nothing itself (the caller splices the full set), and the
     /// next interaction composes from fully cleared axes (issue #250).
-    fn full_sync_reset_clears_every_axis_and_the_entry() {
+    fn source_switch_reset_clears_every_axis_and_the_entry() {
         let context = session_context();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let source_a = vec![fixture_track("Rock", "Alpha", "Old", "T1")];
@@ -2735,6 +2805,10 @@ mod tests {
     /// and the `leafonly` leaf, the layout the activation contracts
     /// navigate (issue #251).
     fn attach_sole_root_ellipsis_model(state: &BrowserState, scratch: &FolderScratch) {
+        attach_folder_model(state, sole_root_ellipsis_model(scratch));
+    }
+
+    fn sole_root_ellipsis_model(scratch: &FolderScratch) -> FolderBrowser {
         let roots = vec![crate::ui::folder_browser::BrowsableRoot::from_configured(
             scratch.root_path("sole").to_str().expect("utf8 root path"),
             None,
@@ -2750,10 +2824,7 @@ mod tests {
             },
         ];
         let (placed, _report) = crate::ui::folder_browser::place_tracks(&roots, &inputs);
-        attach_folder_model(
-            state,
-            crate::ui::folder_browser::FolderBrowser::new(roots, placed),
-        );
+        FolderBrowser::new(roots, placed)
     }
 
     /// Drive the production `ListView::activate` signal — the exact path
@@ -2921,7 +2992,7 @@ mod tests {
         panes: Vec<gtk::Box>,
         source: Vec<TrackObject>,
         log: EmitLog,
-        _scratch: FolderScratch,
+        scratch: FolderScratch,
     }
 
     impl FolderActivationFixture {
@@ -2941,7 +3012,7 @@ mod tests {
                 panes,
                 source,
                 log,
-                _scratch: scratch,
+                scratch,
             }
         }
     }
@@ -3236,6 +3307,352 @@ mod tests {
         );
     }
 
+    /// A same-source full sync swaps in a rebuilt folder model: the pane
+    /// stays where the user navigated while that root is still configured,
+    /// and returns to the roots once it is not (issue #250).
+    fn folder_location_survives_same_source_full_sync() {
+        let fx = FolderActivationFixture::new("resync");
+        let folder_pane = &fx.panes[3];
+        let list_view = pane_list_view(folder_pane).expect("folder pane ListView");
+        emit_folder_activation(&list_view, 0);
+
+        let rebuilt = sole_root_ellipsis_model(&fx.scratch);
+        resync_browser_data(&fx.browser_box, &fx.state, &fx.source, rebuilt);
+        assert_refresh_preserves_folder_axis(&fx, folder_pane);
+
+        let (placed, _report) = crate::ui::folder_browser::place_tracks(&[], &[]);
+        let without_root = FolderBrowser::new(Vec::new(), placed);
+        resync_browser_data(&fx.browser_box, &fx.state, &fx.source, without_root);
+        assert!(matches!(
+            &*fx.state.folder_location.borrow(),
+            FolderLocation::Roots
+        ));
+        assert!(fx.state.folder_prefix.borrow().is_none());
+    }
+
+    // ── The view on screen across same-source refreshes (#250, #329) ──
+
+    /// The production track list and browser, wired as the window wires
+    /// them: the browser's filter composes the list from `master_tracks`.
+    /// The list sits in a window (list rows are only set up once rooted),
+    /// but the widget session never runs GTK's frame clock, so
+    /// [`Self::layout`] lays it out by hand to make scroll positions real.
+    struct LiveTrackView {
+        window: gtk::Window,
+        tracklist: gtk::Box,
+        track_store: gio::ListStore,
+        status_label: gtk::Label,
+        column_view: gtk::ColumnView,
+        browser_box: gtk::Box,
+        state: BrowserState,
+        master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+        app_config: Rc<RefCell<crate::ui::preferences::AppConfig>>,
+    }
+
+    impl LiveTrackView {
+        fn new() -> Self {
+            let (admission, _commands) =
+                crate::ui::library_commands::LibraryCommandAdmission::channel();
+            let (tracklist, track_store, status_label, column_view, _, _) =
+                crate::ui::tracklist::build_tracklist(&[], admission);
+            let master_tracks = Rc::new(RefCell::new(Vec::new()));
+            let app_config = Rc::new(RefCell::new(crate::ui::preferences::AppConfig::default()));
+            let filter = crate::ui::window::browser_filter(
+                track_store.clone(),
+                status_label.clone(),
+                master_tracks.clone(),
+                app_config.clone(),
+            );
+            let (browser_box, state) = build_browser(&[], false, false, 48, filter);
+            let window = gtk::Window::builder().child(&tracklist).build();
+            Self {
+                window,
+                tracklist,
+                track_store,
+                status_label,
+                column_view,
+                browser_box,
+                state,
+                master_tracks,
+                app_config,
+            }
+        }
+
+        /// Open `rows` as a new view, as selecting a source does.
+        fn open(&self, rows: &[TrackObject]) {
+            crate::ui::window::display_tracks(
+                rows,
+                &self.track_store,
+                &self.master_tracks,
+                &self.browser_box,
+                &self.state,
+                &self.status_label,
+                &self.column_view,
+            );
+        }
+
+        fn layout(&self) {
+            let context = session_context();
+            while context.pending() {
+                context.iteration(false);
+            }
+            self.tracklist.measure(gtk::Orientation::Horizontal, -1);
+            self.tracklist.measure(gtk::Orientation::Vertical, 800);
+            self.tracklist.allocate(800, 400, -1, None);
+        }
+
+        fn scroll_offset(&self) -> f64 {
+            self.column_view
+                .vadjustment()
+                .map_or(0.0, |adjustment| adjustment.value())
+        }
+
+        /// Scroll `row` to the top and return the resulting offset.
+        fn scroll_to(&self, row: u32) -> f64 {
+            self.layout();
+            self.column_view
+                .scroll_to(row, None, gtk::ListScrollFlags::NONE, None);
+            self.layout();
+            let offset = self.scroll_offset();
+            assert!(offset > 0.0, "precondition: the list must scroll");
+            offset
+        }
+
+        /// Search through the production entry and wait for the list.
+        fn search(&self, text: &str, expected_rows: u32) {
+            type_search(&self.browser_box, text);
+            pump_until(
+                &session_context(),
+                std::time::Instant::now() + std::time::Duration::from_secs(3),
+                || self.track_store.n_items() == expected_rows,
+            );
+            assert_eq!(self.track_store.n_items(), expected_rows);
+        }
+
+        fn close(self) {
+            self.window.destroy();
+        }
+
+        /// The search and list size survived, and the list did not move.
+        fn assert_kept(&self, search: &str, rows: u32, offset: f64) {
+            self.layout();
+            assert_eq!(self.state.search_text(), search);
+            assert_eq!(search_entry_of(&self.browser_box).text(), search);
+            assert_eq!(self.track_store.n_items(), rows);
+            assert!(
+                (self.scroll_offset() - offset).abs() < f64::EPSILON,
+                "the list must keep its scroll position"
+            );
+        }
+    }
+
+    /// One playlist's rows: "Song 000" … "Song 199", each a distinct local
+    /// track in its own playlist occurrence.
+    fn playlist_rows() -> Vec<TrackObject> {
+        (0..200)
+            .map(|n| {
+                let row = TrackObject::new(
+                    1,
+                    &format!("Song {n:03}"),
+                    180,
+                    "Artist",
+                    "Album",
+                    "Genre",
+                    "",
+                    2026,
+                    "",
+                    320,
+                    44_100,
+                    0,
+                    "FLAC",
+                    &format!("file:///music/{n:03}.flac"),
+                );
+                let track_id =
+                    crate::architecture::TrackId::new(format!("track-{n:03}")).expect("track ID");
+                row.set_playlist_occurrence_binding(
+                    crate::ui::objects::PlaylistOccurrenceBinding::available_local(
+                        format!("entry-{n:03}"),
+                        track_id,
+                    )
+                    .expect("local occurrence"),
+                );
+                row
+            })
+            .collect()
+    }
+
+    /// A counted play of the row at the top of an open regular playlist:
+    /// the playlist is not reloaded, the row shows its new count in place,
+    /// and the search and scroll position survive (issue #329).
+    fn playlist_view_keeps_search_and_scroll_across_a_play_count_event() {
+        use crate::ui::source_navigation::{CompletionDisposition, SourceNavigation};
+
+        let view = LiveTrackView::new();
+        let key = "playlist:mix".to_string();
+        let rows = playlist_rows();
+        let source_tracks = RefCell::new(std::collections::HashMap::from([(
+            key.clone(),
+            rows.clone(),
+        )]));
+        let navigation = RefCell::new(SourceNavigation::new("local"));
+        let request = navigation.borrow_mut().select(key.clone());
+        let sidebar = gio::ListStore::new::<crate::ui::objects::SourceObject>();
+        sidebar.append(&crate::ui::objects::SourceObject::playlist_entry(
+            &crate::local::playlist_sidebar::PlaylistSidebarEntry::new(
+                "mix",
+                "Mix",
+                crate::ui::objects::PlaylistSidebarKind::EditableRegular,
+            ),
+        ));
+        view.open(&rows);
+        view.search("Song 1", 100);
+        let offset = view.scroll_to(50);
+
+        let played = rows[150].duplicate();
+        played.set_play_count(1);
+        crate::ui::window::refresh_playlist_play_statistics(
+            &played,
+            &source_tracks,
+            &RefCell::new(key.clone()),
+            &view.master_tracks,
+            &view.track_store,
+        );
+        let reload = crate::ui::window::retire_stale_playlist_projections(
+            crate::ui::source_connect::PlaylistChange::PlayStatistics,
+            &sidebar,
+            &navigation,
+            &source_tracks,
+            &key,
+        );
+
+        assert_eq!(reload, None, "a regular playlist must not be reloaded");
+        assert_eq!(
+            navigation.borrow().completion(&request),
+            CompletionDisposition::CacheAndRender
+        );
+        view.assert_kept("Song 1", 100, offset);
+        let shown = view.track_store.item(50).and_downcast::<TrackObject>();
+        assert_eq!(
+            shown.map(|row| (row.title(), row.play_count())),
+            Some(("Song 150".to_string(), 1))
+        );
+        view.close();
+    }
+
+    /// A playlist whose rows must be re-read (a history playlist after a
+    /// counted play) publishes its new rows as a same-source refresh: the
+    /// search and scroll position survive the replacement (issue #329).
+    fn playlist_reload_keeps_search_and_scroll() {
+        let view = LiveTrackView::new();
+        view.open(&playlist_rows());
+        view.search("Song 1", 100);
+        let offset = view.scroll_to(50);
+
+        let reloaded = playlist_rows();
+        crate::ui::window::refresh_displayed_tracks(
+            &reloaded,
+            &view.master_tracks,
+            &view.browser_box,
+            &view.state,
+        );
+
+        view.assert_kept("Song 1", 100, offset);
+        assert_eq!(
+            view.track_store.item(0).and_downcast::<TrackObject>(),
+            Some(reloaded[100].clone()),
+            "the list must show the reloaded rows"
+        );
+        view.close();
+    }
+
+    /// Committed library rows "Song 0000" … for `numbers`; even numbers are
+    /// Rock, odd ones Jazz.
+    fn full_sync_library(
+        numbers: impl Iterator<Item = u32>,
+    ) -> Vec<crate::architecture::models::Track> {
+        numbers
+            .map(|n| crate::architecture::models::Track {
+                id: uuid::Uuid::from_u128(u128::from(n)),
+                native_track_id: None,
+                title: format!("Song {n:04}"),
+                artist_name: "Artist".to_string(),
+                album_artist_name: None,
+                artist_id: None,
+                album_title: "Album".to_string(),
+                album_id: None,
+                track_number: Some(1),
+                disc_number: None,
+                duration_secs: Some(180),
+                composer: None,
+                genre: Some(if n % 2 == 0 { "Rock" } else { "Jazz" }.to_string()),
+                year: Some(2026),
+                file_path: Some(format!("/library/{n:04}.flac")),
+                stream_url: None,
+                cover_art_url: None,
+                date_added: None,
+                date_modified: None,
+                bitrate_kbps: Some(320),
+                sample_rate_hz: Some(44_100),
+                format: Some("FLAC".to_string()),
+                play_count: Some(0),
+                rating: crate::architecture::models::TrackRating::Unsupported,
+                last_played: None,
+            })
+            .collect()
+    }
+
+    /// A watcher reconciliation republishes the whole library while Local
+    /// is on screen: the genre selection, the search and the scroll
+    /// position survive, and a new matching track joins the filtered list
+    /// (issue #250).
+    fn local_view_keeps_filters_search_and_scroll_across_a_same_source_full_sync() {
+        let view = LiveTrackView::new();
+        let active = Rc::new(RefCell::new("local".to_string()));
+        let session = Rc::new(RefCell::new(crate::ui::playback::PlaybackSession::default()));
+        let source_tracks = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let publish = |tracks: &[crate::architecture::models::Track]| {
+            crate::ui::window::apply_full_sync_publication(
+                tracks,
+                &active,
+                &session,
+                &source_tracks,
+                &view.master_tracks,
+                &view.browser_box,
+                &view.state,
+                &view.app_config,
+            );
+        };
+        publish(&full_sync_library(0..2000));
+        let panes = browser_panes(&view.browser_box).expect("panes");
+        let genres = get_store_from_pane(&panes[0]).expect("genre store");
+        let rock = (0..genres.n_items())
+            .find(|&position| {
+                genres
+                    .item(position)
+                    .and_downcast::<BrowserItem>()
+                    .is_some_and(|item| item.label() == "Rock")
+            })
+            .expect("Rock genre row");
+        get_selection(&panes[0]).set_selected(rock);
+        // "Song 1000" … "Song 1999", Rock only.
+        view.search("song 1", 500);
+        let offset = view.scroll_to(200);
+        let covers = view.state.album_art_controller.cache().content_generation();
+
+        publish(&full_sync_library((0..2000).chain([10_000])));
+
+        view.assert_kept("song 1", 501, offset);
+        assert_eq!(
+            get_selected_label(&get_selection(&panes[0])).as_deref(),
+            Some("Rock")
+        );
+        assert!(
+            view.state.album_art_controller.cache().content_generation() > covers,
+            "a full sync must re-resolve covers"
+        );
+        view.close();
+    }
+
     /// The crate's single consolidated GTK widget test, all run on the ONE
     /// thread that owns the GTK session:
     ///
@@ -3352,6 +3769,7 @@ mod tests {
                 crate::ui::discovery_handler::widget_tests::airplay_rows_are_hidden_without_a_sender();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_edits_report_consistent_settings();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
+                crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 q4_publication_contract_and_bench();
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();
@@ -3359,10 +3777,11 @@ mod tests {
 
                 // Browser data lifecycle contracts (issue #250).
                 album_selection_survives_typing_and_clearing();
+                escape_clears_the_search();
                 source_replacement_resets_every_filter_axis();
                 refresh_preserves_matching_selection_through_upsert();
                 refresh_drops_vanished_album_and_keeps_surviving_artist();
-                full_sync_reset_clears_every_axis_and_the_entry();
+                source_switch_reset_clears_every_axis_and_the_entry();
                 pending_search_debounce_never_fires_after_source_replacement();
                 source_replacement_resets_folder_navigation();
 
@@ -3377,6 +3796,13 @@ mod tests {
                 repeated_up_activations_climb_three_levels_to_roots();
                 folder_status_rows_never_navigate();
                 folder_navigation_survives_same_source_refresh();
+
+                // Same-source refreshes keep the view on screen (issues
+                // #250 and #329).
+                folder_location_survives_same_source_full_sync();
+                playlist_view_keeps_search_and_scroll_across_a_play_count_event();
+                playlist_reload_keeps_search_and_scroll();
+                local_view_keeps_filters_search_and_scroll_across_a_same_source_full_sync();
             },
         ) else {
             return;

