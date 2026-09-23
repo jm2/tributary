@@ -142,8 +142,14 @@ impl Harness {
         *self.handle.subscribe_status().borrow()
     }
 
-    fn runtime_phase(&self) -> Option<LastFmRuntimePhase> {
-        self.status().runtime.map(|runtime| runtime.phase)
+    /// Wait until the relayed runtime phase satisfies `accept`. The runtime
+    /// status reaches the application snapshot through an asynchronous relay,
+    /// so it can trail a command's completion.
+    async fn wait_for_runtime_phase(&self, accept: fn(Option<LastFmRuntimePhase>) -> bool) {
+        let mut status = self.handle.subscribe_status();
+        within(status.wait_for(|status| accept(status.runtime.map(|runtime| runtime.phase))))
+            .await
+            .expect("application owner remains active");
     }
 
     fn binding(&self) -> LastFmAccountBinding {
@@ -258,10 +264,9 @@ async fn repeat_disconnect_finishes_a_failed_credential_deletion() {
         Err(LastFmApplicationDisconnectError::Incomplete)
     );
     assert_eq!(harness.status().phase, LastFmApplicationPhase::Active);
-    assert_eq!(
-        harness.runtime_phase(),
-        Some(LastFmRuntimePhase::CredentialCleanup)
-    );
+    harness
+        .wait_for_runtime_phase(|phase| phase == Some(LastFmRuntimePhase::CredentialCleanup))
+        .await;
     assert!(harness.vault.stored().is_some());
 
     assert_eq!(harness.disconnect().await, Ok(0));
@@ -293,10 +298,9 @@ async fn same_account_reauthorization_clears_the_durable_pause() {
     .await
     .expect("seed the code-9 pause");
     harness.activate().await.expect("paused account activates");
-    assert_eq!(
-        harness.runtime_phase(),
-        Some(LastFmRuntimePhase::ReauthenticationRequired)
-    );
+    harness
+        .wait_for_runtime_phase(|phase| phase == Some(LastFmRuntimePhase::ReauthenticationRequired))
+        .await;
 
     assert_eq!(
         harness.reauthorize("other-listener").await,
@@ -317,10 +321,11 @@ async fn same_account_reauthorization_clears_the_durable_pause() {
         harness.vault.stored().expect("stored").key().expose(),
         RENEWED_KEY
     );
-    assert_ne!(
-        harness.runtime_phase(),
-        Some(LastFmRuntimePhase::ReauthenticationRequired)
-    );
+    harness
+        .wait_for_runtime_phase(|phase| {
+            phase.is_some() && phase != Some(LastFmRuntimePhase::ReauthenticationRequired)
+        })
+        .await;
     harness.finish().await;
 }
 
