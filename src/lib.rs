@@ -2,14 +2,14 @@
 //!
 //! Tributary is primarily a binary (`src/main.rs`). This library exposes
 //! the small subset of modules that benefit from being exercised in
-//! isolation by integration tests and the `tributary-fuzz` harness —
-//! currently the DAAP/DMAP binary protocol parser.
+//! isolation by integration tests and the `tributary-fuzz` harness: the
+//! parsers that read untrusted bytes (DMAP, XSPF, Rhythmbox XML, Last.fm
+//! auth responses, and the cast relay's URL and `Range` handling).
 //!
 //! It is intentionally minimal: rather than re-declaring the entire
-//! application module tree, it surfaces only `architecture::error`
-//! (the shared `BackendError` type) and `daap::dmap` (the parser). The
-//! networking backend/client and the GTK UI continue to live solely in
-//! the binary.
+//! application module tree, it declares only those parser modules and the
+//! leaf modules they import. The networking backends and the GTK UI
+//! continue to live solely in the binary.
 //!
 //! The clippy `warn`/`allow` block below mirrors `src/main.rs` so the
 //! modules shared between the binary and this library lint identically
@@ -60,12 +60,21 @@
 )]
 #![allow(dead_code)] // This library exposes only a slice of each module.
 
-/// Core architecture types shared across backends.
-///
-/// Only the error type is re-exported here; the full module (backend
-/// traits, data models) lives in the binary.
+/// Core architecture types: the error type plus the media-route leaves
+/// that `http_security` imports.
 pub mod architecture {
+    pub mod backend;
     pub mod error;
+    pub mod identity;
+    pub mod media;
+    pub mod models;
+
+    pub use media::AdvertisedHttpRoute;
+}
+
+/// Cast relay request parsing (ticket extensions and `Range` headers).
+pub mod audio {
+    pub mod cast_http_parse;
 }
 
 /// DAAP (iTunes Sharing) protocol support.
@@ -74,4 +83,30 @@ pub mod architecture {
 /// networking `backend` and `client` submodules live in the binary.
 pub mod daap {
     pub mod dmap;
+}
+
+/// Database entity leaves imported by the playlist and Rhythmbox parsers.
+pub mod db {
+    pub mod entities {
+        pub mod rhythmbox_import_receipt;
+        pub mod track;
+    }
+}
+
+pub mod http_body;
+pub mod http_security;
+// The Last.fm client's unit tests import this stub HTTP service.
+#[cfg(test)]
+mod http_test_service;
+
+/// Last.fm client (strict auth-response validation) and its credential types.
+pub mod lastfm {
+    pub mod client;
+    pub mod credentials;
+}
+
+/// Playlist and Rhythmbox import parsers.
+pub mod local {
+    pub mod playlist_io;
+    pub mod rhythmbox_import;
 }

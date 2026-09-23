@@ -13,7 +13,34 @@ libfuzzer-sys = "0.4"
 [dependencies.tributary]
 path = ".."
 
+# `test = false` on every target: a libFuzzer binary run as a test never
+# terminates, so `cargo test` must not build or launch these.
 [[bin]]
 name = "fuzz_dmap"
 path = "fuzz_targets/fuzz_dmap.rs"
 doc = false
+test = false
+
+[[bin]]
+name = "fuzz_xspf"
+path = "fuzz_targets/fuzz_xspf.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_rhythmbox"
+path = "fuzz_targets/fuzz_rhythmbox.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_lastfm_auth"
+path = "fuzz_targets/fuzz_lastfm_auth.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_url_range"
+path = "fuzz_targets/fuzz_url_range.rs"
+doc = false
+test = false

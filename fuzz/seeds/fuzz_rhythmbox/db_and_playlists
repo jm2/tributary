@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rhythmdb version="2.0"><entry type="song"><artist>Alpha</artist><title>Beta</title><location>file:///music/one.mp3</location></entry></rhythmdb><?xml version="1.0" encoding="UTF-8"?>
+<rhythmdb-playlists><playlist name="Mix" type="static"><location>file:///music/one.mp3</location></playlist></rhythmdb-playlists>
