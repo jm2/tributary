@@ -1703,6 +1703,101 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
     );
 }
 
+fn ci_jobs() -> serde_yaml::Mapping {
+    let ci: serde_yaml::Value = serde_yaml::from_str(CI_WORKFLOW).expect("ci.yml must parse");
+    ci["jobs"]
+        .as_mapping()
+        .expect("CI jobs must be a mapping")
+        .clone()
+}
+
+#[test]
+fn ci_security_audit_runs_only_the_advisory_audit() {
+    let jobs = ci_jobs();
+    let audit = &jobs["audit"];
+    assert_eq!(audit["name"].as_str(), Some("Security Audit"));
+    let commands: Vec<_> = audit["steps"]
+        .as_sequence()
+        .expect("audit steps must be a sequence")
+        .iter()
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .collect();
+    assert_eq!(
+        commands,
+        ["cargo install cargo-audit --locked", "cargo audit"],
+        "policy scripts belong in Repository Policy, not the required audit check"
+    );
+    assert_eq!(
+        jobs["repository-policy"]["name"].as_str(),
+        Some("Repository Policy")
+    );
+}
+
+#[test]
+fn ci_documentation_only_changes_still_report_every_platform_check() {
+    let jobs = ci_jobs();
+    let fail_open_gate = "${{ !cancelled() && needs.changes.outputs.code != 'false' }}";
+    let mut expanded_matrix_names = Vec::new();
+    for (id, job) in &jobs {
+        let id = id.as_str().expect("CI job IDs must be strings");
+        if job["needs"].as_str() == Some("changes") && id != "docs-only-platforms" {
+            assert_eq!(
+                job["if"].as_str(),
+                Some(fail_open_gate),
+                "{id} must skip only for documentation-only changes and run if detection fails"
+            );
+        }
+        let Some(include) = job["strategy"]["matrix"]["include"].as_sequence() else {
+            continue;
+        };
+        let name = job["name"].as_str().expect("matrix jobs must be named");
+        for entry in include {
+            let arch = entry["arch"]
+                .as_str()
+                .expect("matrix entries must name an arch");
+            expanded_matrix_names.push(name.replace("${{ matrix.arch }}", arch));
+        }
+    }
+
+    let stand_ins = &jobs["docs-only-platforms"];
+    assert_eq!(
+        stand_ins["if"].as_str(),
+        Some("needs.changes.outputs.code == 'false'")
+    );
+    let mut stand_in_names = yaml_string_list(&stand_ins["strategy"]["matrix"], "check");
+    stand_in_names.sort();
+    expanded_matrix_names.sort();
+    assert_eq!(
+        stand_in_names, expanded_matrix_names,
+        "a skipped matrix job loses its per-platform check names, so each needs a stand-in"
+    );
+}
+
+#[test]
+fn workflow_checkouts_do_not_persist_the_token() {
+    let (workflows_dir, workflows) = repository_workflow_names();
+    for workflow in &workflows {
+        let source = std::fs::read_to_string(workflows_dir.join(workflow))
+            .unwrap_or_else(|error| panic!("workflow {workflow} must be readable: {error}"));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&source)
+            .unwrap_or_else(|error| panic!("workflow {workflow} must parse: {error}"));
+        let jobs = parsed["jobs"]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("workflow {workflow} jobs must be a mapping"));
+        for (id, job) in jobs {
+            for step in job["steps"].as_sequence().into_iter().flatten() {
+                let is_checkout = step["uses"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("actions/checkout@"));
+                assert!(
+                    !is_checkout || step["with"]["persist-credentials"].as_bool() == Some(false),
+                    "{workflow} job {id:?}: no job pushes, so checkouts must not keep the token"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn developer_coverage_commands_do_not_hide_source_areas() {
     for (platform, script) in [
