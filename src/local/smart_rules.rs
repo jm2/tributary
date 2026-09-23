@@ -330,18 +330,20 @@ pub fn evaluate_seeded<T: SmartTrack + Clone>(
     tracks: &[T],
     random_seed: u64,
 ) -> Vec<T> {
-    evaluate_at(rules, tracks, chrono::Utc::now(), random_seed)
+    evaluate_at(rules, tracks, &chrono::Local::now(), random_seed)
 }
 
 /// Evaluate rules using one immutable clock snapshot.
 ///
 /// Capturing time once keeps every relative-date predicate in an evaluation on
 /// the same inclusive boundary, even when a large library takes long enough to
-/// cross a millisecond or day boundary while it is being filtered.
-fn evaluate_at<T: SmartTrack + Clone>(
+/// cross a millisecond or day boundary while it is being filtered. The clock's
+/// time zone decides which calendar day an instant falls on for absolute-date
+/// rules; production evaluates in the user's local time zone.
+fn evaluate_at<T: SmartTrack + Clone, Tz: chrono::TimeZone>(
     rules: &SmartRules,
     tracks: &[T],
-    now: chrono::DateTime<chrono::Utc>,
+    now: &chrono::DateTime<Tz>,
     random_seed: u64,
 ) -> Vec<T> {
     // Filter tracks through rules.
@@ -508,10 +510,10 @@ fn sort_key<T: SmartTrack>(track: &T, field: SortField) -> SortKey {
 }
 
 /// Evaluate a single rule against a track.
-fn evaluate_rule_at<T: SmartTrack>(
+fn evaluate_rule_at<T: SmartTrack, Tz: chrono::TimeZone>(
     rule: &SmartRule,
     track: &T,
-    now: chrono::DateTime<chrono::Utc>,
+    now: &chrono::DateTime<Tz>,
 ) -> bool {
     match rule.field {
         RuleField::Title => eval_text(track.title(), &rule.operator, &rule.value),
@@ -554,14 +556,15 @@ fn evaluate_rule_at<T: SmartTrack>(
             // `Utc::now()` carries fractional-millisecond nanoseconds. Keep the
             // original clock for RFC3339 date-added/modified fields below.
             let history_now = chrono::DateTime::from_timestamp_millis(now.timestamp_millis())
-                .expect("a valid UTC instant remains representable at millisecond precision");
+                .expect("a valid UTC instant remains representable at millisecond precision")
+                .with_timezone(&now.timezone());
             eval_optional_instant(
                 track
                     .last_played_at_ms()
                     .and_then(chrono::DateTime::from_timestamp_millis),
                 &rule.operator,
                 &rule.value,
-                history_now,
+                &history_now,
             )
         }
         RuleField::FileSize => eval_number(track.file_size_bytes(), &rule.operator, &rule.value),
@@ -574,7 +577,7 @@ fn evaluate_rule_at<T: SmartTrack>(
 
 #[cfg(test)]
 fn evaluate_rule<T: SmartTrack>(rule: &SmartRule, track: &T) -> bool {
-    evaluate_rule_at(rule, track, chrono::Utc::now())
+    evaluate_rule_at(rule, track, &chrono::Utc::now())
 }
 
 /// Evaluate a text field against a text operator.
@@ -703,8 +706,10 @@ fn canonical_rating_rule_value(op: &RuleOperator, value: &RuleValue) -> bool {
 ///
 /// A track's `date_added`/`date_modified` is an **instant** — RFC3339 with an
 /// offset, e.g. `2025-01-15T10:30:00+00:00`. A rule's date is a **calendar
-/// day** picked in the editor, e.g. `2025-01-15`, and is interpreted as the
-/// whole UTC day `[00:00:00, next 00:00:00)`.
+/// day** entered in the editor, e.g. `2025-01-15`. An instant matches that day
+/// when it falls on it in the time zone of `now` (the user's local zone in
+/// production), so a track added at 21:00 local time counts on that local day
+/// whatever its UTC date.
 ///
 /// These used to be compared as raw strings, which meant an instant was never
 /// equal to a day: `"2025-01-15T10:30:00+00:00" == "2025-01-15"` is false, so
@@ -714,11 +719,11 @@ fn canonical_rating_rule_value(op: &RuleOperator, value: &RuleValue) -> bool {
 ///
 /// Both sides are now parsed. An unparseable instant or rule date makes the
 /// rule fail to match rather than match everything.
-fn eval_date_at(
+fn eval_date_at<Tz: chrono::TimeZone>(
     field_val: &str,
     op: &RuleOperator,
     value: &RuleValue,
-    now: chrono::DateTime<chrono::Utc>,
+    now: &chrono::DateTime<Tz>,
 ) -> bool {
     eval_optional_instant(parse_track_instant(field_val), op, value, now)
 }
@@ -726,36 +731,44 @@ fn eval_date_at(
 /// Evaluate a parsed instant. A missing or unrepresentable timestamp is
 /// unknown and therefore never satisfies a predicate, including negative
 /// predicates such as `IsNot` and `IsNotInTheLast`.
-fn eval_optional_instant(
+fn eval_optional_instant<Tz: chrono::TimeZone>(
     instant: Option<chrono::DateTime<chrono::Utc>>,
     op: &RuleOperator,
     value: &RuleValue,
-    now: chrono::DateTime<chrono::Utc>,
+    now: &chrono::DateTime<Tz>,
 ) -> bool {
     let Some(instant) = instant else {
         return false;
     };
+    // The calendar day the instant falls on in the clock's zone, paired with
+    // the rule's day. Comparing whole days handles DST transitions without
+    // resolving a local midnight that may not exist.
+    let days = || {
+        rule_day(value).map(|rule_day| {
+            (
+                instant.with_timezone(&now.timezone()).date_naive(),
+                rule_day,
+            )
+        })
+    };
+    let now_utc = now.with_timezone(&chrono::Utc);
     match op {
-        RuleOperator::Is => {
-            rule_day(value).is_some_and(|(start, end)| instant >= start && instant < end)
-        }
-        RuleOperator::IsNot => {
-            rule_day(value).is_some_and(|(start, end)| instant < start || instant >= end)
-        }
-        RuleOperator::IsBefore => rule_day(value).is_some_and(|(start, _)| instant < start),
+        RuleOperator::Is => days().is_some_and(|(day, rule_day)| day == rule_day),
+        RuleOperator::IsNot => days().is_some_and(|(day, rule_day)| day != rule_day),
+        RuleOperator::IsBefore => days().is_some_and(|(day, rule_day)| day < rule_day),
         // "After 15 Jan" means after the whole of 15 Jan, not after its first
         // instant — a track added at noon that day is not "after" it.
-        RuleOperator::IsAfter => rule_day(value).is_some_and(|(_, end)| instant >= end),
+        RuleOperator::IsAfter => days().is_some_and(|(day, rule_day)| day > rule_day),
         RuleOperator::IsInTheLast { amount, unit } => {
             // A window too large to represent reaches back past any possible
             // track. The upper bound is also inclusive: a future timestamp is
             // not evidence that a track was played within the past window.
-            instant <= now
-                && date_cutoff_from(now, *amount, *unit).is_none_or(|cutoff| instant >= cutoff)
+            instant <= now_utc
+                && date_cutoff_from(now_utc, *amount, *unit).is_none_or(|cutoff| instant >= cutoff)
         }
         RuleOperator::IsNotInTheLast { amount, unit } => {
-            instant <= now
-                && date_cutoff_from(now, *amount, *unit).is_some_and(|cutoff| instant < cutoff)
+            instant <= now_utc
+                && date_cutoff_from(now_utc, *amount, *unit).is_some_and(|cutoff| instant < cutoff)
         }
         _ => false,
     }
@@ -763,7 +776,7 @@ fn eval_optional_instant(
 
 #[cfg(test)]
 fn eval_date(field_val: &str, op: &RuleOperator, value: &RuleValue) -> bool {
-    eval_date_at(field_val, op, value, chrono::Utc::now())
+    eval_date_at(field_val, op, value, &chrono::Utc::now())
 }
 
 /// Parse a track timestamp, which is stored as RFC3339 with an offset.
@@ -773,18 +786,18 @@ fn parse_track_instant(field_val: &str) -> Option<chrono::DateTime<chrono::Utc>>
         .map(|instant| instant.with_timezone(&chrono::Utc))
 }
 
-/// Resolve a rule's calendar day to the half-open UTC instant range it covers.
-fn rule_day(
-    value: &RuleValue,
-) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+/// The calendar day a rule's absolute date names.
+fn rule_day(value: &RuleValue) -> Option<chrono::NaiveDate> {
     let RuleValue::Date(raw) = value else {
         return None;
     };
-    let day = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
+    parse_rule_day(raw)
+}
 
-    let start = day.and_hms_opt(0, 0, 0)?.and_utc();
-    let end = day.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc();
-    Some((start, end))
+/// Parse an absolute rule date. `YYYY-MM-DD` is the only accepted form; the
+/// editor refuses anything else instead of saving a rule that matches nothing.
+pub fn parse_rule_day(raw: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").ok()
 }
 
 /// The instant N days/weeks/months before now.
@@ -1549,6 +1562,74 @@ mod tests {
         ));
     }
 
+    /// An absolute date names a day in the evaluating clock's time zone: at
+    /// UTC−5, a track added at 21:00 local on 15 June is stored as 02:00 UTC
+    /// on 16 June but still belongs to 15 June.
+    #[test]
+    fn absolute_dates_are_calendar_days_in_the_clock_time_zone() {
+        let utc_minus_five = chrono::FixedOffset::west_opt(5 * 3600).expect("UTC-5");
+        let now = chrono::Utc::now().with_timezone(&utc_minus_five);
+        let evening = "2025-06-16T02:00:00+00:00";
+
+        assert!(eval_date_at(
+            evening,
+            &RuleOperator::Is,
+            &day("2025-06-15"),
+            &now
+        ));
+        assert!(!eval_date_at(
+            evening,
+            &RuleOperator::Is,
+            &day("2025-06-16"),
+            &now
+        ));
+        assert!(eval_date_at(
+            evening,
+            &RuleOperator::IsNot,
+            &day("2025-06-16"),
+            &now
+        ));
+        assert!(eval_date_at(
+            evening,
+            &RuleOperator::IsBefore,
+            &day("2025-06-16"),
+            &now
+        ));
+        assert!(!eval_date_at(
+            evening,
+            &RuleOperator::IsAfter,
+            &day("2025-06-15"),
+            &now
+        ));
+        assert!(eval_date_at(
+            evening,
+            &RuleOperator::IsAfter,
+            &day("2025-06-14"),
+            &now
+        ));
+
+        // The same instant is on 16 June for a UTC clock.
+        assert!(eval_date(evening, &RuleOperator::Is, &day("2025-06-16")));
+    }
+
+    #[test]
+    fn rule_dates_accept_only_year_month_day() {
+        assert_eq!(
+            parse_rule_day(" 2024-01-15 "),
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+        );
+        for raw in [
+            "01/15/2024",
+            "15.01.2024",
+            "2024-13-01",
+            "2024-02-30",
+            "",
+            "yesterday",
+        ] {
+            assert_eq!(parse_rule_day(raw), None, "{raw:?}");
+        }
+    }
+
     #[test]
     fn an_unparseable_instant_or_rule_date_matches_nothing() {
         assert!(!eval_date(
@@ -1871,7 +1952,7 @@ mod tests {
         let result = evaluate_at(
             &rules,
             &[too_old, tie_b, never, newest, corrupt, tie_a, future],
-            now,
+            &now,
             0,
         );
         let ids: Vec<_> = result.iter().map(SmartTrack::track_id).collect();
@@ -1900,7 +1981,7 @@ mod tests {
             sort_order: Vec::new(),
         };
 
-        assert!(evaluate_at(&rules, &[never, corrupt], now, 0).is_empty());
+        assert!(evaluate_at(&rules, &[never, corrupt], &now, 0).is_empty());
     }
 
     #[test]

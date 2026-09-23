@@ -396,6 +396,42 @@ fn show_playlist_mutation_failed_dialog(window: &adw::ApplicationWindow) {
     dialog.present(Some(window));
 }
 
+/// Why Properties refused to open after the user activated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertiesRefusal {
+    /// A selected file or device changed or went away before admission.
+    Unavailable,
+    /// The selection changed while its files were being admitted.
+    SelectionChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PropertiesRefusalCopy {
+    heading: String,
+    body: String,
+}
+
+fn properties_refusal_copy(locale: &str, refusal: PropertiesRefusal) -> PropertiesRefusalCopy {
+    let body = match refusal {
+        PropertiesRefusal::Unavailable => "properties.refused_unavailable",
+        PropertiesRefusal::SelectionChanged => "properties.refused_selection_changed",
+    };
+    PropertiesRefusalCopy {
+        heading: rust_i18n::t!("properties.refused_heading", locale = locale).into_owned(),
+        body: rust_i18n::t!(body, locale = locale).into_owned(),
+    }
+}
+
+fn show_properties_refused(window: &adw::ApplicationWindow, refusal: PropertiesRefusal) {
+    let copy = properties_refusal_copy(&rust_i18n::locale(), refusal);
+    let dialog = adw::AlertDialog::builder()
+        .heading(&copy.heading)
+        .body(&copy.body)
+        .build();
+    dialog.add_response("ok", rust_i18n::t!("dialogs.ok").as_ref());
+    dialog.present(Some(window));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyboardContextMenuPropagation {
     Proceed,
@@ -1443,7 +1479,7 @@ fn open_properties(
         .and_downcast::<gtk::MultiSelection>()
     else {
         tracing::warn!("properties action: live selection model unavailable at activation");
-        context.show_mutation_failed();
+        show_properties_refused(&win, PropertiesRefusal::SelectionChanged);
         return;
     };
     let removable_sources = removable_source_ids(&context.sidebar_store);
@@ -1452,7 +1488,7 @@ fn open_properties(
         tracing::warn!(
             "properties rows changed while the menu was open; surfacing the cancelled action"
         );
-        context.show_mutation_failed();
+        show_properties_refused(&win, PropertiesRefusal::SelectionChanged);
         return;
     };
 
@@ -1481,7 +1517,7 @@ fn open_properties(
         // user activated Properties and must not watch the popover silently
         // close.
         let Ok(Some(admission)) = result else {
-            context.show_mutation_failed();
+            show_properties_refused(&win, PropertiesRefusal::Unavailable);
             return;
         };
         // The selection may have changed while the worker ran. Stitch the
@@ -1521,7 +1557,7 @@ fn open_properties(
                 tracing::warn!(
                     "properties selection changed while targets were admitted; surfacing the cancelled action"
                 );
-                context.show_mutation_failed();
+                show_properties_refused(&win, PropertiesRefusal::SelectionChanged);
             }
             PropertiesCompletion::StitchFault => {
                 // Unreachable: every pending target in `infos` came from the
@@ -2412,6 +2448,36 @@ pub mod tests {
                 assert_ne!(localized, english, "{locale} must not fall back to English");
             }
         }
+    }
+
+    #[test]
+    fn properties_refusals_have_their_own_localized_copy() {
+        let playlist = playlist_mutation_failed_copy("en");
+        for refusal in [
+            PropertiesRefusal::Unavailable,
+            PropertiesRefusal::SelectionChanged,
+        ] {
+            let english = properties_refusal_copy("en", refusal);
+            assert_ne!(english.heading, playlist.heading);
+            assert_ne!(english.body, playlist.body);
+
+            for locale in rust_i18n::available_locales!() {
+                let localized = properties_refusal_copy(&locale, refusal);
+                assert!(!localized.heading.is_empty(), "{locale}: empty heading");
+                assert!(!localized.body.is_empty(), "{locale}: empty body");
+                assert!(
+                    !localized.body.starts_with("properties."),
+                    "{locale}: missing {refusal:?} body"
+                );
+                if locale != "en" {
+                    assert_ne!(localized, english, "{locale} must not fall back to English");
+                }
+            }
+        }
+        assert_ne!(
+            properties_refusal_copy("en", PropertiesRefusal::Unavailable).body,
+            properties_refusal_copy("en", PropertiesRefusal::SelectionChanged).body
+        );
     }
 
     #[test]

@@ -140,6 +140,9 @@ dialogs:
   enter_password: "输入共享密码（如果没有请留空）"
   username: "用户名"
   password: "密码"
+  missing_server_url: "请输入有效的服务器地址，例如 https://music.example.com。"
+  missing_username: "请输入用户名。"
+  missing_password: "请输入密码。"
   new_playlist_heading: "新建播放列表"
   playlist_name: "播放列表名称"
   rename_playlist_heading: "重命名播放列表"
@@ -262,6 +265,12 @@ properties:
   save_conflict_all: "自打开属性以来，%{total} 个文件中有 %{conflicts} 个已在磁盘上更改。发生冲突的文件保持不变——请重新打开属性以编辑当前文件。"
   save_conflict_mixed: "%{total} 个文件中有 %{conflicts} 个已在磁盘上更改，另有 %{other} 个文件无法保存；所有文件均保持不变。请为已更改的文件重新打开属性。"
   save_failure: "%{total} 个文件中有 %{failed} 个无法保存，均已保持不变。"
+  refused_heading: "无法打开属性"
+  refused_unavailable: "在属性打开之前，某个所选文件已更改或变得不可用。未进行任何更改。"
+  refused_selection_changed: "在属性打开之前，所选内容已更改。未进行任何更改。请重新选择曲目以进行编辑。"
+  mixed_cleared: "将在所有曲目中清除"
+  musicbrainz_applied: "已根据 MusicBrainz 发行版“%{release}”填写。保存前请检查各字段。"
+  musicbrainz_title_only: "没有与该专辑匹配的 MusicBrainz 发行版，因此只填写了标题和艺人。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -273,6 +282,10 @@ smart_playlist:
   add_rule: "添加规则"
   remove_rule: "删除规则"
   limit_to: "限制为"
+  rule_not_integer: "请输入整数。"
+  rule_reversed_range: "第一个值不得大于第二个值。"
+  rule_not_positive: "请输入大于或等于 1 的整数。"
+  rule_invalid_date: "请按 YYYY-MM-DD 格式输入日期，例如 2024-01-15。"
 
 # ── 服务器播放列表 ──────────────────────────────────────────────────
 server_playlists:

@@ -140,6 +140,9 @@ dialogs:
   enter_password: "Voer het wachtwoord in (laat leeg als er geen is)"
   username: "Gebruikersnaam"
   password: "Wachtwoord"
+  missing_server_url: "Voer een geldig serveradres in, zoals https://music.example.com."
+  missing_username: "Voer een gebruikersnaam in."
+  missing_password: "Voer een wachtwoord in."
   new_playlist_heading: "Nieuwe afspeellijst"
   playlist_name: "Naam afspeellijst"
   rename_playlist_heading: "Afspeellijst hernoemen"
@@ -262,6 +265,12 @@ properties:
   save_conflict_all: "%{conflicts} van %{total} bestand(en) zijn op schijf gewijzigd sinds Eigenschappen werd geopend. De concurrerende bestanden zijn onaangeroerd gelaten — open Eigenschappen opnieuw om de huidige bestanden te bewerken."
   save_conflict_mixed: "%{conflicts} van %{total} bestand(en) zijn op schijf gewijzigd en %{other} ander(e) bestand(en) konden niet worden opgeslagen; alle zijn ongewijzigd gelaten. Open Eigenschappen opnieuw voor de gewijzigde bestanden."
   save_failure: "%{failed} van %{total} bestand(en) konden niet worden opgeslagen en zijn ongewijzigd gelaten."
+  refused_heading: "Eigenschappen kon niet worden geopend"
+  refused_unavailable: "Een geselecteerd bestand is gewijzigd of niet meer beschikbaar voordat Eigenschappen kon worden geopend. Er is niets gewijzigd."
+  refused_selection_changed: "De selectie is gewijzigd voordat Eigenschappen kon worden geopend. Er is niets gewijzigd. Selecteer de nummers opnieuw om ze te bewerken."
+  mixed_cleared: "Wordt bij alle nummers gewist"
+  musicbrainz_applied: "Ingevuld vanuit de MusicBrainz-uitgave ‘%{release}’. Controleer de velden voordat je opslaat."
+  musicbrainz_title_only: "Geen MusicBrainz-uitgave kwam overeen met het album, dus alleen de titel en artiest zijn ingevuld."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -273,6 +282,10 @@ smart_playlist:
   add_rule: "Regel toevoegen"
   remove_rule: "Regel verwijderen"
   limit_to: "Beperken tot"
+  rule_not_integer: "Voer een geheel getal in."
+  rule_reversed_range: "De eerste waarde mag niet groter zijn dan de tweede."
+  rule_not_positive: "Voer een geheel getal van 1 of meer in."
+  rule_invalid_date: "Voer een datum in als YYYY-MM-DD, bijvoorbeeld 2024-01-15."
 
 # ── Serverafspeellijsten ───────────────────────────────────────────
 server_playlists:

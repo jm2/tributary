@@ -140,6 +140,9 @@ dialogs:
   enter_password: "共有パスワードを入力してください（なければ空欄）"
   username: "ユーザー名"
   password: "パスワード"
+  missing_server_url: "有効なサーバーアドレスを入力してください（例: https://music.example.com）。"
+  missing_username: "ユーザー名を入力してください。"
+  missing_password: "パスワードを入力してください。"
   new_playlist_heading: "新しいプレイリスト"
   playlist_name: "プレイリスト名"
   rename_playlist_heading: "プレイリストの名前を変更"
@@ -262,6 +265,12 @@ properties:
   save_conflict_all: "プロパティを開いてから %{total} 件中 %{conflicts} 件のファイルがディスク上で変更されました。競合したファイルはそのまま保持されています。現在のファイルを編集するには、プロパティを開き直してください。"
   save_conflict_mixed: "%{total} 件中 %{conflicts} 件のファイルがディスク上で変更され、残り %{other} 件のファイルを保存できませんでした。すべて変更されずに残っています。変更されたファイルについてはプロパティを開き直してください。"
   save_failure: "%{total} 件中 %{failed} 件のファイルを保存できず、変更されずに残っています。"
+  refused_heading: "プロパティを開けませんでした"
+  refused_unavailable: "プロパティを開く前に、選択したファイルが変更されたか利用できなくなりました。変更は行われませんでした。"
+  refused_selection_changed: "プロパティを開く前に選択範囲が変更されました。変更は行われませんでした。編集するにはトラックを選択し直してください。"
+  mixed_cleared: "すべてのトラックで消去されます"
+  musicbrainz_applied: "MusicBrainz のリリース「%{release}」から入力しました。保存する前に各項目を確認してください。"
+  musicbrainz_title_only: "アルバムに一致する MusicBrainz のリリースがなかったため、タイトルとアーティストのみ入力しました。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -273,6 +282,10 @@ smart_playlist:
   add_rule: "ルールを追加"
   remove_rule: "ルールを削除"
   limit_to: "制限"
+  rule_not_integer: "整数を入力してください。"
+  rule_reversed_range: "最初の値は2番目の値以下にしてください。"
+  rule_not_positive: "1以上の整数を入力してください。"
+  rule_invalid_date: "日付を YYYY-MM-DD 形式で入力してください（例: 2024-01-15）。"
 
 # ── サーバープレイリスト ──────────────────────────────────────────
 server_playlists:

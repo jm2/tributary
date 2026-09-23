@@ -5,13 +5,16 @@
 //! clicks **Save**.  Cancel discards all changes.
 //!
 //! Batch mode only exposes fields that make sense to set uniformly
-//! across multiple tracks (artist, album, album artist, genre, year,
-//! disc number, comment).  Fields with mixed values show a "Mixed"
-//! placeholder.
+//! across multiple tracks (artist, album, genre, composer, year, disc
+//! number).  Fields with mixed values show a "Mixed" placeholder and are
+//! left alone unless the user edits them; an edited mixed field applies to
+//! every track, and emptying it clears that tag on all of them.
 //!
 //! An optional **MusicBrainz Lookup** button (single-track only) queries
-//! the MusicBrainz API and populates the form — but still requires the
-//! user to click Save.
+//! the MusicBrainz API with the title and artist currently in the form,
+//! prefers a release matching the album in the form, populates the form,
+//! and names the release it used — but still requires the user to click
+//! Save.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -618,73 +621,36 @@ pub fn show_properties_dialog(
     };
 
     // ── Editable fields ──────────────────────────────────────────────
-    // Single-track: title, artist, album, genre, year, track#, disc#, comment
-    // Batch: artist, album, genre, year, disc#, comment (no title, no track#)
+    // Single-track: title, artist, album, genre, composer, year, track#, disc#
+    // Batch: artist, album, genre, composer, year, disc# (no title, no track#)
 
     let mut entries: Vec<(&str, gtk::Entry)> = Vec::new();
+    let mut mixed_edits: Vec<(String, Rc<Cell<bool>>)> = Vec::new();
+    let mut add_field = |name: &'static str, label: &str, getter: fn(&TrackInfo) -> &str| {
+        let mixed = mixed_placeholder(getter);
+        let (row, entry) = make_entry(label, &field_value(getter), mixed);
+        if matches!(name, "year" | "track_number" | "disc_number") {
+            entry.set_input_purpose(gtk::InputPurpose::Digits);
+        }
+        if mixed {
+            mixed_edits.push((name.to_string(), track_mixed_edits(&entry)));
+        }
+        form.append(&row);
+        entries.push((name, entry));
+    };
 
     if !is_batch {
-        let title_entry = make_entry("Title", &field_value(|t| &t.title), false);
-        form.append(&title_entry.0);
-        entries.push(("title", title_entry.1));
+        add_field("title", "Title", |t| &t.title);
     }
-
-    let artist_entry = make_entry(
-        "Artist",
-        &field_value(|t| &t.artist),
-        mixed_placeholder(|t| &t.artist),
-    );
-    form.append(&artist_entry.0);
-    entries.push(("artist", artist_entry.1));
-
-    let album_entry = make_entry(
-        "Album",
-        &field_value(|t| &t.album),
-        mixed_placeholder(|t| &t.album),
-    );
-    form.append(&album_entry.0);
-    entries.push(("album", album_entry.1));
-
-    let genre_entry = make_entry(
-        "Genre",
-        &field_value(|t| &t.genre),
-        mixed_placeholder(|t| &t.genre),
-    );
-    form.append(&genre_entry.0);
-    entries.push(("genre", genre_entry.1));
-
-    let composer_entry = make_entry(
-        "Composer",
-        &field_value(|t| &t.composer),
-        mixed_placeholder(|t| &t.composer),
-    );
-    form.append(&composer_entry.0);
-    entries.push(("composer", composer_entry.1));
-
-    let year_entry = make_entry(
-        "Year",
-        &field_value(|t| &t.year),
-        mixed_placeholder(|t| &t.year),
-    );
-    year_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
-    form.append(&year_entry.0);
-    entries.push(("year", year_entry.1));
-
+    add_field("artist", "Artist", |t| &t.artist);
+    add_field("album", "Album", |t| &t.album);
+    add_field("genre", "Genre", |t| &t.genre);
+    add_field("composer", "Composer", |t| &t.composer);
+    add_field("year", "Year", |t| &t.year);
     if !is_batch {
-        let track_entry = make_entry("Track #", &field_value(|t| &t.track_number), false);
-        track_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
-        form.append(&track_entry.0);
-        entries.push(("track_number", track_entry.1));
+        add_field("track_number", "Track #", |t| &t.track_number);
     }
-
-    let disc_entry = make_entry(
-        "Disc #",
-        &field_value(|t| &t.disc_number),
-        mixed_placeholder(|t| &t.disc_number),
-    );
-    disc_entry.1.set_input_purpose(gtk::InputPurpose::Digits);
-    form.append(&disc_entry.0);
-    entries.push(("disc_number", disc_entry.1));
+    add_field("disc_number", "Disc #", |t| &t.disc_number);
 
     // ── Read-only info section (single track only) ───────────────────
     if !is_batch {
@@ -740,9 +706,23 @@ pub fn show_properties_dialog(
         .margin_top(8)
         .build();
 
+    // Names the MusicBrainz release a lookup filled in, so the user can
+    // judge it before saving.
+    let lookup_label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(4)
+        .visible(false)
+        .build();
+
     scrolled.set_child(Some(&form));
     content.append(&scrolled);
     content.append(&capability_label);
+    content.append(&lookup_label);
 
     // ── Button bar ───────────────────────────────────────────────────
     let button_bar = gtk::Box::builder()
@@ -766,21 +746,32 @@ pub fn show_properties_dialog(
             .sensitive(false)
             .build();
 
-        let title_for_mb = tracks[0].title.clone();
-        let artist_for_mb = tracks[0].artist.clone();
         let entries_for_mb: Vec<(String, gtk::Entry)> = entries
             .iter()
             .map(|(name, entry)| ((*name).to_string(), entry.clone()))
             .collect();
         let generation_for_mb = operation_generation.clone();
+        let lookup_label_for_mb = lookup_label.clone();
 
         mb_button.connect_clicked(move |btn| {
             btn.set_sensitive(false);
             btn.set_label(rust_i18n::t!("properties.searching").as_ref());
+            lookup_label_for_mb.set_visible(false);
 
-            let title = title_for_mb.clone();
-            let artist = artist_for_mb.clone();
+            // Search for what the form says now, not what the file said
+            // when the dialog opened.
+            let form_text = |field: &str| {
+                entries_for_mb
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, entry)| entry.text().to_string())
+                    .unwrap_or_default()
+            };
+            let title = form_text("title");
+            let artist = form_text("artist");
+            let album = form_text("album");
             let entries = entries_for_mb.clone();
+            let lookup_label = lookup_label_for_mb.clone();
             let btn = btn.clone();
             let operation_generation = generation_for_mb.clone();
             // Every lookup owns a distinct generation. In particular, a
@@ -792,7 +783,7 @@ pub fn show_properties_dialog(
             let (tx, rx) = async_channel::bounded::<Option<MusicBrainzResult>>(1);
 
             std::thread::spawn(move || {
-                let result = musicbrainz_lookup(&title, &artist);
+                let result = musicbrainz_lookup(&title, &artist, &album);
                 let _ = tx.send_blocking(result);
             });
 
@@ -803,25 +794,12 @@ pub fn show_properties_dialog(
                 }
                 if let Ok(Some(result)) = result {
                     for (name, entry) in &entries {
-                        match name.as_str() {
-                            "title" if !result.title.is_empty() => {
-                                entry.set_text(&result.title);
-                            }
-                            "artist" if !result.artist.is_empty() => {
-                                entry.set_text(&result.artist);
-                            }
-                            "album" if !result.album.is_empty() => {
-                                entry.set_text(&result.album);
-                            }
-                            "year" if !result.year.is_empty() => {
-                                entry.set_text(&result.year);
-                            }
-                            "track_number" if !result.track_number.is_empty() => {
-                                entry.set_text(&result.track_number);
-                            }
-                            _ => {}
+                        if let Some(value) = result.field(name).filter(|value| !value.is_empty()) {
+                            entry.set_text(value);
                         }
                     }
+                    lookup_label.set_label(&result.summary(&rust_i18n::locale()));
+                    lookup_label.set_visible(true);
                     btn.set_label(rust_i18n::t!("properties.musicbrainz_lookup").as_ref());
                     btn.set_sensitive(true);
                 } else {
@@ -859,15 +837,21 @@ pub fn show_properties_dialog(
 
     dialog.set_child(Some(&content));
 
+    // Button handlers hold the dialog and window weakly: a strong reference
+    // from a widget inside the dialog back to the dialog would keep it, and
+    // every save target it owns, alive after it closes.
+
     // ── Cancel ───────────────────────────────────────────────────────
-    let dialog_for_cancel = dialog.clone();
+    let dialog_for_cancel = dialog.downgrade();
     cancel_button.connect_clicked(move |_| {
-        dialog_for_cancel.close();
+        if let Some(dialog) = dialog_for_cancel.upgrade() {
+            dialog.close();
+        }
     });
 
     // ── Save ─────────────────────────────────────────────────────────
-    let dialog_for_save = dialog.clone();
-    let parent_for_save = parent.clone();
+    let dialog_for_save = dialog.downgrade();
+    let parent_for_save = parent.downgrade();
 
     // Capture initial text values to detect what actually changed.
     let initial_texts: Vec<(String, String)> = entries
@@ -895,6 +879,12 @@ pub fn show_properties_dialog(
     let catalogue_refresh_for_save = catalogue_refresh.clone();
 
     save_button.connect_clicked(move |button| {
+        let (Some(dialog_for_save), Some(parent_for_save)) =
+            (dialog_for_save.upgrade(), parent_for_save.upgrade())
+        else {
+            return;
+        };
+
         // Build TagEdits from the form, only including changed fields.
         let mut edits = TagEdits::default();
         let mut any_changed = false;
@@ -906,16 +896,16 @@ pub fn show_properties_dialog(
                 .find(|(n, _)| n == name)
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
+            let mixed_edited = mixed_edits
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, edited)| edited.get());
 
-            // In batch mode with mixed values, the initial text is empty.
-            // Only apply if the user typed something (non-empty and different
-            // from the original).
-            if current == original {
+            let Some(value) = field_edit(original, &current, mixed_edited) else {
                 continue;
-            }
-
+            };
             any_changed = true;
-            let value = Some(current);
+            let value = Some(value);
             match name.as_str() {
                 "title" => edits.title = value,
                 "artist" => edits.artist = value,
@@ -1072,7 +1062,7 @@ pub fn show_properties_dialog(
         });
 
         let dialog = dialog_for_save.clone();
-        let parent = parent_for_save.clone();
+        let parent = parent_for_save;
         let entries = entries_for_save_state.clone();
         let save_button = button.clone();
         let musicbrainz_button = musicbrainz_for_save.clone();
@@ -1236,13 +1226,40 @@ fn make_entry(label: &str, value: &str, mixed: bool) -> (gtk::Box, gtk::Entry) {
     let entry = gtk::Entry::builder().text(value).hexpand(true).build();
 
     if mixed {
-        entry.set_placeholder_text(Some("Mixed"));
+        entry.set_placeholder_text(Some(&rust_i18n::t!("properties.mixed")));
     }
 
     row.append(&lbl);
     row.append(&entry);
 
     (row, entry)
+}
+
+/// Record whether the user has edited a field that opened with mixed batch
+/// values. The first edit also changes the placeholder, so an emptied field
+/// visibly reads as "clear on every track" rather than "leave as is".
+fn track_mixed_edits(entry: &gtk::Entry) -> Rc<Cell<bool>> {
+    let edited = Rc::new(Cell::new(false));
+    let flag = edited.clone();
+    entry.connect_changed(move |entry| {
+        if !flag.replace(true) {
+            entry.set_placeholder_text(Some(&rust_i18n::t!("properties.mixed_cleared")));
+        }
+    });
+    edited
+}
+
+/// The value Save writes for one field, or `None` to leave it untouched.
+///
+/// A field that opened with one shared value is written when its text
+/// differs, and emptying it clears the tag. A field that opened as "Mixed"
+/// is empty either way, so `mixed_edited` decides: once the user has edited
+/// it, its text — including an empty one, which clears the tag — applies to
+/// every track.
+fn field_edit(original: &str, current: &str, mixed_edited: Option<bool>) -> Option<String> {
+    mixed_edited
+        .unwrap_or(current != original)
+        .then(|| current.to_owned())
 }
 
 /// Add a read-only info row to a container.
@@ -1279,36 +1296,133 @@ fn add_info_row(container: &gtk::Box, label: &str, value: &str) {
 
 const MUSICBRAINZ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_MUSICBRAINZ_BODY_BYTES: u64 = 4 * 1024 * 1024;
+/// MusicBrainz asks every client to identify itself with its real version
+/// and a contact URL.
+const MUSICBRAINZ_USER_AGENT: &str = concat!(
+    "Tributary/",
+    env!("CARGO_PKG_VERSION"),
+    " ( ",
+    env!("CARGO_PKG_REPOSITORY"),
+    " )"
+);
+/// Recordings MusicBrainz scores below this (out of 100) are not matches.
+const MUSICBRAINZ_MIN_SCORE: u64 = 90;
+/// Enough recordings that the release on the user's album is usually among
+/// them: a popular song has dozens of recordings, each on a few releases.
+const MUSICBRAINZ_RESULT_LIMIT: usize = 25;
 
 /// Result from a MusicBrainz recording search.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MusicBrainzResult {
     title: String,
     artist: String,
+    /// The release that album, year, track and disc come from. `None` when
+    /// no release matched the album in the form, so those fields are left
+    /// alone rather than filled from an arbitrary compilation.
+    release: Option<MusicBrainzRelease>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MusicBrainzRelease {
     album: String,
     year: String,
     track_number: String,
+    disc_number: String,
 }
 
-/// Query the MusicBrainz API for a recording matching title + artist.
+impl MusicBrainzResult {
+    /// The value for one form field, by the name the form uses for it.
+    fn field(&self, name: &str) -> Option<&str> {
+        let release = self.release.as_ref();
+        match name {
+            "title" => Some(&self.title),
+            "artist" => Some(&self.artist),
+            "album" => release.map(|release| release.album.as_str()),
+            "year" => release.map(|release| release.year.as_str()),
+            "track_number" => release.map(|release| release.track_number.as_str()),
+            "disc_number" => release.map(|release| release.disc_number.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What the lookup filled in, shown under the form.
+    fn summary(&self, locale: &str) -> String {
+        match &self.release {
+            Some(release) => rust_i18n::t!(
+                "properties.musicbrainz_applied",
+                locale = locale,
+                release = release.album
+            )
+            .into_owned(),
+            None => {
+                rust_i18n::t!("properties.musicbrainz_title_only", locale = locale).into_owned()
+            }
+        }
+    }
+}
+
+/// Escape every Lucene query-syntax character so user text is searched
+/// literally and never parsed as query syntax.
+fn escape_lucene(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '+' | '-'
+                | '&'
+                | '|'
+                | '!'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '^'
+                | '"'
+                | '~'
+                | '*'
+                | '?'
+                | ':'
+                | '\\'
+                | '/'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+fn musicbrainz_query(title: &str, artist: &str) -> String {
+    let title = escape_lucene(title.trim());
+    let artist = artist.trim();
+    if artist.is_empty() || artist == "Unknown Artist" {
+        format!("recording:\"{title}\"")
+    } else {
+        format!(
+            "recording:\"{title}\" AND artist:\"{}\"",
+            escape_lucene(artist)
+        )
+    }
+}
+
+/// Query the MusicBrainz API for a recording matching title + artist,
+/// preferring a release titled like `album`.
 ///
 /// This is a blocking HTTP call — run on a background thread.
-/// Respects MusicBrainz rate limiting via User-Agent header.
-fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
-    let query = if artist.is_empty() || artist == "Unknown Artist" {
-        format!("recording:\"{}\"", title)
-    } else {
-        format!("recording:\"{}\" AND artist:\"{}\"", title, artist)
-    };
-
+fn musicbrainz_lookup(title: &str, artist: &str, album: &str) -> Option<MusicBrainzResult> {
+    if title.trim().is_empty() {
+        return None;
+    }
     let url = format!(
-        "https://musicbrainz.org/ws/2/recording?query={}&fmt=json&limit=1",
-        urlencoding::encode(&query)
+        "https://musicbrainz.org/ws/2/recording?query={}&fmt=json&limit={MUSICBRAINZ_RESULT_LIMIT}",
+        urlencoding::encode(&musicbrainz_query(title, artist))
     );
 
     let client = crate::http_security::public_blocking_client_builder()
         .timeout(MUSICBRAINZ_TIMEOUT)
-        .user_agent("Tributary/0.3.0 (https://github.com/jm2/tributary)")
+        .user_agent(MUSICBRAINZ_USER_AGENT)
         .build()
         .ok()?;
 
@@ -1325,68 +1439,173 @@ fn musicbrainz_lookup(title: &str, artist: &str) -> Option<MusicBrainzResult> {
     )
     .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    let recordings = json.get("recordings")?.as_array()?;
-    let recording = recordings.first()?;
+    let result = best_musicbrainz_match(&json, album);
+    tracing::debug!(
+        found = result.is_some(),
+        with_release = result
+            .as_ref()
+            .is_some_and(|result| result.release.is_some()),
+        "MusicBrainz lookup finished"
+    );
+    result
+}
 
-    let title = recording
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+/// Pick the recording and release to fill the form from a search response.
+///
+/// Only recordings scoring at least [`MUSICBRAINZ_MIN_SCORE`] count. When
+/// the form names an album, only a release with that title (ignoring case
+/// and punctuation) is used; if none matches, just the title and artist are
+/// returned. With no album in the form, the best-ranked release is used.
+fn best_musicbrainz_match(json: &serde_json::Value, album: &str) -> Option<MusicBrainzResult> {
+    let recordings: Vec<&serde_json::Value> = json
+        .get("recordings")?
+        .as_array()?
+        .iter()
+        .filter(|recording| {
+            recording
+                .get("score")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|score| score >= MUSICBRAINZ_MIN_SCORE)
+        })
+        .collect();
+    let first = *recordings.first()?;
 
-    let artist = recording
-        .get("artist-credit")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|ac| ac.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let wanted_album = album_key(album);
+    let chosen = recordings
+        .iter()
+        .flat_map(|recording| {
+            recording
+                .get("releases")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |release| (*recording, release))
+        })
+        .filter(|(_, release)| {
+            wanted_album.is_empty() || album_key(json_str(release, "/title")) == wanted_album
+        })
+        .min_by_key(|(_, release)| release_rank(release));
 
-    // Get album from first release
-    let releases = recording.get("releases").and_then(|v| v.as_array());
-    let (album, year, track_number) = if let Some(releases) = releases {
-        if let Some(release) = releases.first() {
-            let album = release
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let year = release
-                .get("date")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .chars()
-                .take(4) // Extract just the year from "YYYY-MM-DD"
-                .collect::<String>();
-            let track_number = release
-                .get("media")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|m| m.get("track"))
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|t| t.get("number"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            (album, year, track_number)
-        } else {
-            (String::new(), String::new(), String::new())
-        }
-    } else {
-        (String::new(), String::new(), String::new())
+    let (recording, release) = match chosen {
+        Some((recording, release)) => (recording, Some(release_fields(release))),
+        None => (first, None),
     };
-
-    tracing::debug!("MusicBrainz lookup returned a result");
-
     Some(MusicBrainzResult {
-        title,
-        artist,
-        album,
-        year,
-        track_number,
+        title: json_str(recording, "/title").to_owned(),
+        artist: json_str(recording, "/artist-credit/0/name").to_owned(),
+        release,
     })
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, pointer: &str) -> &'a str {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// An album title reduced to lowercase letters and digits, so "Help!" and
+/// "help" compare equal.
+fn album_key(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Sort key for candidate releases; lower is better. Official releases come
+/// before bootlegs, original albums before compilations and live albums,
+/// and then the earliest dated release wins. Undated releases sort last.
+fn release_rank(release: &serde_json::Value) -> (bool, bool, bool, String) {
+    let unofficial = matches!(json_str(release, "/status"), "Bootleg" | "Pseudo-Release");
+    let compilation_or_live = release
+        .pointer("/release-group/secondary-types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| {
+            types
+                .iter()
+                .any(|kind| matches!(kind.as_str(), Some("Compilation" | "Live")))
+        });
+    let date = json_str(release, "/date");
+    (
+        unofficial,
+        compilation_or_live,
+        date.is_empty(),
+        date.to_owned(),
+    )
+}
+
+/// The form values one release supplies. MusicBrainz lists only the medium
+/// holding the searched recording, so the first medium is the right one.
+fn release_fields(release: &serde_json::Value) -> MusicBrainzRelease {
+    let year: String = json_str(release, "/date").chars().take(4).collect();
+    let medium = release.pointer("/media/0");
+    MusicBrainzRelease {
+        album: json_str(release, "/title").to_owned(),
+        year: if year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()) {
+            year
+        } else {
+            String::new()
+        },
+        track_number: medium.map(track_position).unwrap_or_default(),
+        disc_number: medium
+            .and_then(|medium| medium.get("position"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|position| position.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// The track's numeric position on its medium: MusicBrainz's zero-based
+/// offset plus one, or else the leading digits of the printed track number.
+/// A vinyl side number such as "A1" has no leading digits and gives nothing,
+/// since Save accepts only whole numbers.
+fn track_position(medium: &serde_json::Value) -> String {
+    if let Some(offset) = medium
+        .get("track-offset")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return (offset + 1).to_string();
+    }
+    json_str(medium, "/track/0/number")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect()
+}
+
+/// GTK-touching contracts folded into the crate's single consolidated
+/// GTK-initializing test (browser.rs `gtk_widget_contracts_hold_on_one_session`);
+/// see `ui::widget_test_session`. Mirrors the caller's macOS gate so these
+/// helpers are never dead code there.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    use super::*;
+
+    /// A mixed field stays "Mixed" until edited; any edit, even one that
+    /// leaves it empty, marks it to apply to every track.
+    pub fn editing_a_mixed_field_marks_it_for_clearing() {
+        let (_row, entry) = make_entry("Genre", "", true);
+        let edited = track_mixed_edits(&entry);
+        assert!(!edited.get());
+        assert_eq!(
+            entry.placeholder_text().as_deref(),
+            Some(rust_i18n::t!("properties.mixed").as_ref())
+        );
+        assert_eq!(field_edit("", &entry.text(), Some(edited.get())), None);
+
+        entry.set_text("x");
+        entry.set_text("");
+        assert!(edited.get());
+        assert_eq!(
+            entry.placeholder_text().as_deref(),
+            Some(rust_i18n::t!("properties.mixed_cleared").as_ref())
+        );
+        assert_eq!(
+            field_edit("", &entry.text(), Some(edited.get())),
+            Some(String::new())
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1961,6 +2180,184 @@ mod tests {
                     localized, english,
                     "{locale} must not fall back to English conflict guidance"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn untouched_mixed_fields_are_kept_and_edited_ones_apply_even_when_empty() {
+        // Untouched "Mixed": every track keeps its own value.
+        assert_eq!(field_edit("", "", Some(false)), None);
+        // Edited, then emptied: clear the tag on every track.
+        assert_eq!(field_edit("", "", Some(true)), Some(String::new()));
+        assert_eq!(field_edit("", "Rock", Some(true)), Some("Rock".to_owned()));
+        // A shared value is written only when it changes; emptying clears it.
+        assert_eq!(field_edit("Rock", "Rock", None), None);
+        assert_eq!(field_edit("Rock", "", None), Some(String::new()));
+        assert_eq!(field_edit("Rock", "Jazz", None), Some("Jazz".to_owned()));
+    }
+
+    #[test]
+    fn musicbrainz_queries_search_user_text_literally() {
+        assert_eq!(
+            musicbrainz_query(r#"Say "Hi" (Live) 1+1: A/B?"#, "AC/DC"),
+            r#"recording:"Say \"Hi\" \(Live\) 1\+1\: A\/B\?" AND artist:"AC\/DC""#
+        );
+        assert_eq!(
+            musicbrainz_query(r"back\slash", "Unknown Artist"),
+            r#"recording:"back\\slash""#
+        );
+        assert_eq!(musicbrainz_query(" Help! ", " "), r#"recording:"Help\!""#);
+    }
+
+    #[test]
+    fn musicbrainz_user_agent_names_this_version_and_a_contact() {
+        assert_eq!(
+            MUSICBRAINZ_USER_AGENT,
+            format!(
+                "Tributary/{} ( https://github.com/jm2/tributary )",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    /// A search response shaped like MusicBrainz's recording search: each
+    /// release lists only the medium holding the recording.
+    fn musicbrainz_response() -> serde_json::Value {
+        serde_json::json!({
+            "recordings": [
+                {
+                    "score": 100,
+                    "title": "Yesterday",
+                    "artist-credit": [{ "name": "The Beatles" }],
+                    "releases": [{
+                        "title": "Perfect Collection, Volume 5",
+                        "status": "Official",
+                        "date": "1987",
+                        "release-group": { "secondary-types": ["Compilation"] },
+                        "media": [{ "position": 2, "track-offset": 3, "track": [{ "number": "4" }] }]
+                    }, {
+                        "title": "Live in Japan",
+                        "status": "Bootleg",
+                        "date": "1964",
+                        "media": [{ "position": 1, "track-offset": 0, "track": [{ "number": "1" }] }]
+                    }]
+                },
+                {
+                    "score": 95,
+                    "title": "Yesterday",
+                    "artist-credit": [{ "name": "The Beatles" }],
+                    "releases": [{
+                        "title": "Help!",
+                        "date": "1965-08-06",
+                        "release-group": { "secondary-types": ["Soundtrack"] },
+                        "media": [{ "position": 1, "track-offset": 12, "track": [{ "number": "B6" }] }]
+                    }]
+                },
+                {
+                    "score": 40,
+                    "title": "Yesterday (Demo)",
+                    "artist-credit": [{ "name": "Someone Else" }],
+                    "releases": [{
+                        "title": "Rubber Soul",
+                        "status": "Official",
+                        "date": "1965",
+                        "media": [{ "position": 1, "track-offset": 0 }]
+                    }]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn musicbrainz_lookup_uses_the_release_matching_the_form_album() {
+        let result = best_musicbrainz_match(&musicbrainz_response(), "help").expect("match");
+        assert_eq!(result.title, "Yesterday");
+        assert_eq!(result.artist, "The Beatles");
+        assert_eq!(
+            result.release,
+            Some(MusicBrainzRelease {
+                album: "Help!".to_owned(),
+                year: "1965".to_owned(),
+                track_number: "13".to_owned(),
+                disc_number: "1".to_owned(),
+            })
+        );
+        assert_eq!(result.field("track_number"), Some("13"));
+    }
+
+    #[test]
+    fn musicbrainz_lookup_without_a_matching_release_fills_only_title_and_artist() {
+        // "Rubber Soul" exists only on a recording below the score threshold.
+        let result = best_musicbrainz_match(&musicbrainz_response(), "Rubber Soul").expect("match");
+        assert_eq!(result.title, "Yesterday");
+        assert_eq!(result.release, None);
+        for field in ["album", "year", "track_number", "disc_number"] {
+            assert_eq!(result.field(field), None, "{field}");
+        }
+        assert_eq!(result.field("title"), Some("Yesterday"));
+    }
+
+    #[test]
+    fn musicbrainz_lookup_without_an_album_prefers_an_official_original_release() {
+        let result = best_musicbrainz_match(&musicbrainz_response(), "").expect("match");
+        assert_eq!(
+            result.release.map(|release| release.album),
+            Some("Help!".to_owned()),
+            "neither the bootleg nor the compilation should win"
+        );
+    }
+
+    #[test]
+    fn musicbrainz_lookup_ignores_low_scoring_recordings() {
+        let response = serde_json::json!({
+            "recordings": [{ "score": 89, "title": "Close", "releases": [] }]
+        });
+        assert_eq!(best_musicbrainz_match(&response, ""), None);
+    }
+
+    #[test]
+    fn musicbrainz_track_numbers_become_whole_numbers_or_nothing() {
+        let offset = serde_json::json!({ "track-offset": 12, "track": [{ "number": "B6" }] });
+        assert_eq!(track_position(&offset), "13");
+        for (number, expected) in [("7", "7"), ("12a", "12"), ("A1", ""), ("", "")] {
+            let medium = serde_json::json!({ "track": [{ "number": number }] });
+            assert_eq!(track_position(&medium), expected, "{number:?}");
+        }
+        let undated = serde_json::json!({ "title": "X", "date": "", "media": [] });
+        assert_eq!(release_fields(&undated).year, "");
+    }
+
+    #[test]
+    fn lookup_summary_and_cleared_placeholder_are_localized_for_every_catalog() {
+        let applied = MusicBrainzResult {
+            release: Some(MusicBrainzRelease {
+                album: "Help!".to_owned(),
+                ..MusicBrainzRelease::default()
+            }),
+            ..MusicBrainzResult::default()
+        };
+        let title_only = MusicBrainzResult::default();
+        let english = (
+            applied.summary("en"),
+            title_only.summary("en"),
+            rust_i18n::t!("properties.mixed_cleared", locale = "en").into_owned(),
+        );
+
+        for locale in rust_i18n::available_locales!() {
+            let localized = (
+                applied.summary(&locale),
+                title_only.summary(&locale),
+                rust_i18n::t!("properties.mixed_cleared", locale = locale).into_owned(),
+            );
+            assert!(localized.0.contains("Help!"), "{locale}: {}", localized.0);
+            assert!(!localized.0.contains("%{"), "{locale}: {}", localized.0);
+            assert!(!localized.1.starts_with("properties."), "{locale}");
+            assert!(!localized.2.starts_with("properties."), "{locale}");
+            if locale != "en" {
+                assert_ne!(localized.0, english.0, "{locale} fell back to English");
+                assert_ne!(localized.1, english.1, "{locale} fell back to English");
+                assert_ne!(localized.2, english.2, "{locale} fell back to English");
             }
         }
     }

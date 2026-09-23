@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Smart playlist rules** — The smart playlist editor now refuses numbers and dates it can't
+  read, explaining why and keeping OK disabled, instead of silently saving 0 or 30 or a date
+  that never matches. Dates are entered as YYYY-MM-DD and match your local calendar day.
+- **Properties and MusicBrainz Lookup** — Lookup now searches the title and artist as currently
+  typed, prefers the release matching the album, fills in usable track and disc numbers, and
+  says which release it used. Properties has its own message when it can't open, and editing
+  several tracks can now clear a field whose values differ.
+- **Server sign-in** — Jellyfin accounts without a password can now connect, and the Connect
+  and Add Server dialogs stay open with a message about what's missing instead of silently
+  discarding what you typed.
 - **Last.fm keeps queued scrobbles** — Scrobbles saved while offline are no longer deleted when
   Last.fm rejects the app's key or signature or the daily scrobble limit is reached; they wait and
   are sent later. Brief storage errors and web error pages are retried instead of stopping

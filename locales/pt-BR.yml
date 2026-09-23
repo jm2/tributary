@@ -140,6 +140,9 @@ dialogs:
   enter_password: "Insira a senha do compartilhamento (deixe em branco se não houver)"
   username: "Nome de usuário"
   password: "Senha"
+  missing_server_url: "Insira um endereço de servidor válido, como https://music.example.com."
+  missing_username: "Insira um nome de usuário."
+  missing_password: "Insira uma senha."
   new_playlist_heading: "Nova lista de reprodução"
   playlist_name: "Nome da lista"
   rename_playlist_heading: "Renomear lista de reprodução"
@@ -262,6 +265,12 @@ properties:
   save_conflict_all: "%{conflicts} de %{total} arquivo(s) mudaram no disco desde que Propriedades foi aberto. Os arquivos em conflito foram deixados intactos — reabra Propriedades para editar os arquivos atuais."
   save_conflict_mixed: "%{conflicts} de %{total} arquivo(s) mudaram no disco e %{other} outro(s) arquivo(s) não puderam ser salvos; todos foram deixados inalterados. Reabra Propriedades para os arquivos alterados."
   save_failure: "%{failed} de %{total} arquivo(s) não puderam ser salvos e foram deixados inalterados."
+  refused_heading: "Não foi possível abrir Propriedades"
+  refused_unavailable: "Um arquivo selecionado mudou ou ficou indisponível antes que Propriedades pudesse abrir. Nada foi alterado."
+  refused_selection_changed: "A seleção mudou antes que Propriedades pudesse abrir. Nada foi alterado. Selecione as faixas novamente para editá-las."
+  mixed_cleared: "Será apagado em todas as faixas"
+  musicbrainz_applied: "Preenchido a partir do lançamento do MusicBrainz “%{release}”. Confira os campos antes de salvar."
+  musicbrainz_title_only: "Nenhum lançamento do MusicBrainz correspondeu ao álbum, então apenas o título e o artista foram preenchidos."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -273,6 +282,10 @@ smart_playlist:
   add_rule: "Adicionar regra"
   remove_rule: "Remover regra"
   limit_to: "Limitar a"
+  rule_not_integer: "Insira um número inteiro."
+  rule_reversed_range: "O primeiro valor não pode ser maior que o segundo."
+  rule_not_positive: "Insira um número inteiro igual ou maior que 1."
+  rule_invalid_date: "Insira uma data no formato YYYY-MM-DD, por exemplo 2024-01-15."
 
 # ── Playlists do servidor ──────────────────────────────────────────
 server_playlists:

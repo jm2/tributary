@@ -3947,6 +3947,10 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_edits_report_consistent_settings();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
+                crate::ui::playlist_editor::widget_tests::number_and_date_rows_gate_ok();
+                crate::ui::server_dialogs::widget_tests::connect_waits_for_required_credentials();
+                crate::ui::server_dialogs::widget_tests::add_server_keeps_incomplete_input_with_a_reason();
+                crate::ui::properties_dialog::widget_tests::editing_a_mixed_field_marks_it_for_clearing();
                 q4_publication_contract_and_bench();
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();
