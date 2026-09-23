@@ -1,8 +1,8 @@
 //! Preferences window — unified settings for library location, browser
 //! views, and column visibility.
 //!
-//! Uses `adw::PreferencesDialog` with a single page containing three
-//! groups: Library Location, Browser Views, and Visible Columns.
+//! Uses `adw::PreferencesDialog` with a single page containing four
+//! groups: Library Location, Browser Views, Visible Columns, and Equalizer.
 
 use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -85,6 +85,13 @@ pub struct AppConfig {
     /// Default: `Medium` (48 dp). Persisted across restarts.
     #[serde(default)]
     pub album_pane_artwork_size: AlbumArtSize,
+    /// Equalizer state for the local output. A malformed value resets only
+    /// this field when the file loads.
+    #[serde(
+        default,
+        deserialize_with = "crate::audio::equalizer::EqualizerSettings::deserialize_lenient"
+    )]
+    pub equalizer: crate::audio::equalizer::EqualizerSettings,
 }
 
 /// Thumbnail side length for the browser Album pane.
@@ -303,6 +310,7 @@ impl Default for AppConfig {
             group_by_album_artist: false,
             album_pane_artwork: false,
             album_pane_artwork_size: AlbumArtSize::default(),
+            equalizer: crate::audio::equalizer::EqualizerSettings::default(),
         }
     }
 }
@@ -700,6 +708,8 @@ pub fn save_config(config: &AppConfig) -> bool {
 /// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
+/// * `active_output` — the output the equalizer group applies its settings to
+#[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     column_view: &gtk::ColumnView,
@@ -708,6 +718,7 @@ pub fn show_preferences(
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    active_output: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::audio::output::AudioOutput>>>,
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
@@ -1173,6 +1184,11 @@ pub fn show_preferences(
     columns_group.add(&columns_grid);
     columns_group.add(&reset_btn);
     page.add(&columns_group);
+    page.add(&super::equalizer_panel::preferences_group(
+        &prefs_dialog,
+        config,
+        active_output,
+    ));
 
     prefs_dialog.add(&page);
     drop(cfg);

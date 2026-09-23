@@ -3342,6 +3342,8 @@ mod tests {
                 crate::ui::album_art_cell::widget_tests::revoking_a_cell_revokes_its_outstanding_fetch_token();
                 crate::ui::album_pane_art::widget_tests::album_art_row_publishes_combined_accessible_name();
                 crate::ui::album_pane_art::widget_tests::album_art_row_zero_count_announces_bare_label();
+                crate::ui::equalizer_panel::widget_tests::equalizer_panel_edits_report_consistent_settings();
+                crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
                 q4_publication_contract_and_bench();
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();

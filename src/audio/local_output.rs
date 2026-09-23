@@ -4,6 +4,7 @@
 //! This is the default "My Computer" output that plays audio through
 //! the system's speakers or headphones via a GStreamer `playbin3` pipeline.
 
+use super::equalizer::EqualizerSettings;
 use super::output::{AudioOutput, OutputType};
 use super::{Player, PlayerEventGeneration, PlayerState};
 use crate::architecture::media::ResolvedHttpRequest;
@@ -32,6 +33,14 @@ impl AudioOutput for LocalOutput {
 
     fn supports_volume(&self) -> bool {
         true
+    }
+
+    fn supports_equalizer(&self) -> bool {
+        self.player.has_equalizer()
+    }
+
+    fn set_equalizer(&self, settings: &EqualizerSettings) {
+        self.player.set_equalizer(settings);
     }
 
     fn load_uri(&self, uri: &str) -> bool {
