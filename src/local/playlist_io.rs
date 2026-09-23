@@ -9,8 +9,9 @@
 //! design of surviving library rebuilds via metadata fingerprinting.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::Path;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
 use quick_xml::events::{BytesStart, Event};
@@ -42,15 +43,38 @@ pub struct ImportedTrack {
 /// stored value is non-negative and representable as `u64` milliseconds.
 /// Ratings are intentionally omitted: XSPF v1 has no standard rating field,
 /// and a playlist export is not a consent-bearing metadata transfer.
+///
+/// The file is replaced atomically. A symlinked destination is written at its
+/// target so the link survives. On Unix an existing file keeps its permission
+/// bits and a new file gets the usual `0666` less the umask, so other readers
+/// of the directory can open it.
 pub fn export_xspf(tracks: &[track::Model], path: &Path) -> anyhow::Result<()> {
     // Validate and render the whole document before touching the destination.
     let document = serialize_xspf(tracks)?;
+    let destination = resolve_export_destination(path)?;
+    let path = destination.as_path();
     let parent = destination_parent(path);
     let prefix = temporary_file_prefix(path);
-    let mut temporary = tempfile::Builder::new()
-        .prefix(&prefix)
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `open(2)` applies the umask to this mode, as for any new file.
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(parent)?;
+    #[cfg(unix)]
+    match fs::metadata(path) {
+        Ok(existing) if existing.is_file() => {
+            temporary
+                .as_file()
+                .set_permissions(existing.permissions())?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
 
     temporary.write_all(&document)?;
     temporary.flush()?;
@@ -148,7 +172,17 @@ fn serialize_xspf(tracks: &[track::Model]) -> anyhow::Result<Vec<u8>> {
 /// Rating-like `<meta>` or extension content is intentionally inert and can
 /// never overwrite Tributary's app-owned library rating.
 pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
-    let content = std::fs::read_to_string(path)?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_XSPF_IMPORT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_XSPF_IMPORT_BYTES {
+        bail!(
+            "playlist file is larger than the {} MiB import limit",
+            MAX_XSPF_IMPORT_BYTES / (1024 * 1024)
+        );
+    }
+    let content = String::from_utf8(bytes).map_err(|_| anyhow!("XSPF file is not UTF-8"))?;
     let tracks = parse_xspf(&content)?;
 
     info!(
@@ -160,6 +194,10 @@ pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
 }
 
 const XSPF_NAMESPACE: &[u8] = b"http://xspf.org/ns/0/";
+
+/// Largest XSPF file `import_xspf` reads. Far above any real playlist, it
+/// keeps a mistaken selection from being read into memory whole.
+const MAX_XSPF_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 enum XspfNode {
@@ -277,7 +315,7 @@ fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                                 .ok_or_else(|| anyhow!("malformed XSPF: field outside a track"))?,
                             field,
                             &value,
-                        )?;
+                        );
                     }
                     XspfNode::Playlist => root_closed = true,
                     XspfNode::TrackList | XspfNode::Other => {}
@@ -295,7 +333,7 @@ fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                                 .ok_or_else(|| anyhow!("malformed XSPF: field outside a track"))?,
                             field,
                             &value,
-                        )?;
+                        );
                     }
                     XspfNode::Track => {
                         tracks.push(current_track.take().ok_or_else(|| {
@@ -550,11 +588,7 @@ fn resolve_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> anyhow:
         .ok_or_else(|| anyhow!("unsupported XSPF entity reference: &{name};"))
 }
 
-fn apply_xspf_field(
-    track: &mut ImportedTrack,
-    field: XspfField,
-    value: &str,
-) -> anyhow::Result<()> {
+fn apply_xspf_field(track: &mut ImportedTrack, field: XspfField, value: &str) {
     match field {
         XspfField::Location if track.file_path.is_empty() => {
             let file_path = uri_to_file_path(value.trim());
@@ -566,15 +600,17 @@ fn apply_xspf_field(
         XspfField::Title => track.title = value.to_string(),
         XspfField::Creator => track.artist = value.to_string(),
         XspfField::Album => track.album = value.to_string(),
+        // Duration is optional matching evidence: an unparsable value leaves
+        // this entry without one instead of rejecting the whole playlist.
         XspfField::Duration => {
-            let milliseconds = value
+            track.duration_secs = value
                 .trim()
                 .parse::<u64>()
-                .map_err(|_| anyhow!("invalid XSPF duration: expected unsigned milliseconds"))?;
-            track.duration_secs = Some(milliseconds / 1000);
+                .map(|milliseconds| milliseconds / 1000)
+                .inspect_err(|_| warn!("Ignoring invalid XSPF duration"))
+                .ok();
         }
     }
-    Ok(())
 }
 
 // ── Track matching ──────────────────────────────────────────────────
@@ -730,6 +766,17 @@ pub(super) fn match_imported_track<'a>(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+/// The file an export replaces: the target of a symlinked destination, so the
+/// link itself survives, or the destination itself.
+fn resolve_export_destination(path: &Path) -> anyhow::Result<PathBuf> {
+    let is_symlink = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    if !is_symlink {
+        return Ok(path.to_path_buf());
+    }
+    fs::canonicalize(path)
+        .map_err(|error| anyhow!("failed to resolve symlink {}: {error}", path.display()))
+}
+
 fn destination_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -827,7 +874,7 @@ mod tests {
 
     use super::{
         export_xspf, import_xspf, match_imported_track, serialize_xspf, temporary_file_prefix,
-        ImportedTrack,
+        ImportedTrack, MAX_XSPF_IMPORT_BYTES,
     };
     use crate::db::entities::track;
 
@@ -1087,16 +1134,36 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_out_of_range_xspf_duration_rejects_the_document() {
+    fn invalid_or_out_of_range_xspf_duration_is_dropped_for_that_entry_only() {
         for duration in ["", "   ", "not-a-number", "18446744073709551616"] {
             let document = format!(
                 "<playlist version='1' xmlns='http://xspf.org/ns/0/'><trackList>\
-                 <track><duration>{duration}</duration></track>\
+                 <track><title>Bad</title><duration>{duration}</duration></track>\
+                 <track><title>Good</title><duration>123456</duration></track>\
                  </trackList></playlist>"
             );
-            let error = import_document(&document).expect_err("invalid duration must fail parsing");
-            assert!(error.to_string().contains("invalid XSPF duration"));
+            let tracks =
+                import_document(&document).expect("an invalid duration must not reject the file");
+            assert_eq!(tracks.len(), 2);
+            assert_eq!(tracks[0].title, "Bad");
+            assert_eq!(tracks[0].duration_secs, None);
+            assert_eq!(tracks[1].title, "Good");
+            assert_eq!(tracks[1].duration_secs, Some(123));
         }
+    }
+
+    #[test]
+    fn oversized_xspf_import_is_rejected_with_a_clear_error() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("huge.xspf");
+        // A sparse file: the limit is enforced without writing 64 MiB.
+        fs::File::create(&path)
+            .expect("create oversized fixture")
+            .set_len(MAX_XSPF_IMPORT_BYTES + 1)
+            .expect("extend oversized fixture");
+
+        let error = import_xspf(&path).expect_err("oversized file must be rejected");
+        assert!(error.to_string().contains("64 MiB import limit"));
     }
 
     #[test]
@@ -1440,6 +1507,77 @@ mod tests {
         assert!(!document.contains("<meta"));
         assert!(!document.contains("<extension"));
         assert!(document.contains("<title>Rated</title>"));
+    }
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .expect("read file mode")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_keeps_an_existing_mode_and_gives_new_files_the_umask_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let tracks = vec![library_track(
+            "track",
+            "/music/track.flac",
+            "Song",
+            "Artist",
+            "Album",
+            Some(100),
+        )];
+
+        // A new export gets the same mode as any other newly created file.
+        let reference = directory.path().join("reference");
+        fs::File::create(&reference).expect("create reference file");
+        let fresh = directory.path().join("fresh.xspf");
+        export_xspf(&tracks, &fresh).expect("export new file");
+        assert_eq!(file_mode(&fresh), file_mode(&reference));
+
+        let existing = directory.path().join("existing.xspf");
+        fs::write(&existing, "previous contents").expect("write previous export");
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o640))
+            .expect("set existing mode");
+        export_xspf(&tracks, &existing).expect("replace existing file");
+        assert_eq!(file_mode(&existing), 0o640);
+        assert_eq!(
+            import_xspf(&existing).expect("read replaced export").len(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_through_a_symlink_replaces_the_target_and_keeps_the_link() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let target = directory.path().join("real.xspf");
+        fs::write(&target, "previous contents").expect("write link target");
+        let link = directory.path().join("link.xspf");
+        std::os::unix::fs::symlink(&target, &link).expect("create destination symlink");
+        let tracks = vec![library_track(
+            "track",
+            "/music/track.flac",
+            "Song",
+            "Artist",
+            "Album",
+            Some(100),
+        )];
+
+        export_xspf(&tracks, &link).expect("export through symlink");
+
+        assert!(fs::symlink_metadata(&link)
+            .expect("inspect destination")
+            .file_type()
+            .is_symlink());
+        assert_eq!(import_xspf(&target).expect("read link target").len(), 1);
+        assert!(temporary_artifacts(directory.path(), &target).is_empty());
     }
 
     #[test]
