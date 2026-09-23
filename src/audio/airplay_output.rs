@@ -261,6 +261,13 @@ impl AirPlayOutput {
         Ok(())
     }
 
+    /// Whether this build can send to any AirPlay receiver at all: GStreamer
+    /// initializes and provides `raopsink`. Discovery hides AirPlay rows when
+    /// this is false, since every load would fail.
+    pub(crate) fn sender_available() -> bool {
+        gst::init().is_ok() && Self::raopsink_available()
+    }
+
     /// True when GStreamer's registry has a `raopsink` element to transmit
     /// with. Requires an initialised GStreamer.
     fn raopsink_available() -> bool {

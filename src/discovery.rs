@@ -41,6 +41,11 @@ pub struct DiscoveredServer {
     /// `Some(true)` = password required, `Some(false)` = open,
     /// `None` = unknown (probe not yet completed or not applicable).
     pub requires_password: Option<bool>,
+    /// Normalized AirPlay device identifier (the receiver's MAC/`deviceid`,
+    /// uppercase hex without separators) when the service advertises one.
+    /// Two receivers can share a display name; this, not the name, tells
+    /// them apart. `None` for every other service type.
+    pub device_id: Option<String>,
     /// Ephemeral direct-connection route advertised with this service.
     ///
     /// The URL remains hostname-based so HTTP `Host` and TLS identity are
@@ -519,14 +524,7 @@ fn process_mdns_event(
                     strip_avahi_name_suffix(&raw_name)
                 });
 
-            // AirPlay / RAOP devices often use "MAC@DeviceName" as
-            // their mDNS instance name (e.g. "8EE58A500A56@Rear Lounge TV").
-            // Strip the MAC prefix for a cleaner display name.
-            let name = if service_type == "airplay" || service_type == "airplay2" {
-                strip_airplay_mac_prefix(&raw_name)
-            } else {
-                raw_name
-            };
+            let (device_id, name) = airplay_identity(service_type, &info, raw_name);
 
             let scheme = if port == 443
                 || info
@@ -552,6 +550,7 @@ fn process_mdns_event(
                 url,
                 service_type: service_type.to_string(),
                 requires_password: None,
+                device_id,
             };
             let events = publications.upsert(
                 ServiceInstanceKey::new(service_type, &fullname),
@@ -730,6 +729,7 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
                             service_type: "jellyfin".to_string(),
                             requires_password: None,
                             advertised_route: None,
+                            device_id: None,
                         }));
                     }
 
@@ -898,6 +898,7 @@ fn process_chromecast_event(
                 service_type: service_type.to_string(),
                 requires_password: None,
                 advertised_route: None,
+                device_id: None,
             };
             let events = publications.upsert(
                 key,
@@ -939,19 +940,48 @@ fn process_chromecast_event(
 /// `HEXMAC@FriendlyName` (e.g. `"8EE58A500A56@Rear Lounge TV"`).
 /// This function strips the MAC prefix to produce just `"Rear Lounge TV"`.
 ///
-/// If no `@` is present or the prefix doesn't look like a hex MAC,
-/// the name is returned unchanged.
+/// If no `@` is present or the prefix is not a device identifier by the rule
+/// [`normalize_airplay_device_id`] applies, the name is returned unchanged.
 fn strip_airplay_mac_prefix(name: &str) -> String {
-    if let Some(at_pos) = name.find('@') {
-        let prefix = &name[..at_pos];
-        // MAC addresses are 12 hex characters (6 bytes, no separators)
-        // or sometimes with colons/dashes.  Accept any all-hex prefix
-        // of reasonable length (≥ 6 chars).
-        if prefix.len() >= 6 && prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-            return name[at_pos + 1..].to_string();
-        }
+    match name.split_once('@') {
+        Some((prefix, rest)) if normalize_airplay_device_id(prefix).is_some() => rest.to_string(),
+        _ => name.to_string(),
     }
-    name.to_string()
+}
+
+/// For AirPlay publications, the receiver's normalized device identifier and
+/// its display name without the `MAC@` prefix. Other services keep their raw
+/// name and carry no identifier.
+///
+/// The identifier comes from the TXT `deviceid` when present, otherwise from
+/// the `MAC@` prefix of the display name or of the mDNS instance name (a TXT
+/// `name` can replace the display name while the instance keeps the prefix).
+fn airplay_identity(
+    service_type: &str,
+    info: &mdns_sd::ResolvedService,
+    raw_name: String,
+) -> (Option<String>, String) {
+    if service_type != "airplay" && service_type != "airplay2" {
+        return (None, raw_name);
+    }
+    let device_id = info
+        .get_property_val_str("deviceid")
+        .and_then(normalize_airplay_device_id)
+        .or_else(|| {
+            [raw_name.as_str(), info.get_fullname()]
+                .into_iter()
+                .find_map(|candidate| normalize_airplay_device_id(candidate.split_once('@')?.0))
+        });
+    (device_id, strip_airplay_mac_prefix(&raw_name))
+}
+
+/// Normalize a MAC/`deviceid` string (`AA:BB:..`, `aa-bb-..`, or bare hex) to
+/// uppercase hex without separators, so two spellings of one receiver compare
+/// equal. At least six hex digits are required; anything else is not an
+/// identifier.
+fn normalize_airplay_device_id(raw: &str) -> Option<String> {
+    let hex: String = raw.chars().filter(|c| !matches!(c, ':' | '-')).collect();
+    (hex.len() >= 6 && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| hex.to_ascii_uppercase())
 }
 
 // ── Avahi hostname helpers ──────────────────────────────────────────────
@@ -1018,11 +1048,12 @@ fn strip_avahi_name_suffix(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_chromecast_event, process_mdns_event, strip_airplay_mac_prefix,
-        strip_avahi_display_suffix, strip_avahi_name_suffix, usable_chromecast_control_address,
-        validate_jellyfin_discovery_address, DiscoveredServer, DiscoveryEvent, MdnsPublication,
-        MdnsPublications, PublishedOrigin, ServiceInstanceKey, CHROMECAST_SERVICE,
-        MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, SUBSONIC_SERVICE,
+        normalize_airplay_device_id, process_chromecast_event, process_mdns_event,
+        strip_airplay_mac_prefix, strip_avahi_display_suffix, strip_avahi_name_suffix,
+        usable_chromecast_control_address, validate_jellyfin_discovery_address, DiscoveredServer,
+        DiscoveryEvent, MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey,
+        CHROMECAST_SERVICE, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, RAOP_SERVICE,
+        SUBSONIC_SERVICE,
     };
 
     fn resolved_event(
@@ -1523,6 +1554,7 @@ mod tests {
                     service_type: "subsonic".to_string(),
                     requires_password: None,
                     advertised_route: None,
+                    device_id: None,
                 },
                 advertised_addresses: vec!["192.0.2.1:4533".parse().unwrap()],
             },
@@ -1664,5 +1696,96 @@ mod tests {
         assert_eq!(strip_airplay_mac_prefix("ABCD@Device"), "ABCD@Device");
         // Exactly 6 hex chars — stripped.
         assert_eq!(strip_airplay_mac_prefix("AABBCC@Speaker"), "Speaker");
+        // Separator forms identify the receiver like the bare form does.
+        assert_eq!(
+            strip_airplay_mac_prefix("8E:E5:8A:50:0A:56@Kitchen"),
+            "Kitchen"
+        );
+        assert_eq!(
+            strip_airplay_mac_prefix("8e-e5-8a-50-0a-56@Kitchen"),
+            "Kitchen"
+        );
+        // Separators around too few hex digits, or non-hex text — unchanged.
+        assert_eq!(strip_airplay_mac_prefix("8E:E5@Device"), "8E:E5@Device");
+        assert_eq!(
+            strip_airplay_mac_prefix("not-a-mac@Device"),
+            "not-a-mac@Device"
+        );
+        assert_eq!(strip_airplay_mac_prefix("@Device"), "@Device");
+    }
+
+    #[test]
+    fn normalize_airplay_device_id_accepts_common_forms() {
+        for raw in ["8EE58A500A56", "8e:e5:8a:50:0a:56", "8E-E5-8A-50-0A-56"] {
+            assert_eq!(
+                normalize_airplay_device_id(raw).as_deref(),
+                Some("8EE58A500A56")
+            );
+        }
+        for raw in ["ABCD", "not-a-mac", ""] {
+            assert_eq!(normalize_airplay_device_id(raw), None, "{raw:?}");
+        }
+    }
+
+    fn airplay_found(instance: &str, properties: &[(&str, &str)]) -> DiscoveredServer {
+        let info = mdns_sd::ServiceInfo::new(
+            RAOP_SERVICE,
+            instance,
+            "speaker.local.",
+            "192.0.2.60",
+            7000,
+            properties,
+        )
+        .expect("resolved RAOP fixture");
+        let (tx, rx) = async_channel::unbounded();
+        process_mdns_event(
+            mdns_sd::ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service())),
+            "airplay",
+            &mut MdnsPublications::default(),
+            &tx,
+        );
+        match rx.try_recv() {
+            Ok(DiscoveryEvent::Found(server)) => server,
+            event => panic!("expected one found event, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn airplay_publication_retains_the_normalized_device_id() {
+        let server = airplay_found("8EE58A500A56@Rear Lounge TV", &[]);
+        assert_eq!(server.name, "Rear Lounge TV");
+        assert_eq!(server.device_id.as_deref(), Some("8EE58A500A56"));
+
+        // The TXT `deviceid` wins over the instance prefix.
+        let server = airplay_found(
+            "8EE58A500A56@Rear Lounge TV",
+            &[("deviceid", "8e:e5:8a:50:0a:57")],
+        );
+        assert_eq!(server.device_id.as_deref(), Some("8EE58A500A57"));
+
+        // A TXT `name` replaces the display name; the instance name still
+        // identifies the receiver.
+        let server = airplay_found("8EE58A500A56@Rear Lounge TV", &[("name", "Lounge")]);
+        assert_eq!(server.name, "Lounge");
+        assert_eq!(server.device_id.as_deref(), Some("8EE58A500A56"));
+
+        let server = airplay_found("Rear Lounge TV", &[]);
+        assert_eq!(server.name, "Rear Lounge TV");
+        assert_eq!(server.device_id, None);
+    }
+
+    #[test]
+    fn non_airplay_publications_carry_no_device_id() {
+        let (event, _) = resolved_event(
+            "8EE58A500A56@Navidrome",
+            "music.local.",
+            &["192.0.2.61"],
+            4533,
+            &[],
+        );
+        let events = process(&mut MdnsPublications::default(), event);
+        let server = found(&events);
+        assert_eq!(server.name, "8EE58A500A56@Navidrome");
+        assert_eq!(server.device_id, None);
     }
 }

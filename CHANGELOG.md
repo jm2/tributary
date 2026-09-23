@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **AirPlay outputs need a sender** — AirPlay receivers are listed in the output selector only
+  when the installed GStreamer provides `raopsink`, so builds without it no longer offer rows that
+  fail on play. The README describes routing to AirPlay through the operating system meanwhile.
 - **Implementation backlog** — Reconcile completed slices and Gas City dependencies, add eleven
   corrective and seven engineering records, and expose operator/release acceptance separately.
   Preserve the prior detailed contracts and delivery history in an archive; no feature is marked
@@ -118,6 +121,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One device per install** — Each Tributary install now presents its own device identity
   to Jellyfin and Plex, so signing in on a second computer, or adding the same Jellyfin
   server twice, no longer signs out your other Tributary sessions.
+- **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row from
+  the output selector, and receivers or Chromecasts that share a display name no longer hide each
+  other.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

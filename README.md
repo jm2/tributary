@@ -52,7 +52,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Audio output selector (local + MPD + Chromecast) | ✅ |
 | MPD output backend (sink-only, hardened TCP) | ✅ Requires exclusive-control confirmation |
 | Output switching (click to swap local ↔ MPD) | ✅ |
-| AirPlay 1 (RAOP) output | ⚠️ Discovered, but supported GStreamer builds lack `raopsink` |
+| AirPlay 1 (RAOP) output | ⚠️ Listed only when GStreamer provides `raopsink`; use OS-level routing meanwhile — see [AirPlay roadmap](#airplay-roadmap) |
 | AirPlay 2 / HomeKit output | ❌ Not yet supported — see [AirPlay roadmap](#airplay-roadmap) below |
 | Chromecast output (Cast V2 — local files + remote sources) | ✅ |
 | Album artist sort (preference toggle) | ✅ |
@@ -700,11 +700,20 @@ Open **Preferences** from the hamburger menu (☰) to:
 
 Legacy RAOP receivers are discovered today, but Tributary's AirPlay 1 path is only an integration
 seam for a GStreamer element named `raopsink`. Current official GStreamer, Homebrew, and MSYS2
-packages do not ship that element, so supported builds report AirPlay 1 as unavailable. AirPlay 2
-receivers (HomePod, recent Apple TVs, and AirPlay-2-certified third-party speakers) advertise via
-`_airplay._tcp.local.` and are also detected, but remain filtered out because AirPlay 2 needs a
-different sender protocol stack. Both paths need a maintained sender implementation and
-real-device validation.
+packages do not ship that element, so AirPlay receivers appear in the output selector only when a
+`raopsink`-capable GStreamer is installed; otherwise they are hidden rather than listed and failing
+on play. AirPlay 2 receivers (HomePod, recent Apple TVs, and AirPlay-2-certified third-party
+speakers) advertise via `_airplay._tcp.local.` and are also detected, but remain filtered out
+because AirPlay 2 needs a different sender protocol stack. Both paths need a maintained sender
+implementation and real-device validation.
+
+Meanwhile, route Tributary's local output ("My Computer") to an AirPlay receiver through the OS:
+
+- **Linux:** enable RAOP discovery in PipeWire (`libpipewire-module-raop-discover`) or PulseAudio
+  (`module-raop-discover`). AirPlay receivers then appear as system sinks; select one as the output
+  device and the local output plays to it.
+- **macOS:** choose the AirPlay device as the system sound output (Control Center or System
+  Settings → Sound). The local output follows the system default device.
 
 Sender-side AirPlay 2 support requires, at minimum:
 
