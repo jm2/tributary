@@ -135,6 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   typed, prefers the release matching the album, fills in usable track and disc numbers, and
   says which release it used. Properties has its own message when it can't open, and editing
   several tracks can now clear a field whose values differ.
+- **Server sign-in** — Jellyfin accounts without a password can now connect, and the Connect
+  and Add Server dialogs stay open with a message about what's missing instead of silently
+  discarding what you typed.
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.

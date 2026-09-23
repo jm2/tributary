@@ -139,6 +139,9 @@ dialogs:
   enter_password: "Enter the share password (leave blank if none)"
   username: "Username"
   password: "Password"
+  missing_server_url: "Enter a valid server address, such as https://music.example.com."
+  missing_username: "Enter a username."
+  missing_password: "Enter a password."
   # Playlist dialogs
   new_playlist_heading: "New Playlist"
   playlist_name: "Playlist name"
