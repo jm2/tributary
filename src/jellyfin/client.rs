@@ -97,7 +97,6 @@ impl JellyfinClient {
 
         info!(
             server = %redact_url_secrets(base_url.as_str()),
-            user_id = %user_id,
             "Jellyfin client created (API key)"
         );
 
@@ -222,7 +221,6 @@ impl JellyfinClient {
 
         let api_key = auth_resp.access_token;
         let user_id = auth_resp.user.id;
-        let user_name = auth_resp.user.name;
 
         // Validate the server-supplied token before it can enter any request.
         // A token containing control bytes cannot be represented as an HTTP
@@ -250,8 +248,6 @@ impl JellyfinClient {
 
         info!(
             server = %redact_url_secrets(client.base_url.as_str()),
-            user = %user_name,
-            user_id = %client.user_id,
             "Jellyfin authentication successful"
         );
         Ok(client)
