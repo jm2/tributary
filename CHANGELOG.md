@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Equalizer** — A ten-band equalizer in Preferences for playback on this computer, with
+  Flat, Pop, Rock, Jazz, and Classical presets, a preamp, and optional soft clip protection.
+  Changes apply to the playing track immediately and are remembered between sessions.
 - **Display-backed GTK test gate** — A dedicated CI job runs the crate's production
   widget contracts under a real X (Xvfb) display on one GTK-owning thread with
   `TRIBUTARY_GTK_GATE=require`, so a widget test that cannot reach a display fails the

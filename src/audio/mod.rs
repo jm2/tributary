@@ -25,6 +25,7 @@
 pub mod airplay_output;
 pub mod cast_http_server;
 pub mod chromecast_output;
+pub mod equalizer;
 mod gstreamer_media;
 pub mod local_output;
 #[cfg(any(target_os = "macos", test))]
@@ -55,6 +56,7 @@ use gtk::glib;
 use tracing::{debug, error, info, warn};
 use url::{Host, Url};
 
+use self::equalizer::{EqualizerSettings, PlayerEqualizer};
 use self::gstreamer_media::{GstreamerMediaProxy, GstreamerMediaTicket};
 use crate::architecture::media::ResolvedHttpRequest;
 use crate::local::resolver::ResolvedLocalMedia;
@@ -189,6 +191,9 @@ pub struct Player {
     media_proxy: Arc<GstreamerMediaProxy>,
     /// Generation assigned by the playback session before each URI load.
     event_generation: Rc<Cell<PlayerEventGeneration>>,
+    /// The `audio-filter` equalizer, shared with the bus watch so a failing
+    /// equalizer can be dropped without stopping the track.
+    equalizer: Rc<PlayerEqualizer>,
     /// Holds the latest volume awaiting a debounced disk write, or `None`
     /// when no write is scheduled.  Keeps slider-drag volume changes off
     /// the main-thread hot path (see [`Player::save_volume_debounced`]).
@@ -245,6 +250,7 @@ impl Player {
         // opaque loopback ticket. Configure the HTTP source before it opens so
         // an ambient system proxy can never receive that ticket.
         Self::install_loopback_http_source_policy(&playbin);
+        let equalizer = Rc::new(PlayerEqualizer::install(&playbin));
 
         #[cfg(target_os = "macos")]
         let macos_audio_route = macos_audio::MacosAudioRoute::install(&playbin);
@@ -275,6 +281,7 @@ impl Player {
             event_tx,
             media_proxy: Arc::new(GstreamerMediaProxy::new(Some(rt_handle))),
             event_generation,
+            equalizer,
             volume_save_pending: Rc::new(Cell::new(None)),
             bus_watch: RefCell::new(None),
             #[cfg(target_os = "windows")]
@@ -369,6 +376,7 @@ impl Player {
             ticket.clone(),
             Rc::clone(&self.volume),
             Rc::clone(&self.sink_recovery_claimed),
+            Rc::clone(&self.equalizer),
         ) {
             Ok(watch) => *self.bus_watch.borrow_mut() = Some(watch),
             Err(error) => {
@@ -512,6 +520,18 @@ impl Player {
         self.volume.get()
     }
 
+    // ── Equalizer ───────────────────────────────────────────────────
+
+    /// Whether the equalizer is installed and has not failed.
+    pub fn has_equalizer(&self) -> bool {
+        self.equalizer.is_available()
+    }
+
+    /// Apply equalizer settings; they take effect on the playing stream.
+    pub fn set_equalizer(&self, settings: &EqualizerSettings) {
+        self.equalizer.apply(settings);
+    }
+
     // ── State / position queries ────────────────────────────────────
 
     /// Non-blocking query of the current playback state.
@@ -544,6 +564,7 @@ impl Player {
     /// Watch the pipeline bus for EOS, Error, and StateChanged messages.
     ///
     /// The watch callback runs on the glib main loop (main thread).
+    #[allow(clippy::too_many_arguments)] // each argument is per-load state the callback owns
     fn attach_bus_watch(
         playbin: &gst::Element,
         event_tx: &async_channel::Sender<PlayerEvent>,
@@ -552,6 +573,7 @@ impl Player {
         media_ticket: Option<Arc<GstreamerMediaTicket>>,
         volume: Rc<Cell<f64>>,
         sink_recovery_claimed: Rc<Cell<bool>>,
+        equalizer: Rc<PlayerEqualizer>,
     ) -> anyhow::Result<gst::bus::BusWatchGuard> {
         let bus = playbin
             .bus()
@@ -560,8 +582,9 @@ impl Player {
         let tx = event_tx.clone();
         let playbin_name = playbin.name();
         let started_at = Instant::now();
-        #[cfg(any(target_os = "windows", test))]
-        let playbin_for_recovery = playbin.downgrade();
+        let playbin_weak = playbin.downgrade();
+        // Where this load resumes after restarting without a failed equalizer.
+        let resume_at = Cell::new(None);
         #[cfg(not(any(target_os = "windows", test)))]
         let _ = (&volume, &sink_recovery_claimed);
 
@@ -569,7 +592,7 @@ impl Player {
             use gst::MessageView;
 
             #[cfg(any(target_os = "windows", test))]
-            if playbin_for_recovery.upgrade().is_some_and(|playbin| {
+            if playbin_weak.upgrade().is_some_and(|playbin| {
                 windows_audio::recover_warning(msg, &playbin, volume.get(), &sink_recovery_claimed)
             }) {
                 return glib::ControlFlow::Continue;
@@ -587,6 +610,13 @@ impl Player {
                 }
 
                 MessageView::Error(pipeline_error) => {
+                    if let Some(position) = playbin_weak
+                        .upgrade()
+                        .and_then(|playbin| equalizer.recover(msg, &playbin))
+                    {
+                        resume_at.set(Some(position));
+                        return glib::ControlFlow::Continue;
+                    }
                     if let Some(ticket) = media_ticket.as_ref() {
                         media_proxy.revoke_if_current(ticket);
                     }
@@ -631,6 +661,17 @@ impl Player {
                             "Pipeline state changed"
                         );
                         let _ = tx.try_send(PlayerEvent::state(generation, new_state));
+                    }
+                }
+
+                MessageView::AsyncDone(_) => {
+                    if let (Some(position), Some(playbin)) =
+                        (resume_at.take(), playbin_weak.upgrade())
+                    {
+                        let _ = playbin.seek_simple(
+                            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                            position,
+                        );
                     }
                 }
 
