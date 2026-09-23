@@ -9,6 +9,7 @@ app:
 header:
   previous: "Zurück"
   play: "Wiedergabe"
+  pause: "Pause"
   next: "Weiter"
   repeat_off: "Wiederholung: Aus"
   repeat_all: "Wiederholung: Alle"

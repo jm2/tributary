@@ -9,6 +9,7 @@ app:
 header:
   previous: "Предыдущий"
   play: "Воспроизвести"
+  pause: "Приостановить"
   next: "Следующий"
   repeat_off: "Повтор: Выключен"
   repeat_all: "Повтор: Все"

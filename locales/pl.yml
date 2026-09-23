@@ -9,6 +9,7 @@ app:
 header:
   previous: "Poprzedni"
   play: "Odtwórz"
+  pause: "Wstrzymaj"
   next: "Następny"
   repeat_off: "Powtarzanie: Wyłączone"
   repeat_all: "Powtarzanie: Wszystkie"

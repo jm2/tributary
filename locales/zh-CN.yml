@@ -9,6 +9,7 @@ app:
 header:
   previous: "上一首"
   play: "播放"
+  pause: "暂停"
   next: "下一首"
   repeat_off: "重复：关闭"
   repeat_all: "重复：全部"

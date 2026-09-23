@@ -9,6 +9,7 @@ app:
 header:
   previous: "前へ"
   play: "再生"
+  pause: "一時停止"
   next: "次へ"
   repeat_off: "リピート: オフ"
   repeat_all: "リピート: 全曲"

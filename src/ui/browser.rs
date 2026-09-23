@@ -3388,6 +3388,7 @@ mod tests {
                 crate::ui::discovery_handler::widget_tests::airplay_rows_are_hidden_without_a_sender();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_edits_report_consistent_settings();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
+                crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 q4_publication_contract_and_bench();
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();

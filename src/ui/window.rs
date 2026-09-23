@@ -2707,8 +2707,7 @@ pub(crate) fn build_window(
         let buffering_tracker = buffering_tracker.clone();
         Rc::new(move || {
             buffering_tracker.invalidate();
-            play_button.set_child(Option::<&gtk::Widget>::None);
-            play_button.set_icon_name("media-playback-start-symbolic");
+            header_bar::show_play_button_state(&play_button, false);
             title_label.set_label("Not Playing");
             title_label.set_tooltip_text(Option::<&str>::None);
             artist_label.set_label("");
@@ -3268,15 +3267,12 @@ pub(crate) fn build_window(
                             }
                             PlayerState::Playing => {
                                 buffering_tracker.invalidate();
-                                // Restore icon: show pause.
-                                play_btn.set_child(Option::<&gtk::Widget>::None);
-                                play_btn.set_icon_name("media-playback-pause-symbolic");
+                                header_bar::show_play_button_state(&play_btn, true);
                             }
                             _ => {
                                 buffering_tracker.invalidate();
-                                // Stopped or Paused: show play.
-                                play_btn.set_child(Option::<&gtk::Widget>::None);
-                                play_btn.set_icon_name("media-playback-start-symbolic");
+                                // Stopped or Paused.
+                                header_bar::show_play_button_state(&play_btn, false);
                             }
                         }
 
@@ -3307,8 +3303,7 @@ pub(crate) fn build_window(
                         // buffering completes.
                         if buffering_tracker.is_buffering() {
                             buffering_tracker.invalidate();
-                            play_btn.set_child(Option::<&gtk::Widget>::None);
-                            play_btn.set_icon_name("media-playback-pause-symbolic");
+                            header_bar::show_play_button_state(&play_btn, true);
 
                             if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                                 ctrl.update_playback(true);
@@ -3472,8 +3467,7 @@ pub(crate) fn build_window(
                         // On error, restore the play icon (stop the spinner
                         // if we were buffering).
                         buffering_tracker.invalidate();
-                        play_btn.set_child(Option::<&gtk::Widget>::None);
-                        play_btn.set_icon_name("media-playback-start-symbolic");
+                        header_bar::show_play_button_state(&play_btn, false);
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(false);
                         }

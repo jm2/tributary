@@ -9,6 +9,7 @@ app:
 header:
   previous: "이전"
   play: "재생"
+  pause: "일시 정지"
   next: "다음"
   repeat_off: "반복: 끄기"
   repeat_all: "반복: 전체"
