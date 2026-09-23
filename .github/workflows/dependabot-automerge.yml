@@ -1,6 +1,6 @@
 name: Dependabot auto-merge
 
-# Auto-merge clean (patch + minor) Dependabot PRs once CI is green.
+# Auto-merge clean semver-patch Dependabot PRs once CI is green.
 #
 # How the pieces fit together:
 #   * This workflow only ENABLES GitHub's native auto-merge on the PR.
@@ -9,8 +9,16 @@ name: Dependabot auto-merge
 #     workflow, that ruleset must be migrated to the documented stable check
 #     names, including `MSRV`. Auto-merge then lands the PR only after that
 #     configured set passes.
-#   * Majors are NOT auto-merged: they fall through the update-type guard below
-#     and wait for coordinated repair and review.
+#   * Only semver-patch updates are auto-merged. Minors and majors fall through
+#     the update-type guard below and wait for review: most core crates are
+#     0.x, where a minor bump is a breaking release. For a group,
+#     fetch-metadata reports the largest update in it, so one minor bump keeps
+#     the whole group out of auto-merge.
+#   * Auto-merge survives pushes by accounts with write access, and
+#     `--match-head-commit` binds only the head seen when it was enabled. Any
+#     push to a Dependabot PR by someone other than Dependabot therefore
+#     disables auto-merge again, so follow-up commits need review and an
+#     explicit re-enable once this workflow's run for that push has finished.
 #   * Rust compiler/MSRV and rust-toolchain action-code proposals are NOT
 #     auto-merged. Dependabot still opens them; the compiler repair lane
 #     synchronizes every authoritative version and requires full CI first.
@@ -154,17 +162,15 @@ jobs:
       needs.inspect_changed_files.outputs.package_ecosystem != 'rust-toolchain' &&
       !contains(needs.inspect_changed_files.outputs.dependency_names, 'dtolnay/rust-toolchain') &&
       !contains(needs.inspect_changed_files.outputs.dependency_names, 'dependabot/fetch-metadata') &&
-      (
-        needs.inspect_changed_files.outputs.update_type == 'version-update:semver-patch' ||
-        needs.inspect_changed_files.outputs.update_type == 'version-update:semver-minor'
-      )
+      needs.inspect_changed_files.outputs.update_type == 'version-update:semver-patch'
     permissions:
       contents: write
       pull-requests: write
     steps:
-      # Major bumps, compiler/MSRV proposals, rust-toolchain action-code
-      # proposals, and metadata-action self-updates never reach this writer.
-      - name: Enable exact-head auto-merge for patch & minor updates
+      # Minor and major bumps, compiler/MSRV proposals, rust-toolchain
+      # action-code proposals, and metadata-action self-updates never reach
+      # this writer.
+      - name: Enable exact-head auto-merge for patch updates
         shell: bash
         run: |
           set -euo pipefail
@@ -183,4 +189,36 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ needs.inspect_changed_files.outputs.inspected_head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  disarm_after_foreign_push:
+    runs-on: ubuntu-latest
+    if: |
+      github.event.action == 'synchronize' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.repository == 'jm2/tributary'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Query live state: the event payload predates this run, and an
+      # auto-merge enabled in between must still be caught.
+      - name: Disable auto-merge after a non-Dependabot push
+        shell: bash
+        run: |
+          set -euo pipefail
+          armed="$(gh pr view "${PR_URL}" \
+            --json autoMergeRequest \
+            --jq '.autoMergeRequest != null')"
+          if [ "${armed}" != "true" ]; then
+            echo "Auto-merge is not enabled; nothing to disable."
+            exit 0
+          fi
+          gh pr merge --disable-auto "${PR_URL}"
+          echo "Auto-merge disabled: ${PUSHER} pushed to a Dependabot PR." \
+            "Review the new commits and re-enable auto-merge explicitly."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PUSHER: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

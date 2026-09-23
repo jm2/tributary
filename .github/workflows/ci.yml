@@ -20,9 +20,86 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── Change detection ──────────────────────────────────────────────────────
+  # Documentation-only changes skip the build and test jobs below. Those jobs
+  # are skipped by a job-level `if:`, which GitHub reports as a successful
+  # check, so required checks still resolve. If this job fails, they all run.
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # A pull_request checkout is the test merge commit, whose first
+          # parent is the base branch tip.
+          fetch-depth: 2
+
+      - name: Classify changed paths
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          base='HEAD^1'
+          if [ "${EVENT_NAME}" = push ]; then
+            base="${BEFORE_SHA}"
+            git fetch --no-tags --depth=1 origin "${base}" || base=''
+          fi
+
+          # Anything unexpected (new branch, unreachable base) means "build".
+          code=true
+          if [ -n "${base}" ] &&
+             changed="$(git diff --name-only --no-renames "${base}" HEAD)"; then
+            code=false
+            while IFS= read -r path; do
+              [ -n "${path}" ] || continue
+              case "${path}" in
+                docs/*|.gc/*|CHANGELOG.md)
+                  # Documentation, unless Rust code embeds it with
+                  # include_str!/include_bytes! (as a test does with one doc).
+                  if git grep -q -F -e 'include_' --and -e "${path}" -- \
+                       src tests fuzz build.rs; then
+                    code=true
+                  fi
+                  ;;
+                *) code=true ;;
+              esac
+              [ "${code}" = false ] || break
+            done <<< "${changed}"
+          fi
+          echo "code=${code}" >> "${GITHUB_OUTPUT}"
+          echo "Build and test jobs required: ${code}"
+
   # ── Security audit ─────────────────────────────────────────────────────────
+  # Only `cargo audit`, so this required check fails for one reason: an
+  # unaddressed RustSec advisory in Cargo.lock.
   audit:
     name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # The fuzz harness is a workspace member, so the single root Cargo.lock
+      # covers every dependency graph; exceptions live in .cargo/audit.toml.
+      - name: Audit Cargo.lock
+        run: cargo audit
+
+  # ── Repository policy ─────────────────────────────────────────────────────
+  # Packaging, dependency-update, toolchain, and backlog policy scripts. Keep
+  # this out of the required checks: a broken docs anchor must not block a
+  # security fix. It runs for documentation-only changes too.
+  repository-policy:
+    name: Repository Policy
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -52,14 +129,6 @@ jobs:
           python3 scripts/test_check_backlog_consistency_rework2.py
           python3 scripts/test_check_backlog_consistency_rework3.py
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      # The fuzz harness is a workspace member, so the single root Cargo.lock
-      # covers every dependency graph; exceptions live in .cargo/audit.toml.
-      - name: Audit Cargo.lock
-        run: cargo audit
-
   # ── MSRV (minimum supported Rust version) ─────────────────────────────────
   # Compile-proof for the `rust-version` declared in Cargo.toml. Keep the
   # toolchain pin below in lockstep with that field: the gtk-rs 0.11 release
@@ -69,6 +138,8 @@ jobs:
     # GasCity's old "MSRV (1.92)" expectation and may then add "MSRV" to the
     # live ruleset; this repository change does not mutate either external gate.
     name: MSRV
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -81,6 +152,8 @@ jobs:
             pkgconf-pkg-config git curl
 
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (1.94)
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -105,9 +178,13 @@ jobs:
   # every Linux package and were previously only validated by hand.
   desktop-metadata:
     name: Desktop Metadata
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install validators
         run: sudo apt-get update && sudo apt-get install -y appstream desktop-file-utils
@@ -129,6 +206,8 @@ jobs:
   # ── Linux (native binary + test) ──────────────────────────────────────────
   build-linux:
     name: Linux (${{ matrix.arch }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.runner }}
     container:
       image: fedora:44
@@ -149,6 +228,8 @@ jobs:
             pkgconf-pkg-config git curl
 
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -211,6 +292,8 @@ jobs:
   # thread that initializes it; see `src/ui/mod.rs::widget_test_session`.
   gtk-display-gate:
     name: GTK Display Gate (Linux x86_64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -294,6 +377,8 @@ jobs:
   # cannot produce one comparable cross-platform percentage.
   coverage:
     name: Coverage (Linux x86_64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -307,6 +392,8 @@ jobs:
             pkgconf-pkg-config git curl
 
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install pinned coverage toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -347,6 +434,8 @@ jobs:
   # ── macOS (.app + .dmg) ───────────────────────────────────────────────────
   build-macos:
     name: macOS (${{ matrix.arch }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -356,6 +445,8 @@ jobs:
             rust_target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies (Homebrew)
         run: |
@@ -435,6 +526,8 @@ jobs:
   # ── Windows (.zip DLL bundle) ─────────────────────────────────────────────
   build-windows:
     name: Windows (${{ matrix.arch }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.runner }}
     # Cap the job so a hung MSYS2 mirror fails fast and re-runs instead of
     # stalling to the 6-hour ceiling (as one CLANGARM64 run did).
@@ -462,6 +555,8 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Parse bundler with Windows PowerShell 5.1
         if: matrix.arch == 'x86_64'
@@ -589,6 +684,8 @@ jobs:
   # ── Flatpak ───────────────────────────────────────────────────────────────
   build-flatpak:
     name: Flatpak (Linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
@@ -634,12 +731,35 @@ jobs:
           path: tributary.flatpak
           if-no-files-found: error
 
+  # ── Documentation-only stand-ins ──────────────────────────────────────────
+  # A matrix job skipped by a job-level `if:` reports a single check without
+  # its matrix suffix, so the required per-platform contexts such as
+  # "Linux (x86_64)" would never arrive on a documentation-only change. This
+  # job reports those exact names, and runs only when the builds were skipped.
+  # Keep the list in step with the build matrices above.
+  docs-only-platforms:
+    name: ${{ matrix.check }}
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        check:
+          - Linux (x86_64)
+          - Linux (aarch64)
+          - macOS (aarch64)
+          - Windows (x86_64)
+          - Windows (aarch64)
+    steps:
+      - name: Report the skipped native build
+        run: echo "Only documentation changed; the native build and tests were skipped."
+
   # ── SHA256 Checksums ───────────────────────────────────────────────────────
   checksums:
     name: SHA256 Checksums
     runs-on: ubuntu-24.04
-    needs: [build-linux, build-macos, build-windows, build-flatpak]
-    if: always()
+    needs: [changes, build-linux, build-macos, build-windows, build-flatpak]
+    if: ${{ always() && needs.changes.outputs.code != 'false' }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8

@@ -13,10 +13,12 @@ CI's Security Audit runs `cargo audit` against that lock; its advisory exception
 Cargo and Actions patch/minor updates are each batched into one group. Cargo majors arrive
 individually, except `sea-orm` and `sea-orm-migration`, which always share a group and must keep
 matching manifest requirements and locked versions. The `dependabot-automerge.yml` workflow may
-enable GitHub's native auto-merge for patch and minor updates only, and routine auto-merge stays
-off until the `main` ruleset requires the repository's full all-checks policy (see "Closing the
-gap (the machine gate)" in `docs/refinery-config.md`). Compiler proposals and updates to the
-pinned `dtolnay/rust-toolchain` and `dependabot/fetch-metadata` actions never auto-merge.
+enable GitHub's native auto-merge for semver-patch updates only: most core crates are 0.x, where a
+minor bump is breaking, and a group that contains any minor bump is reported as a minor update.
+Routine auto-merge stays off until the `main` ruleset requires the repository's full all-checks
+policy (see "Closing the gap (the machine gate)" in `docs/refinery-config.md`). Compiler
+proposals and updates to the pinned `dtolnay/rust-toolchain` and `dependabot/fetch-metadata`
+actions never auto-merge.
 
 A `rust-toolchain` proposal is completed in a trusted worktree with
 `python3 scripts/sync_rust_toolchain.py --from-toolchain` followed by `--check`
@@ -30,4 +32,7 @@ The auto-merge workflow runs on `pull_request` and never checks out pull-request
 verifies the actor, author, and repository, re-reads the exact head SHA around changed-file
 enumeration and the metadata action, refuses any PR that touches the workflow itself, and
 enables auto-merge with an expected-head guard, so a head that moves mid-run fails closed.
+That guard binds only when auto-merge is enabled, so a push to a Dependabot PR by anyone other
+than Dependabot disables auto-merge again; after reviewing the pushed commits, re-enable it by
+hand once the workflow run for that push has finished.
 Repairs run in a trusted worktree, never in a privileged `pull_request_target` job.

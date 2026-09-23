@@ -56,6 +56,7 @@ class DependabotAutomergeRaceTests(unittest.TestCase):
         heads: str,
         expected_head: str = "H1",
         merge_head: str = "H1",
+        auto_merge_enabled: str = "false",
     ) -> tuple[subprocess.CompletedProcess[str], str, str]:
         #lizard forgives
         with TemporaryDirectory() as temporary:
@@ -88,6 +89,13 @@ if arguments and arguments[0] == "api":
     state_path.write_text(str(index + 1))
     raise SystemExit(0)
 
+if arguments[:2] == ["pr", "view"]:
+    print(os.environ["FAKE_AUTO_MERGE_ENABLED"])
+    raise SystemExit(0)
+
+if arguments[:2] == ["pr", "merge"] and "--disable-auto" in arguments:
+    raise SystemExit(0)
+
 if arguments[:2] == ["pr", "merge"]:
     guard_index = arguments.index("--match-head-commit") + 1
     guarded_head = arguments[guard_index]
@@ -113,6 +121,8 @@ raise SystemExit(64)
                 "FAKE_GH_CALLS": str(calls),
                 "FAKE_GH_HEADS": heads,
                 "FAKE_MERGE_HEAD": merge_head,
+                "FAKE_AUTO_MERGE_ENABLED": auto_merge_enabled,
+                "PUSHER": "maintainer",
             }
             bash = shutil.which("bash")
             if bash is None:
@@ -153,7 +163,7 @@ raise SystemExit(64)
     def test_server_guard_rejects_h2_after_final_h1_readback(self):
         script = workflow_run_script(
             "dependabot-automerge",
-            "Enable exact-head auto-merge for patch & minor updates",
+            "Enable exact-head auto-merge for patch updates",
         )
         completed, calls, _ = self.run_workflow_script(
             script,
@@ -163,6 +173,38 @@ raise SystemExit(64)
 
         self.assertEqual(completed.returncode, 42)
         self.assertIn("'--match-head-commit', 'H1'", calls)
+
+    def disarm_script(self) -> str:
+        return workflow_run_script(
+            "disarm_after_foreign_push",
+            "Disable auto-merge after a non-Dependabot push",
+        )
+
+    def test_foreign_push_disables_enabled_auto_merge(self):
+        completed, calls, _ = self.run_workflow_script(
+            self.disarm_script(),
+            heads="H2",
+            auto_merge_enabled="true",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("'autoMergeRequest'", calls)
+        self.assertIn(
+            "['pr', 'merge', '--disable-auto', "
+            "'https://github.invalid/jm2/tributary/pull/7']",
+            calls,
+        )
+
+    def test_foreign_push_without_auto_merge_changes_nothing(self):
+        completed, calls, _ = self.run_workflow_script(
+            self.disarm_script(),
+            heads="H2",
+            auto_merge_enabled="false",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("'autoMergeRequest'", calls)
+        self.assertNotIn("'merge'", calls)
 
 
 class RustToolchainPolicyTests(unittest.TestCase):
