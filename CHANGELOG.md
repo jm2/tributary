@@ -328,6 +328,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release verification** — Verify that manual releases build the requested tag and stop
   artifact publication when checksum generation fails.
 
+### Security
+
+- **Discovered Plex servers** — Signing in to a Plex server found on the network no longer
+  sends your Plex account token to it. Tributary first confirms through plex.tv that the server
+  is one of yours, then connects securely with that server's own access.
+- **Network discovery and saved servers** — Servers announced on the network can no longer
+  redirect a server you added yourself. Losing or updating an announcement no longer
+  disconnects a working session unless it was using an address that went away.
+
 ## [0.6.2] — 2026-09-01
 
 ### Changed

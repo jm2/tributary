@@ -1216,21 +1216,40 @@ pub fn setup_source_connect(state: &WindowState) {
                             ))
                         },
                     ),
-                    "plex" => source_registry_for_auth.connect_standard(
-                        source_id,
-                        on_generation,
-                        move || async move {
-                            info!("Authenticating with Plex...");
-                            let client = crate::plex::client::PlexClient::authenticate_with_route(
-                                &server_url,
-                                &user,
-                                &pass,
-                                advertised_route,
-                            )
-                            .await?;
-                            crate::plex::PlexBackend::from_client(&server_name, client).await
-                        },
-                    ),
+                    "plex" => {
+                        // A purely discovered host is unverified: it gets no
+                        // plex.tv token until plex.tv vouches for it.
+                        let discovered = !super::discovery_handler::is_configured_source(
+                            &source_registry_for_auth,
+                            source_id,
+                        );
+                        source_registry_for_auth.connect_standard(
+                            source_id,
+                            on_generation,
+                            move || async move {
+                                use crate::plex::client::PlexClient;
+                                info!("Authenticating with Plex...");
+                                let client = if discovered {
+                                    PlexClient::authenticate_discovered(
+                                        &server_url,
+                                        &user,
+                                        &pass,
+                                        advertised_route,
+                                    )
+                                    .await?
+                                } else {
+                                    PlexClient::authenticate_with_route(
+                                        &server_url,
+                                        &user,
+                                        &pass,
+                                        advertised_route,
+                                    )
+                                    .await?
+                                };
+                                crate::plex::PlexBackend::from_client(&server_name, client).await
+                            },
+                        )
+                    }
                     "daap" => source_registry_for_auth.connect_daap(
                         source_id,
                         on_generation,
