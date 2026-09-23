@@ -314,6 +314,10 @@ errors:
     playback_failed: "Falló la reproducción de audio"
     airplay_raopsink_missing: "La reproducción mediante AirPlay 1 no está disponible: esta compilación no incluye un emisor raopsink de GStreamer compatible"
     mpd_exclusive_control_required: "Vuelva a agregar esta salida MPD, confirme el control exclusivo de la partición y vuelva a seleccionarla antes de reproducir"
+  database:
+    heading: "Biblioteca no disponible"
+    open_failed: "Tributary no pudo abrir la base de datos de la biblioteca, por lo que no se pueden mostrar su biblioteca ni sus listas de reproducción. Consulte el registro para ver los detalles."
+    upgrade_failed: "Tributary no pudo actualizar la base de datos de la biblioteca para esta versión, por lo que no se pueden mostrar su biblioteca ni sus listas de reproducción. Consulte el registro para ver los detalles."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

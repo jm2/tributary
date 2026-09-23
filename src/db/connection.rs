@@ -54,10 +54,38 @@ async fn connect_and_migrate(db_path: &Path) -> Result<DatabaseConnection, DbErr
     let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
 
     info!("Running pending migrations");
-    Migrator::up(&db, None).await?;
-    migration::revalidate_critical_objects(&db).await?;
+    let upgrade = async {
+        Migrator::up(&db, None).await?;
+        migration::revalidate_critical_objects(&db).await
+    };
+    upgrade.await.map_err(|error| match error {
+        DbErr::Migration(_) => error,
+        other => DbErr::Migration(other.to_string()),
+    })?;
 
     Ok(db)
+}
+
+/// Which start-up stage failed, so the UI can name it without showing the
+/// underlying error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseInitFailure {
+    /// The data directory or the database file could not be opened.
+    Open,
+    /// A schema migration or the post-migration schema check failed.
+    Upgrade,
+}
+
+impl DatabaseInitFailure {
+    /// Classify an error from [`get_or_init_db`]: every failure after the
+    /// database file opened is reported as [`DbErr::Migration`].
+    pub const fn of(error: &DbErr) -> Self {
+        if matches!(error, DbErr::Migration(_)) {
+            Self::Upgrade
+        } else {
+            Self::Open
+        }
+    }
 }
 
 /// Obtain the shared database connection, initialising it on first call.
@@ -264,6 +292,21 @@ mod tests {
             .await
             .expect_err("startup must reject a current but damaged migration installation");
         assert!(error.to_string().contains("trigger object"));
+        assert_eq!(
+            DatabaseInitFailure::of(&error),
+            DatabaseInitFailure::Upgrade
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unopenable_database_is_an_open_failure() {
+        let path = std::env::temp_dir()
+            .join(format!("tributary-db-missing-{}", Uuid::new_v4()))
+            .join("library.db");
+        let error = connect_and_migrate(&path)
+            .await
+            .expect_err("the parent directory does not exist");
+        assert_eq!(DatabaseInitFailure::of(&error), DatabaseInitFailure::Open);
     }
 
     /// P1.5's guarantee, asserted end to end against a real pool: deleting a

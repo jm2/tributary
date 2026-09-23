@@ -140,6 +140,9 @@ pub enum LibraryEvent {
         outcome: RootReauthorizationOutcome,
         message: Option<String>,
     },
+    /// The library database could not be opened or upgraded, so the engine
+    /// never started. The detailed error is only logged.
+    DatabaseUnavailable(crate::db::connection::DatabaseInitFailure),
     /// An error occurred.
     Error(String),
 }

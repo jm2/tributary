@@ -118,7 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   briefly for the scan instead of failing at once with "database is locked".
 - **Upgrading libraries from 0.5.x** — A playlist entry whose song was deleted and had a
   blank artist tag no longer stops the upgrade and leaves the library empty; such
-  entries, which could never be matched again, are removed during the upgrade.
+  entries, which could never be matched again, are removed during the upgrade. If the
+  library database cannot be opened or upgraded, Tributary now shows an error instead
+  of an empty library.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

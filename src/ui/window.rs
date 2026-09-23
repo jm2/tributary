@@ -2206,8 +2206,9 @@ pub(crate) fn build_window(
                     warn!(%error, "Server playlist coordinator owner failed after database error");
                 }
                 tracing::error!(error = %e, "Failed to initialise database");
+                let failure = crate::db::connection::DatabaseInitFailure::of(&e);
                 let _ = engine_tx_clone
-                    .send(LibraryEvent::Error(format!("Database error: {e}")))
+                    .send(LibraryEvent::DatabaseUnavailable(failure))
                     .await;
             }
         }
@@ -4551,6 +4552,12 @@ fn setup_library_events(
                     }
                 }
 
+                LibraryEvent::DatabaseUnavailable(failure) => {
+                    scan_spinner.set_spinning(false);
+                    scan_spinner.set_visible(false);
+                    show_database_unavailable(&window, failure);
+                }
+
                 LibraryEvent::Error(msg) => {
                     tracing::error!(error = %msg, "Library engine error");
                     scan_spinner.set_spinning(false);
@@ -4560,6 +4567,28 @@ fn setup_library_events(
             }
         }
     });
+}
+
+/// Tell the user the library database is unavailable, naming the failed
+/// stage. The underlying error was already logged where it occurred.
+fn show_database_unavailable(
+    window: &adw::ApplicationWindow,
+    failure: crate::db::connection::DatabaseInitFailure,
+) {
+    use crate::db::connection::DatabaseInitFailure;
+
+    let body = match failure {
+        DatabaseInitFailure::Open => rust_i18n::t!("errors.database.open_failed"),
+        DatabaseInitFailure::Upgrade => rust_i18n::t!("errors.database.upgrade_failed"),
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(rust_i18n::t!("errors.database.heading").as_ref())
+        .body(body.as_ref())
+        .close_response("ok")
+        .default_response("ok")
+        .build();
+    dialog.add_response("ok", rust_i18n::t!("dialogs.ok").as_ref());
+    dialog.present(Some(window));
 }
 
 #[allow(clippy::too_many_arguments)]

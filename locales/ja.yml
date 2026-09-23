@@ -314,6 +314,10 @@ errors:
     playback_failed: "オーディオ再生に失敗しました"
     airplay_raopsink_missing: "AirPlay 1 再生は利用できません。このビルドには互換性のある GStreamer raopsink 送信機が含まれていません"
     mpd_exclusive_control_required: "この MPD 出力を再追加してパーティションの排他的制御を確認し、再生前にもう一度選択してください"
+  database:
+    heading: "ライブラリを利用できません"
+    open_failed: "Tributary がライブラリデータベースを開けなかったため、ライブラリとプレイリストを表示できません。詳細はログを確認してください。"
+    upgrade_failed: "Tributary がこのバージョン用にライブラリデータベースを更新できなかったため、ライブラリとプレイリストを表示できません。詳細はログを確認してください。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

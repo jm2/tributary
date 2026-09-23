@@ -314,6 +314,10 @@ errors:
     playback_failed: "音频播放失败"
     airplay_raopsink_missing: "AirPlay 1 播放不可用：此版本不包含兼容的 GStreamer raopsink 发送器"
     mpd_exclusive_control_required: "请重新添加此 MPD 输出，确认对分区的独占控制，然后在播放前再次选择它"
+  database:
+    heading: "音乐库不可用"
+    open_failed: "Tributary 无法打开音乐库数据库，因此无法显示您的音乐库和播放列表。详情请查看日志。"
+    upgrade_failed: "Tributary 无法为此版本升级音乐库数据库，因此无法显示您的音乐库和播放列表。详情请查看日志。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
