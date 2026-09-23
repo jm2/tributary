@@ -91,7 +91,6 @@ mod plex;
 mod radio;
 mod remote_rating_wire;
 mod removable;
-#[allow(dead_code)]
 mod server_playlist_coordinator;
 mod source_lifecycle;
 mod source_registry;
