@@ -3343,6 +3343,7 @@ mod tests {
                 crate::ui::album_pane_art::widget_tests::album_art_row_publishes_combined_accessible_name();
                 crate::ui::album_pane_art::widget_tests::album_art_row_zero_count_announces_bare_label();
                 crate::ui::discovery_handler::widget_tests::discovered_rows_are_keyed_by_identity_not_display_name();
+                crate::ui::discovery_handler::widget_tests::republication_refreshes_the_row_at_its_endpoint();
                 crate::ui::discovery_handler::widget_tests::airplay_loss_removes_only_that_receivers_row();
                 crate::ui::discovery_handler::widget_tests::airplay_rows_are_hidden_without_a_sender();
                 q4_publication_contract_and_bench();

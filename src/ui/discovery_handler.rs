@@ -299,9 +299,12 @@ fn airplay_sender_available(cached: &mut Option<bool>) -> bool {
 /// Add a discovered AirPlay device to the output selector, unless no sender
 /// in this build could play it.
 ///
-/// Rows are keyed by endpoint plus device identifier, never by display name,
-/// and only against other AirPlay rows: receivers sharing a name, or a
-/// Chromecast sharing the name or endpoint, each keep their own row.
+/// Each AirPlay row carries its endpoint plus device identifier and is
+/// matched against other AirPlay rows only, never by display name: receivers
+/// sharing a name, or a Chromecast sharing the name or endpoint, each keep
+/// their own row. Discovery publishes one aggregate per endpoint, so a
+/// repeat publication at a listed endpoint (a rename, or a changed device id)
+/// refreshes that row in place instead of adding a second one.
 fn handle_airplay_found(
     output_list: &gtk::ListBox,
     server: &crate::discovery::DiscoveredServer,
@@ -316,10 +319,12 @@ fn handle_airplay_found(
         return;
     };
     let identity = encode_airplay_row_identity(&endpoint, server.device_id.as_deref());
-    if output_rows_with_icon(output_list, AIRPLAY_ROW_ICON)
-        .iter()
-        .any(|row| row.widget_name() == identity.as_str())
+    if let Some(row) = output_rows_with_icon(output_list, AIRPLAY_ROW_ICON)
+        .into_iter()
+        .find(|row| airplay_row_endpoint(&row.widget_name()) == endpoint)
     {
+        row.set_widget_name(&identity);
+        set_row_label(&row, &server.name);
         return;
     }
 
@@ -346,11 +351,13 @@ fn handle_chromecast_found(
     // Extract host:port from cast://host:port URL.
     let host_port = cast_url.strip_prefix("cast://").unwrap_or(cast_url);
 
-    // Dedup by endpoint among Chromecast rows only, never by display name.
-    if output_rows_with_icon(output_list, CHROMECAST_ROW_ICON)
-        .iter()
-        .any(|row| row.widget_name() == host_port)
+    // Keyed by endpoint among Chromecast rows only, never by display name; a
+    // repeat publication refreshes the listed row's name.
+    if let Some(row) = output_rows_with_icon(output_list, CHROMECAST_ROW_ICON)
+        .into_iter()
+        .find(|row| row.widget_name() == host_port)
     {
+        set_row_label(&row, &cast_name);
         return;
     }
 
@@ -448,6 +455,19 @@ fn output_rows_with_icon(output_list: &gtk::ListBox, icon: &str) -> Vec<gtk::Lis
         }
     }
     rows
+}
+
+/// Replace the display name of an output row built by
+/// [`header_bar::build_output_row`] (icon, then label, then checkmark).
+fn set_row_label(row: &gtk::ListBoxRow, name: &str) {
+    if let Some(label) = row
+        .first_child()
+        .and_then(|row_box| row_box.first_child())
+        .and_then(|icon| icon.next_sibling())
+        .and_then(|label| label.downcast::<gtk::Label>().ok())
+    {
+        label.set_text(name);
+    }
 }
 
 /// Propagate widget name from a ListBox child's inner Box to its wrapping ListBoxRow.
@@ -572,6 +592,23 @@ pub mod widget_tests {
         names
     }
 
+    fn row_labels(output_list: &gtk::ListBox) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut child = output_list.first_child();
+        while let Some(widget) = child {
+            if let Some(label) = widget
+                .first_child()
+                .and_then(|row_box| row_box.first_child())
+                .and_then(|icon| icon.next_sibling())
+                .and_then(|label| label.downcast::<gtk::Label>().ok())
+            {
+                labels.push(label.text().to_string());
+            }
+            child = widget.next_sibling();
+        }
+        labels
+    }
+
     /// The selector as discovery leaves it: the local row, two AirPlay
     /// receivers that share the display name "Den", and a Chromecast also
     /// named "Den" at the first receiver's endpoint. Republications of the
@@ -617,6 +654,34 @@ pub mod widget_tests {
                 "10.0.0.5:7000",
                 "10.0.0.6:7000|112233445566",
             ]
+        );
+    }
+
+    /// A repeat publication at a listed endpoint (renamed, or without the
+    /// device id it had) refreshes that row in place, never adding a second.
+    pub fn republication_refreshes_the_row_at_its_endpoint() {
+        let output_list = selector_with_same_named_receivers();
+        handle_airplay_found(
+            &output_list,
+            &server("Den TV", "http://10.0.0.5:7000", "airplay", None),
+            true,
+        );
+        handle_chromecast_found(
+            &output_list,
+            &server("Den Cast", "cast://10.0.0.5:7000", "chromecast", None),
+        );
+        assert_eq!(
+            row_names(&output_list),
+            [
+                "My Computer",
+                "10.0.0.5:7000",
+                "10.0.0.5:7000",
+                "10.0.0.6:7000|112233445566",
+            ]
+        );
+        assert_eq!(
+            row_labels(&output_list),
+            ["My Computer", "Den TV", "Den Cast", "Den"]
         );
     }
 
