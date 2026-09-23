@@ -115,6 +115,13 @@ preferences:
   browser_views: "瀏覽器檢視"
   visible_columns: "可見欄位"
   reset_to_defaults: "恢復預設值"
+  privacy: "隱私"
+  location_title: "附近電台的位置"
+  location_subtitle: "透過 ipapi.co、ipwho.is 或 freeipapi.com，依據您的 IP 位址查詢大致位置。"
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "無法讀取 %{file}，因此正在使用預設設定。無法讀取的檔案已保留為 %{copy}。"
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -154,6 +161,8 @@ dialogs:
   output_exclusive_control_confirmation: "我確認 Tributary 獨佔控制此 MPD 播放分割區。"
   output_detection_warning: "啟用監督後，Tributary 會在播放期間持續觀察分割區：外部當前歌曲、外部選項變更或觀察視窗遺失都會撤銷播放控制並保留任何孤兒佇列項目。監督只能撤銷，永不授予：出現此類證據後，輸出將拒絕命令，直到你重新選擇它以再次確認。"
   output_detection_confirmation: "監督此獨占輸出，並在偵測到其他控制器的證據時撤銷其控制。"
+  output_probe_failed: "無法連線到 %{host}:%{port} 上的 MPD。未新增此輸出。"
+  output_save_failed: "無法儲存輸出「%{name}」。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

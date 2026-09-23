@@ -115,6 +115,13 @@ preferences:
   browser_views: "Volets du navigateur"
   visible_columns: "Colonnes visibles"
   reset_to_defaults: "Réinitialiser par défaut"
+  privacy: "Confidentialité"
+  location_title: "Localisation pour Stations à proximité"
+  location_subtitle: "Déterminer votre position approximative à partir de votre adresse IP via ipapi.co, ipwho.is ou freeipapi.com."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "Impossible de lire %{file} : les paramètres par défaut sont utilisés. Le fichier illisible a été conservé sous le nom %{copy}."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -154,6 +161,8 @@ dialogs:
   output_exclusive_control_confirmation: "Je confirme que Tributary contrôle exclusivement cette partition de lecture MPD."
   output_detection_warning: "Avec la supervision activée, Tributary continue d'observer la partition pendant la lecture : une chanson actuelle étrangère, un changement d'option étranger ou une fenêtre d'observation perdue révoque le contrôle de la lecture et conserve toute entrée de file orpheline. La supervision ne peut que révoquer, jamais accorder : après de telles preuves, la sortie refuse les commandes jusqu'à ce que vous la resélectionniez pour la confirmer à nouveau."
   output_detection_confirmation: "Superviser cette sortie exclusive et révoquer son contrôle en cas de preuve d'un autre contrôleur."
+  output_probe_failed: "Impossible de joindre MPD à l'adresse %{host}:%{port}. La sortie n'a pas été ajoutée."
+  output_save_failed: "Impossible d'enregistrer la sortie « %{name} »."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

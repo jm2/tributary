@@ -598,6 +598,17 @@ Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and 
 
 To manually add a server, click the **+** button in the sidebar toolbar and enter the server type (Subsonic, Jellyfin, or Plex), URL, and credentials. Manually-added servers are persisted across launches (credentials are entered in the UI only — they are not stored on disk).
 
+### Internet Radio
+
+The **Internet Radio** entries in the sidebar list stations from the public
+[Radio-Browser](https://www.radio-browser.info/) directory. **Stations Near Me** needs your
+approximate location, so Tributary asks before its first use. When you allow it, Tributary asks
+ipapi.co for your location, falling back to ipwho.is and then freeipapi.com if a service does not
+answer; every service it contacts receives your public IP address. The approximate coordinates,
+country, and region that come back are sent to Radio-Browser to find nearby stations. Choosing
+**No Thanks** is remembered, while closing the prompt asks again next time. You can turn the
+location lookup on or off at any time under **Privacy** in Preferences.
+
 ### Searching Your Library
 
 Use the **search bar** above the browser panes to filter tracks in real-time. The search matches across title, artist, album, and genre simultaneously, and composes with any active browser pane selections. Clear the search by clicking the ✕ button or pressing Escape.
@@ -745,6 +756,7 @@ Open **Preferences** from the hamburger menu (☰) to:
 - Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
 - Show/hide tracklist columns
 - Set up the equalizer for playback on this computer
+- Turn the location lookup for Stations Near Me on or off (see [Internet Radio](#internet-radio))
 
 ---
 

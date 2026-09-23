@@ -8,6 +8,8 @@ use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::{info, warn};
 
+use super::persistence::{read_settings_file, write_atomic, SetAsideFile, SettingsRead};
+
 // ── Tracklist columns ───────────────────────────────────────────────────
 
 /// Stable IDs of the tracklist columns, in default display order.
@@ -644,27 +646,35 @@ fn config_path() -> Option<std::path::PathBuf> {
 
 /// Load the configuration from disk, falling back to defaults.
 ///
+/// An unreadable or unparsable `config.json` is moved aside (see
+/// [`read_settings_file`]) and reported through the second value, so the
+/// next save cannot silently overwrite the user's library folders and
+/// pending reauthorizations. Defaults loaded that way leave
+/// `library_paths_loaded` false.
+pub fn load_config() -> (AppConfig, Option<SetAsideFile>) {
+    config_path().map_or_else(
+        || (AppConfig::default(), None),
+        |path| load_config_from(&path),
+    )
+}
+
+fn load_config_from(path: &std::path::Path) -> (AppConfig, Option<SetAsideFile>) {
+    match read_settings_file(path, parse_config) {
+        SettingsRead::Parsed(config) => (config, None),
+        SettingsRead::Missing => (AppConfig::default(), None),
+        SettingsRead::Unreadable { set_aside } => (AppConfig::default(), set_aside),
+    }
+}
+
+/// Parse `config.json`.
+///
 /// Handles migration from the legacy `library_path` (single string)
 /// format. We parse to a `serde_json::Value` first and rename the key
 /// programmatically rather than doing a textual `String::replace`,
 /// which would corrupt user-supplied values that happened to contain
 /// the literal substring `"library_path"`.
-pub fn load_config() -> AppConfig {
-    let Some(path) = config_path() else {
-        return AppConfig::default();
-    };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return AppConfig::default();
-    };
-    parse_config(&raw)
-}
-
-fn parse_config(raw: &str) -> AppConfig {
-    // Parse to a generic Value so we can rewrite the legacy key safely.
-    let mut value: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return AppConfig::default(),
-    };
+fn parse_config(raw: &str) -> Result<AppConfig, serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(raw)?;
 
     if let Some(obj) = value.as_object_mut() {
         if !obj.contains_key("library_paths") {
@@ -677,17 +687,10 @@ fn parse_config(raw: &str) -> AppConfig {
         .as_object()
         .is_some_and(|obj| obj.contains_key("library_paths"));
 
-    match serde_json::from_value::<AppConfig>(value) {
-        Ok(mut config) => {
-            config.library_paths_loaded = library_paths_loaded;
-            migrate_column_schema(&mut config);
-            config
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to deserialize config.json — falling back to defaults");
-            AppConfig::default()
-        }
-    }
+    let mut config = serde_json::from_value::<AppConfig>(value)?;
+    config.library_paths_loaded = library_paths_loaded;
+    migrate_column_schema(&mut config);
+    Ok(config)
 }
 
 /// Normalize persisted column keys to stable IDs, then expose each newly
@@ -721,76 +724,123 @@ fn migrate_column_schema(config: &mut AppConfig) {
 ///
 /// A failed serialization, write, flush, or rename leaves the previous
 /// `config.json` untouched. The boolean lets actions whose correctness
-/// depends on persistence avoid claiming success, while legacy callers may
-/// continue relying on the error log for best-effort preference changes.
+/// depends on persistence avoid claiming success, while preference toggles
+/// rely on the error log.
 pub fn save_config(config: &AppConfig) -> bool {
-    use std::io::Write;
-
     let Some(path) = config_path() else {
         warn!("Cannot save config.json because the platform data directory is unavailable");
         return false;
     };
-    let Some(parent) = path.parent() else {
-        warn!(path = %path.display(), "Cannot save config.json without a parent directory");
-        return false;
-    };
-    if let Err(error) = std::fs::create_dir_all(parent) {
-        warn!(error = %error, path = %parent.display(), "Failed to create config directory");
-        return false;
-    }
-    let json = match serde_json::to_vec_pretty(config) {
+    let mut json = match serde_json::to_vec_pretty(config) {
         Ok(json) => json,
         Err(error) => {
             warn!(error = %error, "Failed to serialize config.json");
             return false;
         }
     };
-    let mut temporary = match tempfile::NamedTempFile::new_in(parent) {
-        Ok(temporary) => temporary,
+    json.push(b'\n');
+    match write_atomic(&path, &json) {
+        Ok(()) => true,
         Err(error) => {
-            warn!(error = %error, path = %parent.display(), "Failed to create temporary config file");
-            return false;
-        }
-    };
-    if let Err(error) = temporary
-        .write_all(&json)
-        .and_then(|()| temporary.write_all(b"\n"))
-        .and_then(|()| temporary.flush())
-        .and_then(|()| temporary.as_file().sync_all())
-    {
-        warn!(error = %error, "Failed to durably write temporary config file");
-        return false;
-    }
-    if let Err(error) = temporary.persist(&path) {
-        warn!(error = %error, path = %path.display(), "Failed to atomically replace config.json");
-        return false;
-    }
-
-    // On Unix, syncing the containing directory makes the rename durable
-    // across a sudden power loss. The file itself was synchronized above.
-    #[cfg(unix)]
-    match std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
-        Ok(()) => {}
-        Err(error) => {
-            // The atomic replacement has already succeeded, so returning
-            // failure here would incorrectly prompt the caller to retry an
-            // update that is visible to this process.
-            warn!(error = %error, path = %parent.display(), "Could not synchronize config directory metadata");
+            warn!(error = %error, path = %path.display(), "Failed to save config.json");
+            false
         }
     }
+}
 
-    true
+/// How long preference edits wait before one `config.json` write, so a
+/// burst of toggles, a Reset, or a slider drag costs a single synchronous
+/// write on the GTK thread.
+const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Coalesces preference edits into one delayed `config.json` save.
+///
+/// Every edit updates the shared config immediately and calls
+/// [`ConfigSaveQueue::schedule`]; [`ConfigSaveQueue::flush`] writes a pending
+/// save at once and runs when the Preferences dialog or the window closes.
+#[derive(Clone)]
+pub struct ConfigSaveQueue {
+    config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    pending: std::rc::Rc<std::cell::Cell<bool>>,
+    write: std::rc::Rc<dyn Fn(&AppConfig) -> bool>,
+}
+
+impl ConfigSaveQueue {
+    pub fn new(config: std::rc::Rc<std::cell::RefCell<AppConfig>>) -> Self {
+        Self::with_writer(config, std::rc::Rc::new(save_config))
+    }
+
+    fn with_writer(
+        config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
+        write: std::rc::Rc<dyn Fn(&AppConfig) -> bool>,
+    ) -> Self {
+        Self {
+            config,
+            pending: std::rc::Rc::default(),
+            write,
+        }
+    }
+
+    /// Save after [`SAVE_DELAY`] unless a save is already scheduled.
+    pub fn schedule(&self) {
+        if self.request() {
+            let queue = self.clone();
+            gtk::glib::timeout_add_local_once(SAVE_DELAY, move || queue.flush());
+        }
+    }
+
+    /// Mark a save as pending. Returns whether this request must arm the
+    /// timer, which is only the first request since the last flush.
+    fn request(&self) -> bool {
+        !self.pending.replace(true)
+    }
+
+    /// Write a scheduled save now.
+    pub fn flush(&self) {
+        if self.pending.replace(false) {
+            (self.write)(&self.config.borrow());
+        }
+    }
 }
 
 // ── Preferences window builder ──────────────────────────────────────────
+
+/// The main-window views that Preferences toggles restyle.
+#[derive(Clone)]
+pub struct LayoutTargets {
+    pub column_view: gtk::ColumnView,
+    pub browser_box: gtk::Box,
+    pub active_source_key: std::rc::Rc<std::cell::RefCell<String>>,
+}
+
+impl LayoutTargets {
+    /// Radio views show their own station columns and hide the browser. Every
+    /// switch away from radio re-applies the saved layout, so while a radio
+    /// view is active a toggle only updates the config.
+    fn radio_active(&self) -> bool {
+        super::radio::is_radio_backend(&self.active_source_key.borrow())
+    }
+
+    fn show_columns(&self, visible: &[String]) {
+        if !self.radio_active() {
+            apply_column_visibility(&self.column_view, visible);
+        }
+    }
+
+    fn show_browser(&self, views: &BrowserViewsConfig) {
+        if !self.radio_active() {
+            update_browser_visibility(&self.browser_box, views);
+        }
+    }
+}
 
 /// Build and present the preferences window.
 ///
 /// # Arguments
 /// * `parent` — the main application window (for transient-for)
-/// * `column_view` — the tracklist `ColumnView` to toggle column visibility
-/// * `browser_box` — the browser container `Box` to toggle pane visibility
-/// * `config` — current configuration (will be mutated and saved on changes)
+/// * `layout` — the tracklist, browser, and active source the toggles restyle
+/// * `config` — current configuration, mutated on changes
+/// * `saves` — coalesces the resulting `config.json` writes
 /// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
@@ -800,9 +850,9 @@ pub fn save_config(config: &AppConfig) -> bool {
 #[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
-    column_view: &gtk::ColumnView,
-    browser_box: &gtk::Box,
+    layout: &LayoutTargets,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
@@ -811,6 +861,11 @@ pub fn show_preferences(
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
+    {
+        // Closing the dialog writes any edit still waiting on the delay.
+        let saves = saves.clone();
+        prefs_dialog.connect_closed(move |_| saves.flush());
+    }
 
     let page = adw::PreferencesPage::new();
     let cfg = config.borrow();
@@ -1051,14 +1106,12 @@ pub fn show_preferences(
     // Wire album artist toggle
     {
         let config = config.clone();
+        let saves = saves.clone();
         let on_change = on_album_artist_changed.clone();
         album_artist_check.connect_toggled(move |btn| {
             let active = btn.is_active();
-            {
-                let mut cfg = config.borrow_mut();
-                cfg.group_by_album_artist = active;
-                save_config(&cfg);
-            }
+            config.borrow_mut().group_by_album_artist = active;
+            saves.schedule();
             on_change(active);
         });
     }
@@ -1066,42 +1119,46 @@ pub fn show_preferences(
     // Wire browser view toggles
     {
         let config = config.clone();
-        let browser_box = browser_box.clone();
+        let saves = saves.clone();
+        let layout = layout.clone();
         genre_check.connect_toggled(move |btn| {
             let mut cfg = config.borrow_mut();
             cfg.browser_views.genre = btn.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
+            layout.show_browser(&cfg.browser_views);
+            saves.schedule();
         });
     }
     {
         let config = config.clone();
-        let browser_box = browser_box.clone();
+        let saves = saves.clone();
+        let layout = layout.clone();
         artist_check.connect_toggled(move |btn| {
             let mut cfg = config.borrow_mut();
             cfg.browser_views.artist = btn.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
+            layout.show_browser(&cfg.browser_views);
+            saves.schedule();
         });
     }
     {
         let config = config.clone();
-        let browser_box = browser_box.clone();
+        let saves = saves.clone();
+        let layout = layout.clone();
         album_check.connect_toggled(move |btn| {
             let mut cfg = config.borrow_mut();
             cfg.browser_views.album = btn.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
+            layout.show_browser(&cfg.browser_views);
+            saves.schedule();
         });
     }
     {
         let config = config.clone();
-        let browser_box = browser_box.clone();
+        let saves = saves.clone();
+        let layout = layout.clone();
         folder_check.connect_toggled(move |btn| {
             let mut cfg = config.borrow_mut();
             cfg.browser_views.folder = btn.is_active();
-            update_browser_visibility(&browser_box, &cfg.browser_views);
-            save_config(&cfg);
+            layout.show_browser(&cfg.browser_views);
+            saves.schedule();
         });
     }
 
@@ -1109,60 +1166,32 @@ pub fn show_preferences(
     // the on-change callback so the browser owns the swap.
     {
         let config = config.clone();
+        let saves = saves.clone();
         let on_change = on_album_pane_artwork_changed.clone();
         album_art_check.connect_toggled(move |btn| {
             let active = btn.is_active();
-            {
-                let mut cfg = config.borrow_mut();
-                cfg.album_pane_artwork = active;
-                save_config(&cfg);
-            }
+            config.borrow_mut().album_pane_artwork = active;
+            saves.schedule();
             on_change(active);
         });
     }
 
     // Wire album-pane artwork size radios. Same pattern as the toggle.
-    {
-        let cfg_for_small = config.clone();
-        let on_change_small = on_album_pane_artwork_size_changed.clone();
-        let cfg_for_medium = config.clone();
-        let on_change_medium = on_album_pane_artwork_size_changed.clone();
-        let cfg_for_large = config.clone();
-        let on_change_large = on_album_pane_artwork_size_changed.clone();
-        let medium = album_art_size_medium.clone();
-        let large = album_art_size_large.clone();
-        album_art_size_small.connect_toggled(move |btn| {
+    for (button, size) in [
+        (&album_art_size_small, AlbumArtSize::Small),
+        (&album_art_size_medium, AlbumArtSize::Medium),
+        (&album_art_size_large, AlbumArtSize::Large),
+    ] {
+        let config = config.clone();
+        let saves = saves.clone();
+        let on_change = on_album_pane_artwork_size_changed.clone();
+        button.connect_toggled(move |btn| {
             if !btn.is_active() {
                 return;
             }
-            {
-                let mut cfg = cfg_for_small.borrow_mut();
-                cfg.album_pane_artwork_size = AlbumArtSize::Small;
-                save_config(&cfg);
-            }
-            on_change_small(AlbumArtSize::Small);
-        });
-        medium.connect_toggled(move |btn| {
-            if !btn.is_active() {
-                return;
-            }
-            {
-                let mut cfg = cfg_for_medium.borrow_mut();
-                cfg.album_pane_artwork_size = AlbumArtSize::Medium;
-                save_config(&cfg);
-            }
-            on_change_medium(AlbumArtSize::Medium);
-        });
-        large.connect_toggled(move |btn| {
-            if !btn.is_active() {
-                return;
-            }
-            {
-                let mut cfg = cfg_for_large.borrow_mut();
-                cfg.album_pane_artwork_size = AlbumArtSize::Large;
-                save_config(&cfg);
-            }
-            on_change_large(AlbumArtSize::Large);
+            config.borrow_mut().album_pane_artwork_size = size;
+            saves.schedule();
+            on_change(size);
         });
     }
 
@@ -1208,7 +1237,8 @@ pub fn show_preferences(
 
             // Wire each column toggle
             let config = config.clone();
-            let cv = column_view.clone();
+            let saves = saves.clone();
+            let layout = layout.clone();
             let id = col_id.to_string();
             check.connect_toggled(move |btn| {
                 let mut cfg = config.borrow_mut();
@@ -1219,8 +1249,8 @@ pub fn show_preferences(
                 } else {
                     cfg.visible_columns.retain(|c| c != &id);
                 }
-                apply_column_visibility(&cv, &cfg.visible_columns);
-                save_config(&cfg);
+                layout.show_columns(&cfg.visible_columns);
+                saves.schedule();
             });
 
             let col = (i % COLUMNS_PER_ROW) as i32;
@@ -1239,7 +1269,8 @@ pub fn show_preferences(
         .build();
     {
         let config = config.clone();
-        let cv = column_view.clone();
+        let saves = saves.clone();
+        let layout = layout.clone();
         let checks = column_checks
             .iter()
             .map(|(t, c)| ((*t).to_string(), c.clone()))
@@ -1263,9 +1294,9 @@ pub fn show_preferences(
                 check.set_active(DEFAULT_VISIBLE.contains(&id.as_str()));
             }
             let cfg = config.borrow();
-            apply_column_visibility(&cv, &cfg.visible_columns);
-            apply_column_order(&cv, &cfg.column_order);
-            save_config(&cfg);
+            layout.show_columns(&cfg.visible_columns);
+            apply_column_order(&layout.column_view, &cfg.column_order);
+            saves.schedule();
             info!("Column visibility and order reset to defaults");
         });
     }
@@ -1274,16 +1305,43 @@ pub fn show_preferences(
     columns_group.add(&reset_btn);
     page.add(&columns_group);
     page.add(&super::equalizer_panel::preferences_group(
-        &prefs_dialog,
         config,
+        saves,
         active_output,
     ));
+    page.add(&privacy_group(config, saves));
 
     prefs_dialog.add(&page);
     drop(cfg);
 
     prefs_dialog.present(Some(parent));
     page
+}
+
+/// The Privacy group: consent to the IP geolocation behind Stations Near Me.
+///
+/// Off is an explicit decline, so Stations Near Me stops asking; the consent
+/// prompt itself records only an explicit answer.
+fn privacy_group(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.privacy").as_ref())
+        .build();
+    let location = adw::SwitchRow::builder()
+        .title(rust_i18n::t!("preferences.location_title").as_ref())
+        .subtitle(rust_i18n::t!("preferences.location_subtitle").as_ref())
+        .active(config.borrow().location_enabled == Some(true))
+        .build();
+    let config = config.clone();
+    let saves = saves.clone();
+    location.connect_active_notify(move |row| {
+        config.borrow_mut().location_enabled = Some(row.is_active());
+        saves.schedule();
+    });
+    group.add(&location);
+    group
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -2023,14 +2081,76 @@ mod tests {
 
     #[test]
     fn only_a_parsed_folder_list_counts_as_loaded() {
-        assert!(parse_config(r#"{"library_paths":[]}"#).library_paths_loaded);
-        let legacy = parse_config(r#"{"library_path":"/music"}"#);
+        let parse = |raw| parse_config(raw).expect("valid config");
+        assert!(parse(r#"{"library_paths":[]}"#).library_paths_loaded);
+        let legacy = parse(r#"{"library_path":"/music"}"#);
         assert_eq!(legacy.library_paths, ["/music"]);
         assert!(legacy.library_paths_loaded);
-        assert!(!parse_config("{}").library_paths_loaded);
-        assert!(!parse_config("{not json").library_paths_loaded);
-        assert!(!parse_config(r#"{"library_paths":7}"#).library_paths_loaded);
+        assert!(!parse("{}").library_paths_loaded);
+        assert!(parse_config("{not json").is_err());
+        assert!(parse_config(r#"{"library_paths":7}"#).is_err());
         assert!(!AppConfig::default().library_paths_loaded);
+    }
+
+    #[test]
+    fn a_corrupt_config_is_kept_aside_and_loads_defaults() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("config.json");
+        let corrupt = r#"{"library_paths":["/music/one","/music/two"],"visible"#;
+        std::fs::write(&path, corrupt).expect("corrupt config");
+
+        let (config, set_aside) = load_config_from(&path);
+        // Defaults loaded this way never count as a configured folder list,
+        // so startup cannot forget tracks outside the default folder.
+        assert!(!config.library_paths_loaded);
+        let set_aside = set_aside.expect("the corrupt config is reported");
+        assert_eq!(set_aside.original, path);
+        assert!(!path.exists(), "a later save starts a fresh file");
+        assert_eq!(
+            std::fs::read_to_string(&set_aside.copy).expect("read the kept copy"),
+            corrupt
+        );
+
+        // A readable config loads normally and reports nothing.
+        std::fs::write(&path, r#"{"library_paths":["/music"]}"#).expect("valid config");
+        let (config, set_aside) = load_config_from(&path);
+        assert!(set_aside.is_none());
+        assert!(config.library_paths_loaded);
+        assert_eq!(config.library_paths, ["/music"]);
+    }
+
+    #[test]
+    fn a_burst_of_preference_edits_is_saved_once() {
+        let config = std::rc::Rc::new(std::cell::RefCell::new(AppConfig::default()));
+        let written = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorder = written.clone();
+        let saves = ConfigSaveQueue::with_writer(
+            config.clone(),
+            std::rc::Rc::new(move |saved: &AppConfig| {
+                recorder.borrow_mut().push(saved.visible_columns.clone());
+                true
+            }),
+        );
+
+        // Only the first edit arms the delayed save.
+        assert!(saves.request());
+        config.borrow_mut().visible_columns = vec!["Title".to_string()];
+        assert!(!saves.request());
+        config.borrow_mut().visible_columns = vec!["Artist".to_string()];
+        assert!(!saves.clone().request());
+        assert!(
+            written.borrow().is_empty(),
+            "nothing is written before the delay"
+        );
+
+        saves.flush();
+        saves.flush();
+        assert_eq!(
+            written.borrow().as_slice(),
+            [vec!["Artist".to_string()]],
+            "one write with the latest settings"
+        );
+        assert!(saves.request(), "a new edit arms a new save");
     }
 
     #[test]
@@ -2104,6 +2224,33 @@ mod tests {
                     Some(id),
                     "{locale} title {title:?} must map back to {id}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn every_catalog_describes_the_location_switch() {
+        let locale_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        for locale in rust_i18n::available_locales!() {
+            let locale: &str = locale.as_ref();
+            let path = locale_dir.join(format!("{locale}.yml"));
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let catalog: serde_yaml::Value = serde_yaml::from_str(&yaml)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            for key in ["privacy", "location_title", "location_subtitle"] {
+                assert!(
+                    catalog["preferences"][key]
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    "{locale}.preferences.{key} must be present"
+                );
+            }
+            let subtitle = catalog["preferences"]["location_subtitle"]
+                .as_str()
+                .unwrap_or_default();
+            for service in ["ipapi.co", "ipwho.is", "freeipapi.com"] {
+                assert!(subtitle.contains(service), "{locale} must name {service}");
             }
         }
     }
@@ -2418,6 +2565,41 @@ pub mod widget_tests {
             None,
             "the sentinel column stays last"
         );
+    }
+
+    /// While a radio view is active, Preferences toggles update only the
+    /// config: the station columns and the hidden browser stay as the radio
+    /// view set them.
+    pub fn preference_toggles_leave_the_radio_layout_alone() {
+        let column_view = german_tracklist();
+        let row = PaneRow::build();
+        let layout = super::LayoutTargets {
+            column_view: column_view.clone(),
+            browser_box: row.browser_box.clone(),
+            active_source_key: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::ui::radio::TOP_VOTE_SOURCE_KEY.to_string(),
+            )),
+        };
+        crate::ui::radio::apply_radio_columns(&column_view, true);
+        row.browser_box.set_visible(false);
+        let radio_columns = visible_ids(&column_view);
+
+        let views = BrowserViewsConfig::default();
+        layout.show_columns(&["Composer".to_string(), "Plays".to_string()]);
+        layout.show_browser(&views);
+        assert_eq!(visible_ids(&column_view), radio_columns);
+        assert!(
+            !row.browser_box.is_visible(),
+            "the radio view hides the browser"
+        );
+
+        // Outside radio the same toggles apply at once.
+        *layout.active_source_key.borrow_mut() = "local".to_string();
+        crate::ui::radio::apply_radio_columns(&column_view, false);
+        layout.show_columns(&["Composer".to_string(), "Plays".to_string()]);
+        layout.show_browser(&views);
+        assert_eq!(visible_ids(&column_view), ["Composer", "Plays"]);
+        assert!(row.browser_box.is_visible());
     }
 
     /// Radio mode retitles Artist and Album and hides non-station columns,

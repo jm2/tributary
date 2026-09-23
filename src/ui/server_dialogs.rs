@@ -6,7 +6,6 @@
 use adw::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -348,28 +347,13 @@ fn upsert_saved_source_in_store(
 
 /// Save one complete v1 envelope through a same-directory atomic replacement.
 fn save_servers_to(path: &Path, servers: &[SavedServer]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory")
-    })?;
-    std::fs::create_dir_all(parent)?;
     let envelope = SavedServerEnvelope {
         schema_version: SAVED_SERVER_SCHEMA_VERSION,
         servers: servers.to_vec(),
     };
     let mut json = serde_json::to_vec_pretty(&envelope).map_err(std::io::Error::other)?;
     json.push(b'\n');
-
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(&json)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-
-    #[cfg(unix)]
-    {
-        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
-    }
-    Ok(())
+    super::persistence::write_atomic(path, &json)
 }
 
 fn add_saved_server_to(
