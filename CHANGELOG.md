@@ -128,6 +128,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Safer library upgrades** — Tributary now copies the library database to a `backups` folder
+  before upgrading it, keeping the three newest copies, and an upgrade interrupted partway can
+  be retried. An older version opened on a newer library now says so and points to the copies,
+  instead of showing an empty library.
+- **Opening and closing** — Opening a web or network address Tributary can't play shows a
+  message instead of nothing, and launching Tributary while it is closing says so. Logging out
+  and Ctrl+C close Tributary normally so pending changes are saved, closing stops waiting after
+  30 seconds, a macOS cache problem no longer stops the app from starting, and crashes are
+  recorded with their location in a crash log.
 - **Subsonic albums with several artists** — Songs on an album credited to more than one
   album artist (common on Navidrome) no longer appear twice, and no longer make every
   playlist entry from that server show as unavailable.
