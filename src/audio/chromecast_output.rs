@@ -1155,6 +1155,14 @@ struct WorkerSession<T> {
     last_poll: Instant,
 }
 
+impl<T> WorkerSession<T> {
+    /// Whether the next load can send LOAD on this session's receiver app
+    /// instead of relaunching it.
+    const fn is_reusable(&self) -> bool {
+        self.app_connected && !self.retired
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CleanupOutcome {
     Completed,
@@ -1168,6 +1176,7 @@ fn spawn_cast_worker<C>(
     current_state: Arc<Mutex<PlayerState>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
+    initial_volume: f64,
 ) -> WorkerCommandSender
 where
     C: CastConnector,
@@ -1183,6 +1192,7 @@ where
                 current_state,
                 event_tx,
                 timing,
+                initial_volume,
             );
         });
     if let Err(spawn_error) = spawn {
@@ -1198,10 +1208,15 @@ fn run_cast_worker<C>(
     current_state: Arc<Mutex<PlayerState>>,
     event_tx: async_channel::Sender<PlayerEvent>,
     timing: WorkerTiming,
+    initial_volume: f64,
 ) where
     C: CastConnector,
 {
     let mut active: Option<WorkerSession<C::Transport>> = None;
+    // The slider level last sent to the receiver (initially the output's
+    // starting level). Loads carry the slider level but send it only when
+    // it differs, so a volume set on the receiver itself is kept.
+    let mut applied_volume = initial_volume;
 
     loop {
         let wait = match active.as_ref() {
@@ -1224,6 +1239,7 @@ fn run_cast_worker<C>(
                             uri,
                             media,
                             volume,
+                            &mut applied_volume,
                             &intent_epoch,
                             &current_state,
                             &event_tx,
@@ -1315,6 +1331,7 @@ fn run_cast_worker<C>(
                             &mut active,
                             command.owner,
                             kind,
+                            &mut applied_volume,
                             &intent_epoch,
                             &current_state,
                             &event_tx,
@@ -1365,12 +1382,42 @@ fn handle_load<C>(
     uri: String,
     media: CastLoadMedia,
     volume: f64,
+    applied_volume: &mut f64,
     intent_epoch: &AtomicU64,
     current_state: &Mutex<PlayerState>,
     event_tx: &async_channel::Sender<PlayerEvent>,
 ) where
     C: CastConnector,
 {
+    let reusing = active.as_ref().is_some_and(WorkerSession::is_reusable);
+    if reusing {
+        if !set_state_and_emit(
+            owner,
+            PlayerState::Buffering,
+            intent_epoch,
+            current_state,
+            event_tx,
+        ) {
+            return;
+        }
+        match reload_on_running_app(
+            active,
+            owner,
+            &uri,
+            media,
+            volume,
+            applied_volume,
+            intent_epoch,
+        ) {
+            Reload::Sent(loaded) => {
+                finish_load(active, owner, loaded, intent_epoch, current_state, event_tx);
+                return;
+            }
+            Reload::Superseded => return,
+            Reload::Relaunch => info!("Chromecast: receiver app unreachable; relaunching"),
+        }
+    }
+
     match cleanup_session(active, owner, intent_epoch) {
         CleanupOutcome::Completed => {}
         CleanupOutcome::Failed(failure) => {
@@ -1385,13 +1432,15 @@ fn handle_load<C>(
         }
         CleanupOutcome::Stale => return,
     }
-    if !set_state_and_emit(
-        owner,
-        PlayerState::Buffering,
-        intent_epoch,
-        current_state,
-        event_tx,
-    ) {
+    if !reusing
+        && !set_state_and_emit(
+            owner,
+            PlayerState::Buffering,
+            intent_epoch,
+            current_state,
+            event_tx,
+        )
+    {
         return;
     }
 
@@ -1421,7 +1470,7 @@ fn handle_load<C>(
     if !is_current(owner, intent_epoch) {
         return;
     }
-    let result = transport.set_volume(volume);
+    let result = sync_volume(&mut transport, volume, applied_volume);
     if !finish_stage(result, owner, intent_epoch, current_state, event_tx) {
         return;
     }
@@ -1496,6 +1545,119 @@ fn handle_load<C>(
         let session = active.as_mut().expect("connected session recorded");
         session.transport.load(&session.app, &uri, media)
     };
+    finish_load(active, owner, loaded, intent_epoch, current_state, event_tx);
+}
+
+/// How a load on an already running receiver app ended.
+enum Reload {
+    /// LOAD was sent; its result is handled exactly like a fresh launch's.
+    Sent(CastResult<CastStatusSnapshot>),
+    Superseded,
+    /// The connection proved unusable and the session was dropped.
+    Relaunch,
+}
+
+/// Replace the media on the session's running receiver app instead of
+/// relaunching it: apply a moved slider, stop the current media (so no late
+/// status for it can be taken as the new LOAD's reply), then LOAD on the same
+/// app. A refused volume or stop is not fatal; an unusable connection falls
+/// back to a relaunch.
+fn reload_on_running_app<T>(
+    active: &mut Option<WorkerSession<T>>,
+    owner: CommandOwner,
+    uri: &str,
+    media: CastLoadMedia,
+    volume: f64,
+    applied_volume: &mut f64,
+    intent_epoch: &AtomicU64,
+) -> Reload
+where
+    T: CastTransport,
+{
+    let session = active.as_mut().expect("reusable session checked");
+    session.owner = owner;
+    session.state = PlayerState::Buffering;
+    let result = sync_volume(&mut session.transport, volume, applied_volume);
+    if let Some(outcome) = reuse_step_outcome(active, &result, owner, intent_epoch) {
+        return outcome;
+    }
+
+    if let Some(media_session_id) = active.as_ref().and_then(|session| session.media_session_id) {
+        let session = active.as_mut().expect("reusable session checked");
+        let result = session.transport.stop(&session.app, media_session_id);
+        if result.is_ok() {
+            session.media_session_id = None;
+        }
+        if let Some(outcome) = reuse_step_outcome(active, &result, owner, intent_epoch) {
+            return outcome;
+        }
+    }
+
+    info!(
+        content_type = media.content_type,
+        "Chromecast: loading media on the running receiver app"
+    );
+    let loaded = {
+        let session = active.as_mut().expect("reusable session checked");
+        session.transport.load(&session.app, uri, media)
+    };
+    if is_current(owner, intent_epoch)
+        && loaded
+            .as_ref()
+            .is_err_and(|failure| !failure.connection_usable)
+    {
+        active.take();
+        return Reload::Relaunch;
+    }
+    Reload::Sent(loaded)
+}
+
+/// End a reuse attempt when it was superseded or its connection proved
+/// unusable; a synchronized refusal lets the attempt continue.
+fn reuse_step_outcome<T, U>(
+    active: &mut Option<WorkerSession<T>>,
+    result: &CastResult<U>,
+    owner: CommandOwner,
+    intent_epoch: &AtomicU64,
+) -> Option<Reload> {
+    if discard_poisoned_session_if_stale(active, result, owner, intent_epoch) {
+        return Some(Reload::Superseded);
+    }
+    if result
+        .as_ref()
+        .is_err_and(|failure| !failure.connection_usable)
+    {
+        active.take();
+        return Some(Reload::Relaunch);
+    }
+    None
+}
+
+/// Send the slider level only when it differs from the level last applied,
+/// so a volume set on the receiver itself survives track changes.
+fn sync_volume<T>(transport: &mut T, volume: f64, applied_volume: &mut f64) -> CastResult<()>
+where
+    T: CastTransport,
+{
+    if (volume - *applied_volume).abs() < f64::EPSILON {
+        return Ok(());
+    }
+    transport.set_volume(volume)?;
+    *applied_volume = volume;
+    Ok(())
+}
+
+/// Record and apply the result of a LOAD sent on the session in `active`.
+fn finish_load<T>(
+    active: &mut Option<WorkerSession<T>>,
+    owner: CommandOwner,
+    loaded: CastResult<CastStatusSnapshot>,
+    intent_epoch: &AtomicU64,
+    current_state: &Mutex<PlayerState>,
+    event_tx: &async_channel::Sender<PlayerEvent>,
+) where
+    T: CastTransport,
+{
     if let Ok(status) = loaded.as_ref() {
         if let Some(media_session_id) = status.media_session_id {
             active
@@ -1538,11 +1700,9 @@ fn handle_load<C>(
 
     match loaded.terminal {
         Some(TerminalReason::Finished) => {
+            // Keep the receiver app for the next track.
             if let Some(session) = active.as_mut() {
                 session.media_session_id = None;
-            }
-            if let CleanupOutcome::Failed(failure) = cleanup_session(active, owner, intent_epoch) {
-                error!(operation = failure.operation, "Chromecast cleanup failed");
             }
             if set_state_and_emit(
                 owner,
@@ -1676,6 +1836,7 @@ fn handle_control<T>(
     active: &mut Option<WorkerSession<T>>,
     owner: CommandOwner,
     kind: CommandKind,
+    applied_volume: &mut f64,
     intent_epoch: &AtomicU64,
     current_state: &Mutex<PlayerState>,
     event_tx: &async_channel::Sender<PlayerEvent>,
@@ -1745,6 +1906,9 @@ fn handle_control<T>(
         return;
     }
 
+    if let CommandKind::Volume(level) = kind {
+        *applied_volume = level;
+    }
     if let Some(new_state) = new_state {
         if let Some(session) = active.as_mut() {
             session.state = new_state;
@@ -1842,11 +2006,10 @@ fn poll_active<T>(
 
     match status.terminal {
         Some(TerminalReason::Finished) => {
+            // Keep the receiver app for the next track; Stop (at the end of
+            // the queue) or an output switch stops it.
             if let Some(session) = active.as_mut() {
                 session.media_session_id = None;
-            }
-            if let CleanupOutcome::Failed(failure) = cleanup_session(active, owner, intent_epoch) {
-                error!(operation = failure.operation, "Chromecast cleanup failed");
             }
             if set_state_and_emit(
                 owner,
@@ -2211,6 +2374,7 @@ impl ChromecastOutput {
         info!(%address, name = %display_name, "Chromecast output configured");
         let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
         let intent_epoch = Arc::new(AtomicU64::new(0));
+        let initial_volume = initial_volume.clamp(0.0, 1.0);
         let worker_tx = spawn_cast_worker(
             RustCastConnector {
                 address,
@@ -2220,6 +2384,7 @@ impl ChromecastOutput {
             Arc::clone(&current_state),
             event_tx.clone(),
             WorkerTiming::production(),
+            initial_volume,
         );
 
         Self {
@@ -2227,7 +2392,7 @@ impl ChromecastOutput {
             device_address: address,
             event_tx,
             event_generation: AtomicU64::new(0),
-            volume: initial_volume.clamp(0.0, 1.0),
+            volume: initial_volume,
             current_state,
             cast_server: Arc::new(Mutex::new(None)),
             rt_handle: tokio::runtime::Handle::try_current().ok(),
@@ -3109,6 +3274,10 @@ mod tests {
         }
     }
 
+    /// The worker's starting volume in harness tests; loads carrying this
+    /// slider level send no volume.
+    const HARNESS_INITIAL_VOLUME: f64 = 0.5;
+
     struct Harness {
         tx: WorkerCommandSender,
         epoch: Arc<AtomicU64>,
@@ -3139,18 +3308,17 @@ mod tests {
         {
             let (tx, rx) = worker_command_channel(MAX_PENDING_WORKER_COMMANDS);
             let epoch = Arc::new(AtomicU64::new(0));
-            let state = Arc::new(Mutex::new(PlayerState::Stopped));
             let (event_tx, events) = async_channel::unbounded();
             let epoch_for_worker = Arc::clone(&epoch);
-            let state_for_worker = Arc::clone(&state);
             let worker = std::thread::spawn(move || {
                 run_cast_worker(
                     connector,
                     rx,
                     epoch_for_worker,
-                    state_for_worker,
+                    Arc::new(Mutex::new(PlayerState::Stopped)),
                     event_tx,
                     timing,
+                    HARNESS_INITIAL_VOLUME,
                 );
             });
             Self {
@@ -4534,6 +4702,196 @@ mod tests {
         harness.shutdown();
     }
 
+    fn load_and_fence(harness: &Harness, generation: u64, uri: &str, volume: f64) -> CommandOwner {
+        let owner = harness.next_owner(generation);
+        harness.send(
+            owner,
+            CommandKind::Load {
+                media: test_load_media(),
+                uri: uri.to_string(),
+                volume,
+            },
+        );
+        harness.fence(owner);
+        owner
+    }
+
+    fn app_stop_cleanup(media_session_id: i32) -> Vec<Action> {
+        vec![
+            Action::Stop(media_session_id),
+            Action::Point(Point::AppDisconnect),
+            Action::Point(Point::AppStop),
+        ]
+    }
+
+    #[test]
+    fn consecutive_loads_reuse_the_running_receiver_app() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        load_and_fence(&harness, 1, "https://music.test/a", HARNESS_INITIAL_VOLUME);
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Connect),
+                Action::Point(Point::ReceiverConnect),
+                Action::Point(Point::Launch),
+                Action::Point(Point::AppConnect),
+                Action::Point(Point::Load),
+            ],
+            "the first load launches the app and sends no volume"
+        );
+        shared.clear_actions();
+        let _ = harness.events();
+        shared
+            .load_statuses
+            .lock()
+            .expect("load statuses lock")
+            .push_back(CastStatusSnapshot::loaded(43));
+
+        load_and_fence(&harness, 2, "https://music.test/b", HARNESS_INITIAL_VOLUME);
+        assert_eq!(
+            shared.actions(),
+            vec![Action::Stop(42), Action::Point(Point::Load)],
+            "the next load stops the old media and loads on the same app"
+        );
+        assert!(harness.events().iter().any(|event| matches!(
+            event,
+            PlayerEvent::StateChanged { generation, state: PlayerState::Playing }
+                if *generation == PlayerEventGeneration::from_raw(2)
+        )));
+
+        shared.clear_actions();
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+        assert_eq!(shared.actions(), app_stop_cleanup(43));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn finished_media_keeps_the_receiver_app_for_the_next_load() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let first = load_and_fence(&harness, 1, "https://music.test/a", HARNESS_INITIAL_VOLUME);
+        shared.clear_actions();
+        shared
+            .statuses
+            .lock()
+            .expect("statuses lock")
+            .push_back(CastStatusSnapshot {
+                terminal: Some(TerminalReason::Finished),
+                ..CastStatusSnapshot::loaded(42)
+            });
+        harness.send(first, CommandKind::PollNow);
+        harness.fence(first);
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Heartbeat),
+                Action::Point(Point::Status)
+            ],
+            "natural completion does not stop the receiver app"
+        );
+        assert!(harness
+            .events()
+            .iter()
+            .any(|event| matches!(event, PlayerEvent::TrackEnded { .. })));
+
+        shared.clear_actions();
+        shared
+            .load_statuses
+            .lock()
+            .expect("load statuses lock")
+            .push_back(CastStatusSnapshot::loaded(43));
+        load_and_fence(&harness, 2, "https://music.test/b", HARNESS_INITIAL_VOLUME);
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Load)]);
+
+        // The end of the queue stops the output, which stops the app.
+        shared.clear_actions();
+        let stop = harness.next_owner(2);
+        harness.send(stop, CommandKind::Stop);
+        harness.fence(stop);
+        assert_eq!(shared.actions(), app_stop_cleanup(43));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn unreachable_receiver_app_is_relaunched_by_the_next_load() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        load_and_fence(&harness, 1, "https://music.test/a", HARNESS_INITIAL_VOLUME);
+        shared.clear_actions();
+        let _ = harness.events();
+        *shared.poison_at.lock().expect("poison lock") = Some(Point::Stop);
+
+        load_and_fence(&harness, 2, "https://music.test/b", HARNESS_INITIAL_VOLUME);
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Stop(42),
+                Action::Point(Point::Connect),
+                Action::Point(Point::ReceiverConnect),
+                Action::Point(Point::Launch),
+                Action::Point(Point::AppConnect),
+                Action::Point(Point::Load),
+            ]
+        );
+        let events = harness.events();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, PlayerEvent::Error { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    PlayerEvent::StateChanged {
+                        state: PlayerState::Buffering,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the fallback does not announce Buffering twice"
+        );
+        harness.shutdown();
+    }
+
+    #[test]
+    fn loads_send_volume_only_after_the_slider_moves() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let volumes = |shared: &FakeShared| {
+            shared
+                .actions()
+                .into_iter()
+                .filter_map(|action| match action {
+                    Action::Volume(level) => Some(level),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        load_and_fence(&harness, 1, "https://music.test/a", HARNESS_INITIAL_VOLUME);
+        let second = load_and_fence(&harness, 2, "https://music.test/b", HARNESS_INITIAL_VOLUME);
+        assert!(
+            volumes(&shared).is_empty(),
+            "an unmoved slider never overrides the receiver's own volume"
+        );
+
+        harness.send(second, CommandKind::Volume(0.25));
+        harness.fence(second);
+        load_and_fence(&harness, 3, "https://music.test/c", 0.25);
+        assert_eq!(volumes(&shared), vec![0.25], "a slider move is sent once");
+
+        // A slider move that never reached the receiver (for example, dropped
+        // while nothing was playing) is applied by the next load.
+        load_and_fence(&harness, 4, "https://music.test/d", 0.75);
+        assert_eq!(volumes(&shared), vec![0.25, 0.75]);
+        harness.shutdown();
+    }
+
     #[test]
     fn shutdown_cleans_active_media_without_emitting_events() {
         let shared = FakeShared::new();
@@ -4901,6 +5259,7 @@ mod tests {
         ) -> Self {
             let current_state = Arc::new(Mutex::new(PlayerState::Stopped));
             let intent_epoch = Arc::new(AtomicU64::new(0));
+            let initial_volume = initial_volume.clamp(0.0, 1.0);
             let worker_tx = spawn_cast_worker(
                 FakeConnector {
                     shared: Arc::clone(shared),
@@ -4914,13 +5273,14 @@ mod tests {
                     cleanup_retry: Duration::from_millis(10),
                     tick: Duration::from_millis(10),
                 },
+                initial_volume,
             );
             Self {
                 display_name: "Test Receiver".to_string(),
                 device_address: "127.0.0.1:8009".parse().expect("test address"),
                 event_tx,
                 event_generation: AtomicU64::new(0),
-                volume: initial_volume.clamp(0.0, 1.0),
+                volume: initial_volume,
                 current_state,
                 cast_server: Arc::new(Mutex::new(None)),
                 rt_handle: None,

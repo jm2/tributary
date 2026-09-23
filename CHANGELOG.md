@@ -130,6 +130,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row from
   the output selector, and receivers or Chromecasts that share a display name no longer hide each
   other.
+- **Chromecast track changes** — Moving to the next track keeps the receiver's media app
+  open instead of closing and relaunching it, so TVs and displays no longer drop back to
+  their ambient screen between tracks. Tributary also stops resetting the speaker's own
+  volume on every track.
 - **Year edits** — Changing or clearing the year in Properties now takes effect for MP3
   and M4A files, and replaces the existing date on FLAC and Ogg files instead of being
   hidden by it.
