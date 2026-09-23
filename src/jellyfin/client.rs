@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use reqwest::Client;
 use tracing::{debug, info};
 use url::Url;
@@ -17,6 +17,7 @@ use crate::http_security::{
     append_base_path_segments, apply_advertised_http_route, authenticated_client_builder,
     redact_url_secrets, strip_request_url, validate_base_url,
 };
+use crate::install_id::install_id;
 
 use super::api::{JellyfinAuthRequest, JellyfinAuthResponse};
 
@@ -47,7 +48,7 @@ const API_RESPONSE_DEADLINE: Duration = Duration::from_mins(2);
 const TEXT_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Holds credentials and a reusable `reqwest::Client` with the
-/// `X-Emby-Authorization` header pre-configured on every request.
+/// `Authorization` header pre-configured on every request.
 pub struct JellyfinClient {
     base_url: Url,
     advertised_route: Option<AdvertisedHttpRoute>,
@@ -64,7 +65,7 @@ pub struct JellyfinClient {
 impl JellyfinClient {
     /// Build a new Jellyfin client from a pre-existing API key and user ID.
     ///
-    /// The `X-Emby-Authorization` header is injected as a default header
+    /// The `Authorization` header is injected as a default header
     /// on the inner `reqwest::Client`, so every outgoing request is
     /// automatically authenticated.
     ///
@@ -140,14 +141,10 @@ impl JellyfinClient {
         })?;
 
         // Build a temporary client WITHOUT a token for the auth request.
-        let pre_auth_header = format!(
-            r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{CLIENT_NAME}", Version="{CLIENT_VERSION}""#,
-        );
-
         let mut pre_auth_headers = HeaderMap::new();
         pre_auth_headers.insert(
-            "X-Emby-Authorization",
-            HeaderValue::from_str(&pre_auth_header).map_err(|e| {
+            AUTHORIZATION,
+            HeaderValue::from_str(&client_authorization()).map_err(|e| {
                 BackendError::ConnectionFailed {
                     message: format!("Invalid auth header value: {e}"),
                     source: Some(Box::new(e)),
@@ -338,10 +335,7 @@ impl JellyfinClient {
         url.query_pairs_mut().append_pair("static", "true");
         let request = ResolvedHttpRequest::new(url)?
             .with_representation(representation)
-            .with_sensitive_header(
-                HeaderName::from_static("x-emby-authorization"),
-                jellyfin_auth_header(&self.api_key)?,
-            )?;
+            .with_sensitive_header(AUTHORIZATION, jellyfin_auth_header(&self.api_key)?)?;
         match &self.advertised_route {
             Some(route) => request.with_advertised_route(route.clone()),
             None => Ok(request),
@@ -356,10 +350,8 @@ impl JellyfinClient {
         let mut url = self.api_url(&format!("Items/{item_id}/Images/Primary"));
         url.set_query(None);
         url.set_fragment(None);
-        let request = ResolvedHttpRequest::new(url)?.with_sensitive_header(
-            HeaderName::from_static("x-emby-authorization"),
-            jellyfin_auth_header(&self.api_key)?,
-        )?;
+        let request = ResolvedHttpRequest::new(url)?
+            .with_sensitive_header(AUTHORIZATION, jellyfin_auth_header(&self.api_key)?)?;
         match &self.advertised_route {
             Some(route) => request.with_advertised_route(route.clone()),
             None => Ok(request),
@@ -471,7 +463,7 @@ impl JellyfinClient {
     }
 }
 
-/// Build a `reqwest::Client` with the full `X-Emby-Authorization` header.
+/// Build a `reqwest::Client` with the token-bearing `Authorization` header.
 fn build_http_client(
     api_key: &str,
     base_url: &Url,
@@ -486,7 +478,7 @@ fn build_http_client_with_auth_header(
     advertised_route: Option<&AdvertisedHttpRoute>,
 ) -> BackendResult<Client> {
     let mut default_headers = HeaderMap::new();
-    default_headers.insert("X-Emby-Authorization", auth_header);
+    default_headers.insert(AUTHORIZATION, auth_header);
     default_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
 
     let builder = authenticated_client_builder()
@@ -554,16 +546,28 @@ async fn best_effort_logout_minted_session(
     append_base_path_segments(&mut url, ["Sessions", "Logout"]);
     let _ = pre_auth_http
         .post(url.as_str())
-        .header("X-Emby-Authorization", auth_header)
+        .header(AUTHORIZATION, auth_header)
         .timeout(AUTH_RESPONSE_DEADLINE)
         .send()
         .await;
 }
 
+/// The `MediaBrowser` client identification Jellyfin reads from the standard
+/// `Authorization` header.
+///
+/// Every Jellyfin release accepts this header. 12.0 by default ignores the
+/// legacy `X-Emby-Authorization` header, so only the standard one is sent.
+/// `DeviceId` must be unique per install: issuing a token logs out the same
+/// user's other sessions that share it.
+fn client_authorization() -> String {
+    format!(
+        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{}", Version="{CLIENT_VERSION}""#,
+        install_id(),
+    )
+}
+
 fn jellyfin_auth_header(api_key: &str) -> BackendResult<HeaderValue> {
-    let auth_value = format!(
-        r#"MediaBrowser Client="{CLIENT_NAME}", Device="{CLIENT_NAME}", DeviceId="{CLIENT_NAME}", Version="{CLIENT_VERSION}", Token="{api_key}""#,
-    );
+    let auth_value = format!(r#"{}, Token="{api_key}""#, client_authorization());
     let mut value =
         HeaderValue::from_str(&auth_value).map_err(|e| BackendError::ConnectionFailed {
             message: format!("Invalid auth header value: {e}"),
@@ -593,9 +597,13 @@ fn response_body_error(context: &str, error: ResponseBodyError) -> BackendError 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, Mutex};
 
+    use axum::extract::{Request, State};
     use axum::http::{Method, StatusCode};
+    use axum::response::{IntoResponse, Response};
 
     use crate::architecture::remote_json::rendered_error_chain;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
@@ -656,9 +664,10 @@ mod tests {
             assert!(request.private_query_pairs().is_empty());
             let value = request
                 .sensitive_headers()
-                .get("x-emby-authorization")
+                .get(AUTHORIZATION)
                 .expect("auth header");
             assert!(value.is_sensitive());
+            assert_eq!(request.sensitive_headers().len(), 1);
         }
     }
 
@@ -759,7 +768,7 @@ mod tests {
         assert_eq!(requests[1].method, Method::POST);
         let authorization = requests[1]
             .headers
-            .get("x-emby-authorization")
+            .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .expect("logout authorization");
         assert!(authorization.contains(&format!(r#"Token="{token}""#)));
@@ -781,7 +790,7 @@ mod tests {
         // the per-request minted-token header replaces its tokenless default.
         let mut pre_auth_headers = HeaderMap::new();
         pre_auth_headers.insert(
-            "X-Emby-Authorization",
+            AUTHORIZATION,
             HeaderValue::from_static("MediaBrowser Client=\"pre-auth\""),
         );
         let pre_auth_http = authenticated_client_builder()
@@ -817,11 +826,15 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, Method::POST);
         assert_eq!(requests[0].uri.path(), "/gateway/Sessions/Logout");
-        let authorization = requests[0]
-            .headers
-            .get("x-emby-authorization")
+        let mut authorizations = requests[0].headers.get_all(AUTHORIZATION).iter();
+        let authorization = authorizations
+            .next()
             .and_then(|value| value.to_str().ok())
             .expect("cleanup authorization");
+        assert!(
+            authorizations.next().is_none(),
+            "tokenless default replaced"
+        );
         assert!(authorization.contains(&format!(r#"Token="{token}""#)));
         assert!(!requests[0].uri.to_string().contains(&token));
         service.finish().await;
@@ -872,6 +885,161 @@ mod tests {
 
         assert!(service.requests().is_empty());
         service.finish().await;
+    }
+
+    const JELLYFIN_12_TOKEN: &str = "jellyfin-12-token";
+
+    /// Parameters of a standard `Authorization: MediaBrowser …` header.
+    fn standard_authorization(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
+        let Some((scheme, parameters)) = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_once(' '))
+        else {
+            return HashMap::new();
+        };
+        if !scheme.eq_ignore_ascii_case("MediaBrowser") {
+            return HashMap::new();
+        }
+        parameters
+            .split(',')
+            .filter_map(|parameter| parameter.split_once('='))
+            .map(|(key, value)| {
+                (
+                    key.trim().to_owned(),
+                    value.trim().trim_matches('"').to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Accepted request paths and the `DeviceId` each one carried.
+    type Accepted = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Jellyfin 12.0 with its default `EnableLegacyAuthorization = false`: the
+    /// client identification and token are read only from the standard
+    /// `Authorization` header, never from `X-Emby-Authorization`.
+    async fn jellyfin_12(State(accepted): State<Accepted>, request: Request) -> Response {
+        let parameters = standard_authorization(request.headers());
+        let path = request.uri().path().to_owned();
+        let signing_in = path == "/Users/AuthenticateByName";
+        let authorized = if signing_in {
+            ["Client", "Device", "DeviceId", "Version"]
+                .iter()
+                .all(|key| parameters.get(*key).is_some_and(|value| !value.is_empty()))
+        } else {
+            parameters.get("Token").map(String::as_str) == Some(JELLYFIN_12_TOKEN)
+        };
+        if !authorized {
+            return if signing_in {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+            .into_response();
+        }
+
+        let device_id = parameters.get("DeviceId").cloned().unwrap_or_default();
+        accepted.lock().unwrap().push((path, device_id));
+        if signing_in {
+            return axum::Json(serde_json::json!({
+                "User": { "Id": "user-id", "Name": "Fixture" },
+                "AccessToken": JELLYFIN_12_TOKEN
+            }))
+            .into_response();
+        }
+        StatusCode::OK.into_response()
+    }
+
+    /// Serve [`jellyfin_12`] on an ephemeral loopback port.
+    async fn start_jellyfin_12() -> (
+        String,
+        Accepted,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let accepted = Accepted::default();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Jellyfin 12 fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let app = axum::Router::new()
+            .fallback(jellyfin_12)
+            .with_state(Arc::clone(&accepted));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        (base_url, accepted, server)
+    }
+
+    /// Guards the regression test below against a fixture that would also
+    /// accept what older Tributary builds sent.
+    #[tokio::test]
+    async fn jellyfin_12_fixture_rejects_the_legacy_header_alone() {
+        let (base_url, accepted, server) = start_jellyfin_12().await;
+        let legacy_only = authenticated_client_builder()
+            .build()
+            .expect("client")
+            .get(format!("{base_url}/System/Ping"))
+            .header(
+                "X-Emby-Authorization",
+                jellyfin_auth_header(JELLYFIN_12_TOKEN).expect("legacy header"),
+            )
+            .send()
+            .await
+            .expect("legacy-only request");
+        server.abort();
+
+        assert_eq!(legacy_only.status(), StatusCode::UNAUTHORIZED);
+        assert!(accepted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn jellyfin_12_default_server_accepts_sign_in_api_media_and_logout() {
+        let (base_url, accepted, server) = start_jellyfin_12().await;
+        let http = authenticated_client_builder()
+            .build()
+            .expect("media client");
+
+        let client = JellyfinClient::authenticate(&base_url, "fixture-user", "fixture-password")
+            .await
+            .expect("sign-in with the standard header");
+        client
+            .get_text("System/Ping")
+            .await
+            .expect("API request with the standard header");
+        // Streams and artwork leave through the relay and artwork worker,
+        // which send exactly the resolved request's sensitive headers.
+        for request in [
+            client
+                .resolved_stream_request("track-id", MediaRepresentation::buffered_unknown())
+                .expect("stream request"),
+            client
+                .resolved_artwork_request("album-id")
+                .expect("artwork request"),
+        ] {
+            let response = http
+                .get(request.endpoint().clone())
+                .headers(request.sensitive_headers().clone())
+                .send()
+                .await
+                .expect("media request");
+            assert_eq!(response.status(), StatusCode::OK, "{}", request.endpoint());
+        }
+        client
+            .logout_owned_session()
+            .await
+            .expect("logout with the standard header");
+        server.abort();
+
+        let expected: Vec<_> = [
+            "/Users/AuthenticateByName",
+            "/System/Ping",
+            "/Audio/track-id/stream",
+            "/Items/album-id/Images/Primary",
+            "/Sessions/Logout",
+        ]
+        .into_iter()
+        .map(|path| (path.to_owned(), install_id().to_owned()))
+        .collect();
+        assert_eq!(*accepted.lock().unwrap(), expected);
     }
 
     #[test]

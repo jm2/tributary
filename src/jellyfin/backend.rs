@@ -1005,7 +1005,7 @@ mod tests {
         for request in requests {
             let authorization = request
                 .headers
-                .get("x-emby-authorization")
+                .get(reqwest::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .expect("Jellyfin fixture request authorization");
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));
@@ -1326,7 +1326,7 @@ mod tests {
         for request in requests {
             let authorization = request
                 .headers
-                .get("x-emby-authorization")
+                .get(reqwest::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .expect("Jellyfin fixture request authorization");
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));

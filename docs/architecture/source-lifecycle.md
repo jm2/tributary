@@ -400,7 +400,7 @@ media/adapter authority without attempting an account- or device-wide server-sid
 
 There is one earlier Jellyfin cleanup boundary before registry staging is possible. Once
 `AuthenticateByName` returns a token that can be represented exactly as a sensitive
-`X-Emby-Authorization` value, failure to construct the final routed authenticated client triggers
+`Authorization` value, failure to construct the final routed authenticated client triggers
 one bounded best-effort `Sessions/Logout` through the exact pre-authentication transport; the
 original redacted construction failure remains authoritative. A hostile server can instead return
 a token containing HTTP control bytes. Such a token cannot safely form the exact logout header, and
