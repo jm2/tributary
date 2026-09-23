@@ -3461,13 +3461,35 @@ pub(crate) fn build_window(
         let playback_progress = playback_progress.clone();
         let playback_notices = playback_notices.clone();
         let playback_admission = library_commands.clone();
+        let open_toasts = toast_overlay.clone();
+
+        // A launch or open that reaches a window whose close drain has started
+        // is refused visibly: this process cannot build a second window.
+        let closing_notice = gtk::gio::SimpleAction::new("closing-notice", None);
+        {
+            let admission = library_commands.clone();
+            let toasts = toast_overlay.clone();
+            closing_notice.connect_activate(move |_, _| {
+                if !admission.is_open() {
+                    show_closing_notice(&toasts);
+                }
+            });
+        }
+        app.add_action(&closing_notice);
 
         let play_pending = gtk::gio::SimpleAction::new("play-pending-files", None);
         play_pending.connect_activate(move |_, _| {
             if !playback_admission.is_open() {
                 super::open_files::invalidate_admission();
                 let _ = super::open_files::drain();
+                let _ = super::open_files::take_unsupported_location();
+                show_closing_notice(&open_toasts);
                 return;
+            }
+            if super::open_files::take_unsupported_location() {
+                open_toasts.add_toast(adw::Toast::new(&rust_i18n::t!(
+                    "errors.open_files.unsupported_location"
+                )));
             }
             let delivery = super::open_files::drain();
             if delivery.is_empty() {
@@ -4710,6 +4732,10 @@ fn setup_library_events(
             }
         }
     });
+}
+
+fn show_closing_notice(toasts: &adw::ToastOverlay) {
+    toasts.add_toast(adw::Toast::new(&rust_i18n::t!("errors.open_files.closing")));
 }
 
 /// Tell the user the library database is unavailable, naming the failed

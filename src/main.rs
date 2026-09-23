@@ -364,6 +364,11 @@ fn main() {
         // MPRIS service and double-fire media keys.
         if let Some(win) = select_existing_window(app.active_window(), app.windows()) {
             win.present();
+            // A window whose close drain has started cannot take this launch,
+            // and this process cannot build another window; it says so.
+            if let Some(action) = app.lookup_action("closing-notice") {
+                action.activate(None);
+            }
             return;
         }
 
@@ -449,9 +454,13 @@ fn main() {
     //
     //   * activate the app — on first launch, the window is not yet
     //     built; the queue is drained at the end of `build_window`;
-    //   * or, if a window is already live, fire the application-level
-    //     `play-pending-files` GAction registered by `build_window` to
-    //     drain the queue immediately.
+    //   * or, if a window is already live, present it and fire the
+    //     application-level `play-pending-files` GAction registered by
+    //     `build_window` to drain the queue immediately.
+    //
+    // Locations without a local path (`https://`, or `smb://` without a
+    // FUSE mount) cannot be played. They still bring up a window, which
+    // explains why nothing plays, instead of the process exiting silently.
     app.connect_open(move |app, files, _hint| {
         let mut paths = Vec::new();
         for file in files {
@@ -459,15 +468,24 @@ fn main() {
                 paths.push(path);
             }
         }
-        if paths.is_empty() {
-            return;
+        let unsupported = files.len() - paths.len();
+        if unsupported > 0 {
+            info!(count = unsupported, "OS open request without a local path");
+            ui::open_files::note_unsupported_location();
         }
-        info!(count = paths.len(), "Files received via OS handler");
-        ui::open_files::enqueue(paths);
+        if !paths.is_empty() {
+            info!(count = paths.len(), "Files received via OS handler");
+            ui::open_files::enqueue(paths);
+        }
 
         if pending_files_need_application_activation(app.active_window(), app.windows()) {
             app.activate();
-        } else if let Some(action) = app.lookup_action("play-pending-files") {
+            return;
+        }
+        if let Some(window) = select_existing_window(app.active_window(), app.windows()) {
+            window.present();
+        }
+        if let Some(action) = app.lookup_action("play-pending-files") {
             action.activate(None);
         }
     });

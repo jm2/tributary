@@ -329,6 +329,9 @@ errors:
     upgrade_failed: "Tributary 无法为此版本升级音乐库数据库，因此无法显示您的音乐库和播放列表。详情请查看日志。"
     backup_saved: "升级前的音乐库副本已保存到 %{path}。"
     newer_version: "此音乐库数据库由更新版本的 Tributary 创建，此版本无法打开。请重新安装更新的版本，或退出 Tributary 并用 %{path} 中较早的副本替换 library.db。"
+  open_files:
+    unsupported_location: "无法打开此位置。Tributary 只能打开此电脑上的文件。"
+    closing: "Tributary 正在关闭。请在关闭后重新打开。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

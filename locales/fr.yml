@@ -329,6 +329,9 @@ errors:
     upgrade_failed: "Tributary n’a pas pu mettre à niveau la base de données de la bibliothèque pour cette version ; votre bibliothèque et vos listes de lecture ne peuvent donc pas être affichées. Consultez le journal pour plus de détails."
     backup_saved: "Une copie de votre bibliothèque antérieure à la mise à niveau a été enregistrée dans %{path}."
     newer_version: "Cette base de données de la bibliothèque a été créée par une version plus récente de Tributary, que cette version ne peut pas ouvrir. Réinstallez la version plus récente, ou quittez Tributary et remplacez library.db par une copie antérieure provenant de %{path}."
+  open_files:
+    unsupported_location: "Impossible d’ouvrir cet emplacement. Tributary ne peut ouvrir que des fichiers présents sur cet ordinateur."
+    closing: "Tributary est en cours de fermeture. Rouvrez-le une fois qu’il sera fermé."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:
