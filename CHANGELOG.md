@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job instead of skipping silently. The widget session now refuses to reuse an
   initialized GTK from a different thread, and recognizes Broadway as a display server
   for local headless runs.
+- **Broader parser fuzzing** — The weekly fuzz run now also covers the XSPF playlist,
+  Rhythmbox import, Last.fm sign-in response, and cast streaming URL and byte-range parsers,
+  each started from committed sample inputs and stopped at fixed time and iteration limits.
 - **Folder browsing** — Browse the local library by configured root and folder, with
   distinct identities for multiple roots, lazy navigation, and visible reasons when a root
   is unavailable or has changed identity.
