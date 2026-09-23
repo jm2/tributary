@@ -5221,7 +5221,7 @@ async fn initial_scan_with_control(
                     // Test-only seam: park the probe the way a hung kernel call
                     // would (jq5lT regression).
                     #[cfg(test)]
-                    tests::hold_stale_absence_probe();
+                    tests::hold_stale_absence_probe(&proof_path);
                     proof_lease.prove_absent(&proof_path).map(Arc::new)
                 }),
             )
@@ -7982,25 +7982,54 @@ mod tests {
 
     use super::*;
 
-    /// jq5lT regression seam: when armed, the stale-deletion absence probe
-    /// parks its blocking worker thread the way a removable/network root
-    /// parks the kernel call, so the shutdown settle budget becomes
-    /// observable. The flag is never armed outside the regression test, and
-    /// the closure reference is compiled only under `cfg(test)`.
-    static STALE_ABSENCE_PROBE_HELD: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    /// Regression seam: while a root is armed here, a stale-deletion absence
+    /// probe for a path under that root parks its blocking worker thread the
+    /// way a removable/network root parks the kernel call, so the shutdown
+    /// settle budget becomes observable. Scoped to one root so concurrently
+    /// running scan tests never park, and released by `StaleAbsenceProbeHold`
+    /// even if the arming test panics.
+    static STALE_ABSENCE_PROBE_HELD: std::sync::Mutex<Option<PathBuf>> =
+        std::sync::Mutex::new(None);
 
-    /// Set just before the armed probe starts spinning, so the regression
+    /// Set just before an armed probe starts spinning, so the regression
     /// driver knows the scan is parked inside the absence proof.
     static STALE_ABSENCE_PROBE_ARRIVED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    pub(super) fn hold_stale_absence_probe() {
-        if STALE_ABSENCE_PROBE_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+    fn stale_absence_probe_held(path: &Path) -> bool {
+        STALE_ABSENCE_PROBE_HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(|root| path.starts_with(root))
+    }
+
+    pub(super) fn hold_stale_absence_probe(path: &Path) {
+        if stale_absence_probe_held(path) {
             STALE_ABSENCE_PROBE_ARRIVED.store(true, std::sync::atomic::Ordering::SeqCst);
-            while STALE_ABSENCE_PROBE_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+            while stale_absence_probe_held(path) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+        }
+    }
+
+    /// Arms the absence-probe hold for one root until dropped.
+    struct StaleAbsenceProbeHold;
+
+    impl StaleAbsenceProbeHold {
+        fn arm(root: &Path) -> Self {
+            *STALE_ABSENCE_PROBE_HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.to_path_buf());
+            Self
+        }
+    }
+
+    impl Drop for StaleAbsenceProbeHold {
+        fn drop(&mut self) {
+            *STALE_ABSENCE_PROBE_HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 
@@ -12610,7 +12639,7 @@ mod tests {
         let scan_write_txn = ScanWriteTxnGate::default();
         let mut completed = HashMap::new();
 
-        STALE_ABSENCE_PROBE_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let probe_hold = StaleAbsenceProbeHold::arm(directory.path());
         let no_hold = ScanDiscoveryHold::none();
         let engine = service_commands_while_scanning(
             initial_scan_shutdown_aware(
@@ -12664,7 +12693,7 @@ mod tests {
         });
         scan_result.expect("a scan whose absence probe was abandoned returns cleanly");
         // Let the abandoned probe thread exit before its fixtures drop.
-        STALE_ABSENCE_PROBE_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(probe_hold);
 
         let preserved = track::Entity::find_by_id("stale-absent-track")
             .one(&db)
