@@ -12,6 +12,10 @@ use crate::architecture::AdvertisedHttpRoute;
 
 use super::header_bar;
 use super::objects::SourceObject;
+use super::output_switch::{
+    airplay_row_endpoint, encode_airplay_row_identity, row_icon_name, AIRPLAY_ROW_ICON,
+    CHROMECAST_ROW_ICON,
+};
 use super::window;
 use super::window_state::WindowState;
 
@@ -278,27 +282,32 @@ pub fn setup_discovery(state: &WindowState, output_list: &gtk::ListBox) {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Add a discovered AirPlay device to the output selector.
+///
+/// Rows are keyed by endpoint plus device identifier, never by display name,
+/// and only against other AirPlay rows: receivers sharing a name, or a
+/// Chromecast sharing the name or endpoint, each keep their own row.
 fn handle_airplay_found(output_list: &gtk::ListBox, server: &crate::discovery::DiscoveredServer) {
-    let airplay_url = &server.url;
-    let airplay_name = server.name.clone();
-
-    // Dedup: check if this AirPlay device is already in outputs.
-    if is_device_in_output_list(output_list, &airplay_name) {
+    let Some(endpoint) = airplay_endpoint(&server.url) else {
+        tracing::warn!(url = %server.url, "Ignoring AirPlay receiver without a host:port endpoint");
+        return;
+    };
+    let identity = encode_airplay_row_identity(&endpoint, server.device_id.as_deref());
+    if output_rows_with_icon(output_list, AIRPLAY_ROW_ICON)
+        .iter()
+        .any(|row| row.widget_name() == identity.as_str())
+    {
         return;
     }
 
     info!(
-        name = %airplay_name,
-        url = %airplay_url,
+        name = %server.name,
+        url = %server.url,
+        device_id = ?server.device_id,
         "AirPlay receiver discovered — adding to output selector"
     );
-    let row = header_bar::build_output_row(&airplay_name, "network-wireless-symbolic", false);
-    // Store the host:port on the row so the output selector can use it.
-    if let Ok(parsed) = url::Url::parse(airplay_url) {
-        let host = parsed.host_str().unwrap_or("").to_string();
-        let port = parsed.port().unwrap_or(7000);
-        row.set_widget_name(&format!("{host}:{port}"));
-    }
+    let row = header_bar::build_output_row(&server.name, AIRPLAY_ROW_ICON, false);
+    // The output selector resolves the row's target from this identity.
+    row.set_widget_name(&identity);
     output_list.append(&row);
     propagate_widget_name(output_list);
 }
@@ -310,9 +319,14 @@ fn handle_chromecast_found(
 ) {
     let cast_url = &server.url;
     let cast_name = server.name.clone();
+    // Extract host:port from cast://host:port URL.
+    let host_port = cast_url.strip_prefix("cast://").unwrap_or(cast_url);
 
-    // Dedup: check if this Chromecast is already in outputs.
-    if is_device_in_output_list(output_list, &cast_name) {
+    // Dedup by endpoint among Chromecast rows only, never by display name.
+    if output_rows_with_icon(output_list, CHROMECAST_ROW_ICON)
+        .iter()
+        .any(|row| row.widget_name() == host_port)
+    {
         return;
     }
 
@@ -321,9 +335,7 @@ fn handle_chromecast_found(
         url = %cast_url,
         "Chromecast device discovered — adding to output selector"
     );
-    let row = header_bar::build_output_row(&cast_name, "video-display-symbolic", false);
-    // Extract host:port from cast://host:port URL.
-    let host_port = cast_url.strip_prefix("cast://").unwrap_or(cast_url);
+    let row = header_bar::build_output_row(&cast_name, CHROMECAST_ROW_ICON, false);
     row.set_widget_name(host_port);
     output_list.append(&row);
     propagate_widget_name(output_list);
@@ -334,72 +346,35 @@ fn handle_chromecast_lost(output_list: &gtk::ListBox, url: &str) {
     info!(url = %url, "Chromecast device lost — removing from output selector");
     let lost_hp = url.strip_prefix("cast://").unwrap_or(url);
 
-    let mut child = output_list.first_child();
-    let mut row_idx = 0i32;
-    while let Some(c) = child {
-        let next = c.next_sibling();
-        if row_idx > 0 {
-            if let Some(row_box) = c
-                .first_child()
-                .and_then(|inner| inner.downcast::<gtk::Box>().ok())
-            {
-                if let Some(icon) = row_box
-                    .first_child()
-                    .and_then(|i| i.downcast::<gtk::Image>().ok())
-                {
-                    if icon
-                        .icon_name()
-                        .is_some_and(|n| n == "video-display-symbolic")
-                    {
-                        if let Some(list_row) = c.downcast_ref::<gtk::ListBoxRow>() {
-                            // Match by widget name (host:port).
-                            let row_hp = list_row.widget_name().to_string();
-                            if row_hp == lost_hp {
-                                output_list.remove(list_row);
-                            }
-                        }
-                    }
-                }
-            }
+    for row in output_rows_with_icon(output_list, CHROMECAST_ROW_ICON) {
+        if row.widget_name() == lost_hp {
+            output_list.remove(&row);
         }
-        row_idx += 1;
-        child = next;
     }
 }
 
-/// Remove a lost AirPlay device from the output selector.
+/// Remove a lost AirPlay device from the output selector: only the AirPlay
+/// rows at its endpoint, leaving every other receiver (and a Chromecast at
+/// the same endpoint) in place.
 fn handle_airplay_lost(output_list: &gtk::ListBox, url: &str) {
     info!(url = %url, "AirPlay receiver lost — removing from output selector");
+    let Some(endpoint) = airplay_endpoint(url) else {
+        return;
+    };
 
-    let mut child = output_list.first_child();
-    let mut row_idx = 0i32;
-    while let Some(c) = child {
-        let next = c.next_sibling();
-        // Skip index 0 ("My Computer") — never remove it.
-        if row_idx > 0 {
-            if let Some(row_box) = c
-                .first_child()
-                .and_then(|inner| inner.downcast::<gtk::Box>().ok())
-            {
-                // Check the icon — AirPlay rows use "network-wireless-symbolic".
-                if let Some(icon) = row_box
-                    .first_child()
-                    .and_then(|i| i.downcast::<gtk::Image>().ok())
-                {
-                    if icon
-                        .icon_name()
-                        .is_some_and(|n| n == "network-wireless-symbolic")
-                    {
-                        if let Some(list_row) = c.downcast_ref::<gtk::ListBoxRow>() {
-                            output_list.remove(list_row);
-                        }
-                    }
-                }
-            }
+    for row in output_rows_with_icon(output_list, AIRPLAY_ROW_ICON) {
+        if airplay_row_endpoint(&row.widget_name()) == endpoint {
+            output_list.remove(&row);
         }
-        row_idx += 1;
-        child = next;
     }
+}
+
+/// The `host:port` a discovered AirPlay URL (`http://host[:port]`) addresses.
+fn airplay_endpoint(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str().filter(|host| !host.is_empty())?;
+    let port = parsed.port_or_known_default().unwrap_or(7000);
+    Some(format!("{host}:{port}"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -435,27 +410,20 @@ fn same_remote_server_url(left: &str, right: &str) -> bool {
         .is_some_and(|(left, right)| left == right)
 }
 
-/// Check if a device with the given name already exists in the output list.
-fn is_device_in_output_list(output_list: &gtk::ListBox, name: &str) -> bool {
+/// The output selector rows of one kind, identified by their icon. The local
+/// row and saved MPD rows never carry a discovered receiver's icon.
+fn output_rows_with_icon(output_list: &gtk::ListBox, icon: &str) -> Vec<gtk::ListBoxRow> {
+    let mut rows = Vec::new();
     let mut child = output_list.first_child();
-    while let Some(c) = child {
-        if let Some(row_box) = c
-            .first_child()
-            .and_then(|inner| inner.downcast::<gtk::Box>().ok())
-        {
-            if let Some(label) = row_box
-                .first_child()
-                .and_then(|icon| icon.next_sibling())
-                .and_then(|l| l.downcast::<gtk::Label>().ok())
-            {
-                if label.text() == name {
-                    return true;
-                }
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
+            if row_icon_name(&row) == icon {
+                rows.push(row);
             }
         }
-        child = c.next_sibling();
     }
-    false
+    rows
 }
 
 /// Propagate widget name from a ListBox child's inner Box to its wrapping ListBoxRow.
@@ -543,6 +511,106 @@ fn probe_daap_password(
             }
         }
     });
+}
+
+/// Output-row contracts, run from the crate's single GTK-initializing test
+/// (browser.rs `gtk_widget_contracts_hold_on_one_session`); never standalone
+/// `#[test]`s. See `ui::widget_test_session`.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    use super::*;
+
+    fn server(
+        name: &str,
+        url: &str,
+        service_type: &str,
+        device_id: Option<&str>,
+    ) -> crate::discovery::DiscoveredServer {
+        crate::discovery::DiscoveredServer {
+            name: name.to_string(),
+            url: url.to_string(),
+            service_type: service_type.to_string(),
+            requires_password: None,
+            device_id: device_id.map(str::to_string),
+            advertised_route: None,
+        }
+    }
+
+    fn row_names(output_list: &gtk::ListBox) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut child = output_list.first_child();
+        while let Some(widget) = child {
+            if let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>() {
+                names.push(row.widget_name().to_string());
+            }
+            child = widget.next_sibling();
+        }
+        names
+    }
+
+    /// The selector as discovery leaves it: the local row, two AirPlay
+    /// receivers that share the display name "Den", and a Chromecast also
+    /// named "Den" at the first receiver's endpoint. Republications of the
+    /// same receivers add nothing.
+    fn selector_with_same_named_receivers() -> gtk::ListBox {
+        let output_list = gtk::ListBox::new();
+        let local = header_bar::build_output_row("My Computer", "audio-speakers-symbolic", true);
+        local.set_widget_name("My Computer");
+        output_list.append(&local);
+        propagate_widget_name(&output_list);
+
+        let den_a = server(
+            "Den",
+            "http://10.0.0.5:7000",
+            "airplay",
+            Some("AABBCCDDEEFF"),
+        );
+        let den_b = server(
+            "Den",
+            "http://10.0.0.6:7000",
+            "airplay",
+            Some("112233445566"),
+        );
+        let den_cast = server("Den", "cast://10.0.0.5:7000", "chromecast", None);
+        for _ in 0..2 {
+            handle_airplay_found(&output_list, &den_a);
+            handle_chromecast_found(&output_list, &den_cast);
+            handle_airplay_found(&output_list, &den_b);
+        }
+        output_list
+    }
+
+    /// Rows are keyed by identity within their own kind: same-named AirPlay
+    /// receivers and a same-named Chromecast at a shared endpoint all stay
+    /// listed, and republication does not duplicate any of them.
+    pub fn discovered_rows_are_keyed_by_identity_not_display_name() {
+        let output_list = selector_with_same_named_receivers();
+        assert_eq!(
+            row_names(&output_list),
+            [
+                "My Computer",
+                "10.0.0.5:7000|AABBCCDDEEFF",
+                "10.0.0.5:7000",
+                "10.0.0.6:7000|112233445566",
+            ]
+        );
+    }
+
+    /// Losing one AirPlay receiver removes only its row: the Chromecast at
+    /// the same endpoint and the other same-named receiver survive.
+    pub fn airplay_loss_removes_only_that_receivers_row() {
+        let output_list = selector_with_same_named_receivers();
+
+        handle_airplay_lost(&output_list, "http://10.0.0.5:7000");
+        assert_eq!(
+            row_names(&output_list),
+            ["My Computer", "10.0.0.5:7000", "10.0.0.6:7000|112233445566"]
+        );
+
+        handle_airplay_lost(&output_list, "http://10.0.0.6:7000");
+        handle_chromecast_lost(&output_list, "cast://10.0.0.5:7000");
+        assert_eq!(row_names(&output_list), ["My Computer"]);
+    }
 }
 
 #[cfg(test)]

@@ -113,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row from
+  the output selector, and receivers or Chromecasts that share a display name no longer hide each
+  other.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album
