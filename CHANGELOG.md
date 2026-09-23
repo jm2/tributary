@@ -156,6 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/Music` pointing to another disk) is now indexed instead of showing an empty library.
   Removing a library folder now forgets its unplayable tracks at the next start, while a
   folder that is only temporarily unavailable, such as an unmounted drive, keeps them.
+- **Responsiveness on slow or network drives** — Starting Tributary no longer holds up
+  ratings and other edits while it sets up folder watching, and closing the window no
+  longer waits for a library rescan to finish.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album

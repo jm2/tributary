@@ -542,33 +542,43 @@ impl LibraryEngine {
             }
         }
 
-        // Install before traversing so changes observed during the initial
-        // scan are retained for replay after its snapshot is published.
-        // Construction remains best-effort: a watcher backend failure must
-        // not suppress the useful one-shot scan.
-        let (mut watcher, watcher_error) = match install_directory_watcher(&music_dirs) {
-            Ok(watcher) => (Some(watcher), None),
-            Err(error) => {
-                error!(%error, "Filesystem watcher could not be installed");
-                (None, Some(error.to_string()))
-            }
-        };
-
-        // ── Initial scan (all directories) ───────────────────────────
-        for dir in &music_dirs {
-            info!(dir = %dir.display(), "Starting initial library scan");
-        }
-        // Commands are serviced *while* the scan runs. The scan's read-only
-        // traversal/parsing cannot be cancelled while the window is open, so
-        // awaiting it before this loop would let a held discovery step delay
-        // every admitted rating/history edit until close (R9/R1). Both share
-        // one engine task, so catalogue mutations stay serialized — except
-        // while the scan has a write transaction open across an await point,
-        // when the shared gate defers commands to the transaction boundary.
+        // Commands are serviced *while* the watcher is installed and the scan
+        // runs. Neither notify's recursive registration nor the scan's
+        // read-only traversal/parsing can be cancelled while the window is
+        // open, so awaiting them before this loop would let slow storage delay
+        // every admitted rating/history edit until close. Both share one
+        // engine task, so catalogue mutations stay serialized — except while
+        // the scan has a write transaction open across an await point, when
+        // the shared gate defers commands to the transaction boundary.
+        let mut watcher = None;
+        let mut watcher_error = None;
         let mut completed_commands = HashMap::new();
         let scan_write_txn = ScanWriteTxnGate::default();
-        let scan_result = service_commands_while_scanning(
-            initial_scan_shutdown_aware(
+        let startup = async {
+            // Install before traversing so changes observed during the initial
+            // scan are retained for replay after its snapshot is published.
+            // Construction remains best-effort: a watcher backend failure must
+            // not suppress the useful one-shot scan.
+            let install_dirs = music_dirs.clone();
+            let install =
+                tokio::task::spawn_blocking(move || install_directory_watcher(&install_dirs));
+            match await_readonly_blocking(&scan_cancellation, install).await {
+                Some(Ok(Ok(installed))) => watcher = Some(installed),
+                Some(Ok(Err(error))) => {
+                    error!(%error, "Filesystem watcher could not be installed");
+                    watcher_error = Some(error.to_string());
+                }
+                Some(Err(error)) => {
+                    error!(%error, "Filesystem watcher installation task failed");
+                    watcher_error = Some(error.to_string());
+                }
+                None => info!("Filesystem watcher installation abandoned at shutdown"),
+            }
+
+            for dir in &music_dirs {
+                info!(dir = %dir.display(), "Starting initial library scan");
+            }
+            let scan_result = initial_scan_shutdown_aware(
                 &db,
                 &music_dirs,
                 &tx,
@@ -576,7 +586,33 @@ impl LibraryEngine {
                 &scan_cancellation,
                 &ScanDiscoveryHold::none(),
                 &scan_write_txn,
-            ),
+            )
+            .await;
+
+            // A missing or temporarily unwatchable root can become available
+            // while another root is being enumerated. Retain every successful
+            // pre-scan registration, then retry only the gaps at the handoff so
+            // a root the scan just indexed is never left unwatched until
+            // restart.
+            if let Some(mut installed) = watcher.take() {
+                let retry_dirs = music_dirs.clone();
+                let retry = tokio::task::spawn_blocking(move || {
+                    installed.watch_available_directories(&retry_dirs);
+                    installed
+                });
+                watcher = match await_readonly_blocking(&scan_cancellation, retry).await {
+                    Some(Ok(installed)) => Some(installed),
+                    Some(Err(error)) => {
+                        error!(%error, "Filesystem watcher registration task failed");
+                        None
+                    }
+                    None => None,
+                };
+            }
+            scan_result
+        };
+        let scan_result = service_commands_while_scanning(
+            startup,
             &scan_write_txn,
             &db,
             &music_dirs,
@@ -589,14 +625,6 @@ impl LibraryEngine {
         if let Err(e) = scan_result {
             error!(error = %e, "Initial scan failed");
             let _ = tx.send(LibraryEvent::Error(e.to_string())).await;
-        }
-
-        // A missing or temporarily unwatchable root can become available
-        // while another root is being enumerated. Retain every successful
-        // pre-scan registration, then retry only the gaps at the handoff so a
-        // root the scan just indexed is never left unwatched until restart.
-        if let Some(watcher) = watcher.as_mut() {
-            watcher.watch_available_directories(&music_dirs);
         }
 
         if let Some(error) = watcher_error {
@@ -613,6 +641,7 @@ impl LibraryEngine {
                 &mut completed_commands,
                 watcher,
                 &playlist_sidebar_refresh,
+                &scan_cancellation,
             )
             .await
             {
@@ -1424,7 +1453,9 @@ where
 #[derive(Debug)]
 struct RootScan {
     root: PathBuf,
-    audio_files: Vec<PathBuf>,
+    /// Each discovered audio file with its RFC 3339 mtime, read by the
+    /// traversal worker so the scan loop never stats files on the engine task.
+    audio_files: Vec<(PathBuf, String)>,
     errors: Vec<String>,
     device_id: Option<String>,
     mount_generation: Option<u64>,
@@ -2467,6 +2498,13 @@ where
 
     let (audio_files, traversal_errors) = enumerate_audio_files(&root, root_boundary, exclusions);
     errors.extend(traversal_errors);
+    let audio_files = audio_files
+        .into_iter()
+        .map(|path| {
+            let mtime = get_mtime(&path);
+            (path, mtime)
+        })
+        .collect();
 
     match mount_generation_probe(&root) {
         Ok(generation) if generation == mount_generation => {}
@@ -2766,8 +2804,8 @@ fn directory_identity_destinations(
         .collect()
 }
 
-fn collect_audio_files(root_scans: &[RootScan]) -> Vec<PathBuf> {
-    let mut audio_files: Vec<PathBuf> = root_scans
+fn collect_audio_files(root_scans: &[RootScan]) -> Vec<(PathBuf, String)> {
+    let mut audio_files: Vec<(PathBuf, String)> = root_scans
         .iter()
         .filter(|scan| scan.content_authorized)
         .flat_map(|scan| scan.audio_files.iter().cloned())
@@ -2775,8 +2813,8 @@ fn collect_audio_files(root_scans: &[RootScan]) -> Vec<PathBuf> {
 
     // The same file is visible through every configured ancestor root. Scan
     // it once even if the user's configuration contains overlapping roots.
-    audio_files.sort_unstable();
-    audio_files.dedup();
+    audio_files.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    audio_files.dedup_by(|(left, _), (right, _)| left == right);
     audio_files
 }
 
@@ -4800,7 +4838,7 @@ async fn initial_scan_with_control(
     let mut scanned: u64 = 0;
     let mut on_disk_paths = HashSet::new();
 
-    for path in &audio_files {
+    for (path, mtime) in &audio_files {
         // Check the shutdown boundary before admitting the next parse/upsert.
         // Everything already committed above stands; nothing new is admitted,
         // and the no-deletion phase below is skipped entirely.
@@ -4823,8 +4861,8 @@ async fn initial_scan_with_control(
         let existing = existing_by_path.get(path_str.as_str()).copied();
 
         let needs_update = match existing {
-            // Compare FS mtime with stored date_modified.
-            Some(row) => get_mtime(path) != row.date_modified,
+            // Compare the traversal's mtime with the stored date_modified.
+            Some(row) => *mtime != row.date_modified,
             None => true,
         };
 
@@ -6426,9 +6464,14 @@ fn install_directory_watcher(music_dirs: &[PathBuf]) -> notify::Result<Directory
     Ok(installed)
 }
 
+/// One debounce window of watcher events, kept raw and in order.
+///
+/// Classifying an event stats its paths, which can block on slow storage, so
+/// [`WatcherDebounceBatch::finish`] runs on a blocking worker once the window
+/// closes rather than on the engine task as each event arrives.
 #[derive(Debug, Default)]
 struct WatcherDebounceBatch {
-    batch: WatcherBatch,
+    events: Vec<notify::Event>,
     stream_unreliable: bool,
 }
 
@@ -6442,23 +6485,27 @@ impl WatcherDebounceBatch {
             Ok(event) if event.need_rescan() => {
                 warn!("Filesystem watcher requested an authoritative rescan");
                 self.stream_unreliable = true;
-                self.batch = WatcherBatch::default();
+                self.events.clear();
             }
-            Ok(event) => self.batch.collect(event),
+            Ok(event) => self.events.push(event),
             Err(error) => {
                 warn!(%error, "Filesystem watcher reported an unreliable stream");
                 self.stream_unreliable = true;
-                self.batch = WatcherBatch::default();
+                self.events.clear();
             }
         }
     }
 
-    fn finish(mut self) -> Option<WatcherBatch> {
+    fn finish(self) -> Option<WatcherBatch> {
         if self.stream_unreliable {
             return None;
         }
-        self.batch.finish();
-        Some(self.batch)
+        let mut batch = WatcherBatch::default();
+        for event in self.events {
+            batch.collect(event);
+        }
+        batch.finish();
+        Some(batch)
     }
 }
 
@@ -6466,11 +6513,34 @@ fn discard_watcher_backlog(rx: &mut mpsc::Receiver<notify::Result<notify::Event>
     while rx.try_recv().is_ok() {}
 }
 
+/// The watcher's authoritative fallback: an ordinary library scan, bounded by
+/// the window-close cancellation like the startup scan so closing the window
+/// never waits for a whole-library rescan.
+async fn reconcile_watched_library(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<()> {
+    initial_scan_shutdown_aware(
+        db,
+        music_dirs,
+        tx,
+        playlist_sidebar_refresh,
+        cancellation,
+        &ScanDiscoveryHold::none(),
+        &ScanWriteTxnGate::default(),
+    )
+    .await
+}
+
 async fn reconcile_unreliable_watcher_stream(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
     rx: &mut mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> bool {
     // The queued backlog belongs to the same stream gap and cannot be applied
@@ -6480,7 +6550,9 @@ async fn reconcile_unreliable_watcher_stream(
     // loop iteration.
     discard_watcher_backlog(rx);
     info!("Reconciling library after filesystem watcher stream loss");
-    match initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
+    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
+        .await
+    {
         Ok(()) => true,
         Err(error) => {
             warn!(%error, "Watcher stream reconciliation failed; retry remains pending");
@@ -6494,6 +6566,7 @@ async fn reconcile_root_marker_mutations(
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    cancellation: &CancellationToken,
     roots: &HashSet<PathBuf>,
 ) -> bool {
     // Invalidate persisted authorization before any asynchronous traversal.
@@ -6503,7 +6576,9 @@ async fn reconcile_root_marker_mutations(
         mark_root_path_unavailable(db, root).await;
     }
     info!("Reconciling library after library root marker mutation");
-    match initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
+    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
+        .await
+    {
         Ok(()) => true,
         Err(error) => {
             warn!(%error, "Library root marker reconciliation failed; retry remains pending");
@@ -6512,6 +6587,7 @@ async fn reconcile_root_marker_mutations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_directory_events(
     db: &Arc<DatabaseConnection>,
     music_dirs: &[PathBuf],
@@ -6520,6 +6596,7 @@ async fn process_directory_events(
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     mut watcher: DirectoryWatcher,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    scan_cancellation: &CancellationToken,
 ) -> anyhow::Result<()> {
     // ── Debounced event processing ──────────────────────────────
     // Collect filesystem events for a short window, deduplicate by
@@ -6579,6 +6656,7 @@ async fn process_directory_events(
                 music_dirs,
                 tx,
                 playlist_sidebar_refresh,
+                scan_cancellation,
                 &mut watcher.rx,
             )
             .await;
@@ -6636,7 +6714,11 @@ async fn process_directory_events(
         // callback racing with the scan stores a fresh `true` value, which is
         // intentionally left for the next loop iteration.
         let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
-        let Some(mut batch) = ingress.finish() else {
+        let finished = tokio::task::spawn_blocking(move || ingress.finish()).await;
+        if let Err(error) = &finished {
+            warn!(%error, "Watcher batch classification task failed");
+        }
+        let Ok(Some(mut batch)) = finished else {
             reconciliation_pending = true;
             continue;
         };
@@ -6660,6 +6742,7 @@ async fn process_directory_events(
                 music_dirs,
                 tx,
                 playlist_sidebar_refresh,
+                scan_cancellation,
                 &batch.identity_changed_roots,
             )
             .await;
@@ -7331,8 +7414,14 @@ async fn process_directory_events(
         reconciliation_required |= root_cache.authority_was_lost();
         if reconciliation_required {
             info!("Reconciling library after unpaired or unclaimed watcher changes");
-            if let Err(error) =
-                initial_scan(db.as_ref(), music_dirs, tx, playlist_sidebar_refresh).await
+            if let Err(error) = reconcile_watched_library(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                scan_cancellation,
+            )
+            .await
             {
                 warn!(%error, "Watcher-triggered library reconciliation failed");
             }
@@ -8751,6 +8840,10 @@ mod tests {
         event
     }
 
+    fn scanned_paths(audio_files: &[(PathBuf, String)]) -> Vec<PathBuf> {
+        audio_files.iter().map(|(path, _)| path.clone()).collect()
+    }
+
     #[test]
     fn watcher_ingress_filters_access_noise_before_the_bounded_queue() {
         use notify::event::{AccessKind, AccessMode, Flag, MetadataKind, ModifyKind};
@@ -9236,7 +9329,7 @@ mod tests {
         ))
         .add_path(PathBuf::from("/music/must-not-remove.flac"))));
 
-        assert!(ingress.batch.is_empty());
+        assert!(ingress.events.is_empty());
         assert!(ingress.finish().is_none());
 
         let (tx, mut rx) = mpsc::channel(2);
@@ -9388,6 +9481,7 @@ mod tests {
             drop(event_tx);
         };
 
+        let never_cancelled = CancellationToken::new();
         let (loop_result, ()) = tokio::join!(
             process_directory_events(
                 &db,
@@ -9397,6 +9491,7 @@ mod tests {
                 &mut completed_commands,
                 watcher,
                 &playlist_sidebar_refresh,
+                &never_cancelled,
             ),
             driver,
         );
@@ -13768,6 +13863,7 @@ mod tests {
         };
 
         let mut completed_commands = HashMap::new();
+        let never_cancelled = CancellationToken::new();
         // Bound the join so the exact regressions this test exists to report
         // fail fast instead of hanging the suite until the CI job timeout.
         // 60s is orders of magnitude above this harness's normal sub-second
@@ -13791,6 +13887,7 @@ mod tests {
                         &mut completed_commands,
                         watcher,
                         &playlist_sidebar_refresh,
+                        &never_cancelled,
                     ),
                     driver,
                 )
@@ -15056,7 +15153,10 @@ mod tests {
             scan.content_authorized = true;
         }
 
-        assert_eq!(collect_audio_files(&scans), vec![audio_path]);
+        assert_eq!(
+            scanned_paths(&collect_audio_files(&scans)),
+            vec![audio_path]
+        );
     }
 
     #[test]
@@ -15072,7 +15172,7 @@ mod tests {
         let child_scan = scan_root_with_exclusions(child, &roots);
 
         assert!(parent_scan.audio_files.is_empty());
-        assert_eq!(child_scan.audio_files, vec![audio_path]);
+        assert_eq!(scanned_paths(&child_scan.audio_files), vec![audio_path]);
     }
 
     #[cfg(target_os = "linux")]
@@ -15225,7 +15325,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
             .expect("restore nested permissions");
         assert!(!scan.is_complete());
-        assert_eq!(scan.audio_files, vec![readable_audio]);
+        assert_eq!(scanned_paths(&scan.audio_files), vec![readable_audio]);
     }
 
     fn persisted_root_state(scan: &RootScan, device_id: Option<String>) -> library_root::Model {
@@ -15351,7 +15451,7 @@ mod tests {
         };
         let mounted_volume = RootScan {
             root: root.clone(),
-            audio_files: vec![root.join("song.mp3")],
+            audio_files: vec![(root.join("song.mp3"), String::new())],
             errors: Vec::new(),
             device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
             mount_generation: Some(0),
