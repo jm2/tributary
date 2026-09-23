@@ -441,7 +441,9 @@ pub(super) fn build_tracklist(
         .vexpand(true)
         .build();
 
-    // ── Define columns (display getter + sort key) ──────────────────
+    // ── Define columns (stable ID, display getter + sort key) ───────
+    // Each ID is one of `preferences::ALL_COLUMNS`; the title is derived
+    // from it for the current locale.
     add_sorted_column(
         &column_view,
         "#",
@@ -583,7 +585,7 @@ pub(super) fn build_tracklist(
     if let Some(sorter) = column_view.sorter() {
         let cv = column_view.clone();
         let sm = sort_model.clone();
-        // Track (column_title, was_descending) from the previous state.
+        // Track (column_id, was_descending) from the previous state.
         let prev: Rc<RefCell<Option<(String, bool)>>> = Rc::new(RefCell::new(None));
 
         sorter.connect_changed(move |_, _| {
@@ -596,12 +598,12 @@ pub(super) fn build_tracklist(
                 *prev.borrow_mut() = None;
                 return;
             };
-            let title = col.title().map(|t| t.to_string()).unwrap_or_default();
+            let id = col.id().map(|id| id.to_string()).unwrap_or_default();
             let is_desc = cv_sorter.primary_sort_order() == gtk::SortType::Descending;
 
             let mut prev = prev.borrow_mut();
-            if let Some((ref prev_title, prev_desc)) = *prev {
-                if *prev_title == title && prev_desc && !is_desc {
+            if let Some((ref prev_id, prev_desc)) = *prev {
+                if *prev_id == id && prev_desc && !is_desc {
                     // Column flipped from desc back to asc — that means
                     // the user clicked it a third time.  Clear sorting.
                     // Use idle_add_local_once to avoid re-entrant sorter mutation.
@@ -616,7 +618,7 @@ pub(super) fn build_tracklist(
                     });
                 }
             }
-            *prev = Some((title, is_desc));
+            *prev = Some((id, is_desc));
         });
     }
 
@@ -683,7 +685,7 @@ pub fn update_status(label: &gtk::Label, tracks: &[TrackObject]) {
 
 fn add_sorted_column<F, S>(
     column_view: &gtk::ColumnView,
-    title: &str,
+    id: &str,
     fixed_width: i32,
     right_align: bool,
     getter: F,
@@ -764,7 +766,8 @@ fn add_sorted_column<F, S>(
     });
 
     let column = gtk::ColumnViewColumn::builder()
-        .title(title)
+        .id(id)
+        .title(super::preferences::column_title(id, &rust_i18n::locale()))
         .factory(&factory)
         .sorter(&sorter)
         .resizable(true)
@@ -916,8 +919,6 @@ fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCom
         }
     });
 
-    let rating_title = rust_i18n::t!("columns.rating").into_owned();
-    let sort_rating_title = rating_title.clone();
     let column_view_weak = column_view.downgrade();
     let sorter = gtk::CustomSorter::new(move |a, b| {
         let first = a
@@ -930,20 +931,21 @@ fn add_rating_column(column_view: &gtk::ColumnView, library_commands: LibraryCom
             view.sorter()
                 .and_downcast::<gtk::ColumnViewSorter>()
                 .is_some_and(|sorter| {
-                    rating_sort_is_descending(
-                        (0..sorter.n_sort_columns()).filter_map(|index| {
-                            let (column, order) = sorter.nth_sort_column(index);
-                            Some((column?.title()?, order))
-                        }),
-                        &sort_rating_title,
-                    )
+                    rating_sort_is_descending((0..sorter.n_sort_columns()).filter_map(|index| {
+                        let (column, order) = sorter.nth_sort_column(index);
+                        Some((column?.id()?, order))
+                    }))
                 })
         });
         compare_rating_rows(first, second, descending).into()
     });
 
     let column = gtk::ColumnViewColumn::builder()
-        .title(&rating_title)
+        .id(RATING_COLUMN_ID)
+        .title(super::preferences::column_title(
+            RATING_COLUMN_ID,
+            &rust_i18n::locale(),
+        ))
         .factory(&factory)
         .sorter(&sorter)
         .resizable(true)
@@ -1087,16 +1089,20 @@ fn rating_sort_category(rating: TrackRating) -> u8 {
     }
 }
 
+/// Stable ID of the Rating column (see `preferences::ALL_COLUMNS`).
+const RATING_COLUMN_ID: &str = "Rating";
+
 /// Return the direction assigned specifically to Rating, including when GTK
-/// uses it as a secondary compound-sort key.
-fn rating_sort_is_descending<I, S>(columns: I, rating_title: &str) -> bool
+/// uses it as a secondary compound-sort key. `columns` yields each sort
+/// column's stable ID with its direction.
+fn rating_sort_is_descending<I, S>(columns: I) -> bool
 where
     I: IntoIterator<Item = (S, gtk::SortType)>,
     S: AsRef<str>,
 {
     columns
         .into_iter()
-        .any(|(title, order)| title.as_ref() == rating_title && order == gtk::SortType::Descending)
+        .any(|(id, order)| id.as_ref() == RATING_COLUMN_ID && order == gtk::SortType::Descending)
 }
 
 #[cfg(test)]
@@ -1525,20 +1531,19 @@ mod tests {
 
     #[test]
     fn secondary_rating_sort_uses_its_own_direction() {
-        assert!(rating_sort_is_descending(
-            [
-                ("Artiste", gtk::SortType::Ascending),
-                ("Note", gtk::SortType::Descending),
-            ],
+        assert!(rating_sort_is_descending([
+            ("Artist", gtk::SortType::Ascending),
+            (RATING_COLUMN_ID, gtk::SortType::Descending),
+        ]));
+        assert!(!rating_sort_is_descending([
+            ("Artist", gtk::SortType::Descending),
+            (RATING_COLUMN_ID, gtk::SortType::Ascending),
+        ]));
+        // A localized display title is not the column's ID.
+        assert!(!rating_sort_is_descending([(
             "Note",
-        ));
-        assert!(!rating_sort_is_descending(
-            [
-                ("Artiste", gtk::SortType::Descending),
-                ("Note", gtk::SortType::Ascending),
-            ],
-            "Note",
-        ));
+            gtk::SortType::Descending
+        )]));
     }
 
     #[test]

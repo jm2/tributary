@@ -58,6 +58,7 @@ columns:
   artist: "艺术家"
   album: "专辑"
   genre: "流派"
+  composer: "作曲者"
   year: "年份"
   date_modified: "修改日期"
   bitrate: "比特率"

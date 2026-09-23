@@ -113,6 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rating column in non-English languages** — The Rating column no longer stays hidden
+  when Tributary runs in a language other than English, so ratings can be edited again.
+  Track list column titles and the Preferences column checkboxes are now translated, and
+  saved column visibility, order and sort carry over unchanged.
 - **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
   Selecting a genre/artist/album or typing in the browser search left the three
   panes and the track list disagreeing: typing a search dropped the picked album
