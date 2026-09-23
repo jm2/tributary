@@ -2097,7 +2097,7 @@ pub(crate) fn build_window(
     // Use the configured library paths from preferences, which default
     // to the XDG / platform music directory (e.g. ~/Musique on French
     // systems) via dirs::audio_dir() with a ~/Music fallback.
-    let (music_dirs, pending_root_reauthorizations) = {
+    let (music_dirs, pending_root_reauthorizations, forget_unconfigured_tracks) = {
         let config = app_config.borrow();
         let music_dirs = config
             .library_paths
@@ -2115,7 +2115,7 @@ pub(crate) fn build_window(
                 )
             })
             .collect();
-        (music_dirs, pending)
+        (music_dirs, pending, config.library_paths_loaded)
     };
 
     let engine_tx_clone = engine_tx.clone();
@@ -2191,6 +2191,7 @@ pub(crate) fn build_window(
                     db,
                     music_dirs,
                     pending_root_reauthorizations,
+                    forget_unconfigured_tracks,
                     engine_tx_clone,
                     library_command_rx,
                     services,
