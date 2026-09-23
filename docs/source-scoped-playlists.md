@@ -1,10 +1,11 @@
 # Source-scoped regular playlist storage, authority, and UI contract
 
 This document defines the durable-storage contract, live-catalogue authority, and mixed-source UI
-integration for [P1.5](task.md#p15--persist-source-scoped-playlists). The storage foundation landed
-in [#140](https://github.com/jm2/tributary/pull/140), Record A's default-deny live authority in
-[#141](https://github.com/jm2/tributary/pull/141), and Record B's Add/Remove/render/Play consumer in
-[#142](https://github.com/jm2/tributary/pull/142).
+integration for
+[P1.5](task-implementation-history-2026-09-09.md#p15--persist-source-scoped-playlists). The
+storage foundation landed in [#140](https://github.com/jm2/tributary/pull/140), Record A's
+default-deny live authority in [#141](https://github.com/jm2/tributary/pull/141), and Record B's
+Add/Remove/render/Play consumer in [#142](https://github.com/jm2/tributary/pull/142).
 
 The central rule is:
 
