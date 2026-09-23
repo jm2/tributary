@@ -951,8 +951,12 @@ mod tests {
         StatusCode::OK.into_response()
     }
 
-    #[tokio::test]
-    async fn jellyfin_12_default_server_accepts_sign_in_api_media_and_logout() {
+    /// Serve [`jellyfin_12`] on an ephemeral loopback port.
+    async fn start_jellyfin_12() -> (
+        String,
+        Accepted,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
         let accepted = Accepted::default();
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -962,12 +966,17 @@ mod tests {
             .fallback(jellyfin_12)
             .with_state(Arc::clone(&accepted));
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let http = authenticated_client_builder()
-            .build()
-            .expect("media client");
+        (base_url, accepted, server)
+    }
 
-        // The fixture must reject what older Tributary builds sent.
-        let legacy_only = http
+    /// Guards the regression test below against a fixture that would also
+    /// accept what older Tributary builds sent.
+    #[tokio::test]
+    async fn jellyfin_12_fixture_rejects_the_legacy_header_alone() {
+        let (base_url, accepted, server) = start_jellyfin_12().await;
+        let legacy_only = authenticated_client_builder()
+            .build()
+            .expect("client")
             .get(format!("{base_url}/System/Ping"))
             .header(
                 "X-Emby-Authorization",
@@ -976,7 +985,18 @@ mod tests {
             .send()
             .await
             .expect("legacy-only request");
+        server.abort();
+
         assert_eq!(legacy_only.status(), StatusCode::UNAUTHORIZED);
+        assert!(accepted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn jellyfin_12_default_server_accepts_sign_in_api_media_and_logout() {
+        let (base_url, accepted, server) = start_jellyfin_12().await;
+        let http = authenticated_client_builder()
+            .build()
+            .expect("media client");
 
         let client = JellyfinClient::authenticate(&base_url, "fixture-user", "fixture-password")
             .await
@@ -1009,23 +1029,17 @@ mod tests {
             .expect("logout with the standard header");
         server.abort();
 
-        let accepted = accepted.lock().unwrap().clone();
-        assert_eq!(
-            accepted
-                .iter()
-                .map(|(path, _)| path.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "/Users/AuthenticateByName",
-                "/System/Ping",
-                "/Audio/track-id/stream",
-                "/Items/album-id/Images/Primary",
-                "/Sessions/Logout",
-            ]
-        );
-        assert!(accepted
-            .iter()
-            .all(|(_, device_id)| device_id == install_id()));
+        let expected: Vec<_> = [
+            "/Users/AuthenticateByName",
+            "/System/Ping",
+            "/Audio/track-id/stream",
+            "/Items/album-id/Images/Primary",
+            "/Sessions/Logout",
+        ]
+        .into_iter()
+        .map(|path| (path.to_owned(), install_id().to_owned()))
+        .collect();
+        assert_eq!(*accepted.lock().unwrap(), expected);
     }
 
     #[test]
