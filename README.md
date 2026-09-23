@@ -152,6 +152,10 @@ winget install jm2.Tributary
 ### Other Platforms
 
 Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.exe installer, .zip) are also available on the [Releases](https://github.com/jm2/tributary/releases) page.
+The `.deb` and `.rpm` packages need GTK 4.16+ and libadwaita 1.6+; the `.deb` is built on Debian
+unstable and declares the glibc version it needs. Release assets published after 0.6.2 carry a
+GitHub build-provenance attestation, which `gh attestation verify <file> --repo jm2/tributary`
+checks.
 
 > **macOS note:** The macOS `.dmg` is ad-hoc signed but not notarized, so macOS Gatekeeper will block it on first launch. After mounting the DMG and dragging Tributary to Applications, run:
 > ```bash

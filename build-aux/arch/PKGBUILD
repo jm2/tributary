@@ -1,12 +1,18 @@
 # Maintainer: Tributary Contributors <https://github.com/jm2/tributary>
+#
+# Builds the Tributary checkout it is copied into; the AUR packages are
+# maintained separately. From the repository root:
+#   cp build-aux/arch/PKGBUILD . && makepkg -sf
+# ./scripts/build-linux.sh --arch-pkg does this and validates the package.
 pkgname=tributary
-pkgver=0.1.0
+# The checkout's [package] version from Cargo.toml.
+pkgver=$(awk -F'"' '/^\[/{in_package=0} /^\[package\]/{in_package=1} in_package && /^version = /{print $2; exit}' "$startdir/Cargo.toml")
 pkgrel=1
 pkgdesc="A high-performance, Rhythmbox-style media manager with unified local and remote backends"
 arch=('x86_64')
 url="https://github.com/jm2/tributary"
 license=('GPL-3.0-or-later')
-options=('!lto')
+options=('!lto' '!debug')
 depends=(
   'gtk4>=4.16'
   'libadwaita>=1.6'
@@ -26,7 +32,7 @@ source=()
 
 build() {
   cd "$startdir"
-  cargo build --release
+  cargo build --release --locked
 }
 
 check() {

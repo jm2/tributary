@@ -356,6 +356,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drags from empty space or column headers from transferring the existing selection.
 - **Release verification** — Verify that manual releases build the requested tag and stop
   artifact publication when checksum generation fails.
+- **Linux packages** — Fedora COPR builds now carry plain version numbers, so they update an
+  installed release RPM instead of always ranking below it. The `.deb` has a short description
+  and declares the system libraries, including glibc, that the program needs.
 
 ### Security
 
@@ -365,6 +368,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Network discovery and saved servers** — Servers announced on the network can no longer
   redirect a server you added yourself. Losing or updating an announcement no longer
   disconnects a working session unless it was using an address that went away.
+- **Release builds** — Release packages are built from exact, reviewed versions of the build
+  actions, Rust compiler, and packaging tools, and each published file has a GitHub
+  build-provenance attestation that `gh attestation verify` can check.
 
 ## [0.6.2] — 2026-09-01
 

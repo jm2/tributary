@@ -9,6 +9,10 @@ files_to_sync:
   - .packit.yaml
 
 upstream_package_name: tributary
+# Release tags are v-prefixed, but RPM versions must be bare: rpmvercmp ranks
+# every "v"-prefixed version below any bare one, so a "v0.7.0" COPR build would
+# never replace an installed GitHub-release "0.6.2" RPM.
+upstream_tag_template: "v{version}"
 downstream_package_name: tributary
 upstream_project_url: https://github.com/jm2/tributary
 enable_net: true

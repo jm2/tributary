@@ -248,7 +248,7 @@ info "Building Tributary (release)..."
 if "$RUN"; then
   cargo build --release --locked --target "$RUN_TARGET" --target-dir "${REPO_ROOT}/target"
 else
-  cargo build --release
+  cargo build --release --locked
 fi
 "$PACKAGE_VALIDATOR" --elf "$BINARY"
 info "Binary: $BINARY"
@@ -269,36 +269,34 @@ fi
 if $DEB; then
   command -v cargo-deb &>/dev/null || {
     info "Installing cargo-deb..."
-    cargo install cargo-deb
+    cargo install cargo-deb --locked --version 3.8.0
   }
 
   info "Building .deb package..."
-  cargo deb
-  DEB_FILE=$(ls target/debian/*.deb 2>/dev/null | head -1)
-  if [[ -n "$DEB_FILE" ]]; then
-    "$PACKAGE_VALIDATOR" --deb "$DEB_FILE"
-    info "Debian package: $(pwd)/$DEB_FILE"
-  else
-    error "cargo-deb did not produce a .deb file"
-  fi
+  # An explicit output path, removed first, so an older package can never be
+  # validated or reported in place of this build's.
+  DEB_FILE="target/debian/tributary.deb"
+  rm -f "$DEB_FILE"
+  cargo deb --locked --no-build -o "$DEB_FILE"
+  [[ -f "$DEB_FILE" ]] || error "cargo-deb did not produce $DEB_FILE"
+  "$PACKAGE_VALIDATOR" --deb "$DEB_FILE"
+  info "Debian package: $(pwd)/$DEB_FILE"
 fi
 
 # ── RPM Package (optional) ───────────────────────────────────────────────────
 if $RPM; then
   command -v cargo-generate-rpm &>/dev/null || {
     info "Installing cargo-generate-rpm..."
-    cargo install cargo-generate-rpm
+    cargo install cargo-generate-rpm --locked --version 0.21.0
   }
 
   info "Building .rpm package..."
-  cargo generate-rpm
-  RPM_FILE=$(ls target/generate-rpm/*.rpm 2>/dev/null | head -1)
-  if [[ -n "$RPM_FILE" ]]; then
-    "$PACKAGE_VALIDATOR" --rpm "$RPM_FILE"
-    info "RPM package: $(pwd)/$RPM_FILE"
-  else
-    error "cargo-generate-rpm did not produce an .rpm file"
-  fi
+  RPM_FILE="target/generate-rpm/tributary.rpm"
+  rm -f "$RPM_FILE"
+  cargo generate-rpm -o "$RPM_FILE"
+  [[ -f "$RPM_FILE" ]] || error "cargo-generate-rpm did not produce $RPM_FILE"
+  "$PACKAGE_VALIDATOR" --rpm "$RPM_FILE"
+  info "RPM package: $(pwd)/$RPM_FILE"
 fi
 
 # ── Arch Linux Package (optional) ────────────────────────────────────────────
@@ -306,23 +304,21 @@ if $ARCH_PKG; then
   command -v makepkg &>/dev/null || error "makepkg not found. This option requires Arch Linux (or an Arch-based distro)."
 
   info "Building Arch Linux package..."
-  # Copy PKGBUILD to project root (makepkg expects it in cwd)
+  # The PKGBUILD builds the checkout it sits in and takes pkgver from
+  # Cargo.toml, so run it from the project root.
   cp build-aux/arch/PKGBUILD .
 
-  # Extract version from Cargo.toml and patch PKGBUILD
-  CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-  sed -i "s/^pkgver=.*/pkgver=${CARGO_VERSION}/" PKGBUILD
-
+  # Ask makepkg for this build's exact output rather than globbing for it.
+  PKG_PATH="$(makepkg --packagelist)"
+  [[ -n "$PKG_PATH" && "$PKG_PATH" != *$'\n'* ]] || \
+    error "Expected makepkg to list exactly one package, got: ${PKG_PATH}"
   makepkg -sf --noconfirm --skipchecksums
-  PKG_FILE=$(ls *.pkg.tar.zst 2>/dev/null | head -1)
-  if [[ -n "$PKG_FILE" ]]; then
-    mkdir -p dist
-    mv "$PKG_FILE" dist/
-    "$PACKAGE_VALIDATOR" --arch "dist/$PKG_FILE"
-    info "Arch package: $(pwd)/dist/$PKG_FILE"
-  else
-    error "makepkg did not produce a .pkg.tar.zst file"
-  fi
+  [[ -f "$PKG_PATH" ]] || error "makepkg did not produce ${PKG_PATH}"
+  PKG_FILE="${PKG_PATH##*/}"
+  mkdir -p dist
+  mv "$PKG_PATH" "dist/$PKG_FILE"
+  "$PACKAGE_VALIDATOR" --arch "dist/$PKG_FILE"
+  info "Arch package: $(pwd)/dist/$PKG_FILE"
 
   # Clean up PKGBUILD from project root
   rm -f PKGBUILD

@@ -6,9 +6,9 @@ Those proposals deliberately do not auto-merge. A trusted repairer runs this
 script to coordinate Cargo.toml, CI, cache keys, and developer documentation
 before the complete matrix decides whether the new compiler is feasible.
 
-The two `dtolnay/rust-toolchain` action references are a separate supply-chain
-boundary: they remain immutable commits from the action's permanent master
-history and are never rewritten by a compiler-version synchronization.
+The `dtolnay/rust-toolchain` action references are a separate supply-chain
+boundary: every one is the same immutable commit from the action's permanent
+master history, and a compiler-version synchronization never rewrites them.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ RELEASE_VERSION = re.compile(r"^([1-9][0-9]*\.[0-9]+)\.0$")
 EXACT_TOOLCHAIN_ACTION = re.compile(
     r"(?m)^\s*uses:\s*dtolnay/rust-toolchain@([0-9a-f]{40})\s+#\s*master\s*$"
 )
+ANY_TOOLCHAIN_ACTION = re.compile(r"(?m)^\s*uses:\s*dtolnay/rust-toolchain@")
 EXACT_CI_TOOLCHAIN = re.compile(
     r'(?m)^(\s*toolchain:\s*)([1-9][0-9]*\.[0-9]+\.0)\s*$'
 )
@@ -70,14 +71,16 @@ def candidate_from_toolchain(source: str | None = None) -> str:
 
 def exact_action_pins(ci_source: str) -> list[str]:
     pins = EXACT_TOOLCHAIN_ACTION.findall(ci_source)
-    if len(pins) != 2:
+    refs = len(ANY_TOOLCHAIN_ACTION.findall(ci_source))
+    if len(pins) < 2 or len(pins) != refs:
         raise PolicyError(
-            "CI must contain exactly two full-SHA dtolnay/rust-toolchain refs "
-            f"from permanent master history (MSRV and coverage); found {len(pins)}"
+            "every CI dtolnay/rust-toolchain ref, including MSRV and coverage, "
+            "must be a full-SHA commit from permanent master history; "
+            f"found {len(pins)} of {refs}"
         )
     if len(set(pins)) != 1:
         raise PolicyError(
-            "MSRV and coverage must use the same immutable toolchain action commit"
+            "every CI job must use the same immutable toolchain action commit"
         )
     return pins
 

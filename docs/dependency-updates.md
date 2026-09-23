@@ -24,9 +24,16 @@ A `rust-toolchain` proposal is completed in a trusted worktree with
 `python3 scripts/sync_rust_toolchain.py --from-toolchain` followed by `--check`
 (`--set X.Y` for a maintainer-initiated bump). This synchronizes the Cargo `rust-version`, the
 MSRV and coverage toolchain pins and cache keys, and the README commands, without changing the
-pinned action commit; the CI check keeps the stable name `MSRV`. Both
-`dtolnay/rust-toolchain@<sha> # master` pins must name the same full commit from that action's
+pinned action commit; the CI check keeps the stable name `MSRV`. Every
+`dtolnay/rust-toolchain@<sha> # master` pin must name the same full commit from that action's
 `master` history. A bump is feasible only when the full CI matrix passes.
+
+Every workflow action is pinned to a full commit SHA. Tagged actions carry their release in a
+trailing comment (`@<sha> # v7.0.1`), which Dependabot rewrites along with the SHA when it
+proposes an update. CI's native jobs install the current `stable` compiler; release builds
+install the exact stable release in `release.yml`'s `RUST_RELEASE_TOOLCHAIN`, which is bumped
+by hand to a release CI has already exercised. Release and CI `cargo install` commands use
+`--locked --version`, and release builds pass `--locked`.
 
 The auto-merge workflow runs on `pull_request` and never checks out pull-request code. It
 verifies the actor, author, and repository, re-reads the exact head SHA around changed-file

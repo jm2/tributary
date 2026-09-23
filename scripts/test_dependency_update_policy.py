@@ -230,10 +230,16 @@ class RustToolchainPolicyTests(unittest.TestCase):
             f"uses: dtolnay/rust-toolchain@{'a' * 40} # master\n"
         )
         self.assertEqual(sync_rust_toolchain.exact_action_pins(valid), ["a" * 40] * 2)
+        stable_job = f"uses: dtolnay/rust-toolchain@{'a' * 40} # master\n"
+        self.assertEqual(
+            sync_rust_toolchain.exact_action_pins(valid + stable_job), ["a" * 40] * 3
+        )
         invalid_sources = [
             valid.replace("a" * 40, "a" * 12, 1),
             valid.replace("a" * 40, "b" * 40, 1),
             valid.replace("# master", "# 1.93.0", 1),
+            valid + "uses: dtolnay/rust-toolchain@stable\n",
+            valid + f"uses: dtolnay/rust-toolchain@{'b' * 40} # master\n",
         ]
         for source in invalid_sources:
             with self.subTest(source=source):
