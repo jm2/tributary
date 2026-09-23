@@ -69,7 +69,7 @@ walkdir = "2"
 async-channel = "2"
 
 # XDG / platform directories
-dirs = "6"
+dirs = "7"
 tempfile = "3"
 
 # Shuffle randomness (zero-dependency PRNG)
