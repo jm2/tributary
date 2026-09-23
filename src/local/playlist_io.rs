@@ -683,6 +683,35 @@ impl<'a> ImportedTrackMatchIndex<'a> {
 
         nearest.filter(|_| nearest_is_unique)
     }
+
+    /// Whether any indexed track passes the path, metadata, album, and
+    /// duration gates of [`Self::find`] for `imported`, ignoring uniqueness.
+    /// `false` proves no track in this index can be the entry's match.
+    pub(super) fn has_candidate(&self, imported: &ImportedTrack) -> bool {
+        if !imported.file_path.is_empty() && self.by_path.contains_key(imported.file_path.as_str())
+        {
+            return true;
+        }
+
+        let title = normalized_metadata(&imported.title);
+        let artist = normalized_metadata(&imported.artist);
+        if title.is_empty() || artist.is_empty() {
+            return false;
+        }
+        let album = normalized_metadata(&imported.album);
+        let Some(candidates) = self.by_metadata.get(&(title, artist)) else {
+            return false;
+        };
+        candidates.iter().any(|candidate| {
+            (album.is_empty() || candidate.album == album)
+                && imported.duration_secs.is_none_or(|imported_duration| {
+                    candidate.duration_secs.is_some_and(|candidate_duration| {
+                        candidate_duration.abs_diff(imported_duration)
+                            <= IMPORT_DURATION_TOLERANCE_SECS
+                    })
+                })
+        })
+    }
 }
 
 /// Deterministically match one imported entry against an in-memory library.

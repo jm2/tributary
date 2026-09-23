@@ -1100,10 +1100,36 @@ impl PlaylistManager {
     ///
     /// Returns the number of entries re-linked.
     pub async fn reconcile_all(&self) -> Result<u32, DbErr> {
+        self.reconcile(None).await
+    }
+
+    /// Re-link orphaned entries after `changed` tracks were inserted, updated,
+    /// or relocated.
+    ///
+    /// Unresolved entries are normal (unmatched imports, deleted files), so
+    /// the whole track table is loaded only when some orphan could match one
+    /// of `changed`; the full resolver then decides, keeping its ambiguity
+    /// rules exact. An orphan that could resolve only against unchanged
+    /// tracks waits for the next full [`Self::reconcile_all`].
+    pub async fn reconcile_changed_tracks(&self, changed: &[track::Model]) -> Result<u32, DbErr> {
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        self.reconcile(Some(changed)).await
+    }
+
+    async fn reconcile(&self, changed: Option<&[track::Model]>) -> Result<u32, DbErr> {
         let txn = crate::db::begin_write(&self.db).await?;
         let orphans = orphan_reconciliation_query().all(&txn).await?;
 
-        if orphans.is_empty() {
+        let nothing_to_relink = orphans.is_empty()
+            || changed.is_some_and(|changed| {
+                let changed_index = ImportedTrackMatchIndex::new(changed);
+                !orphans
+                    .iter()
+                    .any(|orphan| changed_index.has_candidate(&orphan_match_evidence(orphan)))
+            });
+        if nothing_to_relink {
             txn.commit().await?;
             return Ok(0);
         }
@@ -1122,26 +1148,14 @@ impl PlaylistManager {
         let mut relinked = 0u32;
 
         for orphan in orphans {
-            let duration_secs = match orphan.match_duration_secs {
-                Some(value) if value >= 0 => Some(value as u64),
-                Some(value) => {
-                    warn!(
-                        entry = %orphan.id,
-                        duration_secs = value,
-                        "Ignoring invalid negative playlist match duration"
-                    );
-                    None
-                }
-                None => None,
-            };
-            let imported = ImportedTrack {
-                title: orphan.match_title.clone(),
-                artist: orphan.match_artist.clone(),
-                album: orphan.match_album.clone(),
-                file_path: orphan.match_file_path.clone().unwrap_or_default(),
-                duration_secs,
-            };
-            let best = match_index.find(&imported);
+            if let Some(value) = orphan.match_duration_secs.filter(|value| *value < 0) {
+                warn!(
+                    entry = %orphan.id,
+                    duration_secs = value,
+                    "Ignoring invalid negative playlist match duration"
+                );
+            }
+            let best = match_index.find(&orphan_match_evidence(&orphan));
 
             if let Some(best) = best {
                 if TrackId::new(best.id.as_str()).is_err() {
@@ -1288,6 +1302,20 @@ where
                 .map_err(|_| DbErr::Custom("Playlist sidebar order row is malformed".to_string()))
         })
         .collect()
+}
+
+/// The retained path and fingerprint of an orphaned entry as matcher input.
+/// A negative stored duration is treated as absent.
+fn orphan_match_evidence(orphan: &playlist_entry::Model) -> ImportedTrack {
+    ImportedTrack {
+        title: orphan.match_title.clone(),
+        artist: orphan.match_artist.clone(),
+        album: orphan.match_album.clone(),
+        file_path: orphan.match_file_path.clone().unwrap_or_default(),
+        duration_secs: orphan
+            .match_duration_secs
+            .and_then(|value| u64::try_from(value).ok()),
+    }
 }
 
 fn orphan_reconciliation_query() -> sea_orm::Select<playlist_entry::Entity> {
@@ -3756,6 +3784,105 @@ mod tests {
             after[1].local_track_id.as_deref(),
             Some(second_new.id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn changed_track_reconciliation_skips_unrelated_changes_and_keeps_ambiguity() {
+        let db = in_memory_db().await;
+        let manager = PlaylistManager::new(db.clone());
+        let playlist = manager
+            .create_regular_playlist("Orphans")
+            .await
+            .expect("create playlist");
+        playlist_entry::ActiveModel {
+            id: Set("orphan".to_string()),
+            playlist_id: Set(playlist.id.clone()),
+            position: Set(0),
+            source_id: Set(SourceId::local().to_string()),
+            track_id: Set(None),
+            local_track_id: Set(None),
+            match_file_path: Set(None),
+            match_title: Set("song".to_string()),
+            match_artist: Set("artist".to_string()),
+            match_album: Set("album".to_string()),
+            match_duration_secs: Set(None),
+        }
+        .insert(&db)
+        .await
+        .expect("insert orphan");
+        insert_track(
+            &db,
+            "unchanged",
+            "/music/a.flac",
+            "Song",
+            "Artist",
+            "Album",
+            None,
+        )
+        .await;
+        let unrelated = insert_track(
+            &db,
+            "unrelated",
+            "/music/u.flac",
+            "Other",
+            "Artist",
+            "Album",
+            None,
+        )
+        .await;
+        let orphan_link = || async {
+            playlist_entry::Entity::find_by_id("orphan")
+                .one(&db)
+                .await
+                .expect("query orphan")
+                .expect("orphan exists")
+                .local_track_id
+        };
+
+        // No orphan can match the changed track, so nothing is reconciled even
+        // though an unchanged track matches.
+        assert_eq!(
+            manager
+                .reconcile_changed_tracks(std::slice::from_ref(&unrelated))
+                .await
+                .expect("reconcile unrelated change"),
+            0
+        );
+        assert_eq!(orphan_link().await, None);
+
+        // The changed duplicate is a candidate, but the whole library makes the
+        // fingerprint ambiguous.
+        let duplicate = insert_track(
+            &db,
+            "duplicate",
+            "/music/b.flac",
+            "Song",
+            "Artist",
+            "Album",
+            None,
+        )
+        .await;
+        assert_eq!(
+            manager
+                .reconcile_changed_tracks(std::slice::from_ref(&duplicate))
+                .await
+                .expect("reconcile ambiguous change"),
+            0
+        );
+        assert_eq!(orphan_link().await, None);
+
+        track::Entity::delete_by_id("unchanged")
+            .exec(&db)
+            .await
+            .expect("delete unchanged duplicate");
+        assert_eq!(
+            manager
+                .reconcile_changed_tracks(std::slice::from_ref(&duplicate))
+                .await
+                .expect("reconcile unique change"),
+            1
+        );
+        assert_eq!(orphan_link().await.as_deref(), Some("duplicate"));
     }
 
     #[tokio::test]
