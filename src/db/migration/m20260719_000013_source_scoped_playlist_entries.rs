@@ -133,6 +133,7 @@ async fn rebuild(
 
     match target {
         PlaylistEntriesSchema::SourceScoped => {
+            delete_unmatchable_legacy_orphans(manager).await?;
             connection
                 .execute_unprepared(&format!(
                     "INSERT INTO {REBUILD_TABLE} (
@@ -189,6 +190,46 @@ async fn rebuild(
     validate_schema(manager, target).await
 }
 
+/// Remove legacy rows that have no track and no usable match evidence.
+///
+/// Before this migration, adding a library track to a playlist stored its
+/// trimmed, lowercased artist and no path. A whitespace-only artist tag
+/// therefore produced a blank `match_artist`, and deleting the track later set
+/// `track_id` to NULL, leaving a row that nothing could ever relink. The
+/// source-scoped orphan-evidence CHECK rejects such rows, so they are deleted
+/// here using that CHECK's own whitespace definition. The remaining rows keep
+/// their positions: gaps are already legal, because appends use the highest
+/// position and the next removal or reorder renumbers the playlist.
+async fn delete_unmatchable_legacy_orphans(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let trim_characters = sql_trim_characters();
+    let deleted = manager
+        .get_connection()
+        .execute_unprepared(&format!(
+            "DELETE FROM playlist_entries
+             WHERE track_id IS NULL
+               AND NOT (
+                   (
+                       match_file_path IS NOT NULL AND
+                       length(CAST(trim(match_file_path, {trim_characters}) AS BLOB)) > 0
+                   )
+                   OR
+                   (
+                       length(CAST(trim(match_title, {trim_characters}) AS BLOB)) > 0 AND
+                       length(CAST(trim(match_artist, {trim_characters}) AS BLOB)) > 0
+                   )
+               )"
+        ))
+        .await?
+        .rows_affected();
+    if deleted > 0 {
+        tracing::warn!(
+            deleted,
+            "Dropped legacy playlist entries with no track and no usable match evidence"
+        );
+    }
+    Ok(())
+}
+
 fn legacy_table_sql(table: &str) -> String {
     format!(
         "CREATE TABLE {table} (
@@ -213,8 +254,9 @@ fn legacy_table_sql(table: &str) -> String {
     )
 }
 
-fn scoped_table_sql(table: &str) -> String {
-    let trim_characters = RUST_TRIM_WHITESPACE
+/// SQL expression for the character set passed to two-argument `trim`.
+fn sql_trim_characters() -> String {
+    RUST_TRIM_WHITESPACE
         .iter()
         .map(|code_point| {
             if *code_point == 32 {
@@ -224,7 +266,11 @@ fn scoped_table_sql(table: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" || ");
+        .join(" || ")
+}
+
+fn scoped_table_sql(table: &str) -> String {
+    let trim_characters = sql_trim_characters();
     format!(
         "CREATE TABLE {table} (
              id VARCHAR PRIMARY KEY NOT NULL,
@@ -1491,16 +1537,31 @@ mod tests {
         .is_err());
     }
 
+    /// An unmatched predecessor row with no usable path and no complete
+    /// title-and-artist fingerprint can never be relinked. The upgrade drops
+    /// it, judging blankness by the CHECK's Unicode whitespace set, and keeps
+    /// every unmatched row that still carries evidence.
     #[tokio::test]
-    async fn corrupt_predecessor_orphan_fails_atomically_and_can_be_repaired_and_retried() {
+    async fn upgrade_drops_only_unmatched_rows_without_usable_evidence() {
         let db = database_before_migration().await;
         insert_playlist(&db, "playlist").await;
-        insert_legacy_entry(&db, "empty-orphan", "playlist", 0, None, None).await;
+        insert_legacy_entry(&db, "whitespace-orphan", "playlist", 0, None, None).await;
+        insert_legacy_entry(&db, "blank-artist-orphan", "playlist", 1, None, None).await;
+        insert_legacy_entry(
+            &db,
+            "path-orphan",
+            "playlist",
+            2,
+            None,
+            Some("/music/a.flac"),
+        )
+        .await;
+        insert_legacy_entry(&db, "fingerprint-orphan", "playlist", 3, None, None).await;
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE playlist_entries
              SET match_title = ?, match_artist = ?, match_file_path = ?
-             WHERE id = 'empty-orphan'",
+             WHERE id = 'whitespace-orphan'",
             [
                 "\u{00a0}".into(),
                 "\u{000c}".into(),
@@ -1509,32 +1570,72 @@ mod tests {
         ))
         .await
         .expect("create Unicode-whitespace-only predecessor orphan");
-
-        Migration
-            .up(&SchemaManager::new(&db))
-            .await
-            .expect_err("orphan without identity or match evidence must fail");
-        assert_eq!(
-            inspect_schema(&SchemaManager::new(&db)).await,
-            Ok(PlaylistEntriesSchema::LegacyLocal)
-        );
-        assert_eq!(
-            row_count(&db, "id = 'empty-orphan' AND track_id IS NULL").await,
-            1
-        );
-        assert!(!migration_table_exists(&db).await);
-
         db.execute_unprepared(
             "UPDATE playlist_entries
-             SET match_title = 'Recovered', match_artist = 'Artist'
-             WHERE id = 'empty-orphan'",
+             SET match_artist = ''
+             WHERE id IN ('blank-artist-orphan', 'path-orphan')",
         )
         .await
-        .expect("repair predecessor evidence");
+        .expect("blank the artist evidence");
+
         Migration
             .up(&SchemaManager::new(&db))
             .await
-            .expect("retry accepts repaired fingerprint evidence");
+            .expect("unmatchable rows are dropped instead of failing the upgrade");
+
+        let rows = scoped_rows(&db).await;
+        let kept: Vec<(&str, i32)> = rows.iter().map(|row| (row.0.as_str(), row.2)).collect();
+        assert_eq!(kept, [("path-orphan", 2), ("fingerprint-orphan", 3)]);
+        assert_eq!(row_count(&db, "track_id IS NULL").await, 2);
+    }
+
+    /// The exact shape v0.5.1 shipped: adding a track stored its lowercased,
+    /// trimmed artist (blank for a whitespace-only tag) and no path, and
+    /// deleting that track later nulled the entry's `track_id`. The full
+    /// upgrade chain must complete and drop only that unmatchable row.
+    #[tokio::test]
+    async fn v0_5_1_blank_artist_entry_for_a_deleted_track_does_not_block_the_upgrade() {
+        const V0_5_1_MIGRATIONS: u32 = 9;
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        Migrator::up(&db, Some(V0_5_1_MIGRATIONS))
+            .await
+            .expect("apply the v0.5.1 schema");
+        insert_playlist(&db, "playlist").await;
+        insert_track(&db, "blank-artist").await;
+        insert_track(&db, "tagged").await;
+        for (id, position, track_id, artist) in [
+            ("entry-blank-artist", 0, "blank-artist", ""),
+            ("entry-tagged", 1, "tagged", "artist"),
+        ] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO playlist_entries (
+                     id, playlist_id, position, track_id,
+                     match_title, match_artist, match_album, match_duration_secs,
+                     match_file_path
+                 )
+                 VALUES (?, 'playlist', ?, ?, 'song', ?, 'album', 180, NULL)",
+                [id.into(), position.into(), track_id.into(), artist.into()],
+            ))
+            .await
+            .expect("insert v0.5.1 add_track entry");
+        }
+        db.execute_unprepared("DELETE FROM tracks")
+            .await
+            .expect("delete the tracks, nulling both entries' track_id");
+
+        Migrator::up(&db, None)
+            .await
+            .expect("the upgrade completes");
+
+        let rows = scoped_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0].0, "entry-tagged");
+        assert_eq!(rows[0].4, None);
+        assert_eq!(rows[0].6, "song");
+        assert_eq!(rows[0].7, "artist");
     }
 
     #[tokio::test]
