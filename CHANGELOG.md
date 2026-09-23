@@ -121,6 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MPD and Chromecast after a network stall** — If a brief stall ends playback with an
+  error while the device keeps playing, Stop (or quitting Tributary) now reconnects and stops
+  it. A supervised MPD output no longer refuses to play when you wait more than two seconds
+  after selecting it, or after a track or the queue ends.
 - **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
   12 servers, which by default reject the older authentication header Tributary used to
   send. Earlier Jellyfin versions keep working.

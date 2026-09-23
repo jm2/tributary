@@ -2049,6 +2049,19 @@ struct WorkerSession<T> {
     last_position_ms: Option<u64>,
     duration_ms: u64,
     last_poll: Instant,
+    /// The connection failed (or ownership could not be confirmed) while
+    /// this session owned a song. The connection is never used again; the
+    /// song id is kept so the next Stop or shutdown can reconnect and run
+    /// the normal ownership-checked cleanup.
+    stranded: bool,
+}
+
+impl<T> WorkerSession<T> {
+    /// Whether the worker polls (and supervises) this session: it owns a
+    /// song on a usable connection.
+    const fn is_polled(&self) -> bool {
+        self.song_id.is_some() && !self.stranded
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2135,9 +2148,7 @@ fn run_mpd_worker<C>(
 {
     let mut active: Option<WorkerSession<C::Connection>> = None;
     loop {
-        let polled = active
-            .as_ref()
-            .is_some_and(|session| session.song_id.is_some());
+        let polled = active.as_ref().is_some_and(WorkerSession::is_polled);
         // The supervision gap is measured only while an owned song is being
         // polled; idle time between sessions never lapses the supervisor.
         supervision
@@ -2255,15 +2266,27 @@ fn run_mpd_worker<C>(
                         true
                     }
                     CommandKind::Stop => {
-                        match cleanup_session(
+                        let cleanup = match reconnect_stranded(
+                            &mut connector,
                             &mut active,
-                            command.owner,
-                            CleanupKind::StopOwned,
+                            command.owner.epoch,
                             &intent_epoch,
                             timing,
-                            plan,
-                            &supervision,
                         ) {
+                            Ok(()) => cleanup_session(
+                                &mut active,
+                                command.owner,
+                                CleanupKind::StopOwned,
+                                &intent_epoch,
+                                timing,
+                                plan,
+                                &supervision,
+                            ),
+                            // The stranded session is kept so another Stop
+                            // (or shutdown) can retry once MPD is reachable.
+                            Err(failure) => CleanupOutcome::Failed(failure),
+                        };
+                        match cleanup {
                             CleanupOutcome::Completed => {
                                 let _ = publish_state(
                                     command.owner,
@@ -2303,6 +2326,13 @@ fn run_mpd_worker<C>(
                         true
                     }
                     CommandKind::Shutdown => {
+                        let _ = reconnect_stranded(
+                            &mut connector,
+                            &mut active,
+                            command.owner.epoch,
+                            &intent_epoch,
+                            timing,
+                        );
                         cleanup_unconditionally(&mut active, timing, plan, &supervision);
                         break;
                     }
@@ -2366,6 +2396,13 @@ fn run_mpd_worker<C>(
                 );
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = reconnect_stranded(
+                    &mut connector,
+                    &mut active,
+                    intent_epoch.load(Ordering::SeqCst),
+                    &intent_epoch,
+                    timing,
+                );
                 cleanup_unconditionally(&mut active, timing, plan, &supervision);
                 break;
             }
@@ -2454,6 +2491,7 @@ fn handle_load<C>(
         last_position_ms: None,
         duration_ms: 0,
         last_poll: Instant::now(),
+        stranded: false,
     });
     if !is_current(owner, intent_epoch) {
         return;
@@ -2795,7 +2833,7 @@ fn retire_poisoned_if_stale<T, C>(
         return false;
     }
     if matches!(result, Err(failure) if !failure.connection_usable) {
-        active.take();
+        strand_session(active);
     }
     true
 }
@@ -2951,8 +2989,10 @@ fn retire_status_if_stale<C>(
             .and_then(|session| session.song_id)
             .is_some_and(|song_id| status_observes_foreign_song(status, song_id))
     });
-    if observed_foreign || matches!(result, Err(failure) if !failure.connection_usable) {
+    if observed_foreign {
         active.take();
+    } else if matches!(result, Err(failure) if !failure.connection_usable) {
+        strand_session(active);
     }
     true
 }
@@ -2983,13 +3023,49 @@ fn cleanup_then_fail<C>(
         );
     } else {
         // An I/O timeout, partial write, truncated response, or parser failure
-        // may leave unread bytes or a half-command on the stream. Drop it
-        // immediately instead of issuing cleanup on a poisoned protocol state.
-        active.take();
+        // may leave unread bytes or a half-command on the stream. Never issue
+        // cleanup on that poisoned protocol state; strand the session so a
+        // later Stop or shutdown reconnects and cleans up the owned song.
+        strand_session(active);
     }
     if is_current(owner, intent_epoch) {
         fail_current(owner, failure, intent_epoch, cache, event_tx);
     }
+}
+
+/// Stop using a session whose connection became unusable. A session that
+/// owns a song keeps its song id (see [`WorkerSession::stranded`]); one that
+/// owns nothing is dropped.
+fn strand_session<C>(active: &mut Option<WorkerSession<C>>) {
+    match active.as_mut() {
+        Some(session) if session.song_id.is_some() => {
+            session.stranded = true;
+            session.ticket = None;
+        }
+        _ => {
+            active.take();
+        }
+    }
+}
+
+/// Give a stranded session a fresh connection so the normal ownership-checked
+/// cleanup can run on it. On failure the session stays stranded.
+fn reconnect_stranded<C>(
+    connector: &mut C,
+    active: &mut Option<WorkerSession<C::Connection>>,
+    owner_epoch: u64,
+    intent_epoch: &AtomicU64,
+    timing: WorkerTiming,
+) -> MpdResult<()>
+where
+    C: MpdConnector,
+{
+    let Some(session) = active.as_mut().filter(|session| session.stranded) else {
+        return Ok(());
+    };
+    session.connection = connector.connect(owner_epoch, intent_epoch, timing.deadline())?;
+    session.stranded = false;
+    Ok(())
 }
 
 fn relinquish_then_fail<C>(
@@ -3100,7 +3176,7 @@ fn handle_control<C>(
     if session.owner.epoch != owner.epoch {
         return;
     }
-    if session.song_id.is_none() {
+    if !session.is_polled() {
         return;
     }
     let deadline = timing.deadline();
@@ -3132,12 +3208,12 @@ fn handle_control<C>(
         }
         Err(failure) => {
             // A failed ownership query cannot authorize even a global pause.
-            // Drop the session without sending any cleanup command, and —
+            // Strand the session without sending any cleanup command, and —
             // on a supervised output — revoke authority: the unreadable
             // reply is a blind window over the partition, and a queued
             // newer load must not mutate inside the window it leaves.
             lapse_on_unreadable_status(plan, supervision);
-            active.take();
+            strand_session(active);
             fail_current(owner, failure, intent_epoch, cache, event_tx);
             return;
         }
@@ -3275,7 +3351,7 @@ fn poll_active<C>(
         return;
     };
     let owner = session.owner;
-    if session.song_id.is_none() {
+    if !session.is_polled() {
         return;
     }
     if !is_current(owner, intent_epoch) || (!force && session.last_poll.elapsed() < timing.poll) {
@@ -3624,7 +3700,9 @@ where
         *active = Some(session);
         return CleanupOutcome::Stale;
     }
-    let Some(song_id) = session.song_id else {
+    // A stranded session is dropped here: its connection is unusable, and
+    // only Stop and shutdown reconnect it first (a load replaces it anyway).
+    let Some(song_id) = session.song_id.filter(|_| !session.stranded) else {
         return CleanupOutcome::Completed;
     };
 
@@ -3644,12 +3722,15 @@ where
                 }
                 Err(_) => lapse_on_unreadable_status(plan, supervision),
             }
-            let can_restore = match &status {
-                Ok(status) => !status_observes_foreign_song(status, song_id),
-                Err(failure) => failure.connection_usable,
-            };
-            if can_restore {
-                *active = Some(session);
+            match &status {
+                Ok(status) if status_observes_foreign_song(status, song_id) => {}
+                Ok(_) => *active = Some(session),
+                Err(failure) => {
+                    *active = Some(session);
+                    if !failure.connection_usable {
+                        strand_session(active);
+                    }
+                }
             }
             return CleanupOutcome::Stale;
         }
@@ -3685,12 +3766,12 @@ where
                     }
                     let stopped = session.connection.stop(deadline);
                     if !is_current(owner, intent_epoch) {
+                        *active = Some(session);
                         if stopped
                             .as_ref()
-                            .err()
-                            .is_none_or(|failure| failure.connection_usable)
+                            .is_err_and(|failure| !failure.connection_usable)
                         {
-                            *active = Some(session);
+                            strand_session(active);
                         }
                         return CleanupOutcome::Stale;
                     }
@@ -3699,7 +3780,11 @@ where
                         Err(stop_failure) if stop_failure.connection_usable => {
                             failure = Some(stop_failure);
                         }
-                        Err(stop_failure) => return CleanupOutcome::Failed(stop_failure),
+                        Err(stop_failure) => {
+                            *active = Some(session);
+                            strand_session(active);
+                            return CleanupOutcome::Failed(stop_failure);
+                        }
                     }
                 }
             }
@@ -3720,7 +3805,11 @@ where
                 // but ownership was indeterminate and the Stop itself failed.
                 failure = Some(status_failure);
             }
-            Err(status_failure) => return CleanupOutcome::Failed(status_failure),
+            Err(status_failure) => {
+                *active = Some(session);
+                strand_session(active);
+                return CleanupOutcome::Failed(status_failure);
+            }
         }
     }
 
@@ -3779,7 +3868,7 @@ fn cleanup_unconditionally<C>(
     C: MpdTransport,
 {
     if let Some(mut session) = active.take() {
-        let Some(song_id) = session.song_id else {
+        let Some(song_id) = session.song_id.filter(|_| !session.stranded) else {
             return;
         };
         // Gate EVERY authority-requiring mutation before the first one —
@@ -8855,6 +8944,98 @@ mod tests {
             ]
         ));
         harness.shutdown();
+    }
+
+    /// Load one owned song, then fail its next status poll with an I/O-level
+    /// error so the session is stranded. Returns the load owner.
+    fn strand_after_stalled_poll(harness: &Harness, shared: &FakeShared) -> CommandOwner {
+        let load = harness.next_owner(1);
+        harness.send(
+            load,
+            CommandKind::Load {
+                uri: "https://music.test/a".to_string(),
+            },
+        );
+        harness.fence(load);
+        shared.clear_actions();
+        *shared.poison_at.lock().expect("poison lock") = Some(Point::Status);
+        harness.send(load, CommandKind::PollNow);
+        harness.fence(load);
+        let _ = harness.events();
+        load
+    }
+
+    #[test]
+    fn stop_after_a_stalled_poll_reconnects_and_stops_the_owned_song() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        let load = strand_after_stalled_poll(&harness, &shared);
+
+        // The stranded connection is never used again.
+        harness.send(load, CommandKind::Pause);
+        harness.send(load, CommandKind::PollNow);
+        harness.fence(load);
+        assert_eq!(shared.actions(), vec![Action::Point(Point::Status)]);
+
+        // MPD is still unreachable: Stop reports the failure and keeps the
+        // owned song for a retry.
+        *shared.fail_at.lock().expect("failure lock") = Some(Point::Connect);
+        let first_stop = harness.next_owner(1);
+        harness.send(first_stop, CommandKind::Stop);
+        harness.fence(first_stop);
+        assert!(matches!(
+            harness.events().as_slice(),
+            [
+                PlayerEvent::StateChanged {
+                    state: PlayerState::Stopped,
+                    ..
+                },
+                PlayerEvent::Error { .. }
+            ]
+        ));
+
+        *shared.fail_at.lock().expect("failure lock") = None;
+        shared.clear_actions();
+        let second_stop = harness.next_owner(1);
+        harness.send(second_stop, CommandKind::Stop);
+        harness.fence(second_stop);
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Connect),
+                Action::Point(Point::Status),
+                Action::Point(Point::Stop),
+                Action::Delete(42),
+            ]
+        );
+        assert!(matches!(
+            harness.events().as_slice(),
+            [PlayerEvent::StateChanged {
+                state: PlayerState::Stopped,
+                ..
+            }]
+        ));
+        harness.shutdown();
+    }
+
+    #[test]
+    fn shutdown_after_a_stalled_poll_reconnects_and_stops_the_owned_song() {
+        let shared = FakeShared::new();
+        let harness = Harness::new(Arc::clone(&shared));
+        strand_after_stalled_poll(&harness, &shared);
+        shared.clear_actions();
+
+        harness.shutdown();
+
+        assert_eq!(
+            shared.actions(),
+            vec![
+                Action::Point(Point::Connect),
+                Action::Point(Point::Status),
+                Action::Point(Point::Stop),
+                Action::Delete(42),
+            ]
+        );
     }
 
     #[test]
