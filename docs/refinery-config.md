@@ -96,7 +96,7 @@ enforced by review discipline, not by the repository refusing the merge.
 
 **Routine auto-merge stays off until the live gate matches the policy.** The
 `dependabot-automerge` workflow enables GitHub native auto-merge on clean
-patch/minor dependency PRs, and native auto-merge waits only for the
+patch dependency PRs, and native auto-merge waits only for the
 ruleset's required checks. So while the ruleset is narrower than the policy,
 auto-merge can land a dependency PR while a bot check is pending or failing.
 Widening the gate is a precondition for trusting auto-merge, not an optional

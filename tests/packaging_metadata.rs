@@ -1511,6 +1511,65 @@ fn dependabot_automerge_writer_is_action_free_concurrent_and_exact_head_guarded(
     );
 }
 
+#[test]
+fn dependabot_automerge_admits_patch_updates_only() {
+    let workflow = dependabot_automerge_workflow();
+    let condition = workflow["jobs"]["dependabot-automerge"]["if"]
+        .as_str()
+        .expect("the write job must have an admission condition");
+    assert!(
+        condition.contains(
+            "needs.inspect_changed_files.outputs.update_type == 'version-update:semver-patch'"
+        ) && !condition.contains("semver-minor")
+            && !condition.contains("semver-major"),
+        "only semver-patch updates may auto-merge: a 0.x minor bump is a breaking release"
+    );
+}
+
+#[test]
+fn dependabot_automerge_is_disabled_by_a_non_dependabot_push() {
+    let workflow = dependabot_automerge_workflow();
+    let disarm = &workflow["jobs"]["disarm_after_foreign_push"];
+    let condition = disarm["if"]
+        .as_str()
+        .expect("the disarm job must have a trigger condition");
+    for clause in [
+        "github.event.action == 'synchronize'",
+        "github.actor != 'dependabot[bot]'",
+        "github.event.pull_request.user.login == 'dependabot[bot]'",
+        "github.repository == 'jm2/tributary'",
+    ] {
+        assert!(
+            condition.contains(clause),
+            "disarm condition must require {clause}"
+        );
+    }
+    assert!(
+        disarm.get("needs").is_none(),
+        "disarming must not wait on the inspection job, which skips non-Dependabot pushes"
+    );
+    assert_eq!(disarm["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(
+        disarm["permissions"]["pull-requests"].as_str(),
+        Some("write")
+    );
+    let steps = disarm["steps"]
+        .as_sequence()
+        .expect("disarm job steps must be a sequence");
+    assert!(
+        steps.len() == 1 && steps[0].get("uses").is_none(),
+        "the write-capable disarm job must be one action-free step"
+    );
+    let script = steps[0]["run"]
+        .as_str()
+        .expect("disarm step must run a script");
+    assert!(
+        script.contains("--json autoMergeRequest")
+            && script.contains("gh pr merge --disable-auto \"${PR_URL}\""),
+        "the disarm step must read live auto-merge state and disable it"
+    );
+}
+
 fn repository_workflow_names() -> (std::path::PathBuf, Vec<String>) {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflows_dir = manifest_dir.join(".github/workflows");
