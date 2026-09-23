@@ -361,6 +361,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an output is reported. Preferences changes no longer disturb the radio station layout, closing
   the Stations Near Me location prompt no longer counts as declining, and a new Privacy switch in
   Preferences turns the location lookup on or off.
+- **Track context menu on large selections** — Right-clicking many tracks no longer stalls or reads
+  every selected file; Properties does that work only when you choose it. Add to Playlist is no
+  longer offered for tracks that can't be added to a playlist.
 
 ### Security
 

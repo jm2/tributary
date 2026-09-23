@@ -3754,6 +3754,7 @@ mod tests {
                 crate::ui::context_menu::tests::popover_from_menu_model_attaches_a_visible_child_widget();
                 crate::ui::context_menu::tests::per_row_playlist_drop_target_drives_the_production_drop_path();
                 crate::ui::context_menu::tests::keyboard_add_action_matches_the_drag_payload_contract();
+                crate::ui::context_menu::tests::properties_rows_are_snapshotted_on_activation();
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
                 crate::ui::preferences::widget_tests::column_state_is_keyed_by_id_under_a_non_english_locale();
                 crate::ui::preferences::widget_tests::radio_columns_keep_their_ids();
