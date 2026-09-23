@@ -20,13 +20,13 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{LastFmClientError, LastFmTrack, SubmissionResult};
+use super::client::{IgnoredReason, LastFmClientError, LastFmTrack, SubmissionResult};
 use super::credentials::{
     CredentialError, LastFmAccountBinding, ProtectedString, SessionCredentialStore, StoredSession,
 };
 use super::delivery::{
-    delivery_disposition, disposition_for_client_error, next_retry_at_ms, LastFmClock,
-    LastFmDeliveryDisposition, LastFmTransport,
+    delivery_disposition, disposition_for_client_error, next_retry_at_ms, next_utc_day_ms,
+    LastFmClock, LastFmDeliveryDisposition, LastFmTransport,
 };
 use super::lifecycle::{acquire_vault_lifecycle, LastFmVaultLifecycleLease};
 use super::policy::LastFmLivePolicy;
@@ -675,6 +675,7 @@ impl LastFmRuntimeHandle {
     }
 
     /// Close all public admission and append the terminal FIFO marker.
+    #[cfg(test)]
     pub fn close_and_flush(&self) -> bool {
         request_shutdown(&self.inner)
     }
@@ -935,6 +936,8 @@ struct TerminalOutcomeCounts {
     accepted: u64,
     ignored: u64,
     rejected: u64,
+    /// Rows Last.fm ignored only because of its daily limit.
+    deferred: u64,
 }
 
 impl TerminalOutcomeCounts {
@@ -950,12 +953,22 @@ impl TerminalOutcomeCounts {
                         SubmissionResult::Accepted { .. } => {
                             counts.accepted = counts.accepted.saturating_add(1);
                         }
+                        SubmissionResult::Ignored {
+                            reason: IgnoredReason::DailyLimit,
+                        } => {
+                            counts.deferred = counts.deferred.saturating_add(1);
+                        }
                         SubmissionResult::Ignored { .. } => {
                             counts.ignored = counts.ignored.saturating_add(1);
                         }
                     }
                 }
-                if counts.accepted.saturating_add(counts.ignored) == row_count {
+                if counts
+                    .accepted
+                    .saturating_add(counts.ignored)
+                    .saturating_add(counts.deferred)
+                    == row_count
+                {
                     Ok(counts)
                 } else {
                     Err(LastFmRuntimeCommandError::DeliveryCapability)
@@ -966,6 +979,32 @@ impl TerminalOutcomeCounts {
                 ..Self::default()
             }),
             Err(_) => Err(LastFmRuntimeCommandError::DeliveryCapability),
+        }
+    }
+}
+
+/// Attempts for one actor queue write whose failure is a transient SQLite
+/// error. SQLite already waits out a competing writer for its busy timeout,
+/// so these short retries only absorb a brief I/O or connection-pool failure.
+const QUEUE_WRITE_ATTEMPTS: u32 = 3;
+const QUEUE_WRITE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Run one exact-receipt queue write, retrying only transient SQLite errors
+/// with a short linear backoff. Every write is one all-or-none transaction,
+/// so a failed attempt changed nothing.
+async fn retry_queue_write<F, Fut>(mut write: F) -> Result<(), LastFmQueueError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), LastFmQueueError>>,
+{
+    let mut attempt = 1;
+    loop {
+        match write().await {
+            Err(LastFmQueueError::Storage) if attempt < QUEUE_WRITE_ATTEMPTS => {
+                tokio::time::sleep(QUEUE_WRITE_RETRY_DELAY * attempt).await;
+                attempt += 1;
+            }
+            result => return result,
         }
     }
 }
@@ -1162,7 +1201,8 @@ struct ActiveAccount {
 /// draining the durable queue after its authority is gone.
 struct PolicySupervision {
     generation: u64,
-    live: LastFmLivePolicy,
+    /// Keeps the watch sender behind `changes` alive for the owner's life.
+    _live: LastFmLivePolicy,
     changes: watch::Receiver<LastFmPolicyGeneration>,
 }
 
@@ -1179,7 +1219,7 @@ impl PolicySupervision {
         changes.borrow_and_update();
         Self {
             generation,
-            live: live.clone(),
+            _live: live.clone(),
             changes,
         }
     }
@@ -1702,7 +1742,9 @@ impl RuntimeOwner {
             Ok(SubmissionResult::Accepted { .. }) => LastFmNowPlayingOutcome::Accepted,
             Ok(SubmissionResult::Ignored { .. }) => LastFmNowPlayingOutcome::Ignored,
             Err(error) => match disposition_for_client_error(error) {
-                LastFmDeliveryDisposition::SettleTerminal => LastFmNowPlayingOutcome::Rejected,
+                // Only a scrobble batch answer can defer rows.
+                LastFmDeliveryDisposition::SettleTerminal
+                | LastFmDeliveryDisposition::DeferDailyLimit => LastFmNowPlayingOutcome::Rejected,
                 LastFmDeliveryDisposition::RetryTransient => LastFmNowPlayingOutcome::Unavailable,
                 LastFmDeliveryDisposition::QuarantineCompatibility => {
                     LastFmNowPlayingOutcome::Incompatible
@@ -2320,20 +2362,23 @@ impl RuntimeOwner {
                     return;
                 }
                 match delivery_disposition(&receipt, &result) {
-                    LastFmDeliveryDisposition::SettleTerminal => {
-                        let Ok(row_count) = u64::try_from(receipt.len()) else {
-                            self.pause_delivery_for_receipt(
-                                binding,
-                                epoch,
-                                &receipt,
-                                storage::LastFmDurablePause::Capability,
-                                acknowledgement,
-                            )
-                            .await;
-                            return;
-                        };
-                        let Ok(outcome_counts) =
-                            TerminalOutcomeCounts::from_result(&result, row_count)
+                    LastFmDeliveryDisposition::SettleTerminal
+                    | LastFmDeliveryDisposition::DeferDailyLimit => {
+                        self.settle_delivery(
+                            binding,
+                            epoch,
+                            generation,
+                            &receipt,
+                            &result,
+                            acknowledgement,
+                        )
+                        .await;
+                    }
+                    LastFmDeliveryDisposition::RetryTransient => {
+                        let Ok(retry_at) = self
+                            .clock
+                            .now_unix_ms()
+                            .and_then(|now| next_retry_at_ms(now, &receipt))
                         else {
                             self.pause_delivery_for_receipt(
                                 binding,
@@ -2345,74 +2390,12 @@ impl RuntimeOwner {
                             .await;
                             return;
                         };
-                        match storage::settle_terminal(&self.database, &receipt).await {
-                            Ok(()) => {
-                                let Some(pending_scrobbles) =
-                                    self.status.pending_scrobbles.checked_sub(row_count)
-                                else {
-                                    self.pause_delivery_for_account(
-                                        binding,
-                                        epoch,
-                                        storage::LastFmDurablePause::Capability,
-                                    )
-                                    .await;
-                                    let _ =
-                                        acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
-                                    return;
-                                };
-                                self.status.pending_scrobbles = pending_scrobbles;
-                                self.status.accepted_scrobbles = self
-                                    .status
-                                    .accepted_scrobbles
-                                    .saturating_add(outcome_counts.accepted);
-                                self.status.ignored_scrobbles = self
-                                    .status
-                                    .ignored_scrobbles
-                                    .saturating_add(outcome_counts.ignored);
-                                self.status.rejected_scrobbles = self
-                                    .status
-                                    .rejected_scrobbles
-                                    .saturating_add(outcome_counts.rejected);
-                                let directive =
-                                    if self.delivery_can_continue(binding, epoch, generation) {
-                                        self.publish(LastFmRuntimePhase::Active, None);
-                                        LastFmDeliveryDirective::Continue
-                                    } else {
-                                        LastFmDeliveryDirective::Stop
-                                    };
-                                let _ = acknowledgement.acknowledge(directive);
-                            }
-                            Err(error) => {
-                                self.pause_delivery_for_receipt(
-                                    binding,
-                                    epoch,
-                                    &receipt,
-                                    storage::LastFmDurablePause::Capability,
-                                    acknowledgement,
-                                )
-                                .await;
-                                let _ = error;
-                            }
-                        }
-                    }
-                    LastFmDeliveryDisposition::RetryTransient => {
-                        let retry_at = self
-                            .clock
-                            .now_unix_ms()
-                            .map_err(|_| LastFmRuntimeCommandError::DeliveryCapability)
-                            .and_then(|now| {
-                                next_retry_at_ms(now, &receipt)
-                                    .map_err(|_| LastFmRuntimeCommandError::DeliveryCapability)
-                            });
-                        let result = match retry_at {
-                            Ok(retry_at) => {
-                                storage::reschedule_batch(&self.database, &receipt, retry_at)
-                                    .await
-                                    .map_err(LastFmRuntimeCommandError::from)
-                            }
-                            Err(error) => Err(error),
-                        };
-                        match result {
+                        let database = &self.database;
+                        let written = retry_queue_write(|| {
+                            storage::reschedule_batch(database, &receipt, retry_at)
+                        })
+                        .await;
+                        match written {
                             Ok(()) => {
                                 let directive =
                                     if self.delivery_can_continue(binding, epoch, generation) {
@@ -2426,7 +2409,11 @@ impl RuntimeOwner {
                                     };
                                 let _ = acknowledgement.acknowledge(directive);
                             }
-                            Err(error) => {
+                            Err(LastFmQueueError::Storage) => {
+                                self.stop_delivery_for_storage_failure(binding, epoch);
+                                let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+                            }
+                            Err(_) => {
                                 self.pause_delivery_for_receipt(
                                     binding,
                                     epoch,
@@ -2435,7 +2422,6 @@ impl RuntimeOwner {
                                     acknowledgement,
                                 )
                                 .await;
-                                let _ = error;
                             }
                         }
                     }
@@ -2480,19 +2466,144 @@ impl RuntimeOwner {
                     let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
                     return;
                 }
-                let pause = match failure {
-                    LastFmDeliveryWorkerFailure::Storage(_) => {
-                        storage::LastFmDurablePause::Capability
-                    }
-                    LastFmDeliveryWorkerFailure::Clock(_)
-                    | LastFmDeliveryWorkerFailure::Preparation(_)
-                    | LastFmDeliveryWorkerFailure::UnexpectedTaskExit => {
-                        storage::LastFmDurablePause::Capability
-                    }
-                };
-                self.pause_delivery_for_account(binding, epoch, pause).await;
+                // The worker has already retried a transient read failure.
+                // Only a proven local fault earns a durable pause.
+                if failure == LastFmDeliveryWorkerFailure::Storage(LastFmQueueError::Storage) {
+                    self.stop_delivery_for_storage_failure(binding, epoch);
+                } else {
+                    self.pause_delivery_for_account(
+                        binding,
+                        epoch,
+                        storage::LastFmDurablePause::Capability,
+                    )
+                    .await;
+                }
                 let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
             }
+        }
+    }
+
+    /// Apply one complete Last.fm answer to its exact receipt: delete every
+    /// settled row and keep the rows ignored for the daily limit until the
+    /// next UTC day.
+    async fn settle_delivery(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+        generation: LastFmDeliveryGeneration,
+        receipt: &storage::LastFmBatchReceipt,
+        result: &Result<super::client::ScrobbleBatchResult, LastFmClientError>,
+        acknowledgement: LastFmDeliveryAcknowledgement,
+    ) {
+        let deferred = match result {
+            Ok(batch) => batch
+                .items
+                .iter()
+                .map(|item| {
+                    matches!(
+                        item,
+                        SubmissionResult::Ignored {
+                            reason: IgnoredReason::DailyLimit
+                        }
+                    )
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let counts = u64::try_from(receipt.len())
+            .ok()
+            .and_then(|row_count| TerminalOutcomeCounts::from_result(result, row_count).ok());
+        let deferred_until = if counts.is_some_and(|counts| counts.deferred > 0) {
+            self.clock.now_unix_ms().and_then(next_utc_day_ms).ok()
+        } else {
+            Some(0)
+        };
+        let (Some(counts), Some(deferred_until)) = (counts, deferred_until) else {
+            self.pause_delivery_for_receipt(
+                binding,
+                epoch,
+                receipt,
+                storage::LastFmDurablePause::Capability,
+                acknowledgement,
+            )
+            .await;
+            return;
+        };
+        let database = &self.database;
+        let written = retry_queue_write(|| {
+            storage::settle_terminal(database, receipt, &deferred, deferred_until)
+        })
+        .await;
+        match written {
+            Ok(()) => {}
+            Err(LastFmQueueError::Storage) => {
+                self.stop_delivery_for_storage_failure(binding, epoch);
+                let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+                return;
+            }
+            Err(_) => {
+                self.pause_delivery_for_receipt(
+                    binding,
+                    epoch,
+                    receipt,
+                    storage::LastFmDurablePause::Capability,
+                    acknowledgement,
+                )
+                .await;
+                return;
+            }
+        }
+        let settled = counts.accepted + counts.ignored + counts.rejected;
+        let Some(pending_scrobbles) = self.status.pending_scrobbles.checked_sub(settled) else {
+            self.pause_delivery_for_account(
+                binding,
+                epoch,
+                storage::LastFmDurablePause::Capability,
+            )
+            .await;
+            let _ = acknowledgement.acknowledge(LastFmDeliveryDirective::Stop);
+            return;
+        };
+        self.status.pending_scrobbles = pending_scrobbles;
+        self.status.accepted_scrobbles = self
+            .status
+            .accepted_scrobbles
+            .saturating_add(counts.accepted);
+        self.status.ignored_scrobbles =
+            self.status.ignored_scrobbles.saturating_add(counts.ignored);
+        self.status.rejected_scrobbles = self
+            .status
+            .rejected_scrobbles
+            .saturating_add(counts.rejected);
+        let directive = if self.delivery_can_continue(binding, epoch, generation) {
+            if counts.deferred > 0 {
+                self.publish(
+                    LastFmRuntimePhase::BackingOff,
+                    Some(LastFmRuntimeCommandError::Delivery),
+                );
+            } else {
+                self.publish(LastFmRuntimePhase::Active, None);
+            }
+            LastFmDeliveryDirective::Continue
+        } else {
+            LastFmDeliveryDirective::Stop
+        };
+        let _ = acknowledgement.acknowledge(directive);
+    }
+
+    /// Stop delivery after a queue read or write kept failing with a transient
+    /// SQLite error. No durable pause records this stop: new plays are still
+    /// admitted, and the next runtime start resumes delivery.
+    fn stop_delivery_for_storage_failure(
+        &mut self,
+        binding: LastFmAccountBinding,
+        epoch: LastFmAccountEpoch,
+    ) {
+        if self.pause_delivery_ingress(binding, epoch, false) {
+            self.publish(
+                LastFmRuntimePhase::Paused,
+                Some(LastFmRuntimeCommandError::Queue),
+            );
         }
     }
 
@@ -3457,10 +3568,6 @@ impl LastFmRuntimeBarrier {
         *self.completion.borrow()
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.state() != LastFmRuntimeDrainState::Pending || self.completion.has_changed().is_err()
-    }
-
     pub async fn wait(&self) -> Result<(), LastFmRuntimeShutdownError> {
         let mut completion = self.completion.clone();
         loop {
@@ -3545,16 +3652,6 @@ impl LastFmRuntimeActivation {
                 _private: (),
                 policy_generation: generation.generation(),
             })
-    }
-
-    /// Construct one activation from an already-consented, enabled
-    /// generation for downstream tests that must not run a live policy slot.
-    #[cfg(test)]
-    pub(in crate::lastfm) fn for_test() -> Self {
-        let live = LastFmLivePolicy::default();
-        live.publish(LastFmPolicyGeneration::for_test(1, HashSet::new()));
-        Self::issue_after_consent_and_enablement(&live)
-            .expect("enabled test generation issues an activation")
     }
 }
 
@@ -4149,12 +4246,6 @@ mod tests {
     impl GatedCredentialStore {
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
-        }
-
-        fn release(&self) {
-            let (released, signal) = &*self.gate;
-            *released.lock().unwrap() = true;
-            signal.notify_all();
         }
     }
 

@@ -439,12 +439,14 @@ where
     /// Current exact qualification threshold, useful to the coordinator's
     /// deterministic tests but never included in diagnostics.
     #[must_use]
+    #[cfg(test)]
     pub const fn threshold_ms(&self) -> u64 {
         self.threshold_ms
     }
 
     /// Observed forward playback credit, capped at the threshold.
     #[must_use]
+    #[cfg(test)]
     pub const fn credited_ms(&self) -> u64 {
         self.credited_ms
     }

@@ -28,8 +28,8 @@ use super::playback::{
 };
 use super::policy::LastFmDispatchAuthority;
 use super::runtime::{
-    LastFmNowPlaying, LastFmNowPlayingOutcome, LastFmPlaybackRuntimeIngress,
-    LastFmRuntimeAdmissionError, LastFmRuntimeCommandError, LastFmRuntimeOperation,
+    LastFmNowPlaying, LastFmPlaybackRuntimeIngress, LastFmRuntimeAdmissionError,
+    LastFmRuntimeOperation,
 };
 use super::storage::{LastFmEnqueueOutcome, UnboundLastFmScrobble};
 
@@ -581,7 +581,7 @@ impl LastFmPlaybackHandoff {
             |now_playing| {
                 runtime
                     .try_update_now_playing(now_playing)
-                    .map(LastFmPlaybackRuntimeOperation::NowPlaying)
+                    .map(|_| LastFmPlaybackRuntimeOperation::NowPlaying)
             },
             |scrobble| {
                 runtime
@@ -591,7 +591,7 @@ impl LastFmPlaybackHandoff {
             || {
                 runtime
                     .try_clear_now_playing()
-                    .map(LastFmPlaybackRuntimeOperation::ClearNowPlaying)
+                    .map(|_| LastFmPlaybackRuntimeOperation::ClearNowPlaying)
             },
             |result| result.is_ok(),
         )
@@ -659,53 +659,28 @@ impl fmt::Debug for LastFmPlaybackHandoff {
     }
 }
 
-/// Admitted runtime work, retaining only its fixed result channel.
+/// Admitted runtime work. Only an enqueue keeps its result channel: its
+/// completion is durable evidence. Now-playing and clear completions carry
+/// none, so their receipts are released at admission.
 #[must_use = "admitted Last.fm runtime work must be awaited or deliberately cancelled"]
 pub enum LastFmPlaybackRuntimeOperation {
-    NowPlaying(LastFmRuntimeOperation<LastFmNowPlayingOutcome>),
+    NowPlaying,
     Enqueue(LastFmRuntimeOperation<LastFmEnqueueOutcome>),
-    ClearNowPlaying(LastFmRuntimeOperation<()>),
-}
-
-impl LastFmPlaybackRuntimeOperation {
-    pub async fn wait(self) -> Result<LastFmPlaybackRuntimeOutcome, LastFmRuntimeCommandError> {
-        match self {
-            Self::NowPlaying(operation) => operation
-                .wait()
-                .await
-                .map(LastFmPlaybackRuntimeOutcome::NowPlaying),
-            Self::Enqueue(operation) => operation
-                .wait()
-                .await
-                .map(LastFmPlaybackRuntimeOutcome::Enqueue),
-            Self::ClearNowPlaying(operation) => operation
-                .wait()
-                .await
-                .map(|()| LastFmPlaybackRuntimeOutcome::ClearNowPlaying),
-        }
-    }
+    ClearNowPlaying,
 }
 
 impl fmt::Debug for LastFmPlaybackRuntimeOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
-            Self::NowPlaying(_) => LastFmPlaybackHandoffKind::NowPlaying,
+            Self::NowPlaying => LastFmPlaybackHandoffKind::NowPlaying,
             Self::Enqueue(_) => LastFmPlaybackHandoffKind::Enqueue,
-            Self::ClearNowPlaying(_) => LastFmPlaybackHandoffKind::ClearNowPlaying,
+            Self::ClearNowPlaying => LastFmPlaybackHandoffKind::ClearNowPlaying,
         };
         formatter
             .debug_tuple("LastFmPlaybackRuntimeOperation")
             .field(&kind)
             .finish()
     }
-}
-
-/// Content-free completion of one admitted runtime handoff.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LastFmPlaybackRuntimeOutcome {
-    NowPlaying(LastFmNowPlayingOutcome),
-    Enqueue(LastFmEnqueueOutcome),
-    ClearNowPlaying,
 }
 
 /// At most one handoff plus one fixed owner failure from a synchronous event.
@@ -1027,6 +1002,7 @@ where
     /// and one-shot latches. A different identity retires the predecessor.
     /// Reusing an identity with changed source or metadata permanently retires
     /// that identity until a genuinely new identity arrives.
+    #[cfg(test)]
     fn accept_load(
         &mut self,
         accepted: LastFmAcceptedPlayback,

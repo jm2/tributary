@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Last.fm keeps queued scrobbles** — Scrobbles saved while offline are no longer deleted when
+  Last.fm rejects the app's key or signature or the daily scrobble limit is reached; they wait and
+  are sent later. Brief storage errors and web error pages are retried instead of stopping
+  delivery. Last.fm remains unavailable in current builds.
 - **Library folders that come and go** — A library folder on a drive or network share that
   connects after Tributary starts, or is remounted, is now watched and scanned within about
   half a minute, and the folder browser shows it as unavailable while it is away and keeps

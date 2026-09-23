@@ -22,6 +22,12 @@ use super::delivery::{
     scrobbles_from_receipt, LastFmClock, LastFmDeliveryPrimitiveError, LastFmTransport,
 };
 use super::storage::{self, LastFmBatchAvailability, LastFmBatchReceipt, LastFmQueueError};
+use crate::db::entities::lastfm_scrobble::MAX_LASTFM_RETRY_AT_MS;
+
+/// In-memory waits before the worker reads the queue again after a transient
+/// SQLite failure. After the last one it reports the failure; the actor then
+/// stops delivery until the next start without recording a durable pause.
+const STORAGE_RETRY_DELAYS_MS: [i64; 3] = [1_000, 10_000, 60_000];
 
 /// Opaque identity of one delivery-worker lifetime.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -113,11 +119,7 @@ pub struct LastFmDeliveryResultEvent {
 
 impl LastFmDeliveryResultEvent {
     #[must_use]
-    pub const fn generation(&self) -> LastFmDeliveryGeneration {
-        self.generation
-    }
-
-    #[must_use]
+    #[cfg(test)]
     pub fn row_count(&self) -> usize {
         self.receipt.len()
     }
@@ -235,6 +237,7 @@ impl LastFmDeliveryWorker {
         true
     }
 
+    #[cfg(test)]
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
@@ -249,6 +252,7 @@ impl LastFmDeliveryWorker {
         self.cancellation.clone()
     }
 
+    #[cfg(test)]
     pub async fn join(mut self) -> Result<LastFmDeliveryWorkerExit, LastFmDeliveryWorkerJoinError> {
         self.join_inner().await
     }
@@ -405,6 +409,7 @@ impl DeliveryTask {
                 return LastFmDeliveryWorkerExit::DirectedStop;
             }
         }
+        let mut storage_failures = 0;
         loop {
             // Treat the current revision as represented by the following
             // authoritative database read. A racing later revision remains
@@ -435,7 +440,28 @@ impl DeliveryTask {
                 return LastFmDeliveryWorkerExit::Cancelled;
             }
             let availability = match availability {
-                Ok(availability) => availability,
+                Ok(availability) => {
+                    storage_failures = 0;
+                    availability
+                }
+                Err(LastFmQueueError::Storage)
+                    if storage_failures < STORAGE_RETRY_DELAYS_MS.len() =>
+                {
+                    let deadline = now_unix_ms
+                        .saturating_add(STORAGE_RETRY_DELAYS_MS[storage_failures])
+                        .min(MAX_LASTFM_RETRY_AT_MS);
+                    storage_failures += 1;
+                    match self.wait_for_deadline_or_wake(deadline).await {
+                        WaitOutcome::Wake => continue,
+                        WaitOutcome::Cancelled => return LastFmDeliveryWorkerExit::Cancelled,
+                        WaitOutcome::WakeChannelClosed => {
+                            return LastFmDeliveryWorkerExit::WakeChannelClosed;
+                        }
+                        WaitOutcome::ClockFailed(error) => {
+                            return self.fail(LastFmDeliveryWorkerFailure::Clock(error)).await;
+                        }
+                    }
+                }
                 Err(error) => {
                     return self.fail(LastFmDeliveryWorkerFailure::Storage(error)).await;
                 }
@@ -835,7 +861,9 @@ mod tests {
         let (generation, receipt, result, acknowledgement) = event.into_parts();
         assert_eq!(generation, LastFmDeliveryGeneration::new(7));
         assert_eq!(result.unwrap().items.len(), count);
-        storage::settle_terminal(database, &receipt).await.unwrap();
+        storage::settle_terminal(database, &receipt, &[], 0)
+            .await
+            .unwrap();
         assert!(acknowledgement.acknowledge(directive));
         count
     }
@@ -1075,6 +1103,80 @@ mod tests {
         );
         assert!(calls.try_recv().is_err());
         assert_eq!(storage::queue_len(&database).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_storage_failure_is_retried_in_memory_then_reported() {
+        let database = database().await;
+        let session = session();
+        let binding = session.account_binding();
+        storage::enqueue(&database, &pending(binding, 0))
+            .await
+            .unwrap();
+        let rename = |from: &str, to: &str| {
+            Statement::from_string(
+                DbBackend::Sqlite,
+                format!("ALTER TABLE {from} RENAME TO {to}"),
+            )
+        };
+        database
+            .execute_raw(rename("lastfm_scrobble_queue", "unavailable_queue"))
+            .await
+            .unwrap();
+        let (transport, calls, responses) = ScriptedTransport::new();
+        let (clock, waits) = ManualClock::new(0);
+        let (worker, events) = spawn_fixture(
+            database.clone(),
+            session,
+            Arc::clone(&transport),
+            Arc::clone(&clock),
+        );
+
+        assert_eq!(receive(&waits).await, 1_000);
+        clock.advance_to(1_000);
+        assert_eq!(receive(&waits).await, 11_000);
+        assert!(events.try_recv().is_err(), "a retried read reports nothing");
+        database
+            .execute_raw(rename("unavailable_queue", "lastfm_scrobble_queue"))
+            .await
+            .unwrap();
+        clock.advance_to(11_000);
+        assert_eq!(receive(&calls).await, 1);
+        responses.send(Ok(accepted(1))).await.unwrap();
+        let LastFmDeliveryEvent::Result(event) = receive(&events).await else {
+            panic!("expected result event");
+        };
+        let (_, receipt, _, acknowledgement) = event.into_parts();
+        storage::settle_terminal(&database, &receipt, &[], 0)
+            .await
+            .unwrap();
+
+        // A successful read resets the budget; a failure that outlasts every
+        // wait is reported once.
+        database
+            .execute_raw(rename("lastfm_scrobble_queue", "unavailable_queue"))
+            .await
+            .unwrap();
+        assert!(acknowledgement.acknowledge(LastFmDeliveryDirective::Continue));
+        for (deadline, now) in [(12_000, 12_000), (22_000, 22_000), (82_000, 82_000)] {
+            assert_eq!(receive(&waits).await, deadline);
+            clock.advance_to(now);
+        }
+        let failure = LastFmDeliveryWorkerFailure::Storage(LastFmQueueError::Storage);
+        let LastFmDeliveryEvent::Failed {
+            failure: observed,
+            acknowledgement,
+            ..
+        } = receive(&events).await
+        else {
+            panic!("expected worker failure event");
+        };
+        assert_eq!(observed, failure);
+        assert!(acknowledgement.acknowledge(LastFmDeliveryDirective::Stop));
+        assert_eq!(
+            worker.join().await.unwrap(),
+            LastFmDeliveryWorkerExit::Failed(failure)
+        );
     }
 
     #[test]
