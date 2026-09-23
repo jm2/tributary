@@ -356,6 +356,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drags from empty space or column headers from transferring the existing selection.
 - **Release verification** — Verify that manual releases build the requested tag and stop
   artifact publication when checksum generation fails.
+- **Settings are no longer lost silently** — An unreadable settings or outputs file is kept aside
+  with a notice instead of being replaced, and a failed save or unreachable MPD server when adding
+  an output is reported. Preferences changes no longer disturb the radio station layout, closing
+  the Stations Near Me location prompt no longer counts as declining, and a new Privacy switch in
+  Preferences turns the location lookup on or off.
 
 ### Security
 

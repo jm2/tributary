@@ -115,6 +115,13 @@ preferences:
   browser_views: "Browserweergaven"
   visible_columns: "Zichtbare kolommen"
   reset_to_defaults: "Standaardinstellingen herstellen"
+  privacy: "Privacy"
+  location_title: "Locatie voor Stations in de buurt"
+  location_subtitle: "Bepaal uw geschatte locatie op basis van uw IP-adres via ipapi.co, ipwho.is of freeipapi.com."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "%{file} kon niet worden gelezen, dus de standaardinstellingen worden gebruikt. Het onleesbare bestand is bewaard als %{copy}."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -154,6 +161,8 @@ dialogs:
   output_exclusive_control_confirmation: "Ik bevestig dat Tributary exclusieve controle over deze MPD-afspeelpartitie heeft."
   output_detection_warning: "Met toezicht ingeschakeld blijft Tributary de partitie observeren tijdens het afspelen: een vreemd huidig nummer, een vreemde optiewijziging of een verloren observatievenster trekt de afspeelcontrole in en behoudt elk wees-wachtrij-item. Toezicht kan alleen intrekken, nooit verlenen: na zulke aanwijzingen weigert de uitgang opdrachten totdat je hem opnieuw selecteert om opnieuw te bevestigen."
   output_detection_confirmation: "Houd deze exclusieve uitgang in de gaten en trek de controle in bij aanwijzingen van een andere controller."
+  output_probe_failed: "MPD op %{host}:%{port} is niet bereikbaar. De uitvoer is niet toegevoegd."
+  output_save_failed: "De uitvoer ‘%{name}’ kon niet worden opgeslagen."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

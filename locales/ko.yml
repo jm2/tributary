@@ -115,6 +115,13 @@ preferences:
   browser_views: "브라우저 보기"
   visible_columns: "표시할 열"
   reset_to_defaults: "기본값으로 재설정"
+  privacy: "개인정보"
+  location_title: "내 주변 방송국 위치"
+  location_subtitle: "ipapi.co, ipwho.is 또는 freeipapi.com을 통해 IP 주소로 대략적인 위치를 확인합니다."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "%{file}을(를) 읽을 수 없어 기본 설정을 사용합니다. 읽을 수 없는 파일은 %{copy}(으)로 보관했습니다."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -154,6 +161,8 @@ dialogs:
   output_exclusive_control_confirmation: "Tributary가 이 MPD 재생 파티션을 독점 제어함을 확인합니다."
   output_detection_warning: "감독을 활성화하면 Tributary는 재생 중에도 파티션을 계속 관찰합니다. 외부 현재 곡, 외부 옵션 변경 또는 관찰 공백이 감지되면 재생 제어 권한을 철회하고 고아 큐 항목을 유지합니다. 감독은 철회만 할 수 있으며 부여할 수는 없습니다. 이러한 증거가 감지되면 다시 선택하여 재확인할 때까지 이 출력은 명령을 거부합니다."
   output_detection_confirmation: "이 배타 출력을 감독하고 다른 컨트롤러의 증거가 감지되면 제어를 철회합니다."
+  output_probe_failed: "%{host}:%{port}의 MPD에 연결할 수 없습니다. 출력이 추가되지 않았습니다."
+  output_save_failed: "“%{name}” 출력을 저장할 수 없습니다."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

@@ -115,6 +115,13 @@ preferences:
   browser_views: "Browser-Ansichten"
   visible_columns: "Sichtbare Spalten"
   reset_to_defaults: "Standardwerte wiederherstellen"
+  privacy: "Datenschutz"
+  location_title: "Standort für Sender in der Nähe"
+  location_subtitle: "Ihren ungefähren Standort anhand Ihrer IP-Adresse über ipapi.co, ipwho.is oder freeipapi.com ermitteln."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "%{file} konnte nicht gelesen werden, daher gelten die Standardeinstellungen. Die unlesbare Datei wurde als %{copy} aufbewahrt."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -154,6 +161,8 @@ dialogs:
   output_exclusive_control_confirmation: "Ich bestätige, dass Tributary die exklusive Kontrolle über diese MPD-Wiedergabepartition hat."
   output_detection_warning: "Mit aktivierter Überwachung beobachtet Tributary die Partition während der Wiedergabe weiter: Ein fremder aktueller Titel, eine fremde Optionsänderung oder ein verloren gegangenes Beobachtungsfenster entzieht die Wiedergabesteuerung und behält jeden verwaisten Warteschlangeneintrag. Überwachung kann nur entziehen, nie gewähren: Nach solchen Hinweisen verweigert die Ausgabe Befehle, bis du sie erneut auswählst, um sie erneut zu bestätigen."
   output_detection_confirmation: "Diese exklusive Ausgabe überwachen und ihre Steuerung bei Anzeichen eines anderen Controllers entziehen."
+  output_probe_failed: "MPD unter %{host}:%{port} ist nicht erreichbar. Die Ausgabe wurde nicht hinzugefügt."
+  output_save_failed: "Die Ausgabe „%{name}“ konnte nicht gespeichert werden."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

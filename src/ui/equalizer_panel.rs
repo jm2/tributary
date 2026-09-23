@@ -1,63 +1,42 @@
 //! The Preferences "Equalizer" group.
 //!
 //! The group edits `AppConfig::equalizer`. Every change applies to the
-//! active output at once and is saved to `config.json` after a short pause,
-//! or when the dialog closes. Outputs that cannot run the equalizer get the
-//! same controls, disabled, with the reason as the group description.
+//! active output at once and is saved to `config.json` through the
+//! Preferences save queue, after a short pause or when the dialog closes.
+//! Outputs that cannot run the equalizer get the same controls, disabled,
+//! with the reason as the group description.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
 
-use super::preferences::{save_config, AppConfig};
+use super::preferences::{AppConfig, ConfigSaveQueue};
 use crate::audio::equalizer::{
     snap_gain_db, ClipProtection, EqualizerSettings, Preset, BAND_CENTERS_HZ, GAIN_STEP_DB,
     MAX_GAIN_DB, MIN_GAIN_DB,
 };
 use crate::audio::output::{AudioOutput, OutputType};
 
-/// Coalesces slider drags into one `config.json` write, like the volume.
-const SAVE_DELAY: Duration = Duration::from_millis(750);
-
-/// Build the group for `dialog`, editing `config` and driving `output`.
+/// Build the group editing `config` and driving `output`.
 pub fn preferences_group(
-    dialog: &adw::PreferencesDialog,
     config: &Rc<RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
     output: &Rc<RefCell<Box<dyn AudioOutput>>>,
 ) -> adw::PreferencesGroup {
-    let save_pending = Rc::new(Cell::new(false));
-    {
-        let config = config.clone();
-        let save_pending = save_pending.clone();
-        dialog.connect_closed(move |_| flush_save(&config, &save_pending));
-    }
     let on_change = {
         let config = config.clone();
+        let saves = saves.clone();
         let output = output.clone();
         Rc::new(move |settings: &EqualizerSettings| {
             output.borrow().set_equalizer(settings);
             config.borrow_mut().equalizer = *settings;
-            if !save_pending.replace(true) {
-                let config = config.clone();
-                let save_pending = save_pending.clone();
-                glib::timeout_add_local_once(SAVE_DELAY, move || {
-                    flush_save(&config, &save_pending);
-                });
-            }
+            saves.schedule();
         })
     };
     let unavailable = unavailable_reason(output.borrow().as_ref());
     let settings = config.borrow().equalizer;
     build(settings, unavailable.as_deref(), on_change).0
-}
-
-fn flush_save(config: &RefCell<AppConfig>, save_pending: &Cell<bool>) {
-    if save_pending.replace(false) {
-        save_config(&config.borrow());
-    }
 }
 
 /// Why `output` cannot run the equalizer, or `None` when it can.

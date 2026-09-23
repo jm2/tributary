@@ -115,6 +115,13 @@ preferences:
   browser_views: "Panele przeglądarki"
   visible_columns: "Widoczne kolumny"
   reset_to_defaults: "Przywróć domyślne"
+  privacy: "Prywatność"
+  location_title: "Lokalizacja dla Stacji w pobliżu"
+  location_subtitle: "Ustalaj przybliżoną lokalizację na podstawie adresu IP za pomocą ipapi.co, ipwho.is lub freeipapi.com."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "Nie można odczytać pliku %{file}, więc używane są ustawienia domyślne. Nieczytelny plik zachowano jako %{copy}."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -154,6 +161,8 @@ dialogs:
   output_exclusive_control_confirmation: "Potwierdzam, że Tributary ma wyłączną kontrolę nad tą partycją odtwarzania MPD."
   output_detection_warning: "Przy włączonym nadzorze Tributary dalej obserwuje partycję podczas odtwarzania: obcy bieżący utwór, obca zmiana opcji lub utracone okno obserwacji cofają kontrolę odtwarzania i zachowują każdy osierocony wpis kolejki. Nadzór może tylko cofać, nigdy przyznawać: po takich dowodach wyjście odrzuca polecenia do momentu ponownego wybrania go w celu ponownego potwierdzenia."
   output_detection_confirmation: "Nadzoruj to wyłączne wyjście i cofaj jego kontrolę po dowodach działania innego kontrolera."
+  output_probe_failed: "Nie można połączyć się z MPD pod adresem %{host}:%{port}. Wyjście nie zostało dodane."
+  output_save_failed: "Nie można zapisać wyjścia „%{name}”."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:

@@ -182,20 +182,20 @@ pub fn handle_radio_nearme(
             let dialog = adw::AlertDialog::builder()
                 .heading(rust_i18n::t!("dialogs.enable_location").as_ref())
                 .body(rust_i18n::t!("dialogs.enable_location_body").as_ref())
-                .close_response("decline")
-                .default_response("enable")
+                .close_response(CONSENT_DISMISSED)
+                .default_response(CONSENT_ENABLE)
                 .build();
-            dialog.add_response("decline", rust_i18n::t!("dialogs.no_thanks").as_ref());
+            dialog.add_response(CONSENT_DECLINE, rust_i18n::t!("dialogs.no_thanks").as_ref());
             dialog.add_response(
-                "enable",
+                CONSENT_ENABLE,
                 rust_i18n::t!("dialogs.enable_location_btn").as_ref(),
             );
-            dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
+            dialog.set_response_appearance(CONSENT_ENABLE, adw::ResponseAppearance::Suggested);
 
             dialog.connect_response(None, move |_dialog, response| {
-                let enabled = response == "enable";
+                let decision = consent_decision(response);
                 clear_exact_consent_prerequisite(&near_me_consent_request, &request);
-                {
+                if let Some(enabled) = decision {
                     let mut config = app_config.borrow_mut();
                     config.location_enabled = Some(enabled);
                     preferences::save_config(&config);
@@ -204,17 +204,20 @@ pub fn handle_radio_nearme(
                 if !source_navigation.borrow().is_current(&request) {
                     tracing::debug!(
                         generation = request.generation(),
-                        enabled,
-                        "Saved stale Near Me consent response without changing navigation"
+                        ?decision,
+                        "Handled stale Near Me consent response without changing navigation"
                     );
                     return;
                 }
 
-                if enabled {
+                if decision == Some(true) {
                     info!("Location enabled by user");
                     refresh();
                 } else {
-                    info!("Location declined by user, switching to local");
+                    info!(
+                        remembered = decision.is_some(),
+                        "Location not enabled, switching to local"
+                    );
                     fall_back_to_local(
                         &app_config,
                         &track_store,
@@ -236,6 +239,21 @@ pub fn handle_radio_nearme(
     }
 }
 
+const CONSENT_ENABLE: &str = "enable";
+const CONSENT_DECLINE: &str = "decline";
+/// Reported when the prompt is closed with Escape or a system action.
+const CONSENT_DISMISSED: &str = "dismiss";
+
+/// The location consent a prompt response records: only an explicit button
+/// is remembered, so dismissing the prompt asks again next time.
+fn consent_decision(response: &str) -> Option<bool> {
+    match response {
+        CONSENT_ENABLE => Some(true),
+        CONSENT_DECLINE => Some(false),
+        _ => None,
+    }
+}
+
 fn clear_exact_consent_prerequisite(
     pending: &RefCell<Option<SourceRequest>>,
     request: &SourceRequest,
@@ -249,7 +267,8 @@ fn clear_exact_consent_prerequisite(
 #[cfg(test)]
 mod tests {
     use super::{
-        column_title, is_radio_backend, radio_source_key, radio_view_origin, NEARME_SOURCE_KEY,
+        column_title, consent_decision, is_radio_backend, radio_source_key, radio_view_origin,
+        CONSENT_DECLINE, CONSENT_DISMISSED, CONSENT_ENABLE, NEARME_SOURCE_KEY,
         TOP_CLICK_SOURCE_KEY, TOP_VOTE_SOURCE_KEY,
     };
     use crate::architecture::ViewOrigin;
@@ -273,6 +292,15 @@ mod tests {
         }
         assert!(!is_radio_backend("radio-attacker-defined"));
         assert_eq!(radio_view_origin("radio-attacker-defined"), None);
+    }
+
+    #[test]
+    fn only_an_explicit_answer_records_location_consent() {
+        assert_eq!(consent_decision(CONSENT_ENABLE), Some(true));
+        assert_eq!(consent_decision(CONSENT_DECLINE), Some(false));
+        // Escape or closing the prompt must not persist a permanent decline.
+        assert_eq!(consent_decision(CONSENT_DISMISSED), None);
+        assert_eq!(consent_decision("close"), None);
     }
 
     #[test]

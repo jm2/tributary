@@ -3,8 +3,12 @@
 //! Manages saved MPD outputs that appear in the header bar output
 //! selector popover.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use super::persistence::{read_settings_file, write_atomic, SetAsideFile, SettingsRead};
 
 /// A saved audio output entry in `outputs.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,28 +45,35 @@ pub enum SavedOutputUpsert {
 }
 
 /// Path to `outputs.json`: `<data_dir>/tributary/outputs.json`.
-fn outputs_json_path() -> Option<std::path::PathBuf> {
+fn outputs_json_path() -> Option<PathBuf> {
     crate::paths::data_dir().map(|d| d.join("tributary").join("outputs.json"))
 }
 
-/// Load saved outputs from `outputs.json`, returning an empty vec on error.
+/// Load saved outputs from `outputs.json`, returning an empty list when the
+/// file is missing or unreadable.
 pub fn load_saved_outputs() -> Vec<SavedOutput> {
-    outputs_json_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    load_saved_outputs_reporting().0
 }
 
-/// Save the list of outputs to `outputs.json`.
-fn save_outputs(outputs: &[SavedOutput]) {
-    if let Some(path) = outputs_json_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(outputs) {
-            let _ = std::fs::write(path, json);
-        }
+/// Load saved outputs, also reporting where an unreadable `outputs.json`
+/// was moved aside so the next save cannot overwrite it.
+pub fn load_saved_outputs_reporting() -> (Vec<SavedOutput>, Option<SetAsideFile>) {
+    outputs_json_path().map_or_else(|| (Vec::new(), None), |path| load_saved_outputs_from(&path))
+}
+
+fn load_saved_outputs_from(path: &Path) -> (Vec<SavedOutput>, Option<SetAsideFile>) {
+    match read_settings_file(path, |raw| serde_json::from_str::<Vec<SavedOutput>>(raw)) {
+        SettingsRead::Parsed(outputs) => (outputs, None),
+        SettingsRead::Missing => (Vec::new(), None),
+        SettingsRead::Unreadable { set_aside } => (Vec::new(), set_aside),
     }
+}
+
+/// Atomically replace `outputs.json` with `outputs`.
+fn save_outputs_to(path: &Path, outputs: &[SavedOutput]) -> std::io::Result<()> {
+    let mut json = serde_json::to_vec_pretty(outputs).map_err(std::io::Error::other)?;
+    json.push(b'\n');
+    write_atomic(path, &json)
 }
 
 fn upsert_saved_output(
@@ -109,6 +120,9 @@ fn upsert_saved_output(
 }
 
 /// Add or explicitly upgrade an output in `outputs.json` (dedup by host:port).
+///
+/// An error means nothing was saved: the output is not available after a
+/// restart and must not be shown as added.
 pub fn add_saved_output(
     output_type: &str,
     name: &str,
@@ -116,8 +130,34 @@ pub fn add_saved_output(
     port: u16,
     exclusive_control: bool,
     detection_enabled: bool,
-) -> SavedOutputUpsert {
-    let mut outputs = load_saved_outputs();
+) -> std::io::Result<SavedOutputUpsert> {
+    let path = outputs_json_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the platform data directory is unavailable",
+        )
+    })?;
+    add_saved_output_at(
+        &path,
+        output_type,
+        name,
+        host,
+        port,
+        exclusive_control,
+        detection_enabled,
+    )
+}
+
+fn add_saved_output_at(
+    path: &Path,
+    output_type: &str,
+    name: &str,
+    host: &str,
+    port: u16,
+    exclusive_control: bool,
+    detection_enabled: bool,
+) -> std::io::Result<SavedOutputUpsert> {
+    let (mut outputs, _) = load_saved_outputs_from(path);
     let outcome = upsert_saved_output(
         &mut outputs,
         output_type,
@@ -127,11 +167,35 @@ pub fn add_saved_output(
         exclusive_control,
         detection_enabled,
     );
-    if !matches!(outcome, SavedOutputUpsert::Unchanged) {
-        save_outputs(&outputs);
+    if outcome != SavedOutputUpsert::Unchanged {
+        save_outputs_to(path, &outputs)?;
         info!(host = %host, port, ?outcome, "Output saved to outputs.json");
     }
-    outcome
+    Ok(outcome)
+}
+
+fn probe_failed_message(locale: &str, host: &str, port: u16) -> String {
+    rust_i18n::t!(
+        "dialogs.output_probe_failed",
+        locale = locale,
+        host = host,
+        port = port
+    )
+    .into_owned()
+}
+
+fn save_failed_message(locale: &str, name: &str) -> String {
+    rust_i18n::t!("dialogs.output_save_failed", locale = locale, name = name).into_owned()
+}
+
+/// Show `message` as plain text; host and output names are user input.
+fn show_toast(toasts: &adw::ToastOverlay, message: &str) {
+    toasts.add_toast(
+        adw::Toast::builder()
+            .title(message)
+            .use_markup(false)
+            .build(),
+    );
 }
 
 fn exclusive_control_warning(locale: &str) -> String {
@@ -156,23 +220,32 @@ fn detection_confirmation(locale: &str) -> String {
 
 /// Remove an output from `outputs.json` by host:port.
 #[allow(dead_code)]
-pub fn remove_saved_output(host: &str, port: u16) {
-    let mut outputs = load_saved_outputs();
-    let key = format!("{host}:{port}");
+pub fn remove_saved_output(host: &str, port: u16) -> std::io::Result<()> {
+    let Some(path) = outputs_json_path() else {
+        return Ok(());
+    };
+    let (mut outputs, _) = load_saved_outputs_from(&path);
     let before = outputs.len();
-    outputs.retain(|o| format!("{}:{}", o.host, o.port) != key);
+    outputs.retain(|o| !(o.host == host && o.port == port));
     if outputs.len() != before {
-        save_outputs(&outputs);
+        save_outputs_to(&path, &outputs)?;
         info!(host = %host, port, "Output removed from outputs.json");
     }
+    Ok(())
 }
 
 /// Present the "Add Output" dialog.
 ///
 /// Currently supports MPD outputs only.  The dialog collects a display
 /// name, host, and port, then probes the MPD server on a background
-/// thread to validate connectivity before saving.
-pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk::ListBox) {
+/// thread to validate connectivity before saving. The dialog has closed by
+/// the time the probe finishes, so a failed probe or save is reported as a
+/// toast.
+pub fn show_add_output_dialog(
+    window: &adw::ApplicationWindow,
+    output_list: &gtk::ListBox,
+    toasts: &adw::ToastOverlay,
+) {
     use adw::prelude::*;
     use gtk::glib;
 
@@ -283,6 +356,7 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
     });
 
     let output_list = output_list.clone();
+    let toasts = toasts.clone();
     let name_entry_c = name_entry.clone();
     let host_entry_c = host_entry.clone();
     let port_spin_c = port_spin.clone();
@@ -312,42 +386,47 @@ pub fn show_add_output_dialog(window: &adw::ApplicationWindow, output_list: &gtk
         });
 
         let output_list = output_list.clone();
-        let name = name.clone();
-        let host = host.clone();
+        let toasts = toasts.clone();
         glib::MainContext::default().spawn_local(async move {
-            if let Ok(result) = probe_rx.recv().await {
-                match result {
-                    Ok(version) => {
-                        info!(
-                            name = %name,
-                            host = %host,
-                            port,
-                            version = %version,
-                            detection_enabled,
-                            "MPD output added successfully"
-                        );
-                        let outcome =
-                            add_saved_output("mpd", &name, &host, port, true, detection_enabled);
-
-                        // A legacy endpoint is upgraded in place; its row is
-                        // already present and retains its saved display name.
-                        if outcome == SavedOutputUpsert::Added {
-                            let row = super::header_bar::build_output_row(
-                                &name,
-                                "network-server-symbolic",
-                                false,
-                            );
-                            output_list.append(&row);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            host = %host,
-                            port,
-                            error = %e,
-                            "MPD probe failed — output not added"
-                        );
-                    }
+            let Ok(result) = probe_rx.recv().await else {
+                return;
+            };
+            let version = match result {
+                Ok(version) => version,
+                Err(e) => {
+                    warn!(
+                        host = %host,
+                        port,
+                        error = %e,
+                        "MPD probe failed — output not added"
+                    );
+                    show_toast(
+                        &toasts,
+                        &probe_failed_message(&rust_i18n::locale(), &host, port),
+                    );
+                    return;
+                }
+            };
+            info!(
+                name = %name,
+                host = %host,
+                port,
+                version = %version,
+                detection_enabled,
+                "MPD output probed successfully"
+            );
+            match add_saved_output("mpd", &name, &host, port, true, detection_enabled) {
+                // A legacy endpoint is upgraded in place; its row is
+                // already present and retains its saved display name.
+                Ok(SavedOutputUpsert::Added) => {
+                    let row =
+                        super::header_bar::build_output_row(&name, "network-server-symbolic", false);
+                    output_list.append(&row);
+                }
+                Ok(SavedOutputUpsert::Upgraded | SavedOutputUpsert::Unchanged) => {}
+                Err(error) => {
+                    warn!(%error, host = %host, port, "Failed to save outputs.json — output not added");
+                    show_toast(&toasts, &save_failed_message(&rust_i18n::locale(), &name));
                 }
             }
         });
@@ -462,6 +541,90 @@ mod tests {
             SavedOutputUpsert::Unchanged
         );
         assert_eq!(outputs.len(), 2);
+    }
+
+    #[test]
+    fn adding_an_output_saves_it_and_reports_the_outcome() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("tributary").join("outputs.json");
+
+        let added = add_saved_output_at(&path, "mpd", "Den", "den.local", 6600, true, false)
+            .expect("save to a writable directory");
+        assert_eq!(added, SavedOutputUpsert::Added);
+        let again = add_saved_output_at(&path, "mpd", "Den", "den.local", 6600, true, false)
+            .expect("re-adding the same endpoint");
+        assert_eq!(again, SavedOutputUpsert::Unchanged);
+
+        let (saved, set_aside) = load_saved_outputs_from(&path);
+        assert!(set_aside.is_none());
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "Den");
+        assert!(saved[0].exclusive_control);
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_instead_of_claiming_the_output_was_added() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        // A regular file where the data directory should be makes the save
+        // fail.
+        let blocker = dir.path().join("tributary");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let result = add_saved_output_at(
+            &blocker.join("outputs.json"),
+            "mpd",
+            "Den",
+            "den.local",
+            6600,
+            true,
+            false,
+        );
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    #[test]
+    fn a_corrupt_outputs_file_is_kept_aside_instead_of_overwritten() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("outputs.json");
+        let corrupt = r#"[{"type":"mpd","name":"Living Room","host":"mpd.local","#;
+        std::fs::write(&path, corrupt).expect("corrupt outputs file");
+
+        let added = add_saved_output_at(&path, "mpd", "Den", "den.local", 6600, true, false)
+            .expect("save after setting the corrupt file aside");
+        assert_eq!(added, SavedOutputUpsert::Added);
+
+        let (saved, _) = load_saved_outputs_from(&path);
+        assert_eq!(saved.len(), 1, "only the new output is in the fresh file");
+        let copies: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list the data directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|entry| entry != &path)
+            .collect();
+        assert_eq!(copies.len(), 1, "the corrupt file was kept: {copies:?}");
+        assert_eq!(
+            std::fs::read_to_string(&copies[0]).expect("read the kept copy"),
+            corrupt
+        );
+    }
+
+    #[test]
+    fn add_output_failures_are_localized_everywhere() {
+        let english_probe = probe_failed_message("en", "mpd.local", 6601);
+        let english_save = save_failed_message("en", "Den <b>");
+        for locale in rust_i18n::available_locales!() {
+            let probe = probe_failed_message(&locale, "mpd.local", 6601);
+            let save = save_failed_message(&locale, "Den <b>");
+            assert!(!probe.contains("%{") && !save.contains("%{"), "{locale}");
+            assert!(
+                probe.contains("mpd.local") && probe.contains("6601"),
+                "{locale}"
+            );
+            assert!(save.contains("Den <b>"), "{locale}");
+            if locale != "en" {
+                assert_ne!(probe, english_probe, "{locale} probe fallback");
+                assert_ne!(save, english_save, "{locale} save fallback");
+            }
+        }
     }
 
     #[test]
