@@ -336,7 +336,7 @@ RUST_LOG=tributary=debug ./target/release/tributary
 RUST_LOG=tributary=trace ./target/release/tributary
 ```
 
-### Library database and upgrades
+### Library database, upgrades, and crashes
 
 Tributary keeps your library, play counts, ratings, and playlists in `library.db` in the
 `tributary` folder of your data directory (usually `~/.local/share` on Linux,
@@ -348,6 +348,10 @@ the schema version it was copied from, and keeps the three newest copies.
 version has upgraded. To go back to an older version, quit Tributary and replace `library.db`
 with a copy from the `backups` folder made before the upgrade; changes made after that copy
 are lost.
+
+If Tributary crashes, it appends a line with the source location of the failure to
+`crash.log` in the `tributary` folder of your cache directory (usually `~/.cache` on Linux,
+`~/Library/Caches` on macOS, and `%LOCALAPPDATA%` on Windows). Include it in bug reports.
 
 
 ---
