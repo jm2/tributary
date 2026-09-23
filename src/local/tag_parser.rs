@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::probe::Probe;
-use lofty::tag::Accessor;
+use lofty::tag::{Accessor, ItemKey};
 
 use super::tag_writer::is_tag_write_temp_file;
 
@@ -60,6 +60,20 @@ pub struct ParsedTrack {
     pub file_size_bytes: Option<u64>,
 }
 
+/// Normalize one tag-derived text value.
+///
+/// Only *trailing* whitespace is trimmed: legacy ID3v1 fields are fixed-width
+/// and space-padded, and some taggers leave sloppy trailing spaces, but
+/// leading and internal whitespace can be meaningful. A value that is nothing
+/// but whitespace (a blank ID3v1 field) is absent, so the filename and
+/// "Unknown" fallbacks apply instead of an empty name.
+fn tag_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim_end)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 /// Parse an audio file at `path` using lofty + filesystem metadata.
 ///
 /// This delegates parsing of untrusted file bytes to `lofty`, whose
@@ -93,14 +107,8 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
         .or_else(|| tagged_file.first_tag());
     let props = tagged_file.properties();
 
-    // Extract tag fields.
-    //
-    // Every tag-derived text value is trimmed of *trailing* whitespace only.
-    // Legacy ID3v1 fields are fixed-width and space-padded to the end of the
-    // field, and some other taggers write sloppy trailing whitespace; those
-    // padding spaces must not be imported as part of the value. Leading and
-    // internal whitespace are preserved, since they can be meaningful.
-    let tagged_title = tag.and_then(|t| t.title().map(|s| s.trim_end().to_string()));
+    // Extract tag fields; `tag_text` normalizes every text value.
+    let tagged_title = tag.and_then(|t| tag_text(t.title().as_deref()));
     let title_from_tag = tagged_title.is_some();
     let title = tagged_title.unwrap_or_else(|| {
         path.file_stem()
@@ -109,27 +117,18 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
             .to_string()
     });
 
-    let tagged_artist = tag.and_then(|t| t.artist().map(|s| s.trim_end().to_string()));
+    let tagged_artist = tag.and_then(|t| tag_text(t.artist().as_deref()));
     let artist_from_tag = tagged_artist.is_some();
     let artist_name = tagged_artist.unwrap_or_else(|| "Unknown Artist".to_string());
 
-    let album_artist_name = tag.and_then(|t| {
-        use lofty::tag::ItemKey;
-        t.get_string(ItemKey::AlbumArtist)
-            .map(|s| s.trim_end().to_string())
-    });
+    let album_artist_name = tag.and_then(|t| tag_text(t.get_string(ItemKey::AlbumArtist)));
+    let composer = tag.and_then(|t| tag_text(t.get_string(ItemKey::Composer)));
 
-    let composer = tag.and_then(|t| {
-        use lofty::tag::ItemKey;
-        t.get_string(ItemKey::Composer)
-            .map(|s| s.trim_end().to_string())
-    });
-
-    let tagged_album = tag.and_then(|t| t.album().map(|s| s.trim_end().to_string()));
+    let tagged_album = tag.and_then(|t| tag_text(t.album().as_deref()));
     let album_from_tag = tagged_album.is_some();
     let album_title = tagged_album.unwrap_or_else(|| "Unknown Album".to_string());
 
-    let genre = tag.and_then(|t| t.genre().map(|s| s.trim_end().to_string()));
+    let genre = tag.and_then(|t| tag_text(t.genre().as_deref()));
     // The year is not always exposed under `ItemKey::Year`. Vorbis-comment
     // formats (FLAC, Ogg, Opus) conventionally store it as the Xiph-standard
     // `DATE` field, and ID3v2 tags carry it as TYER/TDRC — lofty unifies all
@@ -186,6 +185,22 @@ pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedT
         date_modified,
         file_size_bytes,
     })
+}
+
+/// The legacy ID3v1 test fixture with its title, artist and album left blank
+/// the way old taggers left unset fields: all spaces, no NUL terminator.
+#[cfg(test)]
+pub fn blank_id3v1_fixture() -> Vec<u8> {
+    let mut bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/id3v1_padded.mp3"
+    ))
+    .to_vec();
+    // The 128-byte block is 'TAG', then 30-byte title, artist and album.
+    let block = bytes.len() - 128;
+    assert_eq!(&bytes[block..block + 3], b"TAG");
+    bytes[block + 3..block + 93].fill(b' ');
+    bytes
 }
 
 #[cfg(test)]
@@ -411,6 +426,21 @@ mod tests {
         assert_eq!(parsed.artist_name, "Pad Artist");
         assert_eq!(parsed.album_title, "Pad Album");
         // ID3v1 stores a fixed 4-digit year; it must still be recognized.
+        assert_eq!(parsed.year, Some(2007));
+    }
+
+    /// A blank ID3v1 field is only padding. It must parse as absent, not as an
+    /// empty name, so the filename and "Unknown" fallbacks apply.
+    #[test]
+    fn blank_space_padded_id3v1_fields_fall_back() {
+        let parsed = parse_fixture("blank.mp3", &blank_id3v1_fixture());
+
+        assert!(parsed.title.ends_with("-blank"), "{}", parsed.title);
+        assert!(!parsed.title_from_tag);
+        assert_eq!(parsed.artist_name, "Unknown Artist");
+        assert!(!parsed.artist_from_tag);
+        assert_eq!(parsed.album_title, "Unknown Album");
+        assert!(!parsed.album_from_tag);
         assert_eq!(parsed.year, Some(2007));
     }
 

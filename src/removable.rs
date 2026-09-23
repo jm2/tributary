@@ -811,6 +811,38 @@ mod tests {
         drop(owner);
     }
 
+    /// Blank, space-padded ID3v1 fields fall back to the filename and
+    /// "Unknown" names instead of rejecting the track as empty.
+    #[tokio::test]
+    async fn scan_accepts_blank_id3v1_fields_with_fallback_names() {
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        std::fs::write(
+            mount.path().join("blank.mp3"),
+            crate::local::tag_parser::blank_id3v1_fixture(),
+        )
+        .expect("write blank ID3v1 MP3");
+
+        let source_id = SourceId::removable("test:blank-id3v1").expect("source identity");
+        let (_registry, owner, cancellation) = live_cancellation(source_id);
+        let adapter = RemovableMediaAdapter::scan(
+            source_id,
+            mount.path().to_path_buf(),
+            &cancellation,
+            Handle::current(),
+        )
+        .expect("scan removable media")
+        .expect("scan remains current");
+
+        let tracks = adapter.tracks();
+        let [track] = tracks.as_slice() else {
+            panic!("the blank-tagged MP3 must be catalogued");
+        };
+        assert_eq!(track.title, "blank");
+        assert_eq!(track.artist_name, "Unknown Artist");
+        assert_eq!(track.album_title, "Unknown Album");
+        drop(owner);
+    }
+
     #[tokio::test]
     async fn cancellation_is_not_reported_as_a_scan_failure() {
         let source_id = SourceId::removable("test:cancelled-scan").expect("source identity");

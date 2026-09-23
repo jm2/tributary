@@ -95,3 +95,35 @@ SHA-256:
 The audio payloads are mechanically generated silence and contain no
 third-party recording. The fixtures are distributed under Tributary's
 GPL-3.0-or-later license.
+
+## `mp3_tdrc_2007.mp3` and `m4a_day_2007.m4a`
+
+These are 200 ms MP3 (ID3v2.4) / M4A (AAC) files of 8 kHz mono silence whose
+year is stored the way those formats carry it: ID3v2 `TDRC=2007` and the MP4
+`©day=2007` atom. They exercise year edits against a pre-existing recording
+date. Both also carry `title` = `Date Title`, `artist` = `Date Artist` and
+`album` = `Date Album`, and no encoder tag.
+
+They were generated with `ffmpeg 8.1.2`; the `bitexact` flags make the output
+reproducible byte for byte:
+
+```sh
+for out in mp3_tdrc_2007.mp3:libmp3lame m4a_day_2007.m4a:aac; do
+  ffmpeg -f lavfi -i anullsrc=r=8000:cl=mono -t 0.2 -c:a "${out#*:}" \
+    -fflags +bitexact -flags:a +bitexact \
+    -metadata date=2007 -metadata title='Date Title' \
+    -metadata artist='Date Artist' -metadata album='Date Album' \
+    "tests/fixtures/audio/${out%%:*}"
+done
+```
+
+SHA-256:
+
+```text
+cac290ca53fedcf1bec644e5f644f687e66f6f888c6db9e782861892fc875642  mp3_tdrc_2007.mp3
+91220fa489b06e8a51f33194fc44d7ea0f38882aba8ed7777898d722abbda5bb  m4a_day_2007.m4a
+```
+
+The audio payloads are mechanically generated silence and contain no
+third-party recording. The fixtures are distributed under Tributary's
+GPL-3.0-or-later license.
