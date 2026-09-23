@@ -1513,8 +1513,9 @@ where
         active.update(transaction).await?;
     }
 
-    let now = Utc::now().to_rfc3339();
-    for prepared_playlist in &prepared.playlists {
+    // Distinct, increasing creation times keep the sidebar in source order.
+    let creation_times = super::playlist_manager::sequential_creation_timestamps(Utc::now());
+    for (prepared_playlist, created_at) in prepared.playlists.iter().zip(creation_times) {
         let id = Uuid::new_v4().to_string();
         let (
             is_smart,
@@ -1541,8 +1542,8 @@ where
             limit_sort: Set(limit_sort),
             match_mode: Set(match_mode),
             live_updating: Set(true),
-            created_at: Set(now.clone()),
-            updated_at: Set(now.clone()),
+            created_at: Set(created_at.clone()),
+            updated_at: Set(created_at),
         }
         .insert(transaction)
         .await?;
@@ -2283,6 +2284,42 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn imported_playlists_keep_source_order_in_the_sidebar() {
+        use crate::local::playlist_sidebar::{
+            load_playlist_sidebar_snapshot, PlaylistSidebarState,
+        };
+
+        let db = database().await;
+        let playlists = b"<rhythmdb-playlists>\
+            <playlist name=\"Zulu\" type=\"static\"/>\
+            <playlist name=\"Alpha\" type=\"static\"/>\
+            <playlist name=\"Mike\" type=\"static\"/>\
+            <playlist name=\"Bravo\" type=\"static\"/>\
+            <playlist name=\"Yankee\" type=\"static\"/>\
+            </rhythmdb-playlists>";
+        let import = parse_rhythmbox_documents(
+            b"<rhythmdb version=\"2.0\"></rhythmdb>",
+            Some(playlists),
+            RhythmboxImportLimits::default(),
+        )
+        .unwrap();
+        let request = prepare_rhythmbox_migration(&db, import, RhythmboxMigrationPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            apply_rhythmbox_migration(&db, &request).await.unwrap(),
+            RhythmboxMigrationOutcome::Applied
+        );
+
+        let snapshot = load_playlist_sidebar_snapshot(&db).await.unwrap();
+        let PlaylistSidebarState::Ready(rows) = snapshot.state() else {
+            panic!("sidebar snapshot must be available");
+        };
+        let names: Vec<&str> = rows.iter().map(|row| row.name()).collect();
+        assert_eq!(names, ["Zulu", "Alpha", "Mike", "Bravo", "Yankee"]);
     }
 
     #[tokio::test]

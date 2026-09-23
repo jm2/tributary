@@ -52,21 +52,15 @@ const LOCAL_TRACK_COMPAT_NAMESPACE: Uuid =
 // LibraryEvent — messages sent to GTK main thread
 // ---------------------------------------------------------------------------
 
-/// Seed an empty playlist table when possible, then always attempt one
-/// versioned publication through the engine-owned publisher.
+/// Seed the default playlists if this database has never held one, then
+/// always attempt one versioned publication through the engine-owned
+/// publisher.
 async fn seed_default_playlists_and_request(
     playlist_manager: &super::playlist_manager::PlaylistManager,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
 ) {
-    match playlist_manager.list_playlists().await {
-        Ok(playlists) if playlists.is_empty() => {
-            info!("No playlists found — seeding defaults");
-            if let Err(error) = playlist_manager.seed_defaults().await {
-                warn!(%error, "Failed to seed default playlists");
-            }
-        }
-        Ok(_) => {}
-        Err(error) => warn!(%error, "Failed to load playlists before default seeding"),
+    if let Err(error) = playlist_manager.seed_defaults().await {
+        warn!(%error, "Failed to seed default playlists");
     }
 
     if matches!(
@@ -6384,30 +6378,21 @@ fn rename_pairs_overlap(left: &WatcherRenamePair, right: &WatcherRenamePair) -> 
     })
 }
 
-async fn reconcile_playlists_after_watcher_batch(
-    db: &DatabaseConnection,
-    upsert_committed: bool,
-) -> Result<u32, sea_orm::DbErr> {
-    if !upsert_committed {
-        return Ok(0);
-    }
-
-    super::playlist_manager::PlaylistManager::new(db.clone())
-        .reconcile_all()
-        .await
-}
-
 /// Finish the playlist work caused by one watcher batch, then tell the UI to
-/// rebuild any active projection. The notification is deliberately emitted
-/// even when reconciliation fails: the committed track mutation still needs
-/// to become visible, and a later batch or scan can retry orphan relinking.
+/// rebuild any active projection. `upserted` holds every row the batch
+/// inserted, updated, or relocated; only those can newly resolve an orphaned
+/// entry. The notification is deliberately emitted even when reconciliation
+/// fails: the committed track mutation still needs to become visible, and a
+/// later batch or scan can retry orphan relinking.
 async fn settle_playlist_projections_after_watcher_batch(
     db: &DatabaseConnection,
     tx: &async_channel::Sender<LibraryEvent>,
-    upsert_committed: bool,
+    upserted: &[track::Model],
     track_mutation_committed: bool,
 ) -> Result<u32, sea_orm::DbErr> {
-    let result = reconcile_playlists_after_watcher_batch(db, upsert_committed).await;
+    let result = super::playlist_manager::PlaylistManager::new(db.clone())
+        .reconcile_changed_tracks(upserted)
+        .await;
     if track_mutation_committed {
         let _ = tx.send(LibraryEvent::PlaylistProjectionsInvalidated).await;
     }
@@ -6803,7 +6788,9 @@ async fn process_directory_events(
         };
 
         let mut reconciliation_required = batch.reconciliation_required;
-        let mut upsert_committed = false;
+        // Rows this batch inserted, updated, or relocated: the only tracks
+        // that can newly resolve an orphaned playlist entry.
+        let mut upserted_tracks: Vec<track::Model> = Vec::new();
         let mut track_mutation_committed = false;
         let mut library_snapshot_dirty = false;
 
@@ -6970,9 +6957,9 @@ async fn process_directory_events(
                                     &model,
                                 ))))
                                 .await;
-                            upsert_committed = true;
                             track_mutation_committed = true;
                             info!(from = %pair.from.display(), to = %pair.to.display(), id = %model.id, "Preserved track identity across filesystem rename");
+                            upserted_tracks.push(*model);
                         }
                         Ok(RenameTrackOutcome::SourceMissing) => {
                             debug!(from = %pair.from.display(), to = %pair.to.display(), "Rename source was not indexed; falling back to reconciliation");
@@ -7151,10 +7138,9 @@ async fn process_directory_events(
                                 track_mutation_committed = true;
                             }
                             // Displacing a row nulls its playlist links through
-                            // the foreign key; the surviving row can reclaim them.
-                            if displaced > 0 {
-                                upsert_committed = true;
-                            }
+                            // the foreign key; the surviving row can reclaim them,
+                            // and a relocated row can satisfy retained path evidence.
+                            upserted_tracks.extend(moved.iter().map(|(_, model)| model.clone()));
 
                             // Files the rename carried along that were never
                             // indexed — added while the app was closed, or created
@@ -7413,10 +7399,10 @@ async fn process_directory_events(
                         .await;
                         match outcome {
                             Ok(GuardedTrackUpsertOutcome::Committed(model)) => {
-                                upsert_committed = true;
                                 track_mutation_committed = true;
                                 let t = db_model_to_track(&model);
                                 let _ = tx.send(LibraryEvent::TrackUpserted(Box::new(t))).await;
+                                upserted_tracks.push(*model);
                             }
                             Ok(GuardedTrackUpsertOutcome::GuardRejected) => {
                                 if !authority_task_failed && !authority_stable_at_commit {
@@ -7480,7 +7466,7 @@ async fn process_directory_events(
         match settle_playlist_projections_after_watcher_batch(
             db.as_ref(),
             tx,
-            upsert_committed,
+            &upserted_tracks,
             track_mutation_committed,
         )
         .await
@@ -11313,10 +11299,21 @@ mod tests {
         ))
         .await
         .expect("insert orphaned playlist entry");
+        let watcher_track = track::Entity::find_by_id("watcher-track")
+            .one(&db)
+            .await
+            .expect("query watcher track")
+            .expect("watcher track exists");
+        let unrelated_track = track::Model {
+            id: "unrelated-track".to_string(),
+            file_path: "/music/unrelated.flac".to_string(),
+            title: "Unrelated Song".to_string(),
+            ..watcher_track.clone()
+        };
         let (event_tx, event_rx) = async_channel::unbounded();
 
         assert_eq!(
-            settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, false)
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, &[], false)
                 .await
                 .expect("skip unchanged watcher batch"),
             0
@@ -11334,7 +11331,7 @@ mod tests {
         assert_eq!(still_orphaned.local_track_id, None);
 
         assert_eq!(
-            settle_playlist_projections_after_watcher_batch(&db, &event_tx, false, true)
+            settle_playlist_projections_after_watcher_batch(&db, &event_tx, &[], true)
                 .await
                 .expect("settle removal-only watcher batch"),
             0
@@ -11351,6 +11348,30 @@ mod tests {
         assert_eq!(still_orphaned.track_id, None);
         assert_eq!(still_orphaned.local_track_id, None);
 
+        // An upsert that cannot match any orphan skips reconciliation, even
+        // though an unchanged track would match.
+        assert_eq!(
+            settle_playlist_projections_after_watcher_batch(
+                &db,
+                &event_tx,
+                std::slice::from_ref(&unrelated_track),
+                true,
+            )
+            .await
+            .expect("settle unrelated upsert batch"),
+            0
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(LibraryEvent::PlaylistProjectionsInvalidated)
+        ));
+        let still_orphaned = playlist_entry::Entity::find_by_id("watcher-entry")
+            .one(&db)
+            .await
+            .expect("query unrelated-upsert reconciliation")
+            .expect("playlist entry remains");
+        assert_eq!(still_orphaned.local_track_id, None);
+
         db.execute_unprepared(
             "CREATE TRIGGER fail_watcher_playlist_reconciliation
              BEFORE UPDATE OF track_id ON playlist_entries
@@ -11360,9 +11381,14 @@ mod tests {
         )
         .await
         .expect("install reconciliation failure trigger");
-        settle_playlist_projections_after_watcher_batch(&db, &event_tx, true, true)
-            .await
-            .expect_err("surface watcher reconciliation failure");
+        settle_playlist_projections_after_watcher_batch(
+            &db,
+            &event_tx,
+            std::slice::from_ref(&watcher_track),
+            true,
+        )
+        .await
+        .expect_err("surface watcher reconciliation failure");
         assert!(matches!(
             event_rx.try_recv(),
             Ok(LibraryEvent::PlaylistProjectionsInvalidated)
@@ -11372,9 +11398,14 @@ mod tests {
             .expect("remove reconciliation failure trigger");
 
         assert_eq!(
-            settle_playlist_projections_after_watcher_batch(&db, &event_tx, true, true)
-                .await
-                .expect("run watcher reconciliation"),
+            settle_playlist_projections_after_watcher_batch(
+                &db,
+                &event_tx,
+                std::slice::from_ref(&watcher_track),
+                true,
+            )
+            .await
+            .expect("run watcher reconciliation"),
             1
         );
         assert!(matches!(
