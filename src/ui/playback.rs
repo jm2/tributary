@@ -984,6 +984,40 @@ pub struct PlaybackSession {
     /// queue occurrence. Queue navigation and Repeat One replace it even when
     /// the stable media key and metadata are unchanged.
     lastfm_occurrence_candidate: Option<LastFmOccurrenceCandidate>,
+    /// The queue step that reached the current item, or `None` when the user
+    /// chose it. Only an item reached by a step skips onward when it fails.
+    arrived_by: Option<QueueStep>,
+    /// Failed loads since playback last made progress or the user acted.
+    consecutive_load_failures: usize,
+}
+
+/// Most unplayable items in a row that are tried before playback gives up.
+/// A shorter queue is tried at most once around.
+const MAX_CONSECUTIVE_LOAD_FAILURES: usize = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepDirection {
+    Next,
+    Previous,
+}
+
+/// One Next/Previous move through the queue and the modes it was made under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueueStep {
+    direction: StepDirection,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+}
+
+/// What follows a failed load of the current item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadFailureRecovery {
+    /// Stay on the item (the user chose it, or nothing else is left to try).
+    Stay,
+    /// Skip past the item with the step that reached it.
+    Skip(QueueStep),
+    /// Too many items in a row failed: stay stopped on this one.
+    GiveUp,
 }
 
 impl Drop for PlaybackSession {
@@ -1005,8 +1039,45 @@ impl PlaybackSession {
         self.shuffle = None;
         self.pending_resolution = None;
         self.resolution_failed = false;
+        self.mark_current_user_chosen();
         self.begin_history_occurrence_for_current();
         true
+    }
+
+    /// The user chose the current item (or retried it): a failure of its
+    /// load is reported without skipping.
+    fn mark_current_user_chosen(&mut self) {
+        self.arrived_by = None;
+        self.consecutive_load_failures = 0;
+    }
+
+    /// Playback made progress or the user acted, so earlier failures no
+    /// longer count toward giving up.
+    pub(crate) fn reset_load_failures(&mut self) {
+        self.consecutive_load_failures = 0;
+    }
+
+    /// Count a failed load of the current item and decide what follows it.
+    fn recover_from_load_failure(&mut self) -> LoadFailureRecovery {
+        let Some(step) = self.arrived_by else {
+            return LoadFailureRecovery::Stay;
+        };
+        self.consecutive_load_failures += 1;
+        let limit = MAX_CONSECUTIVE_LOAD_FAILURES.min(self.queue.len());
+        if self.consecutive_load_failures < limit {
+            LoadFailureRecovery::Skip(step)
+        } else if self.consecutive_load_failures > 1 {
+            LoadFailureRecovery::GiveUp
+        } else {
+            // A one-item queue has nothing else to try; one failure is not a
+            // run worth a second message.
+            LoadFailureRecovery::Stay
+        }
+    }
+
+    /// The current item's catalogue duration, if known.
+    pub(crate) fn current_duration_ms(&self) -> Option<u64> {
+        self.current().and_then(|item| item.duration_ms)
     }
 
     pub fn clear(&mut self) {
@@ -1028,6 +1099,7 @@ impl PlaybackSession {
         // admission attempt or emptied by an explicit shutdown drop.
         self.history_occurrence = None;
         self.lastfm_occurrence_candidate = None;
+        self.mark_current_user_chosen();
     }
 
     /// Start a fresh shuffle traversal without changing the queue or current
@@ -2083,10 +2155,157 @@ impl BufferingTracker {
     }
 }
 
+/// The header's elapsed time, scrubber, and total time.
+#[derive(Clone)]
+pub struct ProgressDisplay {
+    pub scale: gtk::Scale,
+    pub position_label: gtk::Label,
+    pub duration_label: gtk::Label,
+    /// Raised while the UI moves the scrubber, so its value handler does not
+    /// mistake the change for a user seek.
+    pub seeking: Rc<Cell<bool>>,
+}
+
+impl ProgressDisplay {
+    /// Show `position_ms` on a timeline of `duration_ms`. `None` means a live
+    /// stream, which has no timeline to seek.
+    pub fn show(&self, position_ms: u64, duration_ms: Option<u64>) {
+        let adjustment = self.scale.adjustment();
+        self.seeking.set(true);
+        if let Some(duration_ms) = duration_ms {
+            adjustment.set_upper(duration_ms as f64);
+            adjustment.set_value(position_ms as f64);
+            self.duration_label.set_label(&format_ms(duration_ms));
+        } else {
+            adjustment.set_upper(1.0);
+            adjustment.set_value(0.0);
+            self.duration_label.set_label("LIVE");
+        }
+        self.seeking.set(false);
+        self.scale.set_sensitive(duration_ms.is_some());
+        self.position_label.set_label(&format_ms(position_ms));
+    }
+
+    /// Return to the idle `0:00` display.
+    pub fn clear(&self) {
+        let adjustment = self.scale.adjustment();
+        self.seeking.set(true);
+        adjustment.set_value(0.0);
+        adjustment.set_upper(1.0);
+        self.seeking.set(false);
+        self.scale.set_sensitive(true);
+        self.position_label.set_label("0:00");
+        self.duration_label.set_label("0:00");
+    }
+}
+
+/// The duration to display: the output's when it reports one, otherwise the
+/// catalogue's. `None` (no duration from either) marks a live stream.
+pub fn display_duration_ms(reported_ms: u64, catalogue_ms: Option<u64>) -> Option<u64> {
+    if reported_ms > 0 {
+        Some(reported_ms)
+    } else {
+        catalogue_ms.filter(|duration_ms| *duration_ms > 0)
+    }
+}
+
+/// Toasts that report playback failures.
+///
+/// A message identical to the latest one, while that is still showing or
+/// queued, is not repeated, so an output-wide fault met by several skipped
+/// items in a row shows once.
+#[derive(Clone)]
+pub struct PlaybackNotices {
+    overlay: adw::ToastOverlay,
+    latest: Rc<RefCell<Option<adw::Toast>>>,
+}
+
+impl PlaybackNotices {
+    pub fn new(overlay: adw::ToastOverlay) -> Self {
+        Self {
+            overlay,
+            latest: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    pub fn show(&self, message: &str) {
+        if self
+            .latest
+            .borrow()
+            .as_ref()
+            .is_some_and(|toast| toast.title().as_deref() == Some(message))
+        {
+            return;
+        }
+        // Titles can carry track names, which are not Pango markup.
+        let toast = adw::Toast::builder()
+            .title(message)
+            .use_markup(false)
+            .build();
+        let latest = Rc::downgrade(&self.latest);
+        toast.connect_dismissed(move |toast| {
+            if let Some(latest) = latest.upgrade() {
+                let mut latest = latest.borrow_mut();
+                if latest.as_ref() == Some(toast) {
+                    *latest = None;
+                }
+            }
+        });
+        self.overlay.add_toast(toast.clone());
+        *self.latest.borrow_mut() = Some(toast);
+    }
+}
+
+/// Why the current item could not be played.
+pub enum LoadFailure {
+    /// It could not be resolved to playable media (a missing file, an
+    /// unavailable library folder, or a source that could not provide it).
+    Unavailable,
+    /// The output reported this user-facing error while loading or playing it.
+    Output(String),
+}
+
+/// Report a failed load of the current item and, when queue navigation
+/// reached it, skip onward the same way, giving up after a bounded run of
+/// failures.
+///
+/// The caller has already established that the failure belongs to the
+/// current item.
+pub fn recover_from_failed_load(ctx: &PlaybackContext, failure: LoadFailure) {
+    let (title, recovery) = {
+        let mut session = ctx.session.borrow_mut();
+        let title = session
+            .current()
+            .map(|item| item.title.clone())
+            .unwrap_or_default();
+        (title, session.recover_from_load_failure())
+    };
+    let message = match failure {
+        LoadFailure::Unavailable => {
+            rust_i18n::t!("errors.playback.track_unavailable", title = title).into_owned()
+        }
+        LoadFailure::Output(message) => message,
+    };
+    ctx.notices.show(&message);
+    match recovery {
+        LoadFailureRecovery::Stay => {}
+        LoadFailureRecovery::Skip(step) => {
+            // At the end of an unrepeated queue there is nothing to skip to,
+            // and playback stays stopped on the failed item.
+            let _ = take_queue_step(ctx.session.as_ref(), step, || play_current(ctx));
+        }
+        LoadFailureRecovery::GiveUp => {
+            ctx.notices
+                .show(&rust_i18n::t!("errors.playback.skip_limit"));
+        }
+    }
+}
+
 /// Shared state for playback operations.
 ///
 /// Passed to [`play_track_at`] and [`advance_track`] so they can load
 /// tracks, update the now-playing UI, and track the current position.
+#[derive(Clone)]
 pub struct PlaybackContext {
     pub model: gtk::SortListModel,
     pub active_source_key: Rc<RefCell<String>>,
@@ -2115,6 +2334,8 @@ pub struct PlaybackContext {
     /// playing row into view on track change so the user doesn't lose
     /// their place when sequential / shuffled playback advances.
     pub column_view: gtk::ColumnView,
+    pub progress: ProgressDisplay,
+    pub notices: PlaybackNotices,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2291,7 +2512,7 @@ pub fn play_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
         return true;
     }
     if ctx.session.borrow().resolution_failed {
-        return play_current(ctx);
+        return retry_failed_current(ctx);
     }
     // Do not borrow the RefCell directly in the match scrutinee: scrutinee
     // temporaries live through the selected arm, and StartAt mutably borrows
@@ -2321,7 +2542,7 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
     if ctx.session.borrow().is_resolution_pending() {
         true
     } else if ctx.session.borrow().resolution_failed {
-        play_current(ctx)
+        retry_failed_current(ctx)
     } else if ctx.session.borrow().has_current() {
         // The output abstraction does not expose a race-free prediction of
         // which direction Toggle will take. Conservatively re-anchor both
@@ -2331,6 +2552,13 @@ pub fn toggle_or_start(ctx: &PlaybackContext, shuffle: bool) -> bool {
     } else {
         play_or_start(ctx, shuffle)
     }
+}
+
+/// Play retries a failed current item as the user's own choice, so a second
+/// failure is reported without skipping past it.
+fn retry_failed_current(ctx: &PlaybackContext) -> bool {
+    ctx.session.borrow_mut().mark_current_user_chosen();
+    play_current(ctx)
 }
 
 /// Invalidate the session before stopping the output so synchronously emitted
@@ -2427,6 +2655,16 @@ fn finish_coordinated_output_load(
     true
 }
 
+/// Stop after the current item failed to resolve, then report it and skip
+/// onward when queue navigation reached it.
+fn stop_after_failed_resolution(ctx: &PlaybackContext) {
+    ctx.active_output.borrow().stop();
+    if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
+        ctrl.update_playback(false);
+    }
+    recover_from_failed_load(ctx, LoadFailure::Unavailable);
+}
+
 /// Load the current immutable queue item and refresh now-playing UI.
 fn play_current(ctx: &PlaybackContext) -> bool {
     let session = ctx.session.borrow();
@@ -2473,10 +2711,10 @@ fn play_current(ctx: &PlaybackContext) -> bool {
 
         let session = Rc::clone(&ctx.session);
         let active_output = Rc::clone(&ctx.active_output);
-        let media_ctrl = Rc::clone(&ctx.media_ctrl);
         let app_config = Rc::clone(&ctx.app_config);
         let lastfm_playback = ctx.lastfm_playback.clone();
         let album_art = ctx.album_art.clone();
+        let failure_ctx = ctx.clone();
         glib::MainContext::default().spawn_local(async move {
             match resolved_rx.recv().await {
                 Ok(Ok(media))
@@ -2512,28 +2750,19 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                 Ok(Ok(_)) => {
                     if session.borrow_mut().fail_pending_resolution(generation) {
                         warn!("Local media root changed before output handoff");
-                        active_output.borrow().stop();
-                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                            ctrl.update_playback(false);
-                        }
+                        stop_after_failed_resolution(&failure_ctx);
                     }
                 }
                 Ok(Err(error)) => {
                     if session.borrow_mut().fail_pending_resolution(generation) {
                         warn!(error = %error, "Could not resolve local track by its library identity");
-                        active_output.borrow().stop();
-                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                            ctrl.update_playback(false);
-                        }
+                        stop_after_failed_resolution(&failure_ctx);
                     }
                 }
                 Err(_) => {
                     if session.borrow_mut().fail_pending_resolution(generation) {
                         warn!("Local media resolver stopped before returning a result");
-                        active_output.borrow().stop();
-                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                            ctrl.update_playback(false);
-                        }
+                        stop_after_failed_resolution(&failure_ctx);
                     }
                 }
             }
@@ -2563,6 +2792,8 @@ fn play_current(ctx: &PlaybackContext) -> bool {
         let album_art = ctx.album_art.clone();
         let external_session = item.external_session;
         let regular_playlist_guard = item.regular_playlist_guard;
+        let failure_ctx = ctx.clone();
+        let title = item.title.clone();
         glib::MainContext::default().spawn_local(async move {
             let resolved = if let Some(guard) = regular_playlist_guard {
                 source_registry
@@ -2604,6 +2835,10 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                                             if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                                                 ctrl.update_playback(false);
                                             }
+                                            recover_from_failed_load(
+                                                &failure_ctx,
+                                                LoadFailure::Unavailable,
+                                            );
                                             return;
                                         }
                                     }
@@ -2680,12 +2915,15 @@ fn play_current(ctx: &PlaybackContext) -> bool {
                         if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
                             ctrl.update_playback(false);
                         }
+                        // The one-item external queue is gone, so there is
+                        // nothing to skip to.
+                        failure_ctx.notices.show(&rust_i18n::t!(
+                            "errors.playback.track_unavailable",
+                            title = title
+                        ));
                     } else if session.borrow_mut().fail_pending_resolution(generation) {
                         warn!(error = %error, "Could not resolve track through its live source session");
-                        active_output.borrow().stop();
-                        if let Some(ref mut ctrl) = *media_ctrl.borrow_mut() {
-                            ctrl.update_playback(false);
-                        }
+                        stop_after_failed_resolution(&failure_ctx);
                     }
                 }
             }
@@ -2748,10 +2986,14 @@ fn update_now_playing_ui(
     let artist_album = format!("{} \u{2014} {}", item.artist, item.album);
     ctx.artist_label.set_label(&artist_album);
     ctx.artist_label.set_tooltip_text(Some(&artist_album));
+    // Start from the catalogue duration until the output reports its own, so
+    // neither the labels nor a scrubber drag use the previous item's timeline.
+    ctx.progress.show(0, item.duration_ms);
 
     // Scroll only when the queue's source and item are present in the current
     // view. Navigation still works when the user is viewing another source or
-    // has filtered the playing item out.
+    // has filtered the playing item out. Scrolling leaves the selection and
+    // keyboard focus alone: they belong to the user.
     let active_source_key = ctx.active_source_key.borrow().clone();
     if let Some((identity, view)) = identity
         .filter(|identity| identity_belongs_to_source(identity, &active_source_key))
@@ -2769,12 +3011,8 @@ fn update_now_playing_ui(
                     .and_then(|track| row_position_identity(&view, &track))
             },
         ) {
-            ctx.column_view.scroll_to(
-                position,
-                None,
-                gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                None,
-            );
+            ctx.column_view
+                .scroll_to(position, None, gtk::ListScrollFlags::NONE, None);
         }
     }
 
@@ -2863,11 +3101,12 @@ fn find_queue_item_position(
 /// Returns `true` if a new track was loaded, `false` if we've reached
 /// the end (caller should reset to idle).
 pub fn advance_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
-    navigate_and_play(
-        ctx.session.as_ref(),
-        |session| session.advance(repeat_mode, shuffle),
-        || play_current(ctx),
-    )
+    let step = QueueStep {
+        direction: StepDirection::Next,
+        repeat_mode,
+        shuffle,
+    };
+    take_queue_step(ctx.session.as_ref(), step, || play_current(ctx))
 }
 
 /// Explicit Next behavior. Natural EOS uses [`advance_track`] directly so an
@@ -2878,6 +3117,7 @@ pub fn advance_track_from_user(
     shuffle: bool,
 ) -> bool {
     super::open_files::invalidate_admission();
+    ctx.session.borrow_mut().reset_load_failures();
     advance_track(ctx, repeat_mode, shuffle)
 }
 
@@ -2888,11 +3128,33 @@ pub fn advance_track_from_user(
 /// heuristic belongs to the UI/key callers, which know what threshold
 /// they want to use. Returns `true` if a new track was loaded.
 pub fn previous_track(ctx: &PlaybackContext, repeat_mode: RepeatMode, shuffle: bool) -> bool {
-    navigate_and_play(
-        ctx.session.as_ref(),
-        |session| session.previous(repeat_mode, shuffle),
-        || play_current(ctx),
-    )
+    let step = QueueStep {
+        direction: StepDirection::Previous,
+        repeat_mode,
+        shuffle,
+    };
+    take_queue_step(ctx.session.as_ref(), step, || play_current(ctx))
+}
+
+/// Move one step through the queue and play the item it reaches, recording
+/// the step so a failed load of that item can skip onward the same way.
+fn take_queue_step(
+    session: &RefCell<PlaybackSession>,
+    step: QueueStep,
+    play: impl FnOnce() -> bool,
+) -> bool {
+    let moved = navigate_and_play(
+        session,
+        |session| match step.direction {
+            StepDirection::Next => session.advance(step.repeat_mode, step.shuffle),
+            StepDirection::Previous => session.previous(step.repeat_mode, step.shuffle),
+        },
+        play,
+    );
+    if moved {
+        session.borrow_mut().arrived_by = Some(step);
+    }
+    moved
 }
 
 fn navigate_and_play(
@@ -3013,6 +3275,7 @@ pub fn previous_or_restart_from_user(
     shuffle: bool,
 ) {
     super::open_files::invalidate_admission();
+    ctx.session.borrow_mut().reset_load_failures();
     let position_ms = {
         let output = ctx.active_output.borrow();
         output.position_ms().unwrap_or(0)
@@ -7503,5 +7766,112 @@ mod tests {
         );
         assert_eq!(row_position_identity(&view, &unavailable), None);
         assert_eq!(row_position_identity(&view, &malformed), None);
+    }
+
+    fn queue_of(count: usize) -> RefCell<PlaybackSession> {
+        let mut session = PlaybackSession::default();
+        let items = (0..count)
+            .map(|index| item("local", &format!("t{index}")))
+            .collect();
+        assert!(session.replace_queue(items, 0));
+        RefCell::new(session)
+    }
+
+    const fn step(direction: StepDirection, repeat_mode: RepeatMode) -> QueueStep {
+        QueueStep {
+            direction,
+            repeat_mode,
+            shuffle: false,
+        }
+    }
+
+    fn recover(session: &RefCell<PlaybackSession>) -> LoadFailureRecovery {
+        session.borrow_mut().recover_from_load_failure()
+    }
+
+    #[test]
+    fn only_an_item_reached_by_a_queue_step_skips_when_it_fails() {
+        let session = queue_of(4);
+        assert_eq!(
+            recover(&session),
+            LoadFailureRecovery::Stay,
+            "a track the user chose is reported, not skipped"
+        );
+
+        let next = step(StepDirection::Next, RepeatMode::Off);
+        assert!(take_queue_step(&session, next, || true));
+        assert_eq!(current_id(&session.borrow()), "t1");
+        assert_eq!(recover(&session), LoadFailureRecovery::Skip(next));
+        assert!(take_queue_step(&session, next, || true));
+        assert_eq!(current_id(&session.borrow()), "t2");
+
+        // Pressing Play on the failed item retries it as the user's choice.
+        session.borrow_mut().mark_current_user_chosen();
+        assert_eq!(recover(&session), LoadFailureRecovery::Stay);
+
+        // Previous keeps skipping backwards.
+        let previous = step(StepDirection::Previous, RepeatMode::Off);
+        assert!(take_queue_step(&session, previous, || true));
+        assert_eq!(current_id(&session.borrow()), "t1");
+        assert_eq!(recover(&session), LoadFailureRecovery::Skip(previous));
+
+        // A step that cannot be taken leaves the step that reached the
+        // current item in charge.
+        assert!(!take_queue_step(&session, next, || false));
+        assert_eq!(current_id(&session.borrow()), "t1");
+        assert_eq!(recover(&session), LoadFailureRecovery::Skip(previous));
+
+        // Starting a new queue is the user's choice again.
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![item("local", "fresh")], 0));
+        assert_eq!(recover(&session), LoadFailureRecovery::Stay);
+    }
+
+    #[test]
+    fn skipping_gives_up_after_a_bounded_run_of_failures() {
+        let session = queue_of(MAX_CONSECUTIVE_LOAD_FAILURES + 3);
+        let next = step(StepDirection::Next, RepeatMode::All);
+        assert!(take_queue_step(&session, next, || true));
+        for _ in 1..MAX_CONSECUTIVE_LOAD_FAILURES {
+            assert_eq!(recover(&session), LoadFailureRecovery::Skip(next));
+            assert!(take_queue_step(&session, next, || true));
+        }
+        assert_eq!(recover(&session), LoadFailureRecovery::GiveUp);
+
+        // Progress (or a user action) starts a fresh run.
+        session.borrow_mut().reset_load_failures();
+        assert_eq!(recover(&session), LoadFailureRecovery::Skip(next));
+    }
+
+    #[test]
+    fn a_short_repeating_queue_is_tried_once_around_before_giving_up() {
+        let session = queue_of(3);
+        let next = step(StepDirection::Next, RepeatMode::All);
+        assert!(take_queue_step(&session, next, || true));
+        let mut tried = vec![current_id(&session.borrow()).to_string()];
+        while recover(&session) == LoadFailureRecovery::Skip(next) {
+            assert!(take_queue_step(&session, next, || true));
+            tried.push(current_id(&session.borrow()).to_string());
+        }
+        assert_eq!(tried, ["t1", "t2", "t0"]);
+
+        // A lone item has nothing to skip to, so its failure simply stays.
+        let lone = queue_of(1);
+        assert!(take_queue_step(&lone, next, || true));
+        assert_eq!(recover(&lone), LoadFailureRecovery::Stay);
+    }
+
+    #[test]
+    fn the_catalogue_duration_stands_in_only_when_the_output_reports_none() {
+        assert_eq!(display_duration_ms(215_000, Some(214_000)), Some(215_000));
+        assert_eq!(display_duration_ms(0, Some(214_000)), Some(214_000));
+        assert_eq!(display_duration_ms(0, None), None, "live stream");
+        assert_eq!(display_duration_ms(0, Some(0)), None);
+
+        let session = queue_of(1);
+        assert_eq!(session.borrow().current_duration_ms(), None);
+        session.borrow_mut().queue[0].duration_ms = Some(214_000);
+        assert_eq!(session.borrow().current_duration_ms(), Some(214_000));
     }
 }

@@ -397,6 +397,10 @@ pub fn build_browser(
         });
     }
 
+    // GtkSearchEntry turns Escape into `stop-search` and leaves the text in
+    // place; clearing it makes Escape clear the search.
+    search_entry.connect_stop_search(|entry| entry.set_text(""));
+
     // ── Search entry handler (debounced 100ms) ───────────────────────
     {
         let entry_state = state.clone();
@@ -2361,6 +2365,38 @@ mod tests {
         );
     }
 
+    /// Escape reaches a focused GtkSearchEntry as `stop-search`, which GTK
+    /// leaves to the application: it must clear the text, and the composed
+    /// filter must follow.
+    fn escape_clears_the_search() {
+        let context = session_context();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let tracks = vec![fixture_track("Jazz", "Alpha", "Album One", "T1")];
+        let (log, cb) = recorder();
+        let (browser_box, _state) = build_browser(&tracks, false, false, 48, cb);
+
+        type_search(&browser_box, "zzz");
+        pump_until(&context, deadline, || {
+            last_search(&log).as_deref() == Some("zzz")
+        });
+        assert_eq!(last_search(&log).as_deref(), Some("zzz"));
+
+        let entry = search_entry_of(&browser_box);
+        entry.emit_by_name::<()>("stop-search", &[]);
+        assert_eq!(entry.text(), "", "Escape must clear the search text");
+        // Deliver the search-changed that GTK's delay timer would (see
+        // `type_search`); a duplicate of GTK's own emission is ignored.
+        entry.emit_by_name::<()>("search-changed", &[]);
+        pump_until(&context, deadline, || {
+            last_search(&log).as_deref() == Some("")
+        });
+        assert_eq!(
+            last_search(&log).as_deref(),
+            Some(""),
+            "clearing the text must clear the search filter"
+        );
+    }
+
     /// Source replacement (A → B) resets every axis and the panes agree:
     /// the panes display "All" AND the composed filter carries no stale
     /// artist/album — the issue's exact probe (issue #250).
@@ -3352,6 +3388,7 @@ mod tests {
                 crate::ui::discovery_handler::widget_tests::airplay_rows_are_hidden_without_a_sender();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_edits_report_consistent_settings();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
+                crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 q4_publication_contract_and_bench();
                 factory_swap_preserves_album_filters_and_selection();
                 rebuild_bumps_album_art_content_generation();
@@ -3359,6 +3396,7 @@ mod tests {
 
                 // Browser data lifecycle contracts (issue #250).
                 album_selection_survives_typing_and_clearing();
+                escape_clears_the_search();
                 source_replacement_resets_every_filter_axis();
                 refresh_preserves_matching_selection_through_upsert();
                 refresh_drops_vanished_album_and_keeps_surviving_artist();
