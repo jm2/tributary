@@ -17,6 +17,7 @@ use sea_orm::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::smart_rules::SmartRules;
 use crate::db::entities::server_playlist_link::{
     self, ServerPlaylistLocalState, ServerPlaylistRemoteState, StoredServerPlaylistLink,
     MAX_SERVER_PLAYLIST_LINK_NAME_BYTES,
@@ -28,6 +29,7 @@ SELECT
     p.id AS playlist_id,
     p.name AS playlist_name,
     p.is_smart AS playlist_is_smart,
+    p.smart_rules_json AS playlist_smart_rules_json,
     l.playlist_id AS link_playlist_id,
     l.source_id AS link_source_id,
     l.native_playlist_id AS link_native_playlist_id,
@@ -73,6 +75,7 @@ pub struct PlaylistSidebarEntry {
     playlist_id: String,
     name: String,
     kind: PlaylistSidebarKind,
+    reads_play_statistics: bool,
 }
 
 impl PlaylistSidebarEntry {
@@ -85,7 +88,20 @@ impl PlaylistSidebarEntry {
             playlist_id: playlist_id.into(),
             name: name.into(),
             kind,
+            reads_play_statistics: false,
         }
+    }
+
+    /// Mark a smart playlist whose rules read play count, last-played time
+    /// or rating, so a counted play or a rating can change its tracks.
+    #[must_use]
+    pub const fn with_play_statistics_rules(mut self, reads_play_statistics: bool) -> Self {
+        self.reads_play_statistics = reads_play_statistics;
+        self
+    }
+
+    pub const fn reads_play_statistics(&self) -> bool {
+        self.reads_play_statistics
     }
 
     pub fn playlist_id(&self) -> &str {
@@ -108,6 +124,7 @@ impl fmt::Debug for PlaylistSidebarEntry {
             .field("playlist_id_byte_len", &self.playlist_id.len())
             .field("name_byte_len", &self.name.len())
             .field("kind", &self.kind)
+            .field("reads_play_statistics", &self.reads_play_statistics)
             .finish()
     }
 }
@@ -271,6 +288,7 @@ fn decode_snapshot_row(
 
     // Link presence is checked before the legacy smart flag. Even a damaged
     // parent `is_smart` value therefore cannot make a pull mirror editable.
+    let mut reads_play_statistics = false;
     let kind = if let Some(link_playlist_id) = link_playlist_id {
         let link = server_playlist_link::Model {
             playlist_id: link_playlist_id,
@@ -297,12 +315,21 @@ fn decode_snapshot_row(
     } else {
         match decode::<i64>(&row, "playlist_is_smart")? {
             0 => PlaylistSidebarKind::EditableRegular,
-            1 => PlaylistSidebarKind::EditableSmart,
+            1 => {
+                // Missing rules match everything, and unreadable rules match
+                // nothing: neither depends on play statistics.
+                let rules: Option<String> = decode(&row, "playlist_smart_rules_json")?;
+                reads_play_statistics = rules
+                    .and_then(|json| serde_json::from_str::<SmartRules>(&json).ok())
+                    .is_some_and(|rules| rules.reads_play_statistics());
+                PlaylistSidebarKind::EditableSmart
+            }
             _ => return Err(PlaylistSidebarModelError),
         }
     };
 
-    Ok(PlaylistSidebarEntry::new(playlist_id, name, kind))
+    Ok(PlaylistSidebarEntry::new(playlist_id, name, kind)
+        .with_play_statistics_rules(reads_play_statistics))
 }
 
 fn decode<T>(row: &QueryResult, column: &str) -> Result<T, PlaylistSidebarModelError>
@@ -694,6 +721,37 @@ mod tests {
         );
         assert_eq!(entries[0].kind(), PlaylistSidebarKind::EditableRegular);
         assert_eq!(entries[1].kind(), PlaylistSidebarKind::EditableSmart);
+    }
+
+    #[tokio::test]
+    async fn smart_entries_report_whether_their_rules_read_play_statistics() {
+        let db = migrated_database().await;
+        crate::local::playlist_manager::PlaylistManager::new(db.clone())
+            .seed_defaults()
+            .await
+            .expect("seed default smart playlists");
+        insert_playlist(&db, "regular", "Regular", 0, "2026-07-20T00:00:00Z").await;
+        insert_playlist(&db, "no-rules", "No rules", 1, "2026-07-20T00:00:00Z").await;
+
+        let snapshot = load_playlist_sidebar_snapshot(&db).await.unwrap();
+        let PlaylistSidebarState::Ready(entries) = snapshot.state() else {
+            panic!("expected ready sidebar projection");
+        };
+        let mut flags: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.name(), entry.reads_play_statistics()))
+            .collect();
+        flags.sort_unstable();
+        assert_eq!(
+            flags,
+            [
+                ("No rules", false),
+                ("Recently Added", false),
+                ("Recently Played", true),
+                ("Regular", false),
+                ("Top 25 Most Played", true),
+            ]
+        );
     }
 
     #[tokio::test]

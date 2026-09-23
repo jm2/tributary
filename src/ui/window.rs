@@ -38,13 +38,14 @@ use super::playback::{
     admit_history_credit, advance_track, advance_track_from_user, display_duration_ms,
     play_or_start, play_track_at, previous_or_restart_from_user, recover_from_failed_load,
     refresh_projected_library_uris, replay_current, retry_pending_history_credit_before_transition,
-    stop_playback, toggle_or_start, BufferingTracker, LoadFailure, PlaybackContext,
-    PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
+    shows_local_library_track, stop_playback, toggle_or_start, BufferingTracker, LoadFailure,
+    PlaybackContext, PlaybackSession, QueueTrackRefresh, PLAYLIST_SOURCE_PREFIX,
 };
 use super::preferences;
 use super::root_trust;
 use super::server_dialogs::{load_saved_servers, remove_saved_server, show_add_server_dialog};
 use super::sidebar;
+use super::source_connect::{PlaylistChange, PlaylistPublication};
 use super::source_navigation::{
     ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
 };
@@ -1356,6 +1357,7 @@ fn reconcile_source_baseline(
 
     if playlist_authority_changed && !baseline.shutting_down {
         invalidate_playlist_projections(
+            PlaylistChange::RemoteCatalogue,
             &context.rt_handle,
             &context.source_registry,
             &context.sidebar_store,
@@ -1830,91 +1832,11 @@ pub(crate) fn build_window(
     let near_me_consent_request: Rc<RefCell<Option<SourceRequest>>> = Rc::new(RefCell::new(None));
 
     // ── Browser (starts empty, updated by FullSync) ──────────────────
-    let track_store_for_filter = track_store.clone();
-    let status_label_for_filter = status_label.clone();
-    let master_for_filter = master_tracks.clone();
-    let app_config_for_filter = app_config.clone();
-    let on_filter = Box::new(
-        move |genre: Option<String>,
-              artist: Option<String>,
-              album: Option<String>,
-              folder_prefix: Option<String>,
-              search_text: String| {
-            let master = master_for_filter.borrow();
-            let search_lower = search_text.to_lowercase();
-            let use_album_artist = app_config_for_filter.borrow().group_by_album_artist;
-            // Folder browsing filters by filesystem prefix. The prefix is a
-            // plain directory path; convert it to its canonical file:// URI
-            // form once, with a trailing separator so `/a/b` cannot match
-            // `/a/bc` (a track directly in `/a/b` also ends with `/file`).
-            let folder_uri_prefix: Option<String> = folder_prefix
-                .as_ref()
-                .and_then(|p| url::Url::from_file_path(p).ok())
-                .map(|u| {
-                    let mut text = u.to_string();
-                    if !text.ends_with('/') {
-                        text.push('/');
-                    }
-                    text
-                });
-            let filtered: Vec<TrackObject> = master
-                .iter()
-                .filter(|t| {
-                    if let Some(ref prefix) = folder_uri_prefix {
-                        if !t.uri().starts_with(prefix.as_str()) {
-                            return false;
-                        }
-                    }
-                    if let Some(ref g) = genre {
-                        if &t.genre() != g {
-                            return false;
-                        }
-                    }
-                    if let Some(ref a) = artist {
-                        // When album-artist grouping is on, match against
-                        // the album-artist tag (falling back to track artist
-                        // for tracks that lack one), so selecting an album
-                        // artist returns every track on that artist's albums
-                        // even on compilation discs.
-                        let track_aa = t.album_artist();
-                        let key = if use_album_artist && !track_aa.is_empty() {
-                            track_aa
-                        } else {
-                            t.artist()
-                        };
-                        if &key != a {
-                            return false;
-                        }
-                    }
-                    if let Some(ref al) = album {
-                        if &t.album() != al {
-                            return false;
-                        }
-                    }
-                    // Text search filter — match across title, artist, album, genre.
-                    if !search_lower.is_empty() {
-                        let matches = t.title().to_lowercase().contains(&search_lower)
-                            || t.artist().to_lowercase().contains(&search_lower)
-                            || t.album().to_lowercase().contains(&search_lower)
-                            || t.genre().to_lowercase().contains(&search_lower);
-                        if !matches {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                // Clone bumps the GObject refcount, so the same instance may
-                // live in both `master_tracks` and the store.
-                .cloned()
-                .collect();
-
-            // Replace the whole store in a single splice. This emits one
-            // `items-changed` signal instead of N appends and keeps the rows'
-            // identity. Playback navigation uses its own immutable queue and
-            // is deliberately unaffected by this view mutation.
-            track_store_for_filter.splice(0, track_store_for_filter.n_items(), &filtered);
-            tracklist::update_status(&status_label_for_filter, &filtered);
-        },
+    let on_filter = browser_filter(
+        track_store.clone(),
+        status_label.clone(),
+        master_tracks.clone(),
+        app_config.clone(),
     );
 
     let initial_use_album_artist = app_config.borrow().group_by_album_artist;
@@ -3735,6 +3657,99 @@ pub(crate) fn build_window(
 // Helpers (kept in window.rs — used by multiple extracted modules)
 // ═══════════════════════════════════════════════════════════════════════
 
+/// The browser's filter callback: compose the visible rows from
+/// `master_tracks` under the current genre/artist/album/folder/search
+/// filter and replace the track store with them in one splice.
+pub(super) fn browser_filter(
+    track_store: gtk::gio::ListStore,
+    status_label: gtk::Label,
+    master_tracks: Rc<RefCell<Vec<TrackObject>>>,
+    app_config: Rc<RefCell<preferences::AppConfig>>,
+) -> browser::FilterCallback {
+    Box::new(
+        move |genre: Option<String>,
+              artist: Option<String>,
+              album: Option<String>,
+              folder_prefix: Option<String>,
+              search_text: String| {
+            let master = master_tracks.borrow();
+            let search_lower = search_text.to_lowercase();
+            let use_album_artist = app_config.borrow().group_by_album_artist;
+            // Folder browsing filters by filesystem prefix. The prefix is a
+            // plain directory path; convert it to its canonical file:// URI
+            // form once, with a trailing separator so `/a/b` cannot match
+            // `/a/bc` (a track directly in `/a/b` also ends with `/file`).
+            let folder_uri_prefix: Option<String> = folder_prefix
+                .as_ref()
+                .and_then(|p| url::Url::from_file_path(p).ok())
+                .map(|u| {
+                    let mut text = u.to_string();
+                    if !text.ends_with('/') {
+                        text.push('/');
+                    }
+                    text
+                });
+            let filtered: Vec<TrackObject> = master
+                .iter()
+                .filter(|t| {
+                    if let Some(ref prefix) = folder_uri_prefix {
+                        if !t.uri().starts_with(prefix.as_str()) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref g) = genre {
+                        if &t.genre() != g {
+                            return false;
+                        }
+                    }
+                    if let Some(ref a) = artist {
+                        // When album-artist grouping is on, match against
+                        // the album-artist tag (falling back to track artist
+                        // for tracks that lack one), so selecting an album
+                        // artist returns every track on that artist's albums
+                        // even on compilation discs.
+                        let track_aa = t.album_artist();
+                        let key = if use_album_artist && !track_aa.is_empty() {
+                            track_aa
+                        } else {
+                            t.artist()
+                        };
+                        if &key != a {
+                            return false;
+                        }
+                    }
+                    if let Some(ref al) = album {
+                        if &t.album() != al {
+                            return false;
+                        }
+                    }
+                    // Text search filter — match across title, artist, album, genre.
+                    if !search_lower.is_empty() {
+                        let matches = t.title().to_lowercase().contains(&search_lower)
+                            || t.artist().to_lowercase().contains(&search_lower)
+                            || t.album().to_lowercase().contains(&search_lower)
+                            || t.genre().to_lowercase().contains(&search_lower);
+                        if !matches {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                // Clone bumps the GObject refcount, so the same instance may
+                // live in both `master_tracks` and the store.
+                .cloned()
+                .collect();
+
+            // Replace the whole store in a single splice. This emits one
+            // `items-changed` signal instead of N appends and keeps the rows'
+            // identity. Playback navigation uses its own immutable queue and
+            // is deliberately unaffected by this view mutation.
+            track_store.splice(0, track_store.n_items(), &filtered);
+            tracklist::update_status(&status_label, &filtered);
+        },
+    )
+}
+
 /// Replace the visible tracklist, browser, and master track list with a
 /// new set of tracks (e.g., when switching sidebar sources).
 pub fn display_tracks(
@@ -3762,14 +3777,34 @@ pub fn display_tracks(
     // The local-display paths re-attach the model right after this call.
     browser::clear_folder_model(browser_state);
     *master_tracks.borrow_mut() = objects.to_vec();
-    column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
+    // GTK rejects scrolling to a row that does not exist.
+    if track_store.n_items() > 0 {
+        column_view.scroll_to(0, None, gtk::ListScrollFlags::NONE, None);
+    }
+}
+
+/// Replace the rows of the source that is already on screen (a same-source
+/// refresh), unlike [`display_tracks`], which starts a new view.
+///
+/// Browser selections that still exist and the search text survive, and the
+/// browser's filter emit replaces the visible rows in one splice, which keeps
+/// the list's scroll position.
+pub(super) fn refresh_displayed_tracks(
+    objects: &[TrackObject],
+    master_tracks: &RefCell<Vec<TrackObject>>,
+    browser_widget: &gtk::Box,
+    browser_state: &browser::BrowserState,
+) {
+    *master_tracks.borrow_mut() = objects.to_vec();
+    browser::refresh_browser_data(browser_widget, browser_state, objects);
 }
 
 /// Publish a committed full-library snapshot exactly as the
 /// `LibraryEvent::FullSync` arm does: convert the authoritative rows,
 /// refresh playlist and playback-queue state, store the per-source
 /// projection, and — when local is the active source — synchronously
-/// redisplay the local library via [`display_local_tracks`].
+/// refresh the library on screen, keeping the user's browser filters,
+/// search, folder location and scroll position.
 ///
 /// Extracted verbatim from the event loop so the Q4 responsiveness
 /// benchmark times the same unit production runs — conversion through
@@ -3783,11 +3818,8 @@ pub(super) fn apply_full_sync_publication(
     playback_session: &Rc<RefCell<PlaybackSession>>,
     source_tracks: &Rc<RefCell<HashMap<String, Vec<TrackObject>>>>,
     master_tracks: &Rc<RefCell<Vec<TrackObject>>>,
-    track_store: &gtk::gio::ListStore,
     browser_widget: &gtk::Box,
     browser_state: &browser::BrowserState,
-    status_label: &gtk::Label,
-    column_view: &gtk::ColumnView,
     app_config: &Rc<RefCell<preferences::AppConfig>>,
 ) {
     let objects: Vec<TrackObject> = tracks.iter().map(arch_track_to_object).collect();
@@ -3805,18 +3837,12 @@ pub(super) fn apply_full_sync_publication(
         .borrow_mut()
         .insert("local".to_string(), objects.clone());
 
-    // Display only if local is the active source.
+    // Local on screen is republished in place: a same-source refresh, not a
+    // source switch, so nothing the user set up in the view is reset.
     if *active_source_key.borrow() == "local" {
-        display_local_tracks(
-            &objects,
-            track_store,
-            master_tracks,
-            browser_widget,
-            browser_state,
-            status_label,
-            column_view,
-            app_config,
-        );
+        let (folder_model, _) = build_folder_model(app_config, &objects);
+        *master_tracks.borrow_mut() = objects.clone();
+        browser::resync_browser_data(browser_widget, browser_state, &objects, folder_model);
     }
 }
 
@@ -3990,14 +4016,17 @@ impl PlaylistSidebarUiReducer {
     }
 }
 
-/// Retire every cached playlist projection and reload the active one.
+/// Retire the playlist projections `change` can make stale and reload the
+/// active playlist in place when it is one of them.
 ///
-/// A playback-history or rating commit can change smart-playlist membership
-/// and order, while ordinary playlists still need refreshed displayed values.
-/// Invalidating the navigation generation before clearing rows prevents a
-/// late pre-commit query from publishing stale projections again.
+/// The reload is a same-source refresh: the rows on screen stay until the
+/// replacement arrives, so the browser filters, search text and scroll
+/// position survive. Keeping them actionable meanwhile is safe because
+/// playlist edits re-validate exact occurrence IDs and remote rows carry a
+/// catalogue guard, so a stale row fails closed.
 #[allow(clippy::too_many_arguments)]
 fn invalidate_playlist_projections(
+    change: PlaylistChange,
     rt_handle: &tokio::runtime::Handle,
     source_registry: &crate::source_registry::SourceRegistry,
     sidebar_store: &gtk::gio::ListStore,
@@ -4012,31 +4041,15 @@ fn invalidate_playlist_projections(
     column_view: &gtk::ColumnView,
 ) {
     let active_key = active_source_key.borrow().clone();
-    source_navigation
-        .borrow_mut()
-        .invalidate_prefix(PLAYLIST_SOURCE_PREFIX);
-    source_tracks
-        .borrow_mut()
-        .retain(|key, _| !key.starts_with(PLAYLIST_SOURCE_PREFIX));
-
-    let Some(playlist_id) = active_key
-        .strip_prefix(PLAYLIST_SOURCE_PREFIX)
-        .map(str::to_string)
-    else {
+    let Some(playlist_id) = retire_stale_playlist_projections(
+        change,
+        sidebar_store,
+        source_navigation,
+        source_tracks,
+        &active_key,
+    ) else {
         return;
     };
-
-    // Stale rows may already have changed membership or ordering. Leave no
-    // old projection actionable while its committed replacement is loading.
-    display_tracks(
-        &[],
-        track_store,
-        master_tracks,
-        browser_widget,
-        browser_state,
-        status_label,
-        column_view,
-    );
 
     // During remote authentication, visible source and latest navigation
     // intent intentionally differ. Background playlist maintenance must not
@@ -4049,6 +4062,7 @@ fn invalidate_playlist_projections(
             sidebar_store.clone(),
             playlist_id,
             request,
+            PlaylistPublication::Refresh,
             source_navigation.clone(),
             source_tracks.clone(),
             active_source_key.clone(),
@@ -4059,6 +4073,95 @@ fn invalidate_playlist_projections(
             status_label.clone(),
             column_view.clone(),
         );
+    }
+}
+
+/// Retire every sidebar playlist projection `change` can make stale — its
+/// navigation generation first, so a query that read pre-commit rows cannot
+/// publish them afterwards, then its cached rows — and return the active
+/// playlist's ID when it is one of them. Other projections keep their cache
+/// and any load in flight.
+pub(super) fn retire_stale_playlist_projections(
+    change: PlaylistChange,
+    sidebar_store: &gtk::gio::ListStore,
+    source_navigation: &RefCell<SourceNavigation>,
+    source_tracks: &RefCell<HashMap<String, Vec<TrackObject>>>,
+    active_key: &str,
+) -> Option<String> {
+    let mut stale_active = None;
+    for position in 0..sidebar_store.n_items() {
+        let Some(source) = sidebar_store.item(position).and_downcast::<SourceObject>() else {
+            continue;
+        };
+        if !change.affects(&source) {
+            continue;
+        }
+        let playlist_id = source.playlist_id();
+        let key = format!("{PLAYLIST_SOURCE_PREFIX}{playlist_id}");
+        source_navigation.borrow_mut().invalidate_key(&key);
+        source_tracks.borrow_mut().remove(&key);
+        if key == active_key {
+            stale_active = Some(playlist_id);
+        }
+    }
+    stale_active
+}
+
+/// Show a committed play count and rating on every playlist row of this
+/// local track — cached projections and the view on screen — keeping each
+/// row's identity, position and occurrence binding.
+pub(super) fn refresh_playlist_play_statistics(
+    updated: &TrackObject,
+    source_tracks: &RefCell<HashMap<String, Vec<TrackObject>>>,
+    active_source_key: &RefCell<String>,
+    master_tracks: &RefCell<Vec<TrackObject>>,
+    track_store: &gtk::gio::ListStore,
+) {
+    let track_id = updated.track_id();
+    let shows_track =
+        |row: &TrackObject| shows_local_library_track(row) && row.track_id() == track_id;
+    let apply = |row: &TrackObject| {
+        row.set_play_count(updated.play_count());
+        row.set_rating(updated.rating());
+    };
+    // Cached projections are not on screen: update their rows in place.
+    for (_, rows) in source_tracks
+        .borrow()
+        .iter()
+        .filter(|(key, _)| key.starts_with(PLAYLIST_SOURCE_PREFIX))
+    {
+        rows.iter().filter(|row| shows_track(row)).for_each(apply);
+    }
+
+    if !active_source_key
+        .borrow()
+        .starts_with(PLAYLIST_SOURCE_PREFIX)
+    {
+        return;
+    }
+    // On screen, the store and `master_tracks` share row objects. Each
+    // matching row is replaced by an updated duplicate in both, in a single
+    // splice: a different object rebinds the row's cells (and re-sorts a
+    // Plays- or Rating-sorted view) without moving the list's scroll anchor.
+    let mut replaced = Vec::new();
+    for row in master_tracks
+        .borrow_mut()
+        .iter_mut()
+        .filter(|row| shows_track(row))
+    {
+        let copy = row.duplicate();
+        apply(&copy);
+        replaced.push((std::mem::replace(row, copy.clone()), copy));
+    }
+    for (row, copy) in replaced {
+        let shown_at = (0..track_store.n_items()).find(|&position| {
+            track_store
+                .item(position)
+                .is_some_and(|item| item == *row.upcast_ref::<glib::Object>())
+        });
+        if let Some(position) = shown_at {
+            track_store.splice(position, 1, std::slice::from_ref(&copy));
+        }
     }
 }
 
@@ -4155,11 +4258,8 @@ fn setup_library_events(
                         &playback_session,
                         &source_tracks,
                         &master_tracks,
-                        &track_store,
                         &browser_widget,
                         &browser_state,
-                        &status_label,
-                        &column_view,
                         &app_config,
                     );
                 }
@@ -4386,10 +4486,11 @@ fn setup_library_events(
                     };
 
                     if local_updated && *active_source_key.borrow() == "local" {
-                        // Reinsert at the same base-model position. Gtk's sort
-                        // model sees an item change and can immediately reorder
-                        // a Plays- or Rating-sorted view without rebuilding
-                        // unrelated rows.
+                        // Replace at the same base-model position in one
+                        // splice. Gtk's sort model sees an item change and can
+                        // immediately reorder a Plays- or Rating-sorted view
+                        // without rebuilding unrelated rows, and the list keeps
+                        // its scroll anchor.
                         for index in 0..track_store.n_items() {
                             let Some(existing) =
                                 track_store.item(index).and_downcast::<TrackObject>()
@@ -4397,8 +4498,7 @@ fn setup_library_events(
                                 continue;
                             };
                             if existing.track_id() == track_id {
-                                track_store.remove(index);
-                                track_store.insert(index, &replacement);
+                                track_store.splice(index, 1, std::slice::from_ref(&replacement));
                                 break;
                             }
                         }
@@ -4408,7 +4508,15 @@ fn setup_library_events(
                         );
                     }
 
+                    refresh_playlist_play_statistics(
+                        &replacement,
+                        &source_tracks,
+                        &active_source_key,
+                        &master_tracks,
+                        &track_store,
+                    );
                     invalidate_playlist_projections(
+                        PlaylistChange::PlayStatistics,
                         &rt_handle,
                         &source_registry,
                         &sidebar_store,
@@ -4442,6 +4550,7 @@ fn setup_library_events(
 
                 LibraryEvent::PlaylistProjectionsInvalidated => {
                     invalidate_playlist_projections(
+                        PlaylistChange::Library,
                         &rt_handle,
                         &source_registry,
                         &sidebar_store,
@@ -5200,6 +5309,161 @@ mod identity_tests {
         );
     }
 
+    /// Retire playlist projections for `change` with `active` on screen,
+    /// over a sidebar of one playlist of each kind that is cached and has a
+    /// load in flight. Returns the playlists retired and the reload
+    /// requested.
+    fn retired_by(change: PlaylistChange, active: &str) -> (Vec<&'static str>, Option<String>) {
+        use crate::db::entities::server_playlist_link::{
+            ServerPlaylistLocalState, ServerPlaylistRemoteState,
+        };
+
+        let sidebar = gtk::gio::ListStore::new::<SourceObject>();
+        for entry in [
+            PlaylistSidebarEntry::new("regular", "Mix", PlaylistSidebarKind::EditableRegular),
+            PlaylistSidebarEntry::new("genre", "Jazz", PlaylistSidebarKind::EditableSmart),
+            PlaylistSidebarEntry::new("history", "Recent", PlaylistSidebarKind::EditableSmart)
+                .with_play_statistics_rules(true),
+            PlaylistSidebarEntry::new(
+                "mirror",
+                "Server copy",
+                PlaylistSidebarKind::PullMirror {
+                    local_state: ServerPlaylistLocalState::Clean,
+                    remote_state: ServerPlaylistRemoteState::Present,
+                },
+            ),
+        ] {
+            sidebar.append(&SourceObject::playlist_entry(&entry));
+        }
+        let ids = ["regular", "genre", "history", "mirror"];
+        let key = |id: &str| format!("{PLAYLIST_SOURCE_PREFIX}{id}");
+        let navigation = RefCell::new(SourceNavigation::new("local"));
+        let cache = RefCell::new(HashMap::new());
+        for id in ids.into_iter().filter(|id| *id != active).chain([active]) {
+            navigation.borrow_mut().select(key(id));
+            cache.borrow_mut().insert(key(id), Vec::new());
+        }
+
+        let reload =
+            retire_stale_playlist_projections(change, &sidebar, &navigation, &cache, &key(active));
+        let retired = ids
+            .into_iter()
+            .filter(|id| {
+                let retired = !cache.borrow().contains_key(&key(id));
+                assert_eq!(
+                    navigation.borrow().latest_request(&key(id)).is_none(),
+                    retired,
+                    "{id}: a retired projection must also refuse its in-flight load"
+                );
+                retired
+            })
+            .collect();
+        (retired, reload)
+    }
+
+    #[test]
+    fn a_play_or_rating_reloads_only_playlists_whose_rules_read_it() {
+        assert_eq!(
+            retired_by(PlaylistChange::PlayStatistics, "regular"),
+            (vec!["history"], None),
+            "a regular playlist keeps its rows and is never reloaded"
+        );
+        assert_eq!(
+            retired_by(PlaylistChange::PlayStatistics, "genre"),
+            (vec!["history"], None)
+        );
+        assert_eq!(
+            retired_by(PlaylistChange::PlayStatistics, "history"),
+            (vec!["history"], Some("history".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_remote_catalogue_change_reloads_only_stored_entry_playlists() {
+        assert_eq!(
+            retired_by(PlaylistChange::RemoteCatalogue, "history"),
+            (vec!["regular", "mirror"], None)
+        );
+        assert_eq!(
+            retired_by(PlaylistChange::RemoteCatalogue, "mirror"),
+            (vec!["regular", "mirror"], Some("mirror".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_library_change_reloads_every_playlist() {
+        assert_eq!(
+            retired_by(PlaylistChange::Library, "genre"),
+            (
+                vec!["regular", "genre", "history", "mirror"],
+                Some("genre".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn a_play_updates_every_playlist_row_of_that_track_in_place() {
+        let key = format!("{PLAYLIST_SOURCE_PREFIX}mix");
+        let row = |entry: &str| {
+            let row = local_history_row("played", "file:///played.flac", 3);
+            row.set_playlist_occurrence_binding(
+                crate::ui::objects::PlaylistOccurrenceBinding::available_local(
+                    entry,
+                    crate::architecture::TrackId::new("played").expect("track ID"),
+                )
+                .expect("local occurrence"),
+            );
+            row
+        };
+        // The same track twice, plus an unrelated row.
+        let rows = vec![
+            row("first"),
+            local_history_row("other", "file:///other.flac", 1),
+            row("second"),
+        ];
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        store.splice(0, 0, &rows);
+        let master = RefCell::new(rows.clone());
+        let cache = RefCell::new(HashMap::from([(key.clone(), rows.clone())]));
+        let updated = local_history_row("played", "file:///played.flac", 4);
+
+        refresh_playlist_play_statistics(
+            &updated,
+            &cache,
+            &RefCell::new(key.clone()),
+            &master,
+            &store,
+        );
+
+        let shown: Vec<TrackObject> = (0..store.n_items())
+            .filter_map(|position| store.item(position).and_downcast())
+            .collect();
+        assert_eq!(shown, *master.borrow(), "the view keeps sharing its rows");
+        assert_eq!(
+            shown
+                .iter()
+                .map(TrackObject::play_count)
+                .collect::<Vec<_>>(),
+            [4, 1, 4]
+        );
+        assert_eq!(
+            shown
+                .iter()
+                .map(TrackObject::row_instance_id)
+                .collect::<Vec<_>>(),
+            rows.iter()
+                .map(TrackObject::row_instance_id)
+                .collect::<Vec<_>>(),
+            "each row keeps its identity and position"
+        );
+        assert_eq!(
+            shown[2].playlist_occurrence_binding(),
+            rows[2].playlist_occurrence_binding()
+        );
+        assert_ne!(shown[0], rows[0], "a changed row is re-published to rebind");
+        assert_eq!(shown[1], rows[1], "an unrelated row is left alone");
+    }
+
     #[test]
     fn every_full_local_display_restores_the_folder_model_through_one_helper() {
         let window_source = include_str!("window.rs");
@@ -5207,6 +5471,9 @@ mod identity_tests {
         let radio_source = include_str!("radio.rs");
         let helper_marker = ["display_local_", "tracks("].concat();
         let publication_marker = ["apply_full_sync_", "publication("].concat();
+        // A FullSync of the library on screen is a same-source refresh: it
+        // installs the rebuilt folder model without resetting the view.
+        let resync_marker = ["browser::resync_", "browser_data("].concat();
 
         let fallback = window_source
             .split_once("fn display_local_fallback(")
@@ -5219,8 +5486,8 @@ mod identity_tests {
             .map(|(body, _)| body)
             .expect("full-sync body");
         // The FullSync publication unit lives directly before the local
-        // display helper it ends with; bounding the slice there keeps the
-        // assertion pinned to the unit's own body.
+        // display helper; bounding the slice there keeps the assertion
+        // pinned to the unit's own body.
         let full_sync_unit = window_source
             .split_once(&["fn apply_full_sync_", "publication("].concat())
             .and_then(|(_, rest)| {
@@ -5242,7 +5509,7 @@ mod identity_tests {
         for (path, body, marker) in [
             ("lifecycle fallback", fallback, &helper_marker),
             ("full sync", full_sync, &publication_marker),
-            ("full sync publication unit", full_sync_unit, &helper_marker),
+            ("full sync publication unit", full_sync_unit, &resync_marker),
             ("sidebar selection", local_selection, &helper_marker),
             ("radio consent fallback", radio_fallback, &helper_marker),
         ] {
@@ -5254,8 +5521,8 @@ mod identity_tests {
 
         assert_eq!(
             window_source.match_indices(&helper_marker).count(),
-            3,
-            "window.rs must contain the helper plus its fallback and publication-unit calls"
+            2,
+            "window.rs must contain the helper plus its fallback call"
         );
         assert_eq!(
             source_connect.match_indices(&helper_marker).count(),

@@ -27,6 +27,36 @@ pub struct SmartRules {
     pub sort_order: Vec<SortCriterion>,
 }
 
+impl SmartRules {
+    /// Whether a rule, the limit's selection or the final sort reads play
+    /// count, last-played time or rating — the values a counted play or a
+    /// rating change. Only such playlists can change membership or order
+    /// when those values do.
+    pub fn reads_play_statistics(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            matches!(
+                rule.field,
+                RuleField::PlayCount | RuleField::LastPlayed | RuleField::Rating
+            )
+        }) || self.limit.as_ref().is_some_and(|limit| {
+            matches!(
+                limit.selected_by,
+                LimitSort::MostPlayed
+                    | LimitSort::LeastPlayed
+                    | LimitSort::MostRecentlyPlayed
+                    | LimitSort::LeastRecentlyPlayed
+                    | LimitSort::HighestRated
+                    | LimitSort::LowestRated
+            )
+        }) || self.sort_order.iter().any(|criterion| {
+            matches!(
+                criterion.field,
+                SortField::PlayCount | SortField::LastPlayed | SortField::Rating
+            )
+        })
+    }
+}
+
 /// A single sort criterion for compound playlist ordering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortCriterion {
@@ -284,8 +314,23 @@ impl SmartTrack for crate::db::entities::track::Model {
 ///
 /// Returns the matching tracks after applying the three evaluation stages in
 /// order: filter, limit selection/membership, then final compound ordering.
+/// A `LimitSort::Random` limit draws a fresh selection on every call.
 pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<T> {
-    evaluate_at(rules, tracks, chrono::Utc::now())
+    evaluate_seeded(rules, tracks, fastrand::u64(..))
+}
+
+/// [`evaluate`] with a caller-owned seed for a `LimitSort::Random` limit.
+///
+/// Each track's random rank depends only on the seed and its own identity,
+/// so re-evaluating with the same seed selects the same tracks, and tracks
+/// already matched keep their relative rank when others join or leave the
+/// matched set.
+pub fn evaluate_seeded<T: SmartTrack + Clone>(
+    rules: &SmartRules,
+    tracks: &[T],
+    random_seed: u64,
+) -> Vec<T> {
+    evaluate_at(rules, tracks, chrono::Utc::now(), random_seed)
 }
 
 /// Evaluate rules using one immutable clock snapshot.
@@ -297,6 +342,7 @@ fn evaluate_at<T: SmartTrack + Clone>(
     rules: &SmartRules,
     tracks: &[T],
     now: chrono::DateTime<chrono::Utc>,
+    random_seed: u64,
 ) -> Vec<T> {
     // Filter tracks through rules.
     let mut results: Vec<T> = tracks
@@ -328,7 +374,7 @@ fn evaluate_at<T: SmartTrack + Clone>(
     // `selected_by` sort decides which tracks make the cut; `sort_order`
     // independently decides how that selected subset is displayed.
     if let Some(limit) = &rules.limit {
-        apply_limit(&mut results, limit);
+        apply_limit(&mut results, limit, random_seed);
     }
 
     // Apply the final compound presentation order to the selected subset.
@@ -784,15 +830,28 @@ fn rating_value<T: SmartTrack>(track: &T) -> Option<u8> {
     track.rating().value().map(Rating::value)
 }
 
+/// Random rank of one track for a `LimitSort::Random` limit.
+///
+/// Hashing the caller's seed together with the track's opaque identity gives
+/// every track an independent, uniformly distributed rank: a fresh seed is a
+/// fresh draw, and no metadata biases the order. A shuffle would instead tie
+/// every position to the whole input, so one track joining the matched set
+/// would reshuffle the entire selection.
+fn random_rank(seed: u64, track_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    track_id.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Apply result limiting: sort then truncate.
-fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit) {
+fn apply_limit<T: SmartTrack>(results: &mut Vec<T>, limit: &SmartLimit, random_seed: u64) {
     // Sort by the selected criteria.
     match limit.selected_by {
         LimitSort::Random => {
-            // Genuinely random shuffle, re-seeded per evaluation. (A
-            // `DefaultHasher`-based ordering would be fully deterministic
-            // across runs and biased by the title/artist hash.)
-            fastrand::shuffle(results);
+            results.sort_by_cached_key(|track| random_rank(random_seed, track.track_id()));
         }
         // Text sorts are case-insensitive, consistent with the compound
         // sort path (`sort_key`).
@@ -1813,6 +1872,7 @@ mod tests {
             &rules,
             &[too_old, tie_b, never, newest, corrupt, tie_a, future],
             now,
+            0,
         );
         let ids: Vec<_> = result.iter().map(SmartTrack::track_id).collect();
         assert_eq!(ids, ["newest", "a", "b"]);
@@ -1840,7 +1900,7 @@ mod tests {
             sort_order: Vec::new(),
         };
 
-        assert!(evaluate_at(&rules, &[never, corrupt], now).is_empty());
+        assert!(evaluate_at(&rules, &[never, corrupt], now, 0).is_empty());
     }
 
     #[test]
@@ -2235,6 +2295,106 @@ mod tests {
         assert!(result
             .windows(2)
             .all(|pair| pair[0].title().to_lowercase() <= pair[1].title().to_lowercase()));
+    }
+
+    fn random_limit(value: u32) -> SmartRules {
+        SmartRules {
+            match_mode: MatchMode::All,
+            rules: vec![],
+            limit: Some(SmartLimit {
+                value,
+                unit: LimitUnit::Items,
+                selected_by: LimitSort::Random,
+            }),
+            sort_order: vec![],
+        }
+    }
+
+    fn numbered_tracks(range: std::ops::Range<u32>) -> Vec<TestTrack> {
+        range
+            .map(|n| TestTrack::new(&format!("track-{n:03}"), "Artist", "Album"))
+            .collect()
+    }
+
+    fn selected_ids(result: &[TestTrack]) -> std::collections::BTreeSet<String> {
+        result.iter().map(|track| track.id.clone()).collect()
+    }
+
+    #[test]
+    fn a_seeded_random_limit_keeps_its_selection_as_the_matched_set_changes() {
+        let rules = random_limit(10);
+        let tracks = numbered_tracks(0..100);
+        let first = evaluate_seeded(&rules, &tracks, 7);
+        assert_eq!(first.len(), 10);
+        assert_eq!(
+            selected_ids(&evaluate_seeded(&rules, &tracks, 7)),
+            selected_ids(&first),
+            "the same seed must select the same tracks again"
+        );
+
+        // An unselected track leaving the matched set changes nothing.
+        let first_ids = selected_ids(&first);
+        let outsider = tracks
+            .iter()
+            .position(|track| !first_ids.contains(&track.id))
+            .expect("an unselected track");
+        let mut fewer = tracks.clone();
+        fewer.remove(outsider);
+        assert_eq!(selected_ids(&evaluate_seeded(&rules, &fewer, 7)), first_ids);
+
+        // A track joining the matched set displaces at most one member.
+        let mut more = tracks;
+        more.push(TestTrack::new("newcomer", "Artist", "Album"));
+        let after = selected_ids(&evaluate_seeded(&rules, &more, 7));
+        assert!(first_ids.difference(&after).count() <= 1);
+    }
+
+    #[test]
+    fn different_seeds_draw_different_random_selections() {
+        let rules = random_limit(10);
+        let tracks = numbered_tracks(0..100);
+        let draws: std::collections::BTreeSet<_> = (0..5)
+            .map(|seed| selected_ids(&evaluate_seeded(&rules, &tracks, seed)))
+            .collect();
+        assert!(draws.len() > 1, "the seed must drive the random selection");
+    }
+
+    #[test]
+    fn only_play_statistics_rules_limits_and_sorts_read_play_statistics() {
+        let mut rules = random_limit(10);
+        rules.rules.push(SmartRule {
+            field: RuleField::Genre,
+            operator: RuleOperator::Is,
+            value: RuleValue::Text("Jazz".to_string()),
+        });
+        rules.sort_order.push(SortCriterion {
+            field: SortField::Title,
+            direction: SortDirection::Ascending,
+        });
+        assert!(!rules.reads_play_statistics());
+
+        let mut by_rating = rules.clone();
+        by_rating.rules.push(SmartRule {
+            field: RuleField::Rating,
+            operator: RuleOperator::IsRated,
+            value: RuleValue::Number(0),
+        });
+        assert!(by_rating.reads_play_statistics());
+
+        let mut most_played = rules.clone();
+        most_played.limit = Some(SmartLimit {
+            value: 25,
+            unit: LimitUnit::Items,
+            selected_by: LimitSort::MostPlayed,
+        });
+        assert!(most_played.reads_play_statistics());
+
+        let mut by_last_played = rules;
+        by_last_played.sort_order.push(SortCriterion {
+            field: SortField::LastPlayed,
+            direction: SortDirection::Descending,
+        });
+        assert!(by_last_played.reads_play_statistics());
     }
 
     #[test]

@@ -421,6 +421,76 @@ impl TrackObject {
         self.imp().rating.set(rating);
     }
 
+    pub fn set_play_count(&self, play_count: u32) {
+        self.imp().play_count.set(play_count);
+    }
+
+    /// A new object for the same row — every field, including the row
+    /// instance and playlist occurrence, copied. Replacing a list item with
+    /// its duplicate makes the list rebind the row's cells, which replacing
+    /// it with itself does not.
+    pub(crate) fn duplicate(&self) -> Self {
+        // Exhaustive on purpose: a new field fails to compile here until it
+        // is copied too.
+        let imp::TrackObject {
+            source_id,
+            playlist_occurrence,
+            track_id,
+            has_explicit_track_id,
+            source_session_epoch,
+            source_catalogue_generation,
+            row_instance_id,
+            track_number,
+            disc_number,
+            title,
+            duration_secs,
+            artist,
+            album_artist,
+            album,
+            genre,
+            composer,
+            year,
+            date_modified,
+            bitrate_kbps,
+            sample_rate_hz,
+            play_count,
+            rating,
+            format,
+            uri,
+            cover_art_url,
+        } = self.imp();
+        let copy: Self = glib::Object::builder().build();
+        let to = copy.imp();
+        to.source_id.set(source_id.get());
+        to.playlist_occurrence
+            .replace(playlist_occurrence.borrow().clone());
+        to.track_id.replace(track_id.borrow().clone());
+        to.has_explicit_track_id.set(has_explicit_track_id.get());
+        to.source_session_epoch.set(source_session_epoch.get());
+        to.source_catalogue_generation
+            .set(source_catalogue_generation.get());
+        to.row_instance_id.set(row_instance_id.get());
+        to.track_number.set(track_number.get());
+        to.disc_number.set(disc_number.get());
+        to.title.replace(title.borrow().clone());
+        to.duration_secs.set(duration_secs.get());
+        to.artist.replace(artist.borrow().clone());
+        to.album_artist.replace(album_artist.borrow().clone());
+        to.album.replace(album.borrow().clone());
+        to.genre.replace(genre.borrow().clone());
+        to.composer.replace(composer.borrow().clone());
+        to.year.set(year.get());
+        to.date_modified.replace(date_modified.borrow().clone());
+        to.bitrate_kbps.set(bitrate_kbps.get());
+        to.sample_rate_hz.set(sample_rate_hz.get());
+        to.play_count.set(play_count.get());
+        to.rating.set(rating.get());
+        to.format.replace(format.borrow().clone());
+        to.uri.replace(uri.borrow().clone());
+        to.cover_art_url.replace(cover_art_url.borrow().clone());
+        copy
+    }
+
     pub fn duration_display(&self) -> String {
         let secs = self.duration_secs();
         format!("{}:{:02}", secs / 60, secs % 60)
@@ -485,6 +555,55 @@ mod tests {
         assert_eq!(first.track_id(), duplicate.track_id());
         assert_ne!(first.row_instance_id(), duplicate.row_instance_id());
         assert_eq!(first.row_instance_id(), first.clone().row_instance_id());
+    }
+
+    #[test]
+    fn a_duplicate_is_a_new_object_for_the_same_row() {
+        let track_id = TrackId::new("local-track").expect("local track ID");
+        let row = TrackObject::new(
+            3,
+            "Title",
+            200,
+            "Artist",
+            "Album",
+            "Genre",
+            "Composer",
+            2001,
+            "2026-01-01",
+            320,
+            44_100,
+            4,
+            "FLAC",
+            "file:///song.flac",
+        );
+        row.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::available_local("entry", track_id)
+                .expect("valid local occurrence"),
+        );
+        row.set_rating(TrackRating::writable(Some(
+            Rating::try_from(60).expect("valid rating"),
+        )));
+        row.set_album_artist("Album Artist");
+
+        let copy = row.duplicate();
+        assert_ne!(copy, row, "a list only rebinds a different object");
+        assert_eq!(copy.row_instance_id(), row.row_instance_id());
+        assert_eq!(
+            copy.playlist_occurrence_binding(),
+            row.playlist_occurrence_binding()
+        );
+        assert_eq!(copy.source_id(), row.source_id());
+        assert_eq!(copy.track_id(), row.track_id());
+        assert_eq!(copy.rating(), row.rating());
+        assert_eq!(
+            (
+                copy.play_count(),
+                copy.uri(),
+                copy.album_artist(),
+                copy.year()
+            ),
+            (row.play_count(), row.uri(), row.album_artist(), row.year())
+        );
     }
 
     #[test]

@@ -151,6 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Playlist housekeeping** — The default smart playlists no longer come back after you delete
   them, Rhythmbox imports keep their original playlist order, and file changes no longer re-read
   the whole library whenever some playlist entries are unmatched.
+- **Views keep their place** — Counting a play, rating a track, or a change to the library
+  folders no longer empties the open playlist or library view, clears its search and filters,
+  or jumps back to the top. A smart playlist limited to random songs keeps the same songs
+  until you edit its rules or restart Tributary.
 - **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
   12 servers, which by default reject the older authentication header Tributary used to
   send. Earlier Jellyfin versions keep working.
