@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::architecture::backend::BackendResult;
 use crate::architecture::error::BackendError;
+use crate::architecture::remote_json::parse_remote_json;
 use crate::architecture::{AdvertisedHttpRoute, MediaRepresentation, ResolvedHttpRequest};
 use crate::http_body::{read_limited, ResponseBodyError};
 use crate::http_security::{
@@ -235,10 +236,7 @@ impl PlexClient {
             .map_err(|error| response_body_error("Failed to parse Plex sign-in response", error))?;
 
         let sign_in: PlexSignInResponse =
-            serde_json::from_slice(&body).map_err(|e| BackendError::ParseError {
-                message: format!("Failed to parse Plex sign-in response: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            parse_remote_json("Failed to parse Plex sign-in response", &body)?;
 
         let auth_token = sign_in.user.auth_token;
 
@@ -424,10 +422,7 @@ impl PlexClient {
             .await
             .map_err(|error| response_body_error("Failed to parse Plex JSON", error))?;
 
-        let body = serde_json::from_slice::<T>(&body).map_err(|e| BackendError::ParseError {
-            message: format!("Failed to parse Plex JSON: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+        let body = parse_remote_json::<T>("Failed to parse Plex JSON", &body)?;
 
         Ok(body)
     }
@@ -507,7 +502,9 @@ mod tests {
 
     use axum::http::{Method, StatusCode};
 
+    use crate::architecture::remote_json::rendered_error_chain;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
+    use crate::plex::api::PlexSectionsResponse;
 
     use super::*;
 
@@ -745,5 +742,84 @@ mod tests {
             listener.accept(),
             Err(error) if error.kind() == ErrorKind::WouldBlock
         ));
+    }
+
+    /// A Plex sign-in body whose `user` is a string instead of the expected
+    /// object makes `serde_json` quote the wrong-type value. The production
+    /// authentication path must drop it rather than log or surface it.
+    #[tokio::test]
+    async fn auth_parse_failures_omit_response_content_from_diagnostics() {
+        let sentinel = "PLEX-AUTH-PARSE-SENTINEL-5d13";
+        let service =
+            MockHttpService::start(vec![MockRoute::new(Method::POST, "/users/sign_in.json")
+                .reply(MockResponse::json(serde_json::json!({ "user": sentinel })))])
+            .await;
+        let username = uuid::Uuid::new_v4().to_string();
+        let password = uuid::Uuid::new_v4().to_string();
+        let sign_in_url = format!("{}/users/sign_in.json", service.base_url());
+        let error = PlexClient::authenticate_with_route_at(
+            "https://plex.example.test",
+            &username,
+            &password,
+            None,
+            &sign_in_url,
+        )
+        .await
+        .err()
+        .expect("wrong-type sign-in body must fail");
+        service.finish().await;
+
+        assert_parse_error_omits(&error, sentinel, &[&username, &password]);
+    }
+
+    /// A Plex catalogue body whose `MediaContainer.size` is a string instead
+    /// of the expected integer exercises the generic catalogue parser with a
+    /// short and a large sentinel value.
+    #[tokio::test]
+    async fn catalogue_parse_failures_omit_response_content_from_diagnostics() {
+        let cases = [
+            "PLEX-CATALOGUE-SENTINEL-91ac".to_string(),
+            format!("{}{}", "z".repeat(48 * 1024), "PLEX-LARGE-SENTINEL-4b60"),
+        ];
+
+        for payload in cases {
+            let service = MockHttpService::start(vec![MockRoute::get("/library/sections").reply(
+                MockResponse::json(serde_json::json!({
+                    "MediaContainer": { "size": payload }
+                })),
+            )])
+            .await;
+            let client = PlexClient::new(&service.base_url(), "token").expect("client");
+            let error = client
+                .get::<PlexSectionsResponse>("library/sections")
+                .await
+                .expect_err("wrong-type catalogue body must fail");
+            service.finish().await;
+
+            assert_parse_error_omits(&error, &payload, &["token"]);
+        }
+    }
+
+    /// Assert a parse failure retains no response content and keeps the fixed
+    /// category in its message.
+    fn assert_parse_error_omits(error: &BackendError, payload: &str, secrets: &[&str]) {
+        match error {
+            BackendError::ParseError { message, source } => {
+                assert!(source.is_none(), "content-bearing source retained");
+                assert!(
+                    message.contains("unexpected type or shape"),
+                    "unexpected category: {message}"
+                );
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        let rendered = format!("{error:?}\n{error}\n{}", rendered_error_chain(error));
+        assert!(!rendered.contains(payload), "response content leaked");
+        for secret in secrets {
+            // Do not interpolate `secret` into the failure message: the CodeQL
+            // cleartext-logging query treats the panic payload as a log sink,
+            // and this assertion exists precisely to keep secrets out of one.
+            assert!(!rendered.contains(secret), "credential leaked");
+        }
     }
 }
