@@ -3121,6 +3121,14 @@ fn prepare_durable_root_identity(
         return RootIdentityPreparation::Unchanged;
     }
 
+    if let Err(error) = RootAuthorityLease::check_root_retainable(&scan.root) {
+        scan.errors.push(format!(
+            "library root cannot be retained, so no durable identity was written {}: {error}",
+            scan.root.display()
+        ));
+        return RootIdentityPreparation::Unchanged;
+    }
+
     let creation = match create_root_marker(&scan.root) {
         Ok(creation) => creation,
         Err(error) => {
@@ -15474,6 +15482,68 @@ mod tests {
         assert_eq!(updated.device_id, stored.device_id);
         assert!(!updated.is_available);
         assert!(!updated.last_scan_complete);
+    }
+
+    async fn tracks_by_path(db: &DatabaseConnection) -> Vec<track::Model> {
+        track::Entity::find()
+            .order_by_asc(track::Column::FilePath)
+            .all(db)
+            .await
+            .expect("query tracks")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_configured_root_is_indexed_and_rescans_stably() {
+        let container = TestDirectory::new("symlinked-root");
+        let target = container.path().join("data-music");
+        std::fs::create_dir_all(target.join("album")).expect("create symlink target");
+        write_minimal_wav(&target.join("album").join("nested.wav"));
+        write_minimal_wav(&target.join("top.wav"));
+        let root = container.path().join("Music");
+        std::os::unix::fs::symlink(&target, &root).expect("link the configured root");
+        let db = rename_test_database().await;
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let roots = [root.clone()];
+
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("first scan");
+        let first = tracks_by_path(&db).await;
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| PathBuf::from(&row.file_path))
+                .collect::<Vec<_>>(),
+            [root.join("album").join("nested.wav"), root.join("top.wav")],
+            "rows are keyed under the configured spelling of the root"
+        );
+        let state = library_root::Entity::find_by_id(root.to_string_lossy().into_owned())
+            .one(&db)
+            .await
+            .expect("query root state")
+            .expect("root state exists");
+        assert!(state.identity_confirmed && state.is_available);
+
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("rescan");
+        assert_eq!(
+            tracks_by_path(&db).await,
+            first,
+            "a rescan keeps every row, ID and path"
+        );
+
+        std::fs::remove_file(target.join("top.wav")).expect("delete a track on disk");
+        initial_scan(&db, &roots, &event_tx, &refresh)
+            .await
+            .expect("reconciling scan");
+        assert_eq!(
+            tracks_by_path(&db).await,
+            first[..1],
+            "reconciliation through the symlinked root removes only the deleted track"
+        );
     }
 
     #[tokio::test]
