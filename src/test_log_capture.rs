@@ -27,6 +27,7 @@ pub struct CapturedEvent {
 
 impl CapturedEvent {
     /// The rendered `message` field, if the event has one.
+    #[cfg_attr(not(unix), allow(dead_code))] // only the Unix-only tag-writer tests read it
     pub fn message(&self) -> Option<&str> {
         self.fields
             .iter()
