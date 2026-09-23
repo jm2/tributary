@@ -1,186 +1,33 @@
 # Dependency update policy
 
-Tributary keeps Dependabot enabled for the root Cargo package, the independent
-fuzz workspace, and GitHub Actions. The policy separates routine updates from
-changes which need coordinated repair:
+Dependabot proposes updates for Rust crates (the root Cargo workspace), the Rust compiler floor
+(`.github/rust-toolchain.toml`), and GitHub Actions.
 
-- Compatible Cargo and Actions patch/minor updates may use native GitHub
-  auto-merge, but only once the live gate enforces the repository's
-  all-checks policy. Native auto-merge waits only on the checks the `main`
-  ruleset marks required, so until the widened ruleset from the
-  "Deployment gate migration" section (below) is live and verified, routine
-  auto-merge stays off: a green required-check set alone never authorizes a
-  merge while any other check or bot review is pending or failing.
-- `sea-orm` and `sea-orm-migration` always share one Dependabot group and must
-  retain matching manifest requirements and resolved versions.
-- Cargo major updates remain reviewed changes and normally arrive
-  individually; the coupled SeaORM pair is the intentional grouped exception.
-- Rust compiler updates are proposed through `.github/rust-toolchain.toml` and
-  never auto-merge. Updates to the digest-pinned `dtolnay/rust-toolchain`
-  action implementation are a separate, manually reviewed lane.
-- The fuzz crate has its own Dependabot entry because `fuzz/Cargo.toml`
-  intentionally declares a separate workspace and owns `fuzz/Cargo.lock`.
+The repository is one Cargo workspace with one `Cargo.lock`. The fuzz harness in `fuzz/` is a
+non-default member: plain `cargo build`, `cargo test`, and `cargo clippy` cover only the
+application, while cargo-fuzz and `cargo clippy -p tributary-fuzz` build the harness from the
+same lock. A Cargo update therefore changes a single lockfile and needs no follow-up repair.
+CI's Security Audit runs `cargo audit` against that lock; its advisory exceptions live in
+`.cargo/audit.toml`, each with the reason it is inactive and a review date.
 
-## Root Cargo update repair
+Cargo and Actions patch/minor updates are each batched into one group. Cargo majors arrive
+individually, except `sea-orm` and `sea-orm-migration`, which always share a group and must keep
+matching manifest requirements and locked versions. The `dependabot-automerge.yml` workflow may
+enable GitHub's native auto-merge for patch and minor updates only, and routine auto-merge stays
+off until the `main` ruleset requires the repository's full all-checks policy (see "Closing the
+gap (the machine gate)" in `docs/refinery-config.md`). Compiler proposals and updates to the
+pinned `dtolnay/rust-toolchain` and `dependabot/fetch-metadata` actions never auto-merge.
 
-A root Cargo update may also change production dependencies inherited by the
-fuzz workspace. Pull-request CI compares the root lock against the exact base
-SHA, loads that base's `fuzz/Cargo.lock`, and enforces absolute
-root-authoritative equality for every shared production-direct dependency in
-the submitted `fuzz/Cargo.lock`. When the base fuzz lock needs a direct
-transition, CI applies the same bounded base-fuzz-to-head proof used by the
-writer; raw lock edits cannot bypass it merely because the direct versions now
-match.
+A `rust-toolchain` proposal is completed in a trusted worktree with
+`python3 scripts/sync_rust_toolchain.py --from-toolchain` followed by `--check`
+(`--set X.Y` for a maintainer-initiated bump). This synchronizes the Cargo `rust-version`, the
+MSRV and coverage toolchain pins and cache keys, and the README commands, without changing the
+pinned action commit; the CI check keeps the stable name `MSRV`. Both
+`dtolnay/rust-toolchain@<sha> # master` pins must name the same full commit from that action's
+`master` history. A bump is feasible only when the full CI matrix passes.
 
-GasCity should handle that expected failure in a trusted isolated worktree:
-
-```sh
-python3 scripts/sync_fuzz_lock.py write --base-ref <exact-base-sha>
-python3 scripts/sync_fuzz_lock.py check --base-ref <exact-base-sha>
-```
-
-The write command uses targeted `cargo update --precise` operations. It does
-one path-package re-resolution first when the root dependency declaration
-changed. That permits a new direct major to coexist with an older major still
-required transitively. It then requires exact transition readback, rejects any
-package-identity drift outside the exact old and resulting fuzz closures, and
-compares every changed dependency edge by its resolved `(name, version)`
-identity. Formatting-only disambiguation is harmless, but a semantic rebind
-must have either an exact authorized parent or a complete exact old/new target
-surface; crate-name coincidence grants no authority. The Tributary path record
-may move only the exact requested direct transitions. The independent fuzz
-resolver may select a different compatible transitive version inside its exact
-new closure. Identities also present in the current root must match its
-immutable source/checksum metadata, while locked Cargo fetch verifies
-resolver-only identities. A broad resolver rewrite, failed command, failed
-materialization, or failed proof restores the original fuzz lock.
-
-The command does not commit, push, approve, or merge. The Repairer must verify
-the resulting lock diff, commit the repair to the existing Dependabot branch,
-and require the complete CI matrix. Graph rewrites which cannot be proven by
-this bounded version-selection policy fail closed for manual repair.
-`--offline` is available for a pre-populated Cargo cache; normal repair runs
-may use the registry to obtain the exact versions already selected in the root
-lock.
-
-Transitive-only root-lock updates are deliberately not projected into the
-independent fuzz resolver: its graph can legitimately select a different
-compatible version. The dedicated `/fuzz` Dependabot entry and locked fuzz CI
-own those updates. A security update affecting both lockfiles must therefore
-be raised or repaired in both rather than inferred from coincident package
-names. Likewise, when the exact base fuzz lock already needs no direct repair,
-an ordinary fuzz-only Dependabot update remains in that independent lane and
-is not forced through a root-transition closure.
-
-## Security audit boundaries
-
-`cargo audit` at the repository root sees only the production lock. The fuzz
-crate is a separate workspace with its own `fuzz/Cargo.lock`, and its resolver
-may legitimately select different transitive versions, so lock coherence proves
-nothing about whether that graph was security-audited. CI audits both graphs
-explicitly with `scripts/audit_lockfiles.py`:
-
-- each graph is scanned with its own lockfile passed via `--file`, from its own
-  directory, so cargo-audit cannot silently fall back to the root lock;
-- each graph takes only its own `[advisories].ignore` list — the root
-  `.cargo/audit.toml` for the production lock and `fuzz/.cargo/audit.toml` for
-  the fuzz lock — so an exception justified for one graph never suppresses a
-  finding in the other;
-- the JSON report is validated before it is trusted: the scanned dependency
-  count must match the requested lockfile, the applied ignore set must match
-  that graph's scoped exceptions, and no vulnerabilities may remain.
-
-`scripts/test_audit_lockfiles.py` keeps this honest with fixture tests proving
-the fuzz lock is actually selected and that a fuzz-only finding fails the audit
-even while the root audit stays green.
-
-A security advisory affecting both graphs must still be reviewed and repaired
-for each independently: an exception (or a fix) in one lock does not carry to
-the other.
-
-## Rust toolchain and MSRV repair
-
-`.github/rust-toolchain.toml` is Dependabot's authoritative signal for a Rust
-compiler proposal. It lives below `.github` so it does not override a
-developer's selected toolchain merely by entering the repository. On a
-`rust-toolchain` ecosystem PR, GasCity should run:
-
-```sh
-python3 scripts/sync_rust_toolchain.py --from-toolchain
-python3 scripts/sync_rust_toolchain.py --check
-```
-
-This synchronizes the Cargo MSRV, explicit MSRV and coverage compiler inputs,
-cache keys, versioned step labels, and current README commands. It never
-changes the action implementation. The CI job/check name remains the stable
-`MSRV` so future compiler bumps do not rename the hosted context. The bump is
-feasible only when the full Linux, macOS, Windows, Flatpak, fuzz, audit,
-coverage, and repository-policy matrix passes. The repository enforces
-consistency and excludes the entire `rust-toolchain` ecosystem from native
-auto-merge; GasCity must separately provide independent semantic review and
-the normal Refinery exact-SHA merge gate before merging it.
-
-Rust 1.94 is today's declared floor, not a permanent pin. Dependabot remains
-enabled for `.github/rust-toolchain.toml`; each feasible compiler proposal goes
-through this dedicated coordinated, non-auto-merge lane.
-
-For a maintainer-initiated compiler bump rather than a Dependabot proposal:
-
-```sh
-python3 scripts/sync_rust_toolchain.py --set X.Y
-```
-
-The two `dtolnay/rust-toolchain@SHA # master` refs instead pin executable
-third-party action code. Their SHA must be a commit in the action's permanent
-`master` history, as required by that upstream action, and both jobs must use
-the same full 40-character commit. GitHub Actions Dependabot may propose a new
-master-history commit independently; the dependency-name guard prevents every
-such proposal from auto-merging. Review the action-code diff and run the full
-matrix, but do not run the compiler synchronizer unless the compiler manifest
-also changed through its own reviewed proposal.
-
-## Deployment gate migration
-
-This change itself deliberately did not mutate GitHub rulesets or the local
-GasCity configuration; the MSRV migration it anticipated has since landed
-through separate reviewed changes. The live `main` ruleset ("Require CI before
-merge (main)") requires the stable `MSRV` context alongside Security Audit,
-Linux (x86_64), Linux (aarch64), macOS (aarch64), Windows (x86_64), and
-Flatpak (Linux), and GasCity's Tributary hosted-check configuration already
-emits `MSRV` rather than the old versioned `MSRV (1.92)` context. Future Rust
-bumps therefore keep the stable context and need no additional gate rename.
-
-The ruleset is still narrower than the repository's all-checks policy: it does
-not yet require Coverage, CodeQL, Codacy Static Code Analysis, the CodeRabbit
-status context, or bot-review gating. Routine Dependabot auto-merge stays off
-until the live gate matches that policy (see "Closing the gap (the machine
-gate)" in docs/refinery-config.md).
-
-## Workflow security boundary
-
-This Dependabot auto-merge workflow does not check out pull-request code while
-holding a write token. (Other repository workflows, including semantic review,
-have separate permission and trust boundaries and are not covered by that
-claim.) The workflow uses `pull_request`, verifies the actor, PR author, and
-repository, and enables GitHub's native guarded auto-merge without checking
-out the branch.
-
-Its first job has read-only pull-request access. It verifies the event's exact
-head before and after paginated changed-file enumeration, requires the observed
-file count, rejects current or previous names for the privileged workflow, and
-then revalidates the head immediately before and after running the pinned
-metadata action with read authority. Per-PR concurrency cancels stale runs as
-defense in depth. The separate write-capable job contains no third-party
-action: it revalidates that exact head immediately before asking GitHub to
-enable auto-merge with an atomic expected-head guard.
-Thus a same-count H1/H2 race or mixed-path self-update fails closed rather than
-executing an H1 action ref with write authority.
-
-Lockfile and toolchain repair intentionally remain GasCity Repairer operations
-instead of a `pull_request_target` writer. This keeps untrusted dependency or
-pull-request content out of a privileged execution context.
-
-GitHub references: [Dependabot options
-reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference)
-and [Automating Dependabot with GitHub
-Actions](https://docs.github.com/en/code-security/tutorials/secure-your-dependencies/automate-dependabot-with-actions).
+The auto-merge workflow runs on `pull_request` and never checks out pull-request code. It
+verifies the actor, author, and repository, re-reads the exact head SHA around changed-file
+enumeration and the metadata action, refuses any PR that touches the workflow itself, and
+enables auto-merge with an expected-head guard, so a head that moves mid-run fails closed.
+Repairs run in a trusted worktree, never in a privileged `pull_request_target` job.
