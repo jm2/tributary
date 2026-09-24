@@ -6,10 +6,11 @@
 //! and wires its mount-added, changed, pre-unmount, and removed signals for live
 //! hotplug updates. Filesystem traversal remains separate background work.
 //!
-//! This layer currently supports browsing mounted filesystems. Device sync,
-//! transfer, MTP-only access, and mounting an unmounted volume remain outside
-//! its scope; see GitHub issue #8 and `docs/roadmap.md`.
+//! [`copy`] writes tracks and playlists onto a mounted, writable filesystem.
+//! Automatic sync, MTP-only access, and mounting an unmounted volume remain
+//! outside this layer's scope.
 
+pub mod copy;
 pub mod usb;
 
 /// Information about one mounted, browseable device.

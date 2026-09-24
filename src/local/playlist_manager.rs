@@ -966,6 +966,28 @@ impl PlaylistManager {
         Ok(LocalPlaylistExport::Ready(tracks))
     }
 
+    /// The local tracks of an editable regular playlist in playlist order,
+    /// and how many of its entries are not resolved local files.
+    ///
+    /// Unlike [`Self::local_playlist_export`], a remote, removable, or
+    /// unresolved entry is counted instead of refusing the whole playlist.
+    pub async fn local_playlist_tracks(
+        &self,
+        playlist_id: &str,
+    ) -> Result<(Vec<track::Model>, usize), DbErr> {
+        let entries = self
+            .load_editable_playlist_entries_for_export(playlist_id)
+            .await?;
+        let total = entries.len();
+        let tracks: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.stored.source_id == SourceId::local())
+            .filter_map(|entry| entry.local_track)
+            .collect();
+        let others = total - tracks.len();
+        Ok((tracks, others))
+    }
+
     // ── Smart playlist management ────────────────────────────────────
 
     /// Save smart rules to a playlist.
@@ -2953,6 +2975,19 @@ mod tests {
                 .expect("reject remote export"),
             LocalPlaylistExport::UnsupportedEntries
         ));
+        let (copyable, others) = manager
+            .local_playlist_tracks(&playlist.id)
+            .await
+            .expect("local tracks of a mixed playlist");
+        assert_eq!(
+            copyable
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![local.id.as_str(), local.id.as_str()],
+            "a device copy keeps the local entries and counts the rest"
+        );
+        assert_eq!(others, 1);
 
         manager
             .remove_entries(&playlist.id, &[remote[0].id.clone()])
