@@ -283,12 +283,10 @@ fn main() {
         .init();
 
     // ── TLS crypto provider ──────────────────────────────────────────
-    // rustls 0.23+ requires an explicit process-level CryptoProvider.
-    // reqwest and sea-orm configure their own internally, but rust_cast
-    // (Chromecast Cast V2) uses rustls directly on background threads.
-    // Install the ring provider as the global default so all TLS
-    // connections work without per-callsite configuration.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // aws-lc-rs is the only rustls crypto provider compiled in. Install it as
+    // the process default once, before any worker starts, so reqwest clients
+    // and the Cast connector's `ClientConfig::builder()` share one provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // ── i18n: detect system locale ───────────────────────────────────
     if let Err(error) = initialize_i18n_backend() {

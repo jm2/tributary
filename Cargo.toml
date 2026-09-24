@@ -55,8 +55,10 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Local backend — database (SQLite via SeaORM)
-sea-orm = { version = "2", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
-sea-orm-migration = { version = "2", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+# SQLite is a local file, so the plain tokio runtime is enough; a `-rustls`
+# runtime would compile a second TLS crypto provider (ring) for nothing.
+sea-orm = { version = "2", features = ["sqlx-sqlite", "runtime-tokio", "macros"] }
+sea-orm-migration = { version = "2", features = ["sqlx-sqlite", "runtime-tokio"] }
 
 # Local backend — audio tag parsing
 lofty = "0.25"
@@ -116,9 +118,11 @@ axum = "0.8"
 dashmap = "6"
 tower-http = { version = "0.7", features = ["cors"] }
 
-# TLS — explicit dependency to ensure the ring crypto provider is available
-# for rust_cast's TLS connections (rustls 0.23+ requires manual provider setup)
-rustls = { version = "0.23", features = ["ring"], default-features = false }
+# TLS — aws-lc-rs is the only rustls crypto provider in the build: reqwest's
+# `rustls` feature selects it, and rust_cast verifies Cast handshake
+# signatures with `rustls::crypto::aws_lc_rs` directly. `main` installs it as
+# the process default that the Cast connector's `ClientConfig::builder()` uses.
+rustls = { version = "0.23", features = ["aws_lc_rs"], default-features = false }
 
 # Desktop media controls (MPRIS / SMTC / Now Playing)
 souvlaki = "0.8"

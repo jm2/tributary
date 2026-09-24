@@ -60,10 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dividers and dimmed item counts, and screen readers announce each browser row once.
 - **Confirm before deleting** — Deleting a playlist or removing a saved server from the sidebar now
   asks for confirmation first, with Cancel as the default.
+- **GPU rendering in the Flatpak** — The Flatpak can now use the graphics card, so the interface
+  is drawn with hardware acceleration instead of in software.
 - **Maintenance** — Dependencies were refreshed, the fuzz tests now cover more file and network
   parsers, and CI runs the interface tests on a real display, checks one shared lockfile, and
   auto-merges only patch-level dependency updates. Unused internal code and placeholder data no
-  longer ship in the app.
+  longer ship in the app. Builds compile one TLS crypto library instead of two, and CI now runs
+  the test suite on Windows on ARM.
 
 ### Fixed
 

@@ -3640,7 +3640,7 @@ mod tests {
     }
 
     fn short_io_connector(address: SocketAddr) -> RustCastConnector {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         RustCastConnector {
             address,
             timeouts: CastIoTimeouts {

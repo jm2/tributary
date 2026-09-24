@@ -1643,6 +1643,38 @@ fn seaorm_runtime_and_migration_dependencies_move_as_one_unit() {
 }
 
 #[test]
+fn tls_compiles_only_the_aws_lc_rs_crypto_provider() {
+    let dependencies = &manifest()["dependencies"];
+    let features = |name: &str| -> Vec<String> {
+        dependencies[name]["features"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} must list its features"))
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+
+    assert_eq!(features("rustls"), ["aws_lc_rs"]);
+    assert_eq!(
+        dependencies["rustls"]["default-features"].as_bool(),
+        Some(false),
+        "rustls defaults must not re-enable a provider implicitly"
+    );
+    assert!(features("reqwest")
+        .iter()
+        .any(|feature| feature == "rustls"));
+    for name in ["sea-orm", "sea-orm-migration"] {
+        let features = features(name);
+        assert!(
+            features.iter().any(|feature| feature == "runtime-tokio")
+                && !features.iter().any(|feature| feature.contains("tls")),
+            "SQLite needs no TLS, so {name} must use the plain tokio runtime: {features:?}"
+        );
+    }
+}
+
+#[test]
 fn fuzz_harness_shares_the_root_lockfile_without_joining_default_builds() {
     let workspace = &manifest()["workspace"];
     assert_eq!(
@@ -2100,6 +2132,33 @@ fn ci_security_audit_runs_only_the_advisory_audit() {
     assert_eq!(
         jobs["repository-policy"]["name"].as_str(),
         Some("Repository Policy")
+    );
+}
+
+#[test]
+fn ci_runs_windows_tests_natively_on_both_architectures() {
+    let jobs = ci_jobs();
+    let windows = &jobs["build-windows"];
+    let aarch64 = windows["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("the Windows matrix must list its architectures")
+        .iter()
+        .find(|leg| leg["arch"].as_str() == Some("aarch64"))
+        .expect("the Windows matrix must build aarch64");
+    assert_eq!(
+        aarch64["runner"].as_str(),
+        Some("windows-11-arm"),
+        "Windows aarch64 must build on a native runner so its tests can execute"
+    );
+    let tests = windows["steps"]
+        .as_sequence()
+        .expect("Windows steps must be a sequence")
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Run tests"))
+        .expect("the Windows job must run the test suite");
+    assert!(
+        tests.get("if").is_none(),
+        "the Windows test step must run on every architecture"
     );
 }
 
