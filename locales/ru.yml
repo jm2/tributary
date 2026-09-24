@@ -103,6 +103,9 @@ preferences:
   title: "Настройки"
   library_location: "Расположение библиотеки"
   select_music_folder: "Выбрать папку с музыкой"
+  downloads: "Загрузки"
+  download_folder: "Папка для загрузок"
+  select_download_folder: "Выбрать папку для загрузок"
   library_restart_hint: "Перезапустите Tributary, чтобы применить изменения папок с музыкой."
   reauthorize_folder: "Повторно авторизовать…"
   select_reauthorization_folder: "Выбрать ту же папку медиатеки"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Свойства…"
+  download: "Скачать"
   add_to_playlist: "Добавить в плейлист"
   remove_from_playlist: "Удалить из плейлиста"
   playlist_add_unsupported_heading: "Композиции не добавлены"
@@ -261,6 +265,12 @@ context:
     other: "Добавлено композиций: %{count} в %{playlist}."
     few: "Добавлено %{count} композиции в %{playlist}."
     many: "Добавлено %{count} композиций в %{playlist}."
+
+# ── Загрузки ────────────────────────────────────────
+download:
+  progress: "Скачивание: %{done} из %{total}…"
+  finished: "Скачивание завершено. Скачано: %{downloaded}, пропущено: %{skipped}, с ошибкой: %{failed}."
+  cancelled: "Скачивание отменено. Скачано: %{downloaded}, пропущено: %{skipped}, с ошибкой: %{failed}."
 
 # ── Обычные плейлисты ───────────────────────────────────────────
 regular_playlist:

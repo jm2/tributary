@@ -275,6 +275,18 @@ impl SubsonicClient {
             .with_representation(representation))
     }
 
+    /// Resolve an original-file `download.view` request with the same
+    /// credential isolation as [`Self::resolved_stream_request`].
+    pub(crate) fn resolved_download_request(
+        &self,
+        song_id: &str,
+        representation: MediaRepresentation,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        Ok(self
+            .resolved_media_request("download.view", song_id)?
+            .with_representation(representation))
+    }
+
     /// Resolve an artwork request with the same credential isolation.
     pub(crate) fn resolved_artwork_request(
         &self,
@@ -601,6 +613,17 @@ mod tests {
                     "https://music.example.test{prefix}/rest/stream.view?id=song-id&v=1.16.1&c=Tributary&f=json"
                 ),
                 "stream base URL: {base}"
+            );
+            assert_eq!(
+                client
+                    .resolved_download_request("song-id", MediaRepresentation::buffered_unknown())
+                    .expect("download request")
+                    .endpoint()
+                    .as_str(),
+                format!(
+                    "https://music.example.test{prefix}/rest/download.view?id=song-id&v=1.16.1&c=Tributary&f=json"
+                ),
+                "download base URL: {base}"
             );
             assert_eq!(
                 client

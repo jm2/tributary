@@ -218,6 +218,53 @@ impl UpstreamMediaClient {
         self.routed_http.insert(route.clone(), client.clone());
         Ok(client)
     }
+
+    /// Build the exact upstream GET for one fixed request.
+    ///
+    /// Private query material exists in a temporary request URL only for the
+    /// duration of this fetch. It is absent from the registry key, ticket URL,
+    /// logs, and every receiver-facing value.
+    fn upstream_get(
+        &self,
+        upstream_request: &UpstreamRequest,
+    ) -> Result<reqwest::RequestBuilder, ()> {
+        let mut upstream_url = upstream_request.endpoint().clone();
+        if let UpstreamRequest::Resolved(resolved) = upstream_request {
+            let mut query = upstream_url.query_pairs_mut();
+            for (name, value) in resolved.private_query_pairs() {
+                query.append_pair(name, value);
+            }
+        }
+        let mut request = self.http_for(upstream_request)?.get(upstream_url);
+        if let UpstreamRequest::Resolved(resolved) = upstream_request {
+            request = request.headers(resolved.required_headers().clone());
+            request = request.headers(resolved.sensitive_headers().clone());
+        }
+        Ok(request)
+    }
+
+    /// Fetch one resolved request for a consumer that reads the body itself
+    /// (the offline downloader), waiting at most the response-header deadline.
+    ///
+    /// Every failure, including a revoked lease, is `None`: a reqwest error
+    /// can display the credential-bearing URL, so none is surfaced. Read the
+    /// body with [`Self::body_idle_timeout`] bounding each chunk.
+    pub(crate) async fn fetch(&self, resolved: ResolvedHttpRequest) -> Option<reqwest::Response> {
+        let upstream_request = UpstreamRequest::Resolved(Box::new(resolved));
+        if !upstream_request.is_active() {
+            return None;
+        }
+        let request = self.upstream_get(&upstream_request).ok()?;
+        tokio::time::timeout(self.timeouts.response_headers, request.send())
+            .await
+            .ok()?
+            .ok()
+    }
+
+    /// Maximum silence between two body chunks of a [`Self::fetch`] response.
+    pub(crate) const fn body_idle_timeout(&self) -> Duration {
+        self.timeouts.body_idle
+    }
 }
 
 /// What a registered ticket resolves to.
@@ -744,18 +791,7 @@ async fn proxy_upstream(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Private query material exists in a temporary request URL only for the
-    // duration of this fetch. It is absent from the registry key, ticket URL,
-    // logs, and every receiver-facing value.
-    let mut upstream_url = upstream_request.endpoint().clone();
-    if let UpstreamRequest::Resolved(resolved) = upstream_request {
-        let mut query = upstream_url.query_pairs_mut();
-        for (name, value) in resolved.private_query_pairs() {
-            query.append_pair(name, value);
-        }
-    }
-
-    let Ok(http) = client.http_for(upstream_request) else {
+    let Ok(mut request) = client.upstream_get(upstream_request) else {
         error!(
             stage = STAGE_CONNECT,
             category = CATEGORY_TRANSPORT,
@@ -764,11 +800,6 @@ async fn proxy_upstream(
         );
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    let mut request = http.get(upstream_url);
-    if let UpstreamRequest::Resolved(resolved) = upstream_request {
-        request = request.headers(resolved.required_headers().clone());
-        request = request.headers(resolved.sensitive_headers().clone());
-    }
     if let Some(range) = receiver_headers.get(header::RANGE) {
         request = request.header(header::RANGE, range.clone());
     }

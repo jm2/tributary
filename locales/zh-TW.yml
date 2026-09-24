@@ -103,6 +103,9 @@ preferences:
   title: "偏好設定"
   library_location: "音樂庫位置"
   select_music_folder: "選擇音樂資料夾"
+  downloads: "下載"
+  download_folder: "下載資料夾"
+  select_download_folder: "選擇下載資料夾"
   library_restart_hint: "重新啟動 Tributary 以套用音樂資料夾變更。"
   reauthorize_folder: "重新授權…"
   select_reauthorization_folder: "選擇相同的音樂庫資料夾"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "內容…"
+  download: "下載"
   add_to_playlist: "加入播放清單"
   remove_from_playlist: "從播放清單移除"
   playlist_add_unsupported_heading: "曲目未加入"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "已將 %{count} 首曲目加入 %{playlist}。"
     other: "已將 %{count} 首曲目加入 %{playlist}。"
+
+# ── 下載 ────────────────────────────────────────
+download:
+  progress: "正在下載（%{done}/%{total}）…"
+  finished: "下載已完成。已下載：%{downloaded}，已略過：%{skipped}，失敗：%{failed}。"
+  cancelled: "下載已取消。已下載：%{downloaded}，已略過：%{skipped}，失敗：%{failed}。"
 
 # ── 一般播放清單 ──────────────────────────────────────────────
 regular_playlist:

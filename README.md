@@ -43,6 +43,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Regular & smart playlists (iTunes-style rules) | ✅ Regular playlists may include remote tracks |
 | Drag and drop tracks onto playlists | ✅ |
 | Subsonic server playlists (import a copy, or keep a read-only synced mirror) | ✅ |
+| Download remote tracks for offline listening | ✅ Saved as ordinary local files — see [Downloading Remote Tracks](#downloading-remote-tracks) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -464,6 +465,7 @@ src/
 ├── platform_runtime.rs     # Early runtime setup for self-contained Windows/macOS builds
 ├── panic_reporting.rs      # Content-free panic diagnostics
 ├── discovery.rs            # mDNS + UDP zero-config server discovery
+├── download.rs             # Offline downloads of remote tracks into a library folder
 ├── http_security.rs        # Shared hardening for outbound HTTP clients
 ├── http_body.rs            # Bounded response-body collection
 ├── remote_rating_wire.rs   # Tolerant decoding of optional remote ratings
@@ -521,6 +523,7 @@ src/
     ├── folder_browser.rs   # Folder pane over the local library
     ├── tracklist.rs        # GtkColumnView track listing
     ├── context_menu.rs     # Tracklist context menu, playlist add/remove, drag and drop
+    ├── downloads.rs        # Download action progress and summary notifications
     ├── source_connect.rs   # Sidebar selection handler (source switching + auth flows)
     ├── source_navigation.rs# Asynchronous source navigation results
     ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
@@ -616,6 +619,26 @@ and `/mnt`; a device mounted elsewhere can still be listed but cannot be scanned
 Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and UDP broadcast (Jellyfin). Discovered servers appear in the sidebar — click one to connect. Password-protected DAAP shares show a lock icon; passwordless shares connect with a single click.
 
 To manually add a server, click the **+** button in the sidebar toolbar and enter the server type (Subsonic, Jellyfin, or Plex), URL, and credentials. Manually-added servers are persisted across launches (credentials are entered in the UI only — they are not stored on disk).
+
+### Downloading Remote Tracks
+
+Select tracks from a Subsonic, Jellyfin, Plex, or DAAP server (or server tracks in a playlist),
+right-click, and choose **Download**. Each track is saved as
+`<Album Artist>/<Album>/<NN Title>.<ext>` in a **Tributary Downloads** folder inside your music
+folder; choose another folder under **Downloads** in Preferences. Two tracks download at a time,
+a notification shows progress with a **Cancel** button, and a summary reports how many tracks were
+downloaded, skipped because the file already exists, or failed. Subsonic downloads use the
+server's original-file download, so the account needs download permission there; Jellyfin, Plex,
+and DAAP tracks are fetched as the original file.
+
+The download folder is part of your library. When a library folder already contains it (the
+default when your library is your music folder), finished files appear right away. Otherwise
+Tributary adds the download folder as a library folder after the first download, and it is
+scanned from the next start.
+
+A download is an ordinary local copy: it appears in the local library next to the server's track
+rather than replacing it, and playing the server's row still streams from the server. Tributary
+does not delete downloads or limit the folder's size.
 
 ### Internet Radio
 
@@ -772,6 +795,7 @@ Open **Preferences** from the hamburger menu (☰) to:
   links inside a library folder are not followed. Removing a folder forgets its tracks, with their
   play counts and ratings, at the next start; playlists keep those entries as unmatched items.
 - Reauthorize a library folder or import from Rhythmbox
+- Choose the folder that downloaded tracks are saved to (see [Downloading Remote Tracks](#downloading-remote-tracks))
 - Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
 - Show/hide tracklist columns
 - Set up the equalizer for playback on this computer

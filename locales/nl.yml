@@ -103,6 +103,9 @@ preferences:
   title: "Voorkeuren"
   library_location: "Bibliotheeklocatie"
   select_music_folder: "Muziekmap selecteren"
+  downloads: "Downloads"
+  download_folder: "Downloadmap"
+  select_download_folder: "Downloadmap selecteren"
   library_restart_hint: "Herstart Tributary om wijzigingen aan muziekmappen toe te passen."
   reauthorize_folder: "Opnieuw autoriseren…"
   select_reauthorization_folder: "Dezelfde bibliotheekmap selecteren"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Eigenschappen…"
+  download: "Downloaden"
   add_to_playlist: "Toevoegen aan afspeellijst"
   remove_from_playlist: "Verwijderen uit afspeellijst"
   playlist_add_unsupported_heading: "Nummers zijn niet toegevoegd"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "%{count} nummer toegevoegd aan %{playlist}."
     other: "%{count} nummers toegevoegd aan %{playlist}."
+
+# ── Downloads ────────────────────────────────────────
+download:
+  progress: "%{done} van %{total} downloaden…"
+  finished: "Downloads voltooid. Gedownload: %{downloaded}, overgeslagen: %{skipped}, mislukt: %{failed}."
+  cancelled: "Downloads geannuleerd. Gedownload: %{downloaded}, overgeslagen: %{skipped}, mislukt: %{failed}."
 
 # ── Gewone afspeellijsten ─────────────────────────────────────────
 regular_playlist:

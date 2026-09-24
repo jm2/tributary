@@ -156,6 +156,7 @@ struct PlaylistMutationContext {
     status_label: gtk::Label,
     column_view: gtk::ColumnView,
     properties_admissions: PropertiesAdmissions,
+    downloads: super::downloads::Downloads,
 }
 
 impl PlaylistMutationContext {
@@ -176,6 +177,12 @@ impl PlaylistMutationContext {
             status_label: state.status_label.clone(),
             column_view: state.column_view.clone(),
             properties_admissions: PropertiesAdmissions::default(),
+            downloads: super::downloads::Downloads::new(
+                state.toast_overlay.clone(),
+                state.rt_handle.clone(),
+                state.source_registry.clone(),
+                state.app_config.clone(),
+            ),
         }
     }
 
@@ -572,6 +579,14 @@ fn append_context_menu_actions(
         owns_request,
         commit_add,
         show_unsupported,
+    );
+
+    build_download_action(
+        menu,
+        action_group,
+        session.sm,
+        &popup_plan.selection,
+        session.mutation_context,
     );
 
     // ── Properties… ──────────────────────────────────────────
@@ -1297,6 +1312,37 @@ fn exact_playlist_entry_ids(
         entry_ids.push(entry_id);
     }
     (!entry_ids.is_empty()).then_some(entry_ids)
+}
+
+/// Offer Download when the selection includes remote server tracks; local,
+/// radio, and device rows in the same selection are left out.
+fn build_download_action(
+    menu: &gtk::gio::Menu,
+    action_group: &gtk::gio::SimpleActionGroup,
+    sm: &gtk::SortListModel,
+    selection: &SelectionSnapshot,
+    mutation_context: &PlaylistMutationContext,
+) {
+    let remote_sources =
+        super::downloads::remote_server_source_ids(&mutation_context.sidebar_store);
+    let tracks: Vec<_> = selection
+        .positions
+        .iter()
+        .filter_map(|position| sm.item(*position)?.downcast::<TrackObject>().ok())
+        .filter_map(|track| super::downloads::remote_track(&track, &remote_sources))
+        .collect();
+    if tracks.is_empty() {
+        return;
+    }
+
+    let action = gtk::gio::SimpleAction::new("download", None);
+    let downloads = mutation_context.downloads.clone();
+    action.connect_activate(move |_, _| downloads.download(&tracks));
+    action_group.add_action(&action);
+    menu.append(
+        Some(rust_i18n::t!("context.download").as_ref()),
+        Some("tracklist-ctx.download"),
+    );
 }
 
 /// Build the "Properties…" action for selected tracks.

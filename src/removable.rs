@@ -560,7 +560,9 @@ fn resolution_failed() -> BackendError {
 /// is waiting on a blocking mounted probe (2026-09-14 review finding).
 fn probe_class_for(class: StreamResolutionClass) -> crate::local::resolver::ProbeClass {
     match class {
-        StreamResolutionClass::Speculative => crate::local::resolver::ProbeClass::Speculative,
+        StreamResolutionClass::Speculative | StreamResolutionClass::Download => {
+            crate::local::resolver::ProbeClass::Speculative
+        }
         StreamResolutionClass::Playback => crate::local::resolver::ProbeClass::Playback,
     }
 }
