@@ -82,7 +82,7 @@ impl AlbumArtCell {
     /// `set_paintable(None)` — assigning a `None` paintable is GTK4's
     /// `gtk_image_clear`, which wipes the freshly installed icon
     /// (storage back to empty) and renders the missing-art state as a
-    /// blank square (2026-09-07 review finding).
+    /// blank square.
     pub(crate) fn show_placeholder(&self, label_text: &str) {
         self.image.set_icon_name(Some(self.placeholder_icon));
         self.label.set_text(label_text);
@@ -328,18 +328,16 @@ pub mod widget_tests {
 
     /// The placeholder reset must leave the missing-art state VISIBLE.
     ///
-    /// The 2026-09-07 review finding: `show_placeholder` followed its
-    /// `set_icon_name` with `set_paintable(None)`, and a `None` paintable
-    /// assignment is GTK4's `gtk_image_clear` — it wiped the freshly
-    /// installed icon (storage back to empty, blank square) instead of
-    /// replacing a recycled cell's texture. The content store observable
-    /// on every GTK 4.x is the storage type: `IconName` while the
-    /// placeholder is installed, `Empty` after a clearing write. (A
-    /// previous draft asserted `paintable().is_some()` here instead;
-    /// that encoded a false premise — `gtk_image_get_paintable` only
-    /// reports paintables installed with `set_paintable`, and GTK 4.22
-    /// returns `None` for a healthy icon-name image, verified first-hand
-    /// on Fedora 44 / gtk4-4.22.5.)
+    /// Following `set_icon_name` with `set_paintable(None)` would be wrong:
+    /// a `None` paintable assignment is GTK4's `gtk_image_clear`, which
+    /// wipes the freshly installed icon (storage back to empty, blank
+    /// square) instead of replacing a recycled cell's texture. The content
+    /// store observable on every GTK 4.x is the storage type: `IconName`
+    /// while the placeholder is installed, `Empty` after a clearing write.
+    /// `paintable().is_some()` is not a usable check:
+    /// `gtk_image_get_paintable` only reports paintables installed with
+    /// `set_paintable`, and GTK 4.22 returns `None` for a healthy icon-name
+    /// image.
     pub fn show_placeholder_keeps_the_missing_art_visible() {
         let cell = AlbumArtCell::new("audio-x-generic-symbolic");
         // Paint a texture first so the reset truly has stale content to

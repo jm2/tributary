@@ -2,11 +2,10 @@
 //!
 //! Split verbatim from `album_pane_art.rs` so each module stays under
 //! the file-size budget, then extended with an explicit authority
-//! classification (2026-09-12 review finding). Every boundary is
-//! unchanged in spirit: a row that carries a complete registry identity
-//! resolves its `file://` artwork through the retained local-media
-//! authority (exact retained file capability, never a reopened
-//! pathname) and its remote artwork through the lease-isolated
+//! classification. Every boundary is unchanged in spirit: a row that carries a
+//! complete registry identity resolves its `file://` artwork through the
+//! retained local-media authority (exact retained file capability, never a
+//! reopened pathname) and its remote artwork through the lease-isolated
 //! `SourceRegistry::resolve_artwork`; the built-in local library row
 //! resolves through the built-in local retained authority; only rows
 //! with no authority chain at all keep the transitional direct path,
@@ -103,8 +102,7 @@ fn pane_track_id(candidate: &AlbumArtCandidate) -> Option<crate::architecture::T
 /// `cargo test` run never opens, migrates, or changes the real user
 /// library: the previous builtin-local fixture reached the production
 /// `init_db()` seam and therefore created and migrated
-/// `dirs::data_dir()/tributary/library.db` on every developer machine
-/// (R1, 2026-09-17 refinery audit).
+/// `dirs::data_dir()/tributary/library.db` on every developer machine.
 pub enum LocalLibrary {
     /// Open the process-wide shared library database. Production only.
     Shared,
@@ -174,10 +172,7 @@ pub async fn resolve_kind(
 /// local-media authority first, then the lease-isolated remote artwork
 /// resolution as the terminal fallback.
 ///
-/// Extracted verbatim from [`resolve_kind`] so the authority dispatch
-/// stays inside the per-method size budget (2026-09-17 refinery audit,
-/// Codacy 105307205459); every boundary moves with it unchanged — the
-/// retained route is chosen by the live adapter's authoritative
+/// The retained route is chosen by the live adapter's authoritative
 /// capability, runs on the application runtime with mid-flight
 /// revocation aborting it, and the remote resolution is terminal.
 async fn resolve_registry_art(
@@ -195,7 +190,7 @@ async fn resolve_registry_art(
     // retained file beneath its mount authority. The capability
     // check is cheap and synchronous, so it mints no stream
     // credential and reopens no pathname merely to discover the
-    // source kind (2026-09-14 review finding).
+    // source kind.
     if registry.retains_file_streams(id, epoch) {
         // The retained route reaches adapter code that polls Tokio
         // time/blocking APIs (`acquire_retained_probe_permit`
@@ -256,7 +251,7 @@ fn resolve_external_art(candidate: &AlbumArtCandidate) -> ResolvedArtKind {
 /// ([`crate::local::resolver::resolve_track`]) rather than reopening its
 /// raw `file://` pathname; a refused/absent resolution leaves the
 /// placeholder. This preserves local artwork without classifying every
-/// local row as external (2026-09-12 review finding).
+/// local row as external.
 async fn resolve_builtin_local_art(
     library: &LocalLibrary,
     candidate: &AlbumArtCandidate,
@@ -282,15 +277,14 @@ async fn resolve_builtin_local_art(
         },
         // An injected connection is already migrated: `init_db` is
         // unreachable on this path, so an injected resolution can never
-        // create, migrate, or change any library outside the fixture
-        // (R1, 2026-09-17 refinery audit).
+        // create, migrate, or change any library outside the fixture.
         #[cfg(test)]
         LocalLibrary::Injected(db) => db.clone(),
     };
     // Stop before the retained-authority probe if the row was revoked
     // while the database connection was being established. The probe
     // queues `spawn_blocking` work on the shared pool; a revoked row must
-    // not add to that backlog (2026-09-14 review finding).
+    // not add to that backlog.
     if !liveness.is_live() {
         return ResolvedArtKind::NoArtwork;
     }
@@ -316,7 +310,7 @@ async fn resolve_builtin_local_art(
 /// and `tokio::task::spawn_blocking`. The pane fetch is driven on the GTK
 /// main context, which has no entered runtime (`src/main.rs` parks the
 /// runtime on a background thread), so polling those APIs there panics and
-/// the row silently never loads local artwork (2026-09-13 review finding).
+/// the row silently never loads local artwork.
 /// The resolution therefore runs on the runtime handle the window attaches
 /// at construction, and its result is delivered back to the pane's async
 /// task — mirroring the playback resolver's `rt_handle.spawn` hand-off.
@@ -330,7 +324,7 @@ async fn resolve_builtin_local_art_on_runtime(
     // Bound admission: a row whose fetch was already revoked (rebind,
     // unbind, teardown, factory swap) never schedules resolution work at
     // all, so rapid scrolling cannot pile up authority probes for rows
-    // that can no longer paint (2026-09-14 review finding).
+    // that can no longer paint.
     if !liveness.is_live() {
         return ResolvedArtKind::NoArtwork;
     }
@@ -369,7 +363,7 @@ async fn resolve_builtin_local_art_on_runtime(
 /// running cannot unwind that OS thread, but aborting the task stops the
 /// async work that would otherwise queue behind it, and the pre-probe
 /// liveness re-check in [`resolve_builtin_local_art`] avoids starting the
-/// probe at all once the row is gone (2026-09-14 review finding).
+/// probe at all once the row is gone.
 async fn run_until_revoked<T>(
     handle: &tokio::runtime::Handle,
     liveness: &album_art::ScopedArtFetch,
@@ -407,7 +401,7 @@ enum RuntimeResolution<T> {
 /// runtime on a background thread). Merely carrying a runtime handle does not
 /// enter it, so the work is spawned onto the handle. A revoked row aborts the
 /// pending task, and a missing runtime fails closed instead of polling those
-/// APIs from the main context (2026-09-17 review finding).
+/// APIs from the main context.
 async fn resolve_on_application_runtime<T>(
     rt_handle: Option<tokio::runtime::Handle>,
     liveness: &album_art::ScopedArtFetch,
@@ -419,7 +413,7 @@ where
     // Bound admission: a row whose fetch was already revoked (rebind,
     // unbind, teardown, factory swap) never schedules resolution work at
     // all, so rapid scrolling cannot pile up authority probes for rows
-    // that can no longer paint (2026-09-14 review finding).
+    // that can no longer paint.
     if !liveness.is_live() {
         return RuntimeResolution::Aborted;
     }
@@ -444,7 +438,7 @@ where
 /// the album pane resolves artwork for every bound row: an adapter whose
 /// resolution performs a blocking mounted probe (retained removable media)
 /// must draw on the pane-bounded speculative gate and must never delay a
-/// playback resolution (2026-09-14 review finding).
+/// playback resolution.
 ///
 /// Returns `None` when resolution should fall through to the remote
 /// artwork resolver: the authority reported the stream as remote, or the
@@ -508,7 +502,7 @@ async fn resolve_retained_file_art(
 /// request; an explicit `Ok(None)` (authoritative no-artwork) and an
 /// `Err` (refused/errored authority) both leave the placeholder. A
 /// registry-backed row never regains access through its stale snapshot
-/// URL (2026-09-12 review finding).
+/// URL.
 async fn resolve_remote_artwork(
     registry: &crate::source_registry::SourceRegistry,
     id: &SourceId,

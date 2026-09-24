@@ -27,18 +27,18 @@ const MAX_LOCAL_EMBEDDED_ART_BYTES: usize = 32 * 1024 * 1024;
 /// once. Beyond this bound a newly scheduled pane request is dropped at
 /// enqueue time (its reply closes; the row keeps its placeholder and
 /// re-requests on the next bind), so a pathological catalog cannot queue
-/// unbounded work behind the now-playing header (2026-09-10 review finding).
+/// unbounded work behind the now-playing header.
 const MAX_PENDING_PANE_ART_REQUESTS: usize = 32;
 /// How long a still-live pane fetch waits before re-attempting admission to
 /// a saturated pane lane. The lane's bound is unchanged — this only keeps a
 /// visible row from being permanently stranded when a transient backlog
-/// fills every slot (2026-09-13 review finding).
+/// fills every slot.
 const PANE_ADMISSION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 /// Fixed worker count for local embedded-art extraction. A virtualized pane
 /// can schedule one extraction per visible row per rebind; without a shared
-/// pool that is one OS thread per bind (2026-09-10 review finding). Two
-/// workers keep a slow local file from blocking the next row while still
-/// bounding total extraction concurrency.
+/// pool that is one OS thread per bind. Two workers keep a slow local file
+/// from blocking the next row while still bounding total extraction
+/// concurrency.
 const MAX_LOCAL_ART_WORKERS: usize = 2;
 /// Local extraction jobs may sit in the pool queue before new jobs are
 /// refused. This bounds pending work independently of the worker count.
@@ -84,7 +84,7 @@ pub fn invalidate() {
 ///   NOT share the header's counter: every visible row minting from
 ///   [`ART_GENERATION`] would invalidate the previous row's in-flight
 ///   fetch (and the header's), so concurrent thumbnails cancelled one
-///   another and most rows never resolved (2026-09-08 PR #171 review).
+///   another and most rows never resolved.
 ///   A scoped request instead carries a private [`ScopedArtFetch`] token
 ///   that the owning widget revokes on rebind, unbind, teardown, and
 ///   factory swaps.
@@ -205,7 +205,7 @@ impl ArtSource {
 /// The now-playing header and the browser album pane used to share ONE
 /// serial worker: a pane thumbnail stuck on a slow (10-second-timeout)
 /// response delayed every header fetch behind it, so track changes showed
-/// stale artwork for the whole pane backlog (2026-09-10 review finding).
+/// stale artwork for the whole pane backlog.
 /// Each lane now has its own dedicated worker thread:
 ///
 /// * `header_tx` — unbounded; header volume is one request per track
@@ -430,7 +430,7 @@ pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
 /// extraction opens the exact `file://` target behind the supplied
 /// per-request token. Rows that carry a source identity never take this
 /// path — [`update_resolved_file_album_art_scoped`] is their only local
-/// entry point (2026-09-10 review finding).
+/// entry point.
 pub fn update_direct_file_album_art_scoped(
     image: &gtk::Image,
     uri: &str,
@@ -455,8 +455,7 @@ pub fn update_direct_file_album_art_scoped(
 ///
 /// This is the pane's ONLY local-file entry point: the extraction consumes
 /// an exact retained capability and never reopens a database or URI
-/// pathname (2026-09-10 review finding — the former raw-`file://` path
-/// bypassed retained removable-media authority).
+/// pathname, so it cannot bypass retained removable-media authority.
 pub fn update_resolved_file_album_art_scoped(
     image: &gtk::Image,
     media: crate::local::resolver::ResolvedLocalMedia,
@@ -544,8 +543,7 @@ struct LocalArtJob {
 /// queue: a fast scroll can enqueue dozens of slow pane extractions, and
 /// a shared two-worker/64-job pool then either delays the header's one
 /// request behind every pane parser or drops it outright when the pane
-/// lane is saturated (2026-09-12 review finding). Each side therefore
-/// gets its own lane:
+/// lane is saturated. Each side therefore gets its own lane:
 ///
 /// * `header_tx` — unbounded, served by one dedicated worker. Header
 ///   volume is one request per track change, so the queue cannot grow
@@ -676,8 +674,7 @@ where
 }
 
 /// Submit one SCOPED local extraction job, RETAINING it while the bounded pane
-/// lane is saturated so a still-visible row is not silently dropped
-/// (2026-09-13 review finding).
+/// lane is saturated so a still-visible row is not silently dropped.
 ///
 /// The remote pane lane already retries admission (`admit_pane_art_request`),
 /// but the local lane kept the old drop-on-`Full` behaviour:
@@ -1286,8 +1283,8 @@ fn paint_remote_album_art_reply(
 /// the header's request is served by its dedicated worker, while the pane's
 /// request lands in a bounded queue — a full pane queue refuses the request
 /// at enqueue time, which closes the returned receiver instead of growing
-/// pending work without bound (2026-09-10 review finding). Callers that must
-/// not lose a still-visible row retry through [`admit_pane_art_request`].
+/// pending work without bound. Callers that must not lose a still-visible row
+/// retry through [`admit_pane_art_request`].
 fn enqueue_art_request(
     source: ArtSource,
     liveness: RequestLiveness,
@@ -1863,7 +1860,7 @@ mod tests {
     /// with every pane slot blocked or queued, a fresh header request is
     /// still served promptly. On the former single serial worker the
     /// header queued behind the blocked pane fetch and starved for its
-    /// full duration (2026-09-10 review finding).
+    /// full duration.
     #[test]
     fn pane_lane_saturation_cannot_starve_the_header_lane() {
         let _guard = GENERATION_TEST_LOCK
@@ -1888,7 +1885,7 @@ mod tests {
     /// The pane lane is bounded: one more request than the bound allows
     /// must be refused at enqueue time — its receiver closes immediately
     /// (no bytes ever flow), so a pathological catalog cannot grow the
-    /// pending backlog without limit (2026-09-10 review finding).
+    /// pending backlog without limit.
     #[test]
     fn saturated_pane_lane_drops_new_requests_without_network() {
         let _guard = GENERATION_TEST_LOCK
@@ -1918,8 +1915,8 @@ mod tests {
     /// and re-attempts admission until capacity returns, then receives its
     /// artwork. A regression back to a single non-retrying submission would
     /// observe the saturated lane, close the reply immediately, and fail the
-    /// reply assertion below — covering the 2026-09-13 review finding's
-    /// "prove the still-visible row eventually loads" end to end.
+    /// reply assertion below, so this proves end to end that the
+    /// still-visible row eventually loads.
     #[test]
     fn saturated_pane_lane_retries_until_the_still_visible_row_loads() {
         let _guard = GENERATION_TEST_LOCK
@@ -1966,7 +1963,7 @@ mod tests {
     /// extractions, a third blocking job must not start (the former
     /// design spawned one OS thread per bind, so it started immediately),
     /// a full pending queue must refuse further jobs, and a queued job
-    /// must run once a worker frees (2026-09-10 review finding).
+    /// must run once a worker frees.
     /// Enqueue one blocking extraction job that reports on `seen_tx` and
     /// then parks until `release_rx` receives, modelling a slow worker.
     /// Returns the job's reply receiver so the caller can assert the
@@ -2111,7 +2108,7 @@ mod tests {
     /// full pane backlog are blocked. Previously the shared
     /// two-worker/64-job pool let a saturated pane backlog delay the
     /// header behind every pane extraction or refuse it outright with
-    /// `try_send` (2026-09-12 review finding).
+    /// `try_send`.
     #[test]
     fn saturated_pane_lane_does_not_starve_the_header_lane() {
         let _guard = GENERATION_TEST_LOCK
@@ -2164,8 +2161,8 @@ mod tests {
     /// The pane's scoped retained-authority entry point must publish the
     /// ORIGINAL authorized file's artwork through the extraction pool: the
     /// media carries the retained capability, so a pathname replacement
-    /// cannot swap the artwork (2026-09-10 review finding — the raw
-    /// file:// path freshly opened whatever the pathname then pointed to).
+    /// cannot swap the artwork, unlike freshly opening the raw `file://`
+    /// path.
     ///
     /// Holds [`GENERATION_TEST_LOCK`] because the local pool is
     /// process-global and exactly saturated by
@@ -2471,9 +2468,8 @@ mod tests {
 
     /// The pure longest-side bound across every preference: a large decoded
     /// cover must be scaled down to the live 32/48/72 side, preserving
-    /// aspect ratio in both orientations, and never upscaled. This is the
-    /// integer half of the 2026-09-13 review finding (the icon pixel size
-    /// alone did not bound an arbitrary texture).
+    /// aspect ratio in both orientations, and never upscaled. The icon
+    /// pixel size alone does not bound an arbitrary texture.
     #[test]
     fn bounded_dimensions_cover_every_preference_and_aspect_ratio() {
         use crate::ui::preferences::AlbumArtSize;
@@ -2587,7 +2583,7 @@ mod tests {
     /// private glib main context: a still-visible row's job must be retained
     /// through saturation and run once capacity returns. A regression back
     /// to the drop-on-`Full` `try_send` would close the reply immediately and
-    /// fail the reply assertion below (2026-09-13 review finding).
+    /// fail the reply assertion below.
     #[test]
     fn saturated_local_lane_retries_until_the_still_visible_row_runs() {
         let _guard = GENERATION_TEST_LOCK

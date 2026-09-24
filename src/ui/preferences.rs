@@ -1505,12 +1505,6 @@ pub fn update_browser_visibility(browser_box: &gtk::Box, views: &BrowserViewsCon
 
 /// Walk the panes_box toggling pane visibility from the config flags, and
 /// settle each gutter once a pane survives on both sides of it.
-///
-/// Split from [`update_browser_visibility`] so each function stays well
-/// under Codacy's cyclomatic complexity threshold: the separator-aware
-/// traversal was Codacy's one new medium Complexity issue on PR #179, and
-/// collapsing the pane match to an array lookup alone did not clear it
-/// (Codacy counts closures and boolean operators as decision points).
 fn update_panes_box_visibility(panes_box: &gtk::Box, views: &BrowserViewsConfig) {
     let mut pane_idx = 0;
     // A gutter needs a visible pane on its left; the box edge is not one,
@@ -2550,12 +2544,11 @@ pub mod widget_tests {
         );
     }
 
-    /// The gutter contract around hidden panes, including the PR #179
-    /// review defect: a pane disabled between two enabled panes must
-    /// leave exactly one visible 1px gutter between the survivors (panes
-    /// spacing is 0 — the separator widget is the sole gutter), never
-    /// zero (survivors touching) and never two (a doubled gap). Leading
-    /// and trailing gutters must never dangle at a box edge.
+    /// The gutter contract around hidden panes: a pane disabled between
+    /// two enabled panes must leave exactly one visible 1px gutter between the
+    /// survivors (panes spacing is 0 — the separator widget is the sole
+    /// gutter), never zero (survivors touching) and never two (a doubled gap).
+    /// Leading and trailing gutters must never dangle at a box edge.
     pub fn separator_gutters_join_visible_panes_around_hidden_ones() {
         interior_hidden_pane_leaves_exactly_one_gutter();
         all_panes_visible_show_every_interior_gutter();

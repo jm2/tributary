@@ -423,8 +423,7 @@ impl AlbumArtController {
             .unwrap_or_default();
 
         // Snapshot the application runtime alongside the roots: the
-        // built-in local arm must run off the runtime-less GTK main context
-        // (2026-09-13 review finding).
+        // built-in local arm must run off the runtime-less GTK main context.
         let rt_handle = self.rt_handle.borrow().clone();
 
         let fetch = PaneFetch {

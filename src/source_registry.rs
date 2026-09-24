@@ -2793,7 +2793,7 @@ impl SourceRegistry {
     /// Playback callers use [`Self::resolve_stream`], which draws on the
     /// reserved playback capacity. The album pane calls this with
     /// [`StreamResolutionClass::Speculative`] so its mounted probes are
-    /// bounded and isolated from playback (2026-09-14 review finding).
+    /// bounded and isolated from playback.
     pub async fn resolve_stream_classified(
         &self,
         source_id: SourceId,
@@ -8926,8 +8926,7 @@ mod tests {
     /// for the exact live session epoch of a retained-file-capable adapter,
     /// and false for a superseded epoch, an absent source, or a retired
     /// session — so a pathless row never probes a mount it has no authority
-    /// to read and never mints a stream credential to infer the source kind
-    /// (2026-09-14 review finding).
+    /// to read and never mints a stream credential to infer the source kind.
     #[tokio::test]
     async fn retains_file_streams_is_true_only_for_the_exact_live_removable_session() {
         let registry = registry();

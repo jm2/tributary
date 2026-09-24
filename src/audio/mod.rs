@@ -1184,7 +1184,7 @@ mod tests {
         }
     }
 
-    // ── Cross-platform user-state isolation (tr-cy381) ──────────────
+    // ── Cross-platform user-state isolation ──────────────
 
     /// Child marker for [`production_state_resolution_ignores_an_external_user_state_file`].
     const USER_STATE_ISOLATION_CHILD: &str = "TRIBUTARY_USER_STATE_ISOLATION_CHILD";
@@ -1225,7 +1225,7 @@ mod tests {
             .expect("run isolated user-state child")
     }
 
-    /// Behavioral regression for tr-cy381: run the *production* user-state
+    /// Behavioral regression: run the *production* user-state
     /// resolution ([`volume_path`] + [`load_saved_volume`]) in a separate
     /// test process and prove it reads the sandbox, not an external
     /// user-state file seeded behind `HOME`/`XDG_*`.

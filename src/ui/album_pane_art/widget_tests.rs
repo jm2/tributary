@@ -9,8 +9,7 @@ use super::*;
 /// accessible name on the `GtkListItem` — the list-row boundary —
 /// and keep the thumbnail and text label presentational so the row
 /// is announced as one utterance rather than duplicate child
-/// announcements (2026-09-12 review finding, matching
-/// `bind_browser_row` / `unbind_browser_row`).
+/// announcements, matching `bind_browser_row` / `unbind_browser_row`.
 pub fn album_art_row_publishes_combined_accessible_name() {
     let cell = AlbumArtCell::new(FALLBACK_PLACEHOLDER_ICON);
     let list_item: gtk::ListItem = glib::Object::new();

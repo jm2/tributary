@@ -763,11 +763,11 @@ impl PendingHistoryCredit {
 /// [`CommandAdmissionOutcome::Overloaded`] retains the credit inside the
 /// session so a later qualifying sample re-earns it, and also stashes it in
 /// the session-level pending slot so the play survives the occurrence's
-/// retirement at a queue transition (PR #286 round-4 finding j9j83); the
-/// explicit shutdown [`CommandAdmissionOutcome::Closed`] drops the credit
-/// quietly because normal shutdown has already closed and drained the FIFO —
-/// the pending command would never be serviced, so a shutdown drop is not an
-/// overload drop and must not be surfaced as one.
+/// retirement at a queue transition; the explicit shutdown
+/// [`CommandAdmissionOutcome::Closed`] drops the credit quietly because normal
+/// shutdown has already closed and drained the FIFO — the pending command
+/// would never be serviced, so a shutdown drop is not an overload drop and
+/// must not be surfaced as one.
 ///
 /// Every invocation first retries a pending credit whose occurrence a queue
 /// transition has since retired: that credit has no retained snapshot left to
@@ -826,8 +826,7 @@ pub(super) fn admit_history_credit(
             // never-evict-an-orphan invariant keeps the orphan and skips
             // this stash. That is not a loss — `retain_history_credit`
             // above restored the snapshot, so a later qualifying sample
-            // re-earns this credit through the normal path (PR #286
-            // round-4 finding A2).
+            // re-earns this credit through the normal path.
             session
                 .borrow_mut()
                 .stash_pending_history_credit(credit, counted_at_ms);
@@ -967,22 +966,21 @@ pub struct PlaybackSession {
     /// (which re-earns through a later qualifying sample), this slot survives
     /// the occurrence's retirement at a queue transition — without it, a
     /// play qualified at terminal EOS and refused during overload would be
-    /// lost forever once `clear` or the next track replaced the occurrence
-    /// (PR #286 round-4 finding j9j83).
+    /// lost forever once `clear` or the next track replaced the occurrence.
     ///
-    /// Eviction invariant (PR #286 round-4 finding A2): the slot holds at
-    /// most one credit, and [`Self::stash_pending_history_credit`] NEVER
-    /// evicts an orphaned incumbent — one whose play the live occurrence no
-    /// longer owns, so the orphan retry at every admission attempt is its
-    /// only remaining delivery path. When an orphan occupies the slot, a
-    /// second overload in the same admission defers its own stash instead;
-    /// that incoming credit is occurrence-backed (its snapshot was just
-    /// retained), so a later qualifying sample re-earns it through the
-    /// normal path. Only a live-owned incumbent may be replaced: its
-    /// retained snapshot re-earns the play, so a fresher refusal takes the
-    /// slot without loss. The slot is emptied only by a successful delivery
-    /// of the same play, the explicit shutdown drop, or such a replacement
-    /// of a live-owned incumbent — never by occurrence retirement.
+    /// Eviction invariant: the slot holds at most one credit, and
+    /// [`Self::stash_pending_history_credit`] NEVER evicts an orphaned
+    /// incumbent — one whose play the live occurrence no longer owns, so the
+    /// orphan retry at every admission attempt is its only remaining delivery
+    /// path. When an orphan occupies the slot, a second overload in the same
+    /// admission defers its own stash instead; that incoming credit is
+    /// occurrence-backed (its snapshot was just retained), so a later
+    /// qualifying sample re-earns it through the normal path. Only a
+    /// live-owned incumbent may be replaced: its retained snapshot re-earns
+    /// the play, so a fresher refusal takes the slot without loss. The slot is
+    /// emptied only by a successful delivery of the same play, the explicit
+    /// shutdown drop, or such a replacement of a live-owned incumbent — never
+    /// by occurrence retirement.
     pending_history_credit: Option<(PendingHistoryCredit, i64)>,
     /// Frozen candidate shared by accepted retries of the current genuine
     /// queue occurrence. Queue navigation and Repeat One replace it even when
@@ -1098,9 +1096,9 @@ impl PlaybackSession {
         self.resolution_failed = false;
         // `pending_history_credit` deliberately survives this retirement: a
         // terminal-EOS play refused during overload has no occurrence left to
-        // re-earn through, so the stash is the credit's only path to the FIFO
-        // (PR #286 round-4 finding j9j83). It is drained by the next
-        // admission attempt or emptied by an explicit shutdown drop.
+        // re-earn through, so the stash is the credit's only path to the FIFO.
+        // It is drained by the next admission attempt or emptied by an
+        // explicit shutdown drop.
         self.history_occurrence = None;
         self.lastfm_occurrence_candidate = None;
         self.mark_current_user_chosen();
@@ -1420,15 +1418,15 @@ impl PlaybackSession {
     /// Carry a refused credit across a whole-session queue replacement.
     ///
     /// Replacing the session retires the previous occurrence, so a pending
-    /// credit the dropped session still held would die with it (PR #286
-    /// round-4 finding A1). Installing it into the replacement orphans it
-    /// by construction — the replacement's fresh occurrence cannot own the
-    /// previous play — and [`Self::take_orphaned_pending_history_credit`]
-    /// then rides its delivery on the next admission attempt. The
-    /// replacement's slot is always empty here (`play_track_at` installs
-    /// into a fresh `Default` session that no admission attempt has filled
-    /// yet — history events only arrive from the output after the start
-    /// attempt), so the transfer can never evict an undelivered orphan.
+    /// credit the dropped session still held would die with it. Installing
+    /// it into the replacement orphans it by construction — the replacement's
+    /// fresh occurrence cannot own the previous play — and
+    /// [`Self::take_orphaned_pending_history_credit`] then rides its delivery
+    /// on the next admission attempt. The replacement's slot is always empty
+    /// here (`play_track_at` installs into a fresh `Default` session that no
+    /// admission attempt has filled yet — history events only arrive from the
+    /// output after the start attempt), so the transfer can never evict an
+    /// undelivered orphan.
     fn inherit_pending_history_credit(&mut self, pending: Option<(PendingHistoryCredit, i64)>) {
         debug_assert!(self.pending_history_credit.is_none());
         self.pending_history_credit = pending;
@@ -2455,8 +2453,8 @@ pub fn play_track_at(position: u32, ctx: &PlaybackContext) -> bool {
         return false;
     }
 
-    // PR #286 round-4 finding A1: the queue replacement has retired the
-    // previous occurrence, and the two paths below that drop `previous`
+    // The queue replacement has retired the previous occurrence, and the
+    // two paths below that drop `previous`
     // (successful start; explicit abandonment after a failed output load)
     // would otherwise kill any pending credit with the dropped session,
     // permanently omitting that play from history. Each of those paths
@@ -6596,12 +6594,12 @@ mod tests {
         );
     }
 
-    /// Round-3 regression: the one-shot history latch must not be consumed by
-    /// an event the bounded command FIFO refuses. A qualifying position
-    /// sample that arrives during overload retains its credit — a later
-    /// qualifying sample re-earns it, and once the FIFO drains the durable
-    /// command lands. Under the previous latch-on-observe behavior the play
-    /// was lost forever the moment the FIFO was full.
+    /// Regression: the one-shot history latch must not be consumed by an
+    /// event the bounded command FIFO refuses. A qualifying position sample
+    /// that arrives during overload retains its credit — a later qualifying
+    /// sample re-earns it, and once the FIFO drains the durable command
+    /// lands. Latching on observation would lose the play the moment the
+    /// FIFO was full.
     #[test]
     fn history_credit_survives_fifo_overload_and_lands_after_drain() {
         let (admission, receiver) = LibraryCommandAdmission::channel();
@@ -6717,14 +6715,13 @@ mod tests {
         );
     }
 
-    /// Round-4 regression (PR #286 finding j9j83): a play that qualifies at
-    /// terminal EOS and is refused by the saturated FIFO must survive the
-    /// terminal transition. The refusal retains the snapshot into the live
-    /// occurrence — but the window's `TrackEnded` branch then retires that
-    /// occurrence (`clear`), so no later sample can re-earn through it and
-    /// the play was lost forever. The session-level pending slot now carries
-    /// the credit across the retirement, and the next admission attempt
-    /// delivers it under its original timestamp.
+    /// Regression: a play that qualifies at terminal EOS and is refused by
+    /// the saturated FIFO must survive the terminal transition. The refusal
+    /// retains the snapshot into the live occurrence — but the window's
+    /// `TrackEnded` branch then retires that occurrence (`clear`), so no
+    /// later sample can re-earn through it. The session-level pending slot
+    /// carries the credit across the retirement, and the next admission
+    /// attempt delivers it under its original timestamp.
     #[test]
     fn terminal_eos_overload_credit_survives_occurrence_retirement_and_lands_after_drain() {
         let (admission, receiver) = LibraryCommandAdmission::channel();
@@ -6769,7 +6766,7 @@ mod tests {
         );
 
         // The terminal transition retires the occurrence — the exact state
-        // in which the pre-round-4 behavior dropped the play permanently.
+        // in which only the pending slot still holds the play.
         session.borrow_mut().clear();
         assert!(
             session.borrow().history_occurrence.is_none(),
@@ -6803,11 +6800,10 @@ mod tests {
         );
     }
 
-    /// Round-4 regression (PR #286 finding j9j83): the window retries a
-    /// pending credit immediately BEFORE the `TrackEnded` transition, so a
-    /// terminal-EOS play commits as soon as the FIFO has room at transition
-    /// time instead of waiting for admission attempts that may never come
-    /// after a terminal clear.
+    /// Regression: the window retries a pending credit immediately BEFORE the
+    /// `TrackEnded` transition, so a terminal-EOS play commits as soon as the
+    /// FIFO has room at transition time instead of waiting for admission
+    /// attempts that may never come after a terminal clear.
     #[test]
     fn pre_transition_retry_lands_the_terminal_credit_once_the_fifo_has_room() {
         let (admission, receiver) = LibraryCommandAdmission::channel();
@@ -6888,11 +6884,10 @@ mod tests {
         );
     }
 
-    /// Round-4 regression (PR #286 finding j9j83): while the stashed play's
-    /// occurrence is still live, a successful re-earn admission must clear
-    /// the stash — the retained snapshot and the stash describe the SAME
-    /// play, so leaving the stash behind would double-send it on a later
-    /// admission attempt.
+    /// Regression: while the stashed play's occurrence is still live, a
+    /// successful re-earn admission must clear the stash — the retained
+    /// snapshot and the stash describe the SAME play, so leaving the stash
+    /// behind would double-send it on a later admission attempt.
     #[test]
     fn accepted_re_earn_clears_the_stash_without_double_sending() {
         let (admission, receiver) = LibraryCommandAdmission::channel();
@@ -6947,14 +6942,12 @@ mod tests {
         );
     }
 
-    /// Round-4 rework regression (PR #286 finding A2): an orphaned credit
-    /// re-stashed after an overloaded retry must NOT be evicted when the
-    /// SAME admission attempt also overloads for the next track. The stash
-    /// used to replace any incumbent, so the second refusal evicted the
-    /// orphan — which has no retained snapshot left and therefore no
-    /// re-earn path — permanently dropping that play. The
-    /// never-evict-an-orphan invariant now defers the incoming stash
-    /// instead; the deferred credit is occurrence-backed and re-earns
+    /// Regression: an orphaned credit re-stashed after an overloaded retry
+    /// must NOT be evicted when the SAME admission attempt also overloads
+    /// for the next track. Evicting the orphan — which has no retained
+    /// snapshot left and therefore no re-earn path — would permanently drop
+    /// that play. The never-evict-an-orphan invariant defers the incoming
+    /// stash instead; the deferred credit is occurrence-backed and re-earns
     /// through a later qualifying sample, so neither play is lost.
     #[test]
     fn orphan_credit_survives_a_second_overload_in_the_same_admission() {
@@ -7087,10 +7080,9 @@ mod tests {
         assert!(session.borrow().pending_history_credit.is_none());
     }
 
-    /// Round-4 rework regression (PR #286 finding A2, single-occupant
-    /// behavior preserved): once the orphan's retry is ACCEPTED the slot is
-    /// empty again, so the next track's overload stashes normally — exactly
-    /// the pre-rework single-credit behavior.
+    /// Once the orphan's retry is ACCEPTED the slot is empty again, so the
+    /// next track's overload stashes normally, as a single-credit slot
+    /// should.
     #[test]
     fn accepted_orphan_retry_lets_the_next_overload_stash_normally() {
         let (admission, receiver) = LibraryCommandAdmission::channel();
@@ -7193,14 +7185,13 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
-    /// Round-4 rework regression (PR #286 finding A1): a whole-session
-    /// queue replacement used to drop `previous` — and with it any pending
-    /// credit — on every path past the queue swap, so activating a row (or
-    /// play-or-start from idle) while the FIFO was full permanently
-    /// omitted the earlier play. `play_track_at` now transfers the credit
-    /// into the replacement with `inherit_pending_history_credit` on every
-    /// path that drops `previous` (successful start, external abandonment);
-    /// orphaned by construction there, it rides the normal
+    /// Regression: a whole-session queue replacement must not drop the
+    /// pending credit held by `previous` on any path past the queue swap,
+    /// or activating a row (or play-or-start from idle) while the FIFO is
+    /// full permanently omits the earlier play. `play_track_at` transfers
+    /// the credit into the replacement with `inherit_pending_history_credit`
+    /// on every path that drops `previous` (successful start, external
+    /// abandonment); orphaned by construction there, it rides the normal
     /// orphan-retry delivery once the FIFO drains. Both entry points that
     /// reach the transfer (`column_view.connect_activate` and
     /// `play_or_start`'s `StartAt` arm) share this exact statement
@@ -7306,8 +7297,7 @@ mod tests {
         );
     }
 
-    /// Round-4 rework regression (PR #286 finding A1, behavior unchanged):
-    /// a replacement with NO pending credit installs `None` and delivers
+    /// A replacement with NO pending credit installs `None` and delivers
     /// nothing — the transfer must not conjure a phantom play.
     #[test]
     fn session_replacement_without_pending_credit_delivers_nothing() {
