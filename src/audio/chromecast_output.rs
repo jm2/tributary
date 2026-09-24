@@ -2943,6 +2943,11 @@ mod tests {
 
     const TEST_CAST_NAMESPACE: &str = "urn:x-cast:tributary.test";
 
+    /// Bound for a wait that must succeed. It elapses only when the test is
+    /// already failing, so it is generous: a loaded machine must not turn a
+    /// slow worker thread into a false failure.
+    const EXPECTED_WITHIN: Duration = Duration::from_secs(30);
+
     /// Default descriptor for worker tests that do not assert media metadata:
     /// a plain buffered MP3-shaped URL load.
     fn test_load_media() -> CastLoadMedia {
@@ -3308,7 +3313,7 @@ mod tests {
                     .send(())
                     .map_err(|_| CastFailure::new("test gate entry"))?;
                 gate.release
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(EXPECTED_WITHIN)
                     .map_err(|_| CastFailure::new("test gate release"))?;
             }
             if self.poison_at.lock().expect("poison lock").as_ref() == Some(&point) {
@@ -3568,7 +3573,7 @@ mod tests {
             let (done_tx, done_rx) = mpsc::channel();
             self.send(owner, CommandKind::Fence(done_tx));
             done_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EXPECTED_WITHIN)
                 .expect("worker reached fence");
         }
 
@@ -3613,7 +3618,7 @@ mod tests {
                     accepted_tx.send(()).expect("report accepted Cast client");
                 }
                 assert_eq!(streams.len(), expected_connections);
-                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                let _ = release_rx.recv_timeout(EXPECTED_WITHIN);
             });
             Self {
                 address,
@@ -3625,7 +3630,7 @@ mod tests {
 
         fn wait_for_connection(&self) {
             self.accepted
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EXPECTED_WITHIN)
                 .expect("silent Cast connection accepted");
         }
 
@@ -3811,7 +3816,7 @@ mod tests {
             },
         );
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("first connect entered");
         let second = harness.next_owner(2);
         harness.send(
@@ -3868,9 +3873,7 @@ mod tests {
                 volume: 0.5,
             },
         );
-        entered
-            .recv_timeout(Duration::from_secs(2))
-            .expect("load entered");
+        entered.recv_timeout(EXPECTED_WITHIN).expect("load entered");
         let stop = harness.next_owner(2);
         harness.send(stop, CommandKind::Stop);
         release.send(()).expect("release load");
@@ -3906,7 +3909,7 @@ mod tests {
             },
         );
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("app connection entered");
         let stop = harness.next_owner(2);
         harness.send(stop, CommandKind::Stop);
@@ -3954,9 +3957,7 @@ mod tests {
         let (entered, release) = shared.install_gate(Point::Stop);
         let stop = harness.next_owner(2);
         harness.send(stop, CommandKind::Stop);
-        entered
-            .recv_timeout(Duration::from_secs(2))
-            .expect("stop entered");
+        entered.recv_timeout(EXPECTED_WITHIN).expect("stop entered");
         let next = harness.next_owner(3);
         harness.send(
             next,
@@ -4013,7 +4014,7 @@ mod tests {
         let (entered, release) = shared.install_gate(Point::Pause);
         harness.send(owner, CommandKind::Pause);
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("pause entered");
         harness.send(owner, CommandKind::Seek(7_000));
         harness.send(owner, CommandKind::Volume(0.25));
@@ -4214,7 +4215,7 @@ mod tests {
 
         harness.send(first, CommandKind::Pause);
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("pause entered");
         let stop = harness.next_owner(2);
         harness.send(stop, CommandKind::Stop);
@@ -4387,10 +4388,10 @@ mod tests {
         let stop = harness.next_owner(2);
         harness.send(stop, CommandKind::Stop);
         app_stop_entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("first app stop entered");
         app_stops
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("first app stop attempted");
 
         let (hold_entered_tx, hold_entered_rx) = mpsc::channel();
@@ -4404,7 +4405,7 @@ mod tests {
         );
         app_stop_release.send(()).expect("release first app stop");
         hold_entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("queued command entered");
         app_stops
             .try_recv()
@@ -4465,7 +4466,7 @@ mod tests {
         harness.send(stop, CommandKind::Stop);
         for _ in 0..MAX_CLEANUP_ATTEMPTS {
             app_stops
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EXPECTED_WITHIN)
                 .expect("bounded app stop attempt");
         }
         harness.fence(stop);
@@ -4769,9 +4770,7 @@ mod tests {
                 volume: 0.5,
             },
         );
-        entered
-            .recv_timeout(Duration::from_secs(2))
-            .expect("load entered");
+        entered.recv_timeout(EXPECTED_WITHIN).expect("load entered");
         harness.send(owner, CommandKind::Pause);
         harness.send(owner, CommandKind::Seek(7_000));
         release.send(()).expect("release load");
@@ -4842,7 +4841,7 @@ mod tests {
             WorkerEnqueueOutcome::Enqueued
         );
         done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("worker reached fence");
 
         let rendered = std::iter::from_fn(|| events.try_recv().ok())
@@ -4940,7 +4939,7 @@ mod tests {
         let (entered, release) = shared.install_gate(Point::Status);
         harness.send(first, CommandKind::PollNow);
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("status entered");
         let second = harness.next_owner(2);
         harness.send(
@@ -5211,7 +5210,7 @@ mod tests {
         assert_eq!(output.position_ms(), None);
 
         assert!(output.load_uri("https://radio.test/stream.mp3"));
-        assert!(wait_for(2, || output.position_ms() == Some(5_000)));
+        assert!(wait_for(|| output.position_ms() == Some(5_000)));
 
         output.stop();
         assert_eq!(output.position_ms(), None);
@@ -5295,7 +5294,7 @@ mod tests {
                 },
             );
             load_recorded
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(EXPECTED_WITHIN)
                 .expect("worker recorded the outbound load");
 
             let loads = shared.loads();
@@ -5326,7 +5325,7 @@ mod tests {
             },
         );
         load_recorded
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("worker recorded the outbound load");
 
         let loads = shared.loads();
@@ -5351,7 +5350,7 @@ mod tests {
             },
         );
         load_recorded
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("worker recorded the first outbound load");
         harness.send(
             harness.next_owner(2),
@@ -5362,7 +5361,7 @@ mod tests {
             },
         );
         load_recorded
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("worker recorded the second outbound load");
 
         let loads = shared.loads();
@@ -5559,8 +5558,8 @@ mod tests {
     /// Poll `cond` on a quiet loop until it holds or the timeout expires.
     /// Production code paths here run on their own worker thread, so the
     /// test thread can only observe their progress by polling shared state.
-    fn wait_for(timeout_secs: u64, mut cond: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + EXPECTED_WITHIN;
         loop {
             if cond() {
                 return true;
@@ -5634,14 +5633,14 @@ mod tests {
         // receiver operation rather than a session-less no-op.
         output.load_uri("https://music.test/track.flac");
         assert!(
-            wait_for(2, || shared
+            wait_for(|| shared
                 .actions()
                 .iter()
                 .any(|action| matches!(action, Action::Point(Point::Load)))),
             "worker completed the load"
         );
         assert!(
-            wait_for(2, || output.state() == PlayerState::Playing),
+            wait_for(|| output.state() == PlayerState::Playing),
             "load settled into Playing"
         );
         let state_before_saturation = output.state();
@@ -5650,7 +5649,7 @@ mod tests {
         let (entered, release) = shared.install_gate(Point::Pause);
         output.pause();
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("worker entered the held pause");
 
         // Flood the ordinary admission line exactly: capacity minus the two
@@ -5705,7 +5704,7 @@ mod tests {
         let admitted_pauses = MAX_PENDING_WORKER_COMMANDS + 1
             - reserved_final_intent_slots(MAX_PENDING_WORKER_COMMANDS);
         assert!(
-            wait_for(2, || {
+            wait_for(|| {
                 let actions = shared.actions();
                 actions
                     .iter()
@@ -5741,7 +5740,7 @@ mod tests {
         );
         output.seek_to(7_777);
         assert!(
-            wait_for(2, || {
+            wait_for(|| {
                 let actions = shared.actions();
                 actions
                     .iter()
@@ -5756,7 +5755,7 @@ mod tests {
         // Stop retains reserved admission and settles after saturation.
         output.stop();
         assert!(
-            wait_for(2, || shared
+            wait_for(|| shared
                 .actions()
                 .iter()
                 .any(|action| matches!(action, Action::Stop(_)))),
@@ -5780,14 +5779,14 @@ mod tests {
 
         output.load_uri("https://music.test/track.flac");
         assert!(
-            wait_for(2, || shared
+            wait_for(|| shared
                 .actions()
                 .iter()
                 .any(|action| matches!(action, Action::Point(Point::Load)))),
             "worker completed the load"
         );
         assert!(
-            wait_for(2, || output.state() == PlayerState::Playing),
+            wait_for(|| output.state() == PlayerState::Playing),
             "load settled into Playing"
         );
         let stable_state = output.state();
@@ -5795,7 +5794,7 @@ mod tests {
         let (entered, release) = shared.install_gate(Point::Pause);
         output.pause();
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("worker entered the held pause");
 
         // Fill the ordinary admission line exactly, then occupy the reserved
@@ -5843,7 +5842,7 @@ mod tests {
         // pauses.
         release.send(()).expect("release the held pause");
         assert!(
-            wait_for(2, || {
+            wait_for(|| {
                 output.worker_tx.pending_len() == 0
                     && shared
                         .actions()
@@ -5887,7 +5886,7 @@ mod tests {
             "post-overload volume must be admitted and cached"
         );
         assert!(
-            wait_for(2, || {
+            wait_for(|| {
                 shared
                 .actions()
                 .iter()
@@ -5915,25 +5914,19 @@ mod tests {
         assert_eq!(tx.pending_len(), 4);
 
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("first seek")
-                .kind,
+            rx.recv_timeout(EXPECTED_WITHIN).expect("first seek").kind,
             CommandKind::Seek(1_000)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("second seek")
-                .kind,
+            rx.recv_timeout(EXPECTED_WITHIN).expect("second seek").kind,
             CommandKind::Seek(2_000)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("volume")
-                .kind,
+            rx.recv_timeout(EXPECTED_WITHIN).expect("volume").kind,
             CommandKind::Volume(0.25)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).expect("pause").kind,
+            rx.recv_timeout(EXPECTED_WITHIN).expect("pause").kind,
             CommandKind::Pause
         ));
     }
@@ -5972,31 +5965,29 @@ mod tests {
         // fill reaches full capacity and the trailing seek forces the
         // adjacent runs to coalesce.
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("pause barrier")
                 .kind,
             CommandKind::Pause
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
-                .expect("play barrier")
-                .kind,
+            rx.recv_timeout(EXPECTED_WITHIN).expect("play barrier").kind,
             CommandKind::Play
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("coalesced seek run")
                 .kind,
             CommandKind::Seek(2_000)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("coalesced volume run")
                 .kind,
             CommandKind::Volume(0.90)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("newest trailing seek")
                 .kind,
             CommandKind::Seek(3_000)
@@ -6031,25 +6022,25 @@ mod tests {
         // compaction to relieve, so the incoming seek can only be admitted by
         // superseding the older same-kind instance ahead of it.
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("pause retained")
                 .kind,
             CommandKind::Pause
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("volume retained")
                 .kind,
             CommandKind::Volume(0.10)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("superseded seek run keeps its newest member")
                 .kind,
             CommandKind::Seek(2_000)
         ));
         assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1))
+            rx.recv_timeout(EXPECTED_WITHIN)
                 .expect("latest seek retained")
                 .kind,
             CommandKind::Seek(3_000)
@@ -6327,7 +6318,7 @@ mod tests {
             WorkerEnqueueOutcome::Enqueued
         );
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("fake Cast transport held the first seek");
 
         // Fill the ordinary admission line exactly with non-transient Pause
@@ -6393,7 +6384,7 @@ mod tests {
         release.send(()).expect("release held seek");
         // Let the unbounded flood drain before fencing: a fence enqueued while
         // the queue is still full would itself be legitimately refused.
-        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        let drain_deadline = Instant::now() + EXPECTED_WITHIN;
         while harness.tx.pending_len() > 0 && Instant::now() < drain_deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -6465,9 +6456,7 @@ mod tests {
         );
         assert_eq!(tx.pending_len(), 1);
 
-        let command = rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("replacement stop");
+        let command = rx.recv_timeout(EXPECTED_WITHIN).expect("replacement stop");
         assert_eq!(command.owner.epoch, replacement.epoch);
         assert!(matches!(command.kind, CommandKind::Stop));
     }
@@ -6520,7 +6509,7 @@ mod tests {
             WorkerEnqueueOutcome::Enqueued
         );
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("fake Cast transport held the first seek");
         for position in 1..500_u64 {
             assert_eq!(
@@ -6564,7 +6553,7 @@ mod tests {
             WorkerEnqueueOutcome::Enqueued
         );
         entered
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(EXPECTED_WITHIN)
             .expect("fake Cast transport held the first volume");
         for _ in 0..500_u64 {
             assert_eq!(
