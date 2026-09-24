@@ -103,6 +103,9 @@ preferences:
   title: "Preferências"
   library_location: "Localização da biblioteca"
   select_music_folder: "Selecionar pasta de música"
+  downloads: "Downloads"
+  download_folder: "Pasta de downloads"
+  select_download_folder: "Selecionar pasta de downloads"
   library_restart_hint: "Reinicie o Tributary para aplicar as alterações nas pastas de música."
   reauthorize_folder: "Reautorizar…"
   select_reauthorization_folder: "Selecionar a mesma pasta da biblioteca"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Propriedades…"
+  download: "Baixar"
   add_to_playlist: "Adicionar à lista de reprodução"
   remove_from_playlist: "Remover da lista de reprodução"
   playlist_add_unsupported_heading: "As faixas não foram adicionadas"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "%{count} faixa adicionada a %{playlist}."
     other: "%{count} faixas adicionadas a %{playlist}."
+
+# ── Downloads ────────────────────────────────────────
+download:
+  progress: "Baixando %{done} de %{total}…"
+  finished: "Downloads concluídos. Baixadas: %{downloaded}, ignoradas: %{skipped}, com falha: %{failed}."
+  cancelled: "Downloads cancelados. Baixadas: %{downloaded}, ignoradas: %{skipped}, com falha: %{failed}."
 
 # ── Listas de reprodução comuns ─────────────────────────────────────
 regular_playlist:

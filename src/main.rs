@@ -70,6 +70,7 @@ mod db;
 mod desktop_integration;
 mod device;
 mod discovery;
+mod download;
 mod external_file;
 pub(crate) mod http_body;
 pub(crate) mod http_security;

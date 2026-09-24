@@ -8,6 +8,7 @@ pub mod browser;
 mod confirm_dialog;
 pub mod context_menu;
 pub mod discovery_handler;
+mod downloads;
 pub mod equalizer_panel;
 pub mod folder_browser;
 pub mod header_bar;

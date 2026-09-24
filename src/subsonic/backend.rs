@@ -486,6 +486,45 @@ impl SubsonicBackend {
         let cache = self.cache.try_read().ok()?;
         cache.attribution_profiles.get(track_id).cloned()
     }
+
+    /// The native song ID and validated representation of one accepted track.
+    async fn media_locator(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<(String, MediaRepresentation)> {
+        let cache = self.cache.read().await;
+        let song_id = cache
+            .stream_locator_by_track_id
+            .get(track_id)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound {
+                entity_type: "track".into(),
+                id: deterministic_uuid(track_id.as_str()),
+            })?;
+        // Authority: neither `stream.view` nor `download.view` is issued with
+        // transcoding parameters, so the source container from library
+        // metadata is the representation the server is asked to return. A
+        // suffix outside the allowlist resolves to the explicit unknown rather
+        // than a guess.
+        let representation = cache
+            .representation_by_track_id
+            .get(track_id)
+            .copied()
+            .unwrap_or_else(MediaRepresentation::buffered_unknown);
+        Ok((song_id, representation))
+    }
+
+    /// Resolve the original file of one accepted track for an offline
+    /// download. `download.view` never transcodes and is subject to the
+    /// server's download permission, unlike `stream.view`.
+    pub(crate) async fn resolve_download(
+        &self,
+        track_id: &TrackId,
+    ) -> BackendResult<ResolvedHttpRequest> {
+        let (song_id, representation) = self.media_locator(track_id).await?;
+        self.client
+            .resolved_download_request(&song_id, representation)
+    }
 }
 
 fn invalid_playlist_response(message: &'static str) -> BackendError {
@@ -511,25 +550,7 @@ impl crate::architecture::MediaBackend for SubsonicBackend {
 #[async_trait]
 impl RemoteMediaResolver for SubsonicBackend {
     async fn resolve_stream(&self, track_id: &TrackId) -> BackendResult<ResolvedHttpRequest> {
-        let cache = self.cache.read().await;
-        let song_id = cache
-            .stream_locator_by_track_id
-            .get(track_id)
-            .cloned()
-            .ok_or_else(|| BackendError::NotFound {
-                entity_type: "track".into(),
-                id: deterministic_uuid(track_id.as_str()),
-            })?;
-        // Authority: `stream.view` is issued without transcoding parameters, so
-        // the source container from library metadata is the representation the
-        // server is asked to return. A suffix outside the allowlist resolves to
-        // the explicit unknown rather than a guess.
-        let representation = cache
-            .representation_by_track_id
-            .get(track_id)
-            .copied()
-            .unwrap_or_else(MediaRepresentation::buffered_unknown);
-        drop(cache);
+        let (song_id, representation) = self.media_locator(track_id).await?;
         self.client
             .resolved_stream_request(&song_id, representation)
     }

@@ -103,6 +103,9 @@ preferences:
   title: "환경설정"
   library_location: "라이브러리 위치"
   select_music_folder: "음악 폴더 선택"
+  downloads: "다운로드"
+  download_folder: "다운로드 폴더"
+  select_download_folder: "다운로드 폴더 선택"
   library_restart_hint: "음악 폴더 변경 사항을 적용하려면 Tributary를 다시 시작하세요."
   reauthorize_folder: "다시 승인…"
   select_reauthorization_folder: "동일한 라이브러리 폴더 선택"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "속성…"
+  download: "다운로드"
   add_to_playlist: "재생목록에 추가"
   remove_from_playlist: "재생목록에서 제거"
   playlist_add_unsupported_heading: "트랙이 추가되지 않았습니다"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "%{playlist}에 %{count}개 트랙을 추가했습니다."
     other: "%{playlist}에 %{count}개 트랙을 추가했습니다."
+
+# ── 다운로드 ────────────────────────────────────────
+download:
+  progress: "%{total}곡 중 %{done}곡 다운로드 중…"
+  finished: "다운로드를 마쳤습니다. 다운로드됨: %{downloaded}, 건너뜀: %{skipped}, 실패: %{failed}."
+  cancelled: "다운로드를 취소했습니다. 다운로드됨: %{downloaded}, 건너뜀: %{skipped}, 실패: %{failed}."
 
 # ── 일반 재생목록 ───────────────────────────────────────────────
 regular_playlist:

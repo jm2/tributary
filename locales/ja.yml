@@ -103,6 +103,9 @@ preferences:
   title: "設定"
   library_location: "ライブラリの場所"
   select_music_folder: "音楽フォルダーを選択"
+  downloads: "ダウンロード"
+  download_folder: "ダウンロードフォルダー"
+  select_download_folder: "ダウンロードフォルダーを選択"
   library_restart_hint: "音楽フォルダーの変更を適用するには、Tributary を再起動してください。"
   reauthorize_folder: "再承認…"
   select_reauthorization_folder: "同じライブラリフォルダーを選択"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "プロパティ…"
+  download: "ダウンロード"
   add_to_playlist: "プレイリストに追加"
   remove_from_playlist: "プレイリストから削除"
   playlist_add_unsupported_heading: "曲は追加されませんでした"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "%{playlist} に %{count} 曲を追加しました。"
     other: "%{playlist} に %{count} 曲を追加しました。"
+
+# ── ダウンロード ────────────────────────────────────────
+download:
+  progress: "%{total} 曲中 %{done} 曲をダウンロード中…"
+  finished: "ダウンロードが完了しました。ダウンロード済み：%{downloaded}、スキップ：%{skipped}、失敗：%{failed}。"
+  cancelled: "ダウンロードをキャンセルしました。ダウンロード済み：%{downloaded}、スキップ：%{skipped}、失敗：%{failed}。"
 
 # ── 通常のプレイリスト ─────────────────────────────────────────
 regular_playlist:

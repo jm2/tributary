@@ -103,6 +103,9 @@ preferences:
   title: "Einstellungen"
   library_location: "Bibliotheksstandort"
   select_music_folder: "Musikordner auswählen"
+  downloads: "Downloads"
+  download_folder: "Download-Ordner"
+  select_download_folder: "Download-Ordner auswählen"
   library_restart_hint: "Starten Sie Tributary neu, um Änderungen an den Musikordnern zu übernehmen."
   reauthorize_folder: "Erneut autorisieren…"
   select_reauthorization_folder: "Denselben Musikbibliotheksordner auswählen"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Eigenschaften…"
+  download: "Herunterladen"
   add_to_playlist: "Zur Wiedergabeliste hinzufügen"
   remove_from_playlist: "Aus Wiedergabeliste entfernen"
   playlist_add_unsupported_heading: "Titel wurden nicht hinzugefügt"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "%{count} Titel zu %{playlist} hinzugefügt."
     other: "%{count} Titel zu %{playlist} hinzugefügt."
+
+# ── Downloads ────────────────────────────────────────
+download:
+  progress: "%{done} von %{total} werden heruntergeladen…"
+  finished: "Downloads abgeschlossen. Heruntergeladen: %{downloaded}, übersprungen: %{skipped}, fehlgeschlagen: %{failed}."
+  cancelled: "Downloads abgebrochen. Heruntergeladen: %{downloaded}, übersprungen: %{skipped}, fehlgeschlagen: %{failed}."
 
 # ── Reguläre Wiedergabelisten ─────────────────────────────────────
 regular_playlist:

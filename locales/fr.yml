@@ -103,6 +103,9 @@ preferences:
   title: "Préférences"
   library_location: "Emplacement de la bibliothèque"
   select_music_folder: "Sélectionner le dossier de musique"
+  downloads: "Téléchargements"
+  download_folder: "Dossier de téléchargement"
+  select_download_folder: "Sélectionner le dossier de téléchargement"
   library_restart_hint: "Redémarrez Tributary pour appliquer les modifications apportées aux dossiers de musique."
   reauthorize_folder: "Réautoriser…"
   select_reauthorization_folder: "Sélectionner le même dossier de bibliothèque"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Propriétés…"
+  download: "Télécharger"
   add_to_playlist: "Ajouter à la liste de lecture"
   remove_from_playlist: "Retirer de la liste de lecture"
   playlist_add_unsupported_heading: "Les pistes n’ont pas été ajoutées"
@@ -259,6 +263,12 @@ context:
   playlist_add_success:
     one: "%{count} piste ajoutée à %{playlist}."
     other: "%{count} pistes ajoutées à %{playlist}."
+
+# ── Téléchargements ────────────────────────────────────────
+download:
+  progress: "Téléchargement de %{done} sur %{total}…"
+  finished: "Téléchargements terminés. Téléchargés : %{downloaded}, ignorés : %{skipped}, échecs : %{failed}."
+  cancelled: "Téléchargements annulés. Téléchargés : %{downloaded}, ignorés : %{skipped}, échecs : %{failed}."
 
 # ── Listes de lecture normales ───────────────────────────────────────
 regular_playlist:
