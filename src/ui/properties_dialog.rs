@@ -500,12 +500,50 @@ fn show_save_failure_alert(
     conflicts: usize,
 ) {
     let copy = save_failure_copy(&rust_i18n::locale(), modified, failed, conflicts);
+    show_alert(parent, &copy.heading, &copy.body);
+}
+
+/// Present a one-button alert over `parent`.
+fn show_alert(parent: &adw::ApplicationWindow, heading: &str, body: &str) {
     let alert = adw::AlertDialog::builder()
-        .heading(&copy.heading)
-        .body(&copy.body)
+        .heading(heading)
+        .body(body)
         .build();
-    alert.add_response("ok", "OK");
+    alert.add_response("ok", &rust_i18n::t!("dialogs.ok"));
     alert.present(Some(parent));
+}
+
+/// The dialog title: the track's title, or the number of tracks.
+fn properties_heading(tracks: &[TrackInfo], locale: &str) -> String {
+    match tracks {
+        [track] => rust_i18n::t!(
+            "properties.heading_single",
+            locale = locale,
+            title = track.title
+        ),
+        _ => rust_i18n::t!(
+            "properties.heading_batch",
+            locale = locale,
+            count = tracks.len()
+        ),
+    }
+    .into_owned()
+}
+
+/// The label of an editable tag field, named as in [`TagEdits`].
+fn field_label(name: &str, locale: &str) -> String {
+    let key = match name {
+        "title" => "properties.field_title",
+        "artist" => "properties.field_artist",
+        "album" => "properties.field_album",
+        "genre" => "properties.field_genre",
+        "composer" => "properties.field_composer",
+        "year" => "properties.field_year",
+        "track_number" => "properties.field_track_number",
+        "disc_number" => "properties.field_disc_number",
+        _ => return name.to_owned(),
+    };
+    rust_i18n::t!(key, locale = locale).into_owned()
 }
 
 /// Show the properties dialog for one or more tracks.
@@ -538,21 +576,17 @@ pub fn show_properties_dialog(
             selection = tracks.len(),
             "properties dialog refused: selection still carries an unresolved pending identity (caller wiring fault)"
         );
-        let refusal = adw::AlertDialog::builder()
-            .heading("Cannot Edit These Files")
-            .body(TagEditingAvailability::Unavailable.message(automatic_device))
-            .build();
-        refusal.add_response("ok", "OK");
-        refusal.present(Some(parent));
+        show_alert(
+            parent,
+            &rust_i18n::t!("properties.refused_heading"),
+            &TagEditingAvailability::Unavailable.message(automatic_device),
+        );
         return;
     }
 
+    let locale = rust_i18n::locale().to_string();
     let is_batch = tracks.len() > 1;
-    let heading = if is_batch {
-        format!("Properties — {} tracks", tracks.len())
-    } else {
-        format!("Properties — {}", tracks[0].title)
-    };
+    let heading = properties_heading(tracks, &locale);
 
     let dialog = adw::Dialog::builder()
         .title(&heading)
@@ -626,11 +660,13 @@ pub fn show_properties_dialog(
 
     let mut entries: Vec<(&str, gtk::Entry)> = Vec::new();
     let mut mixed_edits: Vec<(String, Rc<Cell<bool>>)> = Vec::new();
-    let mut add_field = |name: &'static str, label: &str, getter: fn(&TrackInfo) -> &str| {
+    let mut add_field = |name: &'static str, getter: fn(&TrackInfo) -> &str| {
         let mixed = mixed_placeholder(getter);
-        let (row, entry) = make_entry(label, &field_value(getter), mixed);
+        let (row, entry) = make_entry(&field_label(name, &locale), &field_value(getter), mixed);
         if matches!(name, "year" | "track_number" | "disc_number") {
             entry.set_input_purpose(gtk::InputPurpose::Digits);
+            // A rejected number is highlighted until the user edits it.
+            entry.connect_changed(|entry| entry.remove_css_class("error"));
         }
         if mixed {
             mixed_edits.push((name.to_string(), track_mixed_edits(&entry)));
@@ -640,17 +676,17 @@ pub fn show_properties_dialog(
     };
 
     if !is_batch {
-        add_field("title", "Title", |t| &t.title);
+        add_field("title", |t| &t.title);
     }
-    add_field("artist", "Artist", |t| &t.artist);
-    add_field("album", "Album", |t| &t.album);
-    add_field("genre", "Genre", |t| &t.genre);
-    add_field("composer", "Composer", |t| &t.composer);
-    add_field("year", "Year", |t| &t.year);
+    add_field("artist", |t| &t.artist);
+    add_field("album", |t| &t.album);
+    add_field("genre", |t| &t.genre);
+    add_field("composer", |t| &t.composer);
+    add_field("year", |t| &t.year);
     if !is_batch {
-        add_field("track_number", "Track #", |t| &t.track_number);
+        add_field("track_number", |t| &t.track_number);
     }
-    add_field("disc_number", "Disc #", |t| &t.disc_number);
+    add_field("disc_number", |t| &t.disc_number);
 
     // ── Read-only info section (single track only) ───────────────────
     if !is_batch {
@@ -665,27 +701,29 @@ pub fn show_properties_dialog(
             .build();
 
         let t = &tracks[0];
-        add_info_row(&info_group, "Format", &t.format);
-        add_info_row(&info_group, "Bitrate", &t.bitrate);
-        add_info_row(&info_group, "Sample Rate", &t.sample_rate);
-        add_info_row(&info_group, "Duration", &t.duration);
+        for (key, value) in [
+            ("properties.field_format", &t.format),
+            ("properties.field_bitrate", &t.bitrate),
+            ("properties.field_sample_rate", &t.sample_rate),
+            ("properties.field_duration", &t.duration),
+        ] {
+            add_info_row(&info_group, &rust_i18n::t!(key, locale = &locale), value);
+        }
 
         // Show the native file path only for a local-library target. A
         // removable row shows its mount-relative identity — the one pathname
         // that may cross the source boundary; its native mount location
         // never enters the UI.
-        match save_targets.first() {
-            Some(SaveTarget::Local(local)) => {
-                add_info_row(&info_group, "File", &local.path().to_string_lossy());
-            }
+        let file = match save_targets.first() {
+            Some(SaveTarget::Local(local)) => Some(local.path().to_string_lossy()),
             Some(SaveTarget::Removable(authority)) => {
-                add_info_row(
-                    &info_group,
-                    "File",
-                    &authority.relative_path().to_string_lossy(),
-                );
+                Some(authority.relative_path().to_string_lossy())
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(file) = file {
+            let label = rust_i18n::t!("properties.field_file", locale = &locale);
+            add_info_row(&info_group, &label, &file);
         }
 
         form.append(&info_group);
@@ -823,10 +861,12 @@ pub fn show_properties_dialog(
         None
     };
 
-    let cancel_button = gtk::Button::builder().label("Cancel").build();
+    let cancel_button = gtk::Button::builder()
+        .label(rust_i18n::t!("dialogs.cancel", locale = &locale).as_ref())
+        .build();
 
     let save_button = gtk::Button::builder()
-        .label("Save")
+        .label(rust_i18n::t!("dialogs.save", locale = &locale).as_ref())
         .css_classes(["suggested-action"])
         .sensitive(false)
         .build();
@@ -927,13 +967,22 @@ pub fn show_properties_dialog(
         // Reject a malformed number here, while the user can still fix it and
         // before a single file is opened. Letting it through would rewrite
         // every selected file, discard the bad field, and report success.
-        if let Err(error) = edits.validate() {
-            let alert = adw::AlertDialog::builder()
-                .heading("Check the Highlighted Field")
-                .body(error.to_string())
-                .build();
-            alert.add_response("ok", "OK");
-            alert.present(Some(&parent_for_save));
+        if let Some(field) = edits.invalid_number_field() {
+            if let Some((_, entry)) = entries_for_save_state.iter().find(|(name, _)| name == field)
+            {
+                entry.add_css_class("error");
+                entry.grab_focus();
+            }
+            let locale = rust_i18n::locale().to_string();
+            show_alert(
+                &parent_for_save,
+                &rust_i18n::t!("properties.invalid_number_heading", locale = &locale),
+                &rust_i18n::t!(
+                    "properties.invalid_number_body",
+                    locale = &locale,
+                    field = field_label(field, &locale)
+                ),
+            );
             return;
         }
 
@@ -1632,6 +1681,30 @@ mod tests {
 
     fn local_track(path: PathBuf) -> TrackInfo {
         track(SaveTarget::Local(LocalMutationTarget::capture(&path)))
+    }
+
+    #[test]
+    fn heading_and_field_labels_follow_the_given_locale() {
+        let first = local_track(PathBuf::from("/music/a.flac"));
+        let second = local_track(PathBuf::from("/music/b.flac"));
+        assert_eq!(
+            properties_heading(std::slice::from_ref(&first), "de"),
+            "Eigenschaften — Title"
+        );
+        assert_eq!(
+            properties_heading(&[first, second], "de"),
+            "Eigenschaften — 2 Titel"
+        );
+        assert_eq!(field_label("composer", "de"), "Komponist");
+        assert_eq!(field_label("track_number", "de"), "Titelnummer");
+        assert_eq!(
+            rust_i18n::t!(
+                "properties.invalid_number_body",
+                locale = "de",
+                field = field_label("year", "de")
+            ),
+            "Jahr muss eine ganze Zahl sein."
+        );
     }
 
     #[test]

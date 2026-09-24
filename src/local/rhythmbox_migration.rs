@@ -68,12 +68,9 @@ impl RhythmboxRootRemap {
         Ok(Self { from, to })
     }
 
+    #[cfg(test)]
     pub fn from(&self) -> &Path {
         &self.from
-    }
-
-    pub fn to(&self) -> &Path {
-        &self.to
     }
 
     /// Apply only an exact component-prefix relocation. Paths outside the old
@@ -171,6 +168,7 @@ impl RhythmboxMigrationPolicy {
         self
     }
 
+    #[cfg(test)]
     pub fn root_remap(&self) -> Option<&RhythmboxRootRemap> {
         self.root_remap.as_ref()
     }

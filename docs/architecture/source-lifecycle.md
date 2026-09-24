@@ -313,7 +313,7 @@ The closed retained categories are authentication rejection, connection failure,
 response, unsupported authentication, unavailable/permission, and other backend failure, paired
 with the connect/refresh/disconnect operation that failed. Cancellation and supersession are state
 transitions, not failures. Backend-specific detail may be used transiently to choose a category but
-does not enter the registry event or error source chain.
+does not enter a registry snapshot or error source chain.
 
 ### Media locations are resolved at use
 
@@ -788,7 +788,7 @@ The identity and ownership invariants above are settled. The UUID namespace, can
 strings, relative-path encoding, and ID bounds are now implemented format state and require an
 explicit migration if changed. The saved-source envelope, legacy-array reader, and whole-file
 conflict quarantine are also implemented; they do not introduce a second saved-source database or
-persist credentials. Exact lifecycle trait names and event-channel shapes remain internal
+persist credentials. Exact lifecycle trait names and invalidation-channel shapes remain internal
 implementation details so long as one registry enforces this contract. A typed retained mutation
 authority for pathless removable Properties editing is deliberately deferred; the UI omits that
 action instead of reconstructing a path or weakening playback authority. Source-scoped regular-

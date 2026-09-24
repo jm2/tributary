@@ -89,6 +89,7 @@ pub(super) struct DaapCatalogueScope {
 }
 
 impl DaapCatalogueScope {
+    #[cfg(test)]
     pub(crate) const fn database_id(self) -> u32 {
         self.database_id
     }
@@ -125,6 +126,7 @@ impl DaapClient {
     /// # Arguments
     /// * `server_url` — Base URL (e.g. `http://192.168.1.50:3689`)
     /// * `password` — Optional share password (DAAP uses password-only auth)
+    #[cfg(test)]
     pub async fn login(server_url: &str, password: Option<&str>) -> BackendResult<Self> {
         Self::login_with_route(server_url, password, None).await
     }
@@ -382,50 +384,21 @@ impl DaapClient {
             .map_err(|error| daap_body_error("Failed to read items body", error))?;
 
         let nodes = dmap::parse_dmap(&bytes)?;
+        drop(bytes);
 
-        // Top-level is `adbs` (database songs response).
-        let adbs_children = unwrap_container(&nodes, b"adbs")?;
+        // Top-level is `adbs` (database songs response). Each level is moved
+        // out of its parent so the item listing is never copied.
+        let adbs_children = take_container(nodes, b"adbs")?;
         ensure_dmap_status(
-            adbs_children,
+            &adbs_children,
             "items",
             "DAAP session expired or unauthorized",
         )?;
-        let mlcl_children = unwrap_nested_container(adbs_children, b"mlcl")?;
-
-        let mlit_items = dmap::find_containers(mlcl_children, b"mlit");
+        let mlcl_children = take_container(adbs_children, b"mlcl")?;
+        let mlit_items = dmap::into_containers(mlcl_children, b"mlit");
 
         info!(count = mlit_items.len(), "DAAP: tracks received");
-
-        // Convert from borrowed slices to owned Vecs.
-        Ok(mlit_items.into_iter().map(|s| s.to_vec()).collect())
-    }
-
-    /// Issue a bounded server-info request to verify the active server is
-    /// still responsive.
-    pub async fn ping(&self) -> BackendResult<()> {
-        let url = format!(
-            "{}/server-info",
-            self.base_url.as_str().trim_end_matches('/')
-        );
-        let resp = self
-            .http
-            .get(&url)
-            .timeout(CONTROL_RESPONSE_DEADLINE)
-            .send()
-            .await
-            .map_err(|error| daap_request_error("DAAP ping failed", error))?;
-
-        if !resp.status().is_success() {
-            return Err(BackendError::ConnectionFailed {
-                message: format!("DAAP ping HTTP {}", resp.status()),
-                source: None,
-            });
-        }
-
-        read_limited(resp, MAX_CONTROL_BODY_BYTES, CONTROL_RESPONSE_DEADLINE)
-            .await
-            .map_err(|error| daap_body_error("Failed to read DAAP ping body", error))?;
-        Ok(())
+        Ok(mlit_items)
     }
 
     /// Construct a credential-isolated cover-art request for a track.
@@ -512,15 +485,6 @@ impl DaapClient {
         logout_session(&self.http, &self.base_url, self.session_id).await;
     }
 
-    /// Probe a DAAP server's `/server-info` to check whether it requires
-    /// a password.
-    ///
-    /// Returns `Some(false)` for open shares (msau == 0 or absent),
-    /// `Some(true)` for password-protected shares, or `None` on error.
-    pub async fn probe_requires_password(server_url: &str) -> Option<bool> {
-        Self::probe_requires_password_with_route(server_url, None).await
-    }
-
     /// Probe through the exact mDNS-advertised route, when one is available.
     pub(crate) async fn probe_requires_password_with_route(
         server_url: &str,
@@ -557,18 +521,6 @@ impl DaapClient {
         // msau: 0 = no auth, 1 = basic, 2 = digest
         let auth_method = dmap::find_u8(children, b"msau").unwrap_or(0);
         Some(auth_method != 0)
-    }
-
-    // ── Accessors ───────────────────────────────────────────────────
-
-    /// The base URL of the DAAP server.
-    pub fn base_url(&self) -> &Url {
-        &self.base_url
-    }
-
-    /// The active session ID.
-    pub fn session_id(&self) -> u32 {
-        self.session_id
     }
 }
 
@@ -706,23 +658,43 @@ async fn logout_session(http: &Client, base_url: &Url, session_id: u32) {
 /// Unwrap the first top-level container node with the given tag,
 /// returning a reference to its children.
 fn unwrap_container<'a>(nodes: &'a [DmapNode], tag: &[u8; 4]) -> BackendResult<&'a [DmapNode]> {
-    let node = dmap::find_node(nodes, tag).ok_or_else(|| BackendError::ParseError {
+    let node = dmap::find_node(nodes, tag).ok_or_else(|| missing_container(tag))?;
+    match &node.data {
+        DmapValue::Container(children) => Ok(children.as_slice()),
+        _ => Err(not_a_container(tag)),
+    }
+}
+
+/// Move the children of the first container node with the given tag out of
+/// `nodes`, dropping its siblings.
+fn take_container(nodes: Vec<DmapNode>, tag: &[u8; 4]) -> BackendResult<Vec<DmapNode>> {
+    let node = nodes
+        .into_iter()
+        .find(|node| &node.tag == tag)
+        .ok_or_else(|| missing_container(tag))?;
+    match node.data {
+        DmapValue::Container(children) => Ok(children),
+        _ => Err(not_a_container(tag)),
+    }
+}
+
+fn missing_container(tag: &[u8; 4]) -> BackendError {
+    BackendError::ParseError {
         message: format!(
             "Expected DMAP container '{}' not found",
             String::from_utf8_lossy(tag)
         ),
         source: None,
-    })?;
+    }
+}
 
-    match &node.data {
-        DmapValue::Container(children) => Ok(children.as_slice()),
-        _ => Err(BackendError::ParseError {
-            message: format!(
-                "DMAP node '{}' is not a container",
-                String::from_utf8_lossy(tag)
-            ),
-            source: None,
-        }),
+fn not_a_container(tag: &[u8; 4]) -> BackendError {
+    BackendError::ParseError {
+        message: format!(
+            "DMAP node '{}' is not a container",
+            String::from_utf8_lossy(tag)
+        ),
+        source: None,
     }
 }
 
@@ -848,7 +820,7 @@ mod tests {
 
         let malformed_status = DmapNode {
             tag: *b"mstt",
-            data: DmapValue::Raw(vec![0, 0, 0, 200]),
+            data: DmapValue::U16(200),
         };
         let error = ensure_dmap_status(&[malformed_status], "items", "expired")
             .expect_err("wrong status type must fail closed");

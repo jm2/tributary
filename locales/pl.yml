@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "Brak odtwarzania"
   scanning: "Skanowanie biblioteki…"
   live: "NA ŻYWO"
@@ -21,6 +20,10 @@ header:
   playback_position: "Pozycja odtwarzania"
   volume: "Głośność"
   rescan_library: "Przeskanuj bibliotekę ponownie"
+  my_computer: "Mój komputer"
+  preferences_menu: "_Ustawienia"
+  about_menu: "_O programie Tributary"
+  quit_menu: "Za_kończ"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "Urządzenia"
   usb_device: "Urządzenie USB"
   add_server: "Dodaj serwer"
-  new_playlist: "Nowa lista odtwarzania"
   remove_server: "Usuń serwer"
   disconnect: "Rozłącz"
   new_playlist_menu: "Nowa lista odtwarzania"
@@ -53,6 +55,13 @@ browser:
   all: "Wszystkie"
   folder_root_unavailable: "%{name} (niedostępny)"
   folder_unavailable_notice: "Ten folder jest obecnie niedostępny"
+  unknown_genre: "Nieznany"
+  folder_no_sources: "Przeglądanie folderów obejmuje tylko źródła biblioteki lokalnej"
+  folder_no_roots: "Nie skonfigurowano folderów biblioteki"
+  album_artwork: "Okładki w panelu albumów"
+  album_artwork_size_small: "Mały"
+  album_artwork_size_medium: "Średni"
+  album_artwork_size_large: "Duży"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -93,8 +102,6 @@ ratings:
 preferences:
   title: "Ustawienia"
   library_location: "Lokalizacja biblioteki"
-  music_folder: "Folder muzyki"
-  browse: "Przeglądaj…"
   select_music_folder: "Wybierz folder muzyki"
   library_restart_hint: "Uruchom ponownie Tributary, aby zastosować zmiany folderów muzycznych."
   reauthorize_folder: "Autoryzuj ponownie…"
@@ -121,6 +128,9 @@ preferences:
   privacy: "Prywatność"
   location_title: "Lokalizacja dla Stacji w pobliżu"
   location_subtitle: "Ustalaj przybliżoną lokalizację na podstawie adresu IP za pomocą ipapi.co, ipwho.is lub freeipapi.com."
+  add_folder: "Dodaj folder"
+  remove_folder: "Usuń folder"
+  group_by_album_artist: "Grupuj według artysty albumu"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -210,6 +220,34 @@ playlist_io:
   export_unchanged_body: "%{error}\n\nMiejsce docelowe pozostało bez zmian; usunięto każdy plik tymczasowy."
   export_worker_failed_body: "Proces eksportu zatrzymał się przed zgłoszeniem wyniku: %{error}"
 
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Zaufać temu folderowi biblioteki?"
+  legacy_body: "Tributary pamięta utwory w %{path} (liczba: %{count}), ale ten folder pochodzi sprzed wprowadzenia kontroli tożsamości biblioteki. Zaufaj mu tylko wtedy, gdy jest to ta sama biblioteka, która była używana wcześniej. Do tego czasu Tributary zachowuje zapisane metadane, ale nie będzie indeksować zmian ani usuwać z biblioteki brakujących utworów z tego folderu. Po ustanowieniu zaufania późniejsze pełne uzgodnienie może usunąć zapamiętane utwory, których nadal brakuje."
+  replacement_heading: "Zmieniła się tożsamość folderu biblioteki"
+  replacement_body: "Nie udało się potwierdzić, że folder %{path} to biblioteka, której Tributary wcześniej ufał i która ma zapamiętane utwory (liczba: %{count}). Użyj tego folderu tylko wtedy, gdy celowo zastąpiono lub przeniesiono tę bibliotekę. Podczas ustanawiania zaufania Tributary zachowuje zapamiętane metadane; późniejsze pełne uzgodnienie może usunąć utwory, których nadal brakuje w tym folderze."
+  empty_new_heading: "Skonfigurować ten folder biblioteki?"
+  empty_new_body: "Tributary nie znalazł obsługiwanych plików audio w %{path}. Może to być nowa, pusta biblioteka, ale może to też oznaczać, że dysk wymienny lub udział sieciowy nie jest zamontowany. Kontynuuj tylko wtedy, gdy jest to zamierzona lokalizacja biblioteki."
+  empty_heading: "Nie znaleziono obsługiwanych plików audio"
+  empty_body: "Tributary nie znalazł obsługiwanych plików audio w %{path}, ale pamięta utwory w tym miejscu (liczba: %{count}). Może to oznaczać, że dysk wymienny lub udział sieciowy nie jest zamontowany. Kontynuuj tylko wtedy, gdy jest to zamierzony wolumin biblioteki, a brak obsługiwanych plików audio jest celowy."
+  empty_new_final_heading: "Potwierdzić tę lokalizację biblioteki?"
+  empty_new_final_body: "W %{path} nie są obecnie widoczne żadne obsługiwane pliki audio. Potwierdź, że jest to zamierzona lokalizacja biblioteki, a nie niezamontowany dysk lub udział sieciowy. Przyszłe pełne skanowania uwzględnią pliki dodane tu lub stąd usunięte; Tributary nigdy nie usuwa samych plików audio."
+  empty_final_heading: "Mimo to zaufać temu folderowi biblioteki?"
+  empty_final_body: "W %{path} nie są obecnie widoczne żadne obsługiwane pliki audio. Ta ścieżka może być jedynie pustym punktem montowania bez zamontowanego woluminu, a nie zamierzoną biblioteką. Skanowanie rejestracyjne zachowuje wszystkie zapamiętane utwory (%{count}), ale późniejsze pełne, wiążące skanowanie może usunąć każdy zapamiętany utwór, którego nadal brakuje w tym folderze. Tributary nigdy nie usuwa samych plików audio."
+  not_now: "Nie teraz"
+  keep_existing: "Zachowaj obecną bibliotekę"
+  trust_folder: "Zaufaj folderowi"
+  use_folder: "Użyj tego folderu"
+  review_empty_risk: "Sprawdź ryzyko"
+  trust_empty_anyway: "Mimo to zaufaj folderowi"
+  pending_toast: "Sprawdzanie folderu biblioteki przed ustanowieniem zaufania…"
+  trusted_toast: "Folder biblioteki jest zaufany i aktywny."
+  replacement_trusted_toast: "Nowy folder biblioteki jest zaufany i aktywny."
+  empty_trusted_toast: "Folder biblioteki jest zaufany i aktywny."
+  unavailable_toast: "Nie udało się ustanowić zaufania, ponieważ folder jest niedostępny lub jego skanowanie nie zostało ukończone. Zapamiętane metadane pozostają chronione."
+  stale_toast: "Folder zmienił się, zanim udało się ustanowić zaufanie. Pozostaje niedostępny, a zapamiętane metadane pozostają chronione."
+  failed_toast: "Tributary nie mógł dokończyć ustanawiania zaufania do tego folderu biblioteki. Pozostaje on niedostępny, a zapamiętane metadane pozostają chronione."
+
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Właściwości…"
@@ -237,11 +275,12 @@ regular_playlist:
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
   heading_single: "Właściwości — %{title}"
-  heading_batch: "Właściwości — %{count} utworów"
+  heading_batch: "Właściwości — utwory: %{count}"
   field_title: "Tytuł"
   field_artist: "Artysta"
   field_album: "Album"
   field_genre: "Gatunek"
+  field_composer: "Kompozytor"
   field_year: "Rok"
   field_track_number: "Numer utworu"
   field_disc_number: "Numer płyty"
@@ -273,14 +312,16 @@ properties:
   mixed_cleared: "Zostanie wyczyszczone we wszystkich utworach"
   musicbrainz_applied: "Uzupełniono na podstawie wydania MusicBrainz „%{release}”. Sprawdź pola przed zapisaniem."
   musicbrainz_title_only: "Żadne wydanie MusicBrainz nie pasowało do albumu, więc uzupełniono tylko tytuł i wykonawcę."
+  invalid_number_heading: "Sprawdź wyróżnione pole"
+  invalid_number_body: "Pole „%{field}” musi zawierać liczbę całkowitą."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "Nowa inteligentna lista"
   edit_title: "Edytuj inteligentną listę: %{name}"
-  match_label: "Dopasowanie"
-  match_all: "Wszystkie"
-  match_any: "Dowolna"
+  match_label: "Spełnia"
+  match_all: "wszystkie"
+  match_any: "dowolną"
   add_rule: "Dodaj regułę"
   remove_rule: "Usuń regułę"
   limit_to: "Ogranicz do"
@@ -288,6 +329,76 @@ smart_playlist:
   rule_reversed_range: "Pierwsza wartość nie może przekraczać drugiej."
   rule_not_positive: "Wprowadź liczbę całkowitą równą 1 lub większą."
   rule_invalid_date: "Wprowadź datę w formacie YYYY-MM-DD, na przykład 2024-01-15."
+  match_suffix: "z następujących reguł:"
+  selected_by: "wybrane według"
+  sort_by: "Sortuj według:"
+  add_sort_level: "Dodaj poziom sortowania"
+  remove_sort_level: "Usuń poziom sortowania"
+  value_placeholder: "wartość"
+  range_end_placeholder: "do"
+  field:
+    title: "Tytuł"
+    artist: "Artysta"
+    album_artist: "Artysta albumu"
+    album: "Album"
+    genre: "Gatunek"
+    composer: "Kompozytor"
+    year: "Rok"
+    track_number: "Numer utworu"
+    disc_number: "Numer płyty"
+    duration: "Czas trwania"
+    duration_seconds: "Czas trwania (s)"
+    bitrate: "Bitrate"
+    bitrate_kbps: "Bitrate (kb/s)"
+    sample_rate_hz: "Częstotliwość próbkowania (Hz)"
+    format: "Format"
+    play_count: "Liczba odtworzeń"
+    last_played: "Ostatnio odtwarzane"
+    date_added: "Data dodania"
+    date_modified: "Data modyfikacji"
+    file_size_bytes: "Rozmiar pliku (bajty)"
+    rating: "Ocena"
+    rating_range: "Ocena (1–100)"
+    track_id: "ID utworu"
+  operator:
+    is: "jest"
+    is_not: "nie jest"
+    contains: "zawiera"
+    does_not_contain: "nie zawiera"
+    starts_with: "zaczyna się od"
+    ends_with: "kończy się na"
+    greater_than: "większe niż"
+    less_than: "mniejsze niż"
+    in_range: "w zakresie"
+    is_rated: "ma ocenę"
+    is_unrated: "nie ma oceny"
+    is_before: "jest przed"
+    is_after: "jest po"
+    is_in_the_last: "w ciągu ostatnich"
+    is_not_in_the_last: "poza ostatnimi"
+  date_unit:
+    days: "dni"
+    weeks: "tygodni"
+    months: "miesięcy"
+  limit_unit:
+    items: "elementów"
+    minutes: "minut"
+    hours: "godzin"
+    megabytes: "MB"
+    gigabytes: "GB"
+  limit_sort:
+    random: "Losowo"
+    most_played: "Najczęściej odtwarzane"
+    least_played: "Najrzadziej odtwarzane"
+    most_recently_added: "Ostatnio dodane"
+    least_recently_added: "Najdawniej dodane"
+    most_recently_played: "Ostatnio odtwarzane"
+    least_recently_played: "Najdawniej odtwarzane"
+    highest_rated: "Najwyżej oceniane"
+    lowest_rated: "Najniżej oceniane"
+  sort_direction:
+    ascending: "Rosnąco"
+    descending: "Malejąco"
 
 # ── Playlisty serwera ──────────────────────────────────────────────
 server_playlists:
@@ -341,6 +452,8 @@ errors:
     invalid_response: "%{backend} zwrócił nieprawidłową odpowiedź"
     authentication_method_unsupported: "Metoda uwierzytelniania %{backend} nie jest obsługiwana"
     source_failed: "Wystąpił błąd źródła %{backend}"
+    removable_backend: "Nośnik wymienny"
+    generic_backend: "Serwer zdalny"
   playback:
     network_request_failed: "Sieciowe żądanie audio nie powiodło się"
     decoder_failed: "Wystąpił błąd dekodera dźwięku"
@@ -360,15 +473,24 @@ errors:
     unsupported_location: "Nie można otworzyć tej lokalizacji. Tributary może otwierać tylko pliki na tym komputerze."
     closing: "Tributary jest zamykany. Otwórz go ponownie po zamknięciu."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} utworów, %{hours} godzin"
-  songs_minutes: "%{count} utworów, %{minutes} minut"
+  songs:
+    one: "%{count} utwór"
+    few: "%{count} utwory"
+    many: "%{count} utworów"
+    other: "%{count} utworu"
+  hours:
+    one: "%{hours} godzina"
+    few: "%{hours} godziny"
+    many: "%{hours} godzin"
+    other: "%{hours} godziny"
+  minutes:
+    one: "%{minutes} minuta"
+    few: "%{minutes} minuty"
+    many: "%{minutes} minut"
+    other: "%{minutes} minuty"
+  summary: "%{songs}, %{duration}"
 
 # ── Migracja z Rhythmbox ──────────────────────────────────────────
 rhythmbox_migration:

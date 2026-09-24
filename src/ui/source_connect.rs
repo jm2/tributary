@@ -463,13 +463,17 @@ fn remote_playlist_row(
     track: crate::source_registry::RegularPlaylistTrack,
 ) -> TrackObject {
     let metadata = track.metadata();
+    let genre = metadata.genre().map_or_else(
+        || rust_i18n::t!("browser.unknown_genre"),
+        std::borrow::Cow::Borrowed,
+    );
     let row = TrackObject::new(
         metadata.track_number().unwrap_or(0),
         metadata.title(),
         metadata.duration_secs().unwrap_or(0),
         metadata.artist_name(),
         metadata.album_title(),
-        metadata.genre().unwrap_or("Unknown"),
+        &genre,
         metadata.composer().unwrap_or(""),
         metadata.year().unwrap_or(0),
         &metadata
@@ -924,7 +928,9 @@ pub fn setup_source_connect(state: &WindowState) {
                 &column_view,
             );
             if let Some(category) = retained_failure {
-                status_label.set_text(&category.user_message("Removable media"));
+                status_label.set_text(
+                    &category.user_message(&rust_i18n::t!("errors.remote.removable_backend")),
+                );
             }
             return;
         }
@@ -1090,7 +1096,6 @@ pub fn setup_source_connect(state: &WindowState) {
             ));
 
             let server_url = url_for_closure.clone();
-            let server_name = name_for_closure.clone();
             let advertised_route = advertised_route.clone();
             let source = src.clone();
             let sidebar_store_for_generation = sidebar_store.clone();
@@ -1123,13 +1128,8 @@ pub fn setup_source_connect(state: &WindowState) {
                 },
                 move || async move {
                     info!("Connecting to passwordless DAAP server...");
-                    crate::daap::DaapBackend::login_with_route(
-                        &server_name,
-                        &server_url,
-                        None,
-                        advertised_route,
-                    )
-                    .await
+                    crate::daap::DaapBackend::login_with_route(&server_url, None, advertised_route)
+                        .await
                 },
             );
             if generation.is_none() {
@@ -1313,7 +1313,6 @@ pub fn setup_source_connect(state: &WindowState) {
                             info!("Connecting to DAAP server...");
                             let password = (!pass.is_empty()).then_some(pass.as_str());
                             crate::daap::DaapBackend::login_with_route(
-                                &server_name,
                                 &server_url,
                                 password,
                                 advertised_route,
@@ -1327,7 +1326,6 @@ pub fn setup_source_connect(state: &WindowState) {
                         move || async move {
                             info!("Authenticating with Subsonic...");
                             crate::subsonic::SubsonicBackend::connect_with_route(
-                                &server_name,
                                 &server_url,
                                 &user,
                                 &pass,

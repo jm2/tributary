@@ -459,11 +459,11 @@ impl Player {
     /// Toggle between Playing ↔ Paused.
     pub fn toggle_play_pause(&self) {
         // Non-blocking state query (zero timeout).
-        let (_, current, _) = self.playbin.state(gst::ClockTime::ZERO);
-        match current {
-            gst::State::Playing => self.pause(),
-            gst::State::Paused => self.play(),
-            _ => {}
+        let (_, current, pending) = self.playbin.state(gst::ClockTime::ZERO);
+        match play_pause_action(current, pending) {
+            Some(PlayPauseAction::Pause) => self.pause(),
+            Some(PlayPauseAction::Play) => self.play(),
+            None => {}
         }
     }
 
@@ -955,6 +955,31 @@ impl Drop for Player {
     }
 }
 
+// ── Play/Pause ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayPauseAction {
+    Play,
+    Pause,
+}
+
+/// Decide what one Play/Pause press does from the pipeline's current and
+/// pending states. The press acts on the state the pipeline is heading to, so
+/// a press while a stream still prerolls toward Playing pauses it; `None`
+/// means nothing is loaded.
+fn play_pause_action(current: gst::State, pending: gst::State) -> Option<PlayPauseAction> {
+    let target = if pending == gst::State::VoidPending {
+        current
+    } else {
+        pending
+    };
+    match target {
+        gst::State::Playing => Some(PlayPauseAction::Pause),
+        gst::State::Paused => Some(PlayPauseAction::Play),
+        _ => None,
+    }
+}
+
 // ── Volume curve ────────────────────────────────────────────────────────
 
 /// Convert a linear slider position (0.0–1.0) to a GStreamer pipeline
@@ -1419,6 +1444,56 @@ mod tests {
             assert!(!category.as_str().contains(secret));
             assert!(!category.ui_message().contains(secret));
         }
+    }
+
+    #[test]
+    fn play_pause_acts_on_the_state_the_pipeline_is_heading_to() {
+        use gst::State::{Null, Paused, Playing, Ready, VoidPending};
+        use PlayPauseAction::{Pause, Play};
+
+        assert_eq!(play_pause_action(Playing, VoidPending), Some(Pause));
+        assert_eq!(play_pause_action(Paused, VoidPending), Some(Play));
+        assert_eq!(play_pause_action(Null, VoidPending), None);
+        assert_eq!(play_pause_action(Ready, VoidPending), None);
+
+        // Mid-transition, the pending state decides.
+        assert_eq!(play_pause_action(Ready, Playing), Some(Pause));
+        assert_eq!(play_pause_action(Paused, Playing), Some(Pause));
+        assert_eq!(play_pause_action(Ready, Paused), Some(Play));
+        assert_eq!(play_pause_action(Playing, Paused), Some(Play));
+    }
+
+    #[test]
+    fn play_pause_pauses_a_pipeline_that_is_still_prerolling() {
+        gst::init().expect("GStreamer init");
+        // An appsrc that never pushes a buffer keeps the sink from
+        // prerolling, so the pipeline stays mid-transition toward Playing.
+        let pipeline = gst::parse::launch("appsrc ! fakesink")
+            .expect("appsrc ! fakesink")
+            .downcast::<gst::Pipeline>()
+            .expect("launch yields a pipeline");
+        assert_eq!(
+            pipeline.set_state(gst::State::Playing),
+            Ok(gst::StateChangeSuccess::Async)
+        );
+        let (_, current, pending) = pipeline.state(gst::ClockTime::ZERO);
+        assert_ne!(current, gst::State::Playing);
+        assert_eq!(
+            play_pause_action(current, pending),
+            Some(PlayPauseAction::Pause)
+        );
+
+        pipeline
+            .set_state(gst::State::Paused)
+            .expect("pause while prerolling");
+        let (_, current, pending) = pipeline.state(gst::ClockTime::ZERO);
+        assert_eq!(
+            play_pause_action(current, pending),
+            Some(PlayPauseAction::Play)
+        );
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("tear down pipeline");
     }
 
     #[test]

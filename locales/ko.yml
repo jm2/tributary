@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "재생 중이 아님"
   scanning: "라이브러리 스캔 중…"
   live: "라이브"
@@ -21,6 +20,10 @@ header:
   playback_position: "재생 위치"
   volume: "음량"
   rescan_library: "라이브러리 다시 검색"
+  my_computer: "내 컴퓨터"
+  preferences_menu: "환경설정(_P)"
+  about_menu: "Tributary 정보(_A)"
+  quit_menu: "끝내기(_Q)"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "장치"
   usb_device: "USB 장치"
   add_server: "서버 추가"
-  new_playlist: "새 재생목록"
   remove_server: "서버 제거"
   disconnect: "연결 끊기"
   new_playlist_menu: "새 재생목록"
@@ -53,6 +55,13 @@ browser:
   all: "전체"
   folder_root_unavailable: "%{name} (사용할 수 없음)"
   folder_unavailable_notice: "이 폴더는 현재 사용할 수 없습니다"
+  unknown_genre: "알 수 없음"
+  folder_no_sources: "폴더 탐색은 로컬 라이브러리 소스에서만 사용할 수 있습니다"
+  folder_no_roots: "설정된 라이브러리 폴더가 없습니다"
+  album_artwork: "앨범 보기 아트워크"
+  album_artwork_size_small: "작게"
+  album_artwork_size_medium: "보통"
+  album_artwork_size_large: "크게"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -93,8 +102,6 @@ ratings:
 preferences:
   title: "환경설정"
   library_location: "라이브러리 위치"
-  music_folder: "음악 폴더"
-  browse: "찾아보기…"
   select_music_folder: "음악 폴더 선택"
   library_restart_hint: "음악 폴더 변경 사항을 적용하려면 Tributary를 다시 시작하세요."
   reauthorize_folder: "다시 승인…"
@@ -121,6 +128,9 @@ preferences:
   privacy: "개인정보"
   location_title: "내 주변 방송국 위치"
   location_subtitle: "ipapi.co, ipwho.is 또는 freeipapi.com을 통해 IP 주소로 대략적인 위치를 확인합니다."
+  add_folder: "폴더 추가"
+  remove_folder: "폴더 제거"
+  group_by_album_artist: "앨범 아티스트별로 묶기"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -210,6 +220,34 @@ playlist_io:
   export_unchanged_body: "%{error}\n\n대상은 변경되지 않았으며 임시 파일은 모두 삭제되었습니다."
   export_worker_failed_body: "내보내기 작업이 결과를 보고하기 전에 중지되었습니다: %{error}"
 
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "이 라이브러리 폴더를 신뢰할까요?"
+  legacy_body: "Tributary는 %{path} 아래의 %{count}곡을 기억하고 있지만, 이 폴더는 라이브러리 동일성 확인 기능이 도입되기 전에 설정되었습니다. 이전에 사용하던 라이브러리와 같은 경우에만 신뢰하세요. 그때까지 Tributary는 저장된 메타데이터를 보존하지만, 이 폴더의 변경 사항을 색인하거나 누락된 곡을 라이브러리에서 제거하지 않습니다. 신뢰가 확립된 후에는 이후 전체 대조 작업에서 여전히 누락된 기억된 곡이 제거될 수 있습니다."
+  replacement_heading: "라이브러리 폴더의 동일성이 변경됨"
+  replacement_body: "%{path}에 있는 폴더가 Tributary가 이전에 신뢰했던 라이브러리(기억된 곡 %{count}곡)인지 확인할 수 없습니다. 해당 라이브러리를 의도적으로 교체하거나 이동한 경우에만 이 폴더를 사용하세요. 신뢰가 확립되는 동안 Tributary는 기억된 메타데이터를 보존합니다. 이후 전체 대조 작업에서 이 폴더에 여전히 없는 곡이 제거될 수 있습니다."
+  empty_new_heading: "이 라이브러리 폴더를 설정할까요?"
+  empty_new_body: "Tributary가 %{path} 아래에서 지원되는 오디오 파일을 찾지 못했습니다. 새로운 빈 라이브러리일 수도 있지만, 이동식 드라이브나 네트워크 공유가 마운트되지 않았다는 뜻일 수도 있습니다. 이곳이 의도한 라이브러리 위치인 경우에만 계속하세요."
+  empty_heading: "지원되는 오디오 파일을 찾을 수 없음"
+  empty_body: "Tributary가 %{path} 아래에서 지원되는 오디오 파일을 찾지 못했지만, 그곳의 %{count}곡을 기억하고 있습니다. 이동식 드라이브나 네트워크 공유가 마운트되지 않았다는 뜻일 수 있습니다. 이곳이 의도한 라이브러리 볼륨이고 지원되는 오디오 파일이 의도적으로 없는 경우에만 계속하세요."
+  empty_new_final_heading: "이 라이브러리 위치를 확정할까요?"
+  empty_new_final_body: "현재 %{path} 아래에 표시되는 지원 오디오 파일이 없습니다. 이곳이 마운트되지 않은 드라이브나 네트워크 공유가 아니라 의도한 라이브러리 위치인지 확인하세요. 이후 전체 스캔에는 이곳에서 추가되거나 제거된 파일이 반영됩니다. Tributary는 오디오 파일 자체를 삭제하지 않습니다."
+  empty_final_heading: "그래도 이 라이브러리 폴더를 신뢰할까요?"
+  empty_final_body: "현재 %{path} 아래에 표시되는 지원 오디오 파일이 없습니다. 이 경로는 의도한 라이브러리가 아니라 아무것도 마운트되지 않은 마운트 지점일 수 있습니다. 등록 스캔은 기억된 %{count}곡을 모두 보존하지만, 이후의 확정적인 전체 스캔에서 이 폴더에 여전히 없는 기억된 곡이 모두 제거될 수 있습니다. Tributary는 오디오 파일 자체를 삭제하지 않습니다."
+  not_now: "나중에"
+  keep_existing: "기존 라이브러리 유지"
+  trust_folder: "폴더 신뢰"
+  use_folder: "이 폴더 사용"
+  review_empty_risk: "위험 검토"
+  trust_empty_anyway: "그래도 폴더 신뢰"
+  pending_toast: "신뢰하기 전에 라이브러리 폴더를 확인하는 중…"
+  trusted_toast: "라이브러리 폴더를 신뢰하고 활성화했습니다."
+  replacement_trusted_toast: "새 라이브러리 폴더를 신뢰하고 활성화했습니다."
+  empty_trusted_toast: "라이브러리 폴더를 신뢰하고 활성화했습니다."
+  unavailable_toast: "폴더를 사용할 수 없거나 스캔이 완료되지 않아 신뢰를 확립할 수 없습니다. 기억된 메타데이터는 계속 보호됩니다."
+  stale_toast: "신뢰 확립이 끝나기 전에 폴더가 변경되었습니다. 폴더는 계속 사용할 수 없으며 기억된 메타데이터는 보호된 상태로 유지됩니다."
+  failed_toast: "Tributary가 해당 라이브러리 폴더의 신뢰 확립을 완료하지 못했습니다. 폴더는 계속 사용할 수 없으며 기억된 메타데이터는 보호된 상태로 유지됩니다."
+
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "속성…"
@@ -240,6 +278,7 @@ properties:
   field_artist: "아티스트"
   field_album: "앨범"
   field_genre: "장르"
+  field_composer: "작곡가"
   field_year: "연도"
   field_track_number: "트랙 번호"
   field_disc_number: "디스크 번호"
@@ -271,12 +310,14 @@ properties:
   mixed_cleared: "모든 트랙에서 지워집니다"
   musicbrainz_applied: "MusicBrainz 릴리스 “%{release}”에서 채웠습니다. 저장하기 전에 필드를 확인하세요."
   musicbrainz_title_only: "앨범과 일치하는 MusicBrainz 릴리스가 없어 제목과 아티스트만 채웠습니다."
+  invalid_number_heading: "강조 표시된 필드를 확인하세요"
+  invalid_number_body: "%{field}에는 정수를 입력해야 합니다."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "새 스마트 재생목록"
   edit_title: "스마트 재생목록 편집: %{name}"
-  match_label: "일치 조건"
+  match_label: "다음 규칙 중"
   match_all: "모두"
   match_any: "하나라도"
   add_rule: "규칙 추가"
@@ -286,6 +327,76 @@ smart_playlist:
   rule_reversed_range: "첫 번째 값은 두 번째 값보다 클 수 없습니다."
   rule_not_positive: "1 이상의 정수를 입력하세요."
   rule_invalid_date: "날짜를 YYYY-MM-DD 형식으로 입력하세요(예: 2024-01-15)."
+  match_suffix: "일치"
+  selected_by: "선택 기준"
+  sort_by: "정렬 기준:"
+  add_sort_level: "정렬 단계 추가"
+  remove_sort_level: "정렬 단계 제거"
+  value_placeholder: "값"
+  range_end_placeholder: "~"
+  field:
+    title: "제목"
+    artist: "아티스트"
+    album_artist: "앨범 아티스트"
+    album: "앨범"
+    genre: "장르"
+    composer: "작곡가"
+    year: "연도"
+    track_number: "트랙 번호"
+    disc_number: "디스크 번호"
+    duration: "재생 시간"
+    duration_seconds: "재생 시간(초)"
+    bitrate: "비트레이트"
+    bitrate_kbps: "비트레이트(kbps)"
+    sample_rate_hz: "샘플레이트(Hz)"
+    format: "형식"
+    play_count: "재생 횟수"
+    last_played: "마지막 재생"
+    date_added: "추가한 날짜"
+    date_modified: "수정 날짜"
+    file_size_bytes: "파일 크기(바이트)"
+    rating: "평점"
+    rating_range: "평점(1–100)"
+    track_id: "트랙 ID"
+  operator:
+    is: "일치"
+    is_not: "일치하지 않음"
+    contains: "포함"
+    does_not_contain: "포함하지 않음"
+    starts_with: "다음으로 시작"
+    ends_with: "다음으로 끝남"
+    greater_than: "보다 큼"
+    less_than: "보다 작음"
+    in_range: "범위 내"
+    is_rated: "평점 있음"
+    is_unrated: "평점 없음"
+    is_before: "이전"
+    is_after: "이후"
+    is_in_the_last: "최근"
+    is_not_in_the_last: "최근이 아님"
+  date_unit:
+    days: "일"
+    weeks: "주"
+    months: "개월"
+  limit_unit:
+    items: "항목"
+    minutes: "분"
+    hours: "시간"
+    megabytes: "MB"
+    gigabytes: "GB"
+  limit_sort:
+    random: "무작위"
+    most_played: "가장 많이 재생한 항목"
+    least_played: "가장 적게 재생한 항목"
+    most_recently_added: "가장 최근에 추가한 항목"
+    least_recently_added: "가장 오래전에 추가한 항목"
+    most_recently_played: "가장 최근에 재생한 항목"
+    least_recently_played: "가장 오래전에 재생한 항목"
+    highest_rated: "평점이 가장 높은 항목"
+    lowest_rated: "평점이 가장 낮은 항목"
+  sort_direction:
+    ascending: "오름차순"
+    descending: "내림차순"
 
 # ── 서버 재생목록 ──────────────────────────────────────────────────
 server_playlists:
@@ -339,6 +450,8 @@ errors:
     invalid_response: "%{backend}에서 잘못된 응답을 받았습니다"
     authentication_method_unsupported: "%{backend}의 인증 방식은 지원되지 않습니다"
     source_failed: "%{backend} 소스에 오류가 발생했습니다"
+    removable_backend: "이동식 미디어"
+    generic_backend: "원격 서버"
   playback:
     network_request_failed: "오디오 네트워크 요청에 실패했습니다"
     decoder_failed: "오디오 디코더에 오류가 발생했습니다"
@@ -358,15 +471,18 @@ errors:
     unsupported_location: "이 위치를 열 수 없습니다. Tributary는 이 컴퓨터에 있는 파일만 열 수 있습니다."
     closing: "Tributary를 종료하는 중입니다. 종료된 후 다시 여세요."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count}곡, %{hours}시간"
-  songs_minutes: "%{count}곡, %{minutes}분"
+  songs:
+    one: "%{count}곡"
+    other: "%{count}곡"
+  hours:
+    one: "%{hours}시간"
+    other: "%{hours}시간"
+  minutes:
+    one: "%{minutes}분"
+    other: "%{minutes}분"
+  summary: "%{songs}, %{duration}"
 
 # ── Rhythmbox 마이그레이션 ────────────────────────────────────────
 rhythmbox_migration:

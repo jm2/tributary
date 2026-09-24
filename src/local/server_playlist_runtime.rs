@@ -73,6 +73,7 @@ pub struct ServerPlaylistSubmission {
 }
 
 impl ServerPlaylistSubmission {
+    #[cfg(test)]
     pub const fn status(&self) -> ServerPlaylistRequestStatus {
         self.status
     }

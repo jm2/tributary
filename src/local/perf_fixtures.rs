@@ -11,8 +11,8 @@
 //! persists what the tag parser reads and the backend aggregates on those
 //! persisted values — not on directory names. Fixture fan-out must become
 //! catalogue fan-out (12 tracks/album, 4 albums/artist; see
-//! [`expected_album_count`] / [`expected_artist_count`]), otherwise album and
-//! artist measurements only ever see a single collapsed row.
+//! [`expected_album_count`] / [`expected_artist_count`]), otherwise the
+//! measurements only ever see a single collapsed album and artist.
 //!
 //! Nothing here ships in a release build. The library is generated on demand
 //! under `${TMPDIR:-/var/tmp}` and removed when the fixture is dropped — no
@@ -26,10 +26,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::architecture::backend::{BackendResult, MediaBackend};
-use crate::architecture::models::{
-    Album, Artist, LibraryStats, Rating, RatingCapability, SearchResults, SortField, SortOrder,
-    Track,
-};
+use crate::architecture::models::{Rating, RatingCapability, Track};
 use crate::architecture::TrackId;
 
 /// Default number of synthetic tracks when no size is requested.
@@ -223,6 +220,16 @@ pub fn expected_artist_count(track_count: usize) -> usize {
     expected_album_count(track_count).div_ceil(ALBUMS_PER_ARTIST)
 }
 
+/// Distinct `(albums, artists)` in a published catalogue, counted by the
+/// album and artist identities every local track carries.
+pub fn catalogue_fan_out(tracks: &[Track]) -> (usize, usize) {
+    let albums: std::collections::HashSet<_> =
+        tracks.iter().filter_map(|track| track.album_id).collect();
+    let artists: std::collections::HashSet<_> =
+        tracks.iter().filter_map(|track| track.artist_id).collect();
+    (albums.len(), artists.len())
+}
+
 /// A fixed, deterministic synthetic library on disk.
 ///
 /// The layout is `Artist{artist:04}/Album{album:04}/Track{track:06}.wav` with
@@ -325,24 +332,6 @@ impl<B: MediaBackend> DelayedBackend<B> {
 
 #[async_trait]
 impl<B: MediaBackend + 'static> MediaBackend for DelayedBackend<B> {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn backend_type(&self) -> &str {
-        self.inner.backend_type()
-    }
-
-    async fn ping(&self) -> BackendResult<()> {
-        self.tick().await;
-        self.inner.ping().await
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults> {
-        self.tick().await;
-        self.inner.search(query, limit).await
-    }
-
     async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
         self.tick().await;
         self.inner.list_tracks().await
@@ -359,31 +348,6 @@ impl<B: MediaBackend + 'static> MediaBackend for DelayedBackend<B> {
     ) -> BackendResult<Option<Track>> {
         self.tick().await;
         self.inner.set_track_rating(track_id, rating).await
-    }
-
-    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
-        self.tick().await;
-        self.inner.list_albums(sort, order).await
-    }
-
-    async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-        self.tick().await;
-        self.inner.list_artists().await
-    }
-
-    async fn get_album_tracks(&self, album_id: &Uuid) -> BackendResult<Vec<Track>> {
-        self.tick().await;
-        self.inner.get_album_tracks(album_id).await
-    }
-
-    async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-        self.tick().await;
-        self.inner.get_artist_tracks(artist_id).await
-    }
-
-    async fn get_stats(&self) -> BackendResult<LibraryStats> {
-        self.tick().await;
-        self.inner.get_stats().await
     }
 }
 
@@ -449,11 +413,6 @@ impl ResponsivenessReport {
             rendered.push('\n');
         }
         rendered
-    }
-
-    /// Recorded metrics.
-    pub fn metrics(&self) -> &[Metric] {
-        &self.metrics
     }
 }
 

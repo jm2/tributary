@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "再生停止中"
   scanning: "ライブラリをスキャン中…"
   live: "ライブ"
@@ -21,6 +20,10 @@ header:
   playback_position: "再生位置"
   volume: "音量"
   rescan_library: "ライブラリを再スキャン"
+  my_computer: "このコンピューター"
+  preferences_menu: "設定(_P)"
+  about_menu: "Tributary について(_A)"
+  quit_menu: "終了(_Q)"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "デバイス"
   usb_device: "USBデバイス"
   add_server: "サーバーを追加"
-  new_playlist: "新しいプレイリスト"
   remove_server: "サーバーを削除"
   disconnect: "切断"
   new_playlist_menu: "新しいプレイリスト"
@@ -53,6 +55,13 @@ browser:
   all: "すべて"
   folder_root_unavailable: "%{name}（利用不可）"
   folder_unavailable_notice: "このフォルダーは現在利用できません"
+  unknown_genre: "不明"
+  folder_no_sources: "フォルダー表示の対象はローカルライブラリのソースだけです"
+  folder_no_roots: "ライブラリフォルダーが設定されていません"
+  album_artwork: "アルバム表示のアートワーク"
+  album_artwork_size_small: "小"
+  album_artwork_size_medium: "中"
+  album_artwork_size_large: "大"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -93,8 +102,6 @@ ratings:
 preferences:
   title: "設定"
   library_location: "ライブラリの場所"
-  music_folder: "音楽フォルダー"
-  browse: "参照…"
   select_music_folder: "音楽フォルダーを選択"
   library_restart_hint: "音楽フォルダーの変更を適用するには、Tributary を再起動してください。"
   reauthorize_folder: "再承認…"
@@ -121,6 +128,9 @@ preferences:
   privacy: "プライバシー"
   location_title: "近くの局のための位置情報"
   location_subtitle: "ipapi.co、ipwho.is、または freeipapi.com を使って、IP アドレスからおおよその位置を調べます。"
+  add_folder: "フォルダーを追加"
+  remove_folder: "フォルダーを削除"
+  group_by_album_artist: "アルバムアーティストでまとめる"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -210,6 +220,34 @@ playlist_io:
   export_unchanged_body: "%{error}\n\n保存先は変更されず、一時ファイルはすべて削除されました。"
   export_worker_failed_body: "エクスポート処理が結果を返す前に停止しました: %{error}"
 
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "このライブラリフォルダーを信頼しますか？"
+  legacy_body: "Tributary は %{path} 以下の %{count} 曲を記憶していますが、このフォルダーはライブラリの同一性確認が導入される前に設定されたものです。以前使用していたものと同じライブラリである場合にのみ信頼してください。それまでの間、Tributary は保存済みのメタデータを保持しますが、このフォルダーの変更をインデックスに反映したり、見つからない曲をライブラリから削除したりはしません。信頼が確立された後は、後続の完全な照合によって、引き続き見つからない記憶済みの曲が削除される場合があります。"
+  replacement_heading: "ライブラリフォルダーの同一性が変更されました"
+  replacement_body: "%{path} にあるフォルダーを、Tributary が以前信頼していたライブラリ（記憶済みの曲：%{count} 曲）として確認できませんでした。そのライブラリを意図的に置き換えたか移動した場合にのみ、このフォルダーを使用してください。信頼が確立されるまで、Tributary は記憶済みのメタデータを保持します。後続の完全な照合によって、このフォルダーに引き続き存在しない曲が削除される場合があります。"
+  empty_new_heading: "このライブラリフォルダーをセットアップしますか？"
+  empty_new_body: "Tributary は %{path} 以下にサポートされているオーディオファイルを見つけられませんでした。新しい空のライブラリである可能性もありますが、リムーバブルドライブやネットワーク共有がマウントされていないことを示している場合もあります。ここが意図したライブラリの場所である場合にのみ続行してください。"
+  empty_heading: "サポートされているオーディオファイルが見つかりません"
+  empty_body: "Tributary は %{path} 以下にサポートされているオーディオファイルを見つけられませんでしたが、そこにある %{count} 曲を記憶しています。リムーバブルドライブやネットワーク共有がマウントされていない可能性があります。ここが意図したライブラリのボリュームであり、サポートされているオーディオファイルが意図的に存在しない場合にのみ続行してください。"
+  empty_new_final_heading: "このライブラリの場所で間違いありませんか？"
+  empty_new_final_body: "現在、%{path} 以下にサポートされているオーディオファイルは表示されていません。ここがマウントされていないドライブやネットワーク共有ではなく、意図したライブラリの場所であることを確認してください。今後の完全なスキャンでは、ここで追加または削除されたファイルが反映されます。Tributary がオーディオファイル自体を削除することはありません。"
+  empty_final_heading: "それでもこのライブラリフォルダーを信頼しますか？"
+  empty_final_body: "現在、%{path} 以下にサポートされているオーディオファイルは表示されていません。このパスは意図したライブラリではなく、何もマウントされていないマウントポイントにすぎない可能性があります。登録時のスキャンでは記憶済みの %{count} 曲がすべて保持されますが、後続の完全な確定スキャンによって、このフォルダーに引き続き存在しない記憶済みの曲がすべて削除される場合があります。Tributary がオーディオファイル自体を削除することはありません。"
+  not_now: "後で"
+  keep_existing: "既存のライブラリを維持"
+  trust_folder: "フォルダーを信頼"
+  use_folder: "このフォルダーを使用"
+  review_empty_risk: "リスクを確認"
+  trust_empty_anyway: "それでもフォルダーを信頼"
+  pending_toast: "信頼する前にライブラリフォルダーを確認しています…"
+  trusted_toast: "ライブラリフォルダーを信頼し、有効にしました。"
+  replacement_trusted_toast: "新しいライブラリフォルダーを信頼し、有効にしました。"
+  empty_trusted_toast: "ライブラリフォルダーを信頼し、有効にしました。"
+  unavailable_toast: "フォルダーが利用できないか、スキャンが完了しなかったため、信頼を確立できませんでした。記憶済みのメタデータは引き続き保護されています。"
+  stale_toast: "信頼の確立が完了する前にフォルダーが変更されました。フォルダーは引き続き利用できず、記憶済みのメタデータは保護されたままです。"
+  failed_toast: "Tributary はそのライブラリフォルダーの信頼を確立できませんでした。フォルダーは引き続き利用できず、記憶済みのメタデータは保護されたままです。"
+
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "プロパティ…"
@@ -240,6 +278,7 @@ properties:
   field_artist: "アーティスト"
   field_album: "アルバム"
   field_genre: "ジャンル"
+  field_composer: "作曲者"
   field_year: "年"
   field_track_number: "トラック番号"
   field_disc_number: "ディスク番号"
@@ -271,12 +310,14 @@ properties:
   mixed_cleared: "すべてのトラックで消去されます"
   musicbrainz_applied: "MusicBrainz のリリース「%{release}」から入力しました。保存する前に各項目を確認してください。"
   musicbrainz_title_only: "アルバムに一致する MusicBrainz のリリースがなかったため、タイトルとアーティストのみ入力しました。"
+  invalid_number_heading: "強調表示された項目を確認してください"
+  invalid_number_body: "%{field} には整数を入力してください。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "新しいスマートプレイリスト"
   edit_title: "スマートプレイリストを編集: %{name}"
-  match_label: "一致条件"
+  match_label: "次の"
   match_all: "すべて"
   match_any: "いずれか"
   add_rule: "ルールを追加"
@@ -286,6 +327,76 @@ smart_playlist:
   rule_reversed_range: "最初の値は2番目の値以下にしてください。"
   rule_not_positive: "1以上の整数を入力してください。"
   rule_invalid_date: "日付を YYYY-MM-DD 形式で入力してください（例: 2024-01-15）。"
+  match_suffix: "のルールに一致"
+  selected_by: "選択基準"
+  sort_by: "並べ替え:"
+  add_sort_level: "並べ替え条件を追加"
+  remove_sort_level: "並べ替え条件を削除"
+  value_placeholder: "値"
+  range_end_placeholder: "～"
+  field:
+    title: "タイトル"
+    artist: "アーティスト"
+    album_artist: "アルバムアーティスト"
+    album: "アルバム"
+    genre: "ジャンル"
+    composer: "作曲者"
+    year: "年"
+    track_number: "トラック番号"
+    disc_number: "ディスク番号"
+    duration: "時間"
+    duration_seconds: "時間（秒）"
+    bitrate: "ビットレート"
+    bitrate_kbps: "ビットレート（kbps）"
+    sample_rate_hz: "サンプルレート（Hz）"
+    format: "形式"
+    play_count: "再生回数"
+    last_played: "最終再生日"
+    date_added: "追加日"
+    date_modified: "更新日"
+    file_size_bytes: "ファイルサイズ（バイト）"
+    rating: "評価"
+    rating_range: "評価（1–100）"
+    track_id: "トラック ID"
+  operator:
+    is: "次と一致"
+    is_not: "次と一致しない"
+    contains: "次を含む"
+    does_not_contain: "次を含まない"
+    starts_with: "次で始まる"
+    ends_with: "次で終わる"
+    greater_than: "次より大きい"
+    less_than: "次より小さい"
+    in_range: "次の範囲内"
+    is_rated: "評価あり"
+    is_unrated: "評価なし"
+    is_before: "次より前"
+    is_after: "次より後"
+    is_in_the_last: "過去"
+    is_not_in_the_last: "過去以外"
+  date_unit:
+    days: "日間"
+    weeks: "週間"
+    months: "か月間"
+  limit_unit:
+    items: "項目"
+    minutes: "分"
+    hours: "時間"
+    megabytes: "MB"
+    gigabytes: "GB"
+  limit_sort:
+    random: "ランダム"
+    most_played: "再生回数が多い順"
+    least_played: "再生回数が少ない順"
+    most_recently_added: "追加日が新しい順"
+    least_recently_added: "追加日が古い順"
+    most_recently_played: "最終再生日が新しい順"
+    least_recently_played: "最終再生日が古い順"
+    highest_rated: "評価が高い順"
+    lowest_rated: "評価が低い順"
+  sort_direction:
+    ascending: "昇順"
+    descending: "降順"
 
 # ── サーバープレイリスト ──────────────────────────────────────────
 server_playlists:
@@ -339,6 +450,8 @@ errors:
     invalid_response: "%{backend} から無効な応答が返されました"
     authentication_method_unsupported: "%{backend} の認証方式はサポートされていません"
     source_failed: "%{backend} ソースでエラーが発生しました"
+    removable_backend: "リムーバブルメディア"
+    generic_backend: "リモートサーバー"
   playback:
     network_request_failed: "オーディオのネットワークリクエストに失敗しました"
     decoder_failed: "オーディオデコーダーでエラーが発生しました"
@@ -358,15 +471,18 @@ errors:
     unsupported_location: "この場所は開けません。Tributary で開けるのはこのコンピューター上のファイルだけです。"
     closing: "Tributary を終了しています。終了してから、もう一度開いてください。"
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} 曲、%{hours} 時間"
-  songs_minutes: "%{count} 曲、%{minutes} 分"
+  songs:
+    one: "%{count} 曲"
+    other: "%{count} 曲"
+  hours:
+    one: "%{hours} 時間"
+    other: "%{hours} 時間"
+  minutes:
+    one: "%{minutes} 分"
+    other: "%{minutes} 分"
+  summary: "%{songs}、%{duration}"
 
 # ── Rhythmbox からの移行 ──────────────────────────────────────────
 rhythmbox_migration:

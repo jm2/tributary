@@ -984,6 +984,7 @@ impl MountedMutationCommit<'_> {
     /// installed with the tagged identity. Callers without a retained
     /// staging handle (the documented path-based flows) pass `None` and
     /// keep their pathname-identity proof.
+    #[cfg(test)]
     pub(crate) fn commit_replacement(
         &mut self,
         staged: &Path,
@@ -2303,6 +2304,7 @@ fn validate_root_binding(authority: &impl RootBinding) -> io::Result<()> {
     authority.root_handle().validate_live()
 }
 
+#[cfg(not(any(unix, windows)))]
 fn unsupported_platform() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

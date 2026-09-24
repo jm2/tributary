@@ -9,7 +9,7 @@
 //! boundary until media use.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::future::Future;
 use std::pin::Pin;
@@ -175,22 +175,17 @@ impl RemovableMutationTarget {
     ///
     /// Fails closed when the owning session was retired, when the mount or
     /// retained evidence changed, or when the exact pathname no longer names
-    /// the admitted file at commit time. A pass through the active check
-    /// atomically acquires one in-flight lease permit and holds it until the
-    /// write commits or rolls back, so a retirement that begins mid-write is
-    /// serialized behind this section instead of revoking the authority
-    /// underneath an observed-but-unadmitted check. Blocking — worker threads
-    /// only.
+    /// the admitted file at commit time. The session lease admits the commit
+    /// itself: a lease permit is held only across the final rename, so a
+    /// retirement never waits behind the staged copy and flush, and once
+    /// revocation returns no write can land. Blocking — worker threads only.
     pub fn write_tags(&self, edits: &crate::local::tag_writer::TagEdits) -> anyhow::Result<()> {
-        // Acquire — never merely observe — the lease. `is_active()` followed
-        // by a write leaves a revocation window between the two steps; a
-        // permit makes admission and revocation mutually exclusive, and the
-        // revoker waits until this section ends.
-        let _write_section = self
-            .lease
-            .try_acquire()
-            .ok_or_else(|| anyhow::anyhow!("The removable media source is no longer active"))?;
-        crate::local::tag_writer::write_tags_with_mutation_target(&self.inner, edits)
+        // Fail fast before copying anything; the commit re-checks under a
+        // permit.
+        if !self.lease.is_active() {
+            anyhow::bail!("The removable media source is no longer active");
+        }
+        crate::local::tag_writer::write_tags_with_mutation_target(&self.inner, edits, &self.lease)
     }
 }
 
@@ -434,87 +429,6 @@ impl PlaybackAttributionProfile {
 impl std::fmt::Debug for PlaybackAttributionProfile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PlaybackAttributionProfile(<redacted>)")
-    }
-}
-
-/// Cumulative bound on search-only playback-attribution retention per source.
-///
-/// Each search response is bounded per request, but a long-lived session can
-/// issue unbounded numbers of searches, each introducing rows with fresh
-/// native identities. Profiles minted from search rows are therefore kept in
-/// a [`BoundedSearchAttributionProfiles`] store capped at this bound instead
-/// of growing an adapter's attribution cache without limit.
-pub const MAX_SEARCH_ATTRIBUTION_PROFILES: usize = 1024;
-
-/// Insertion-ordered, bounded store for playback-attribution profiles minted
-/// from search rows outside the refreshed catalogue.
-///
-/// A refreshed catalogue profile is never stored here, so search traffic can
-/// never evict it. Re-searching an already-retained native identity replaces
-/// its entry in place without evicting anything; only a genuinely new
-/// identity past the bound evicts the oldest search-only entry.
-#[derive(Debug)]
-pub struct BoundedSearchAttributionProfiles {
-    bound: usize,
-    order: VecDeque<TrackId>,
-    profiles: HashMap<TrackId, PlaybackAttributionProfile>,
-}
-
-impl BoundedSearchAttributionProfiles {
-    /// Create an empty store with the production retention bound.
-    pub fn bounded() -> Self {
-        Self::with_bound(MAX_SEARCH_ATTRIBUTION_PROFILES)
-    }
-
-    pub fn with_bound(bound: usize) -> Self {
-        Self {
-            bound,
-            order: VecDeque::new(),
-            profiles: HashMap::new(),
-        }
-    }
-
-    /// Retain one search-minted profile. An already-retained identity is
-    /// replaced in place; a new identity past the bound evicts the oldest
-    /// search-only entry first.
-    pub fn insert(&mut self, track_id: TrackId, profile: PlaybackAttributionProfile) {
-        if let Some(retained) = self.profiles.get_mut(&track_id) {
-            *retained = profile;
-            return;
-        }
-        self.order.push_back(track_id.clone());
-        self.profiles.insert(track_id, profile);
-        while self.order.len() > self.bound {
-            let Some(evicted) = self.order.pop_front() else {
-                break;
-            };
-            self.profiles.remove(&evicted);
-        }
-    }
-
-    /// Drop one search-minted profile, keeping insertion order intact for the
-    /// remaining entries. Catalogue profiles live in a separate map and are
-    /// unaffected.
-    pub fn remove(&mut self, track_id: &TrackId) {
-        if self.profiles.remove(track_id).is_some() {
-            if let Some(position) = self.order.iter().position(|id| id == track_id) {
-                self.order.remove(position);
-            }
-        }
-    }
-
-    pub fn get(&self, track_id: &TrackId) -> Option<&PlaybackAttributionProfile> {
-        self.profiles.get(track_id)
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.profiles.len()
-    }
-
-    #[cfg(test)]
-    pub fn contains_key(&self, track_id: &TrackId) -> bool {
-        self.profiles.contains_key(track_id)
     }
 }
 
@@ -3655,9 +3569,6 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
-    use crate::architecture::models::{
-        Album, Artist, LibraryStats, SearchResults, SortField, SortOrder,
-    };
     use crate::db::migration::Migrator;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
     use crate::local::playlist_manager::{
@@ -3676,78 +3587,6 @@ mod tests {
     };
 
     use super::*;
-
-    fn search_attribution_fixture() -> PlaybackAttributionProfile {
-        PlaybackAttributionProfile::for_test("T", "A", None, None, None, None)
-    }
-
-    fn search_attribution_track(suffix: &str) -> TrackId {
-        TrackId::remote(format!("search-{suffix}")).expect("bounded track ID")
-    }
-
-    #[test]
-    fn bounded_search_profiles_evict_the_oldest_identity_past_the_bound() {
-        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
-        let first = search_attribution_track("first");
-        let second = search_attribution_track("second");
-        let third = search_attribution_track("third");
-
-        store.insert(first.clone(), search_attribution_fixture());
-        store.insert(second.clone(), search_attribution_fixture());
-        assert_eq!(store.len(), 2);
-
-        // A third distinct identity past the bound evicts the oldest entry.
-        store.insert(third.clone(), search_attribution_fixture());
-        assert_eq!(store.len(), 2);
-        assert!(
-            !store.contains_key(&first),
-            "the oldest search-only entry must be evicted first"
-        );
-        assert!(store.contains_key(&second));
-        assert!(store.contains_key(&third));
-    }
-
-    #[test]
-    fn bounded_search_profiles_replace_repeat_identities_in_place() {
-        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
-        let first = search_attribution_track("first");
-        let second = search_attribution_track("second");
-        let profile = search_attribution_fixture();
-
-        store.insert(first.clone(), profile.clone());
-        store.insert(second.clone(), profile);
-        // Re-searching a retained identity replaces its value in place
-        // without evicting the neighbor or growing the store.
-        let refreshed = PlaybackAttributionProfile::for_test("T2", "A2", None, None, None, None);
-        store.insert(first.clone(), refreshed);
-        assert_eq!(store.len(), 2);
-        assert!(
-            store.contains_key(&second),
-            "a repeat insert must not evict anything"
-        );
-        assert_eq!(store.get(&first).expect("retained identity").title(), "T2");
-    }
-
-    #[test]
-    fn bounded_search_profiles_remove_keeps_remaining_entries_ordered() {
-        let mut store = BoundedSearchAttributionProfiles::with_bound(2);
-        let first = search_attribution_track("first");
-        let second = search_attribution_track("second");
-        let profile = search_attribution_fixture();
-
-        store.insert(first.clone(), profile.clone());
-        store.insert(second.clone(), profile);
-        store.remove(&first);
-        assert_eq!(store.len(), 1);
-        assert!(store.contains_key(&second));
-        // The freed slot is refillable: inserting a new identity does not
-        // evict the surviving neighbor.
-        let third = search_attribution_track("third");
-        store.insert(third.clone(), search_attribution_fixture());
-        assert_eq!(store.len(), 2);
-        assert!(store.contains_key(&second));
-        assert!(store.contains_key(&third));
-    }
 
     struct FakeProbe {
         close_calls: AtomicUsize,
@@ -4017,48 +3856,8 @@ mod tests {
 
     #[async_trait]
     impl MediaBackend for FakeAdapter {
-        fn name(&self) -> &str {
-            self.label
-        }
-
-        fn backend_type(&self) -> &str {
-            "test"
-        }
-
-        async fn ping(&self) -> BackendResult<()> {
-            Ok(())
-        }
-
-        async fn search(&self, _query: &str, _limit: usize) -> BackendResult<SearchResults> {
-            Ok(SearchResults::default())
-        }
-
         async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
             Ok(Vec::new())
-        }
-
-        async fn list_albums(
-            &self,
-            _sort: SortField,
-            _order: SortOrder,
-        ) -> BackendResult<Vec<Album>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-            Ok(Vec::new())
-        }
-
-        async fn get_album_tracks(&self, _album_id: &Uuid) -> BackendResult<Vec<Track>> {
-            Ok(Vec::new())
-        }
-
-        async fn get_artist_tracks(&self, _artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-            Ok(Vec::new())
-        }
-
-        async fn get_stats(&self) -> BackendResult<LibraryStats> {
-            Ok(LibraryStats::default())
         }
     }
 
@@ -9256,10 +9055,10 @@ mod tests {
     }
 
     /// Revocation racing a tag write can serialize in either order, and both
-    /// must be consistent: either the write was admitted first — revocation
-    /// waits behind its in-flight permit and the tags land — or retirement
-    /// landed first and the write is refused at admission with the file
-    /// untouched. No order may tear the file or lose the retirement.
+    /// must be consistent: either the commit was admitted first — revocation
+    /// waits behind its permit and the tags land — or retirement landed
+    /// first and the write is refused with the file untouched. No order may
+    /// tear the file or lose the retirement.
     #[tokio::test]
     async fn revocation_during_a_removable_tag_write_never_tears_the_outcome() {
         let registry = registry();
@@ -9296,10 +9095,9 @@ mod tests {
                 .is_ok()
         });
 
-        // Retire while the write may be mid-flight. An admitted section
-        // holds its lease permit until commit or rollback, so a revocation
-        // that began after admission cannot invalidate authority underneath
-        // the write; it must wait for the section to end.
+        // Retire while the write may be mid-flight. A commit holds its lease
+        // permit across the rename, so revocation either waits for that
+        // rename or refuses the commit.
         assert!(registry.release_provenance(source_id, claim));
         let admitted = writer.join().expect("writer thread finishes");
         wait_until_pruned(&registry, source_id).await;
@@ -9318,14 +9116,124 @@ mod tests {
         if admitted {
             assert_eq!(
                 title, "Mid-Flight Title",
-                "an admitted write must complete even when revocation began mid-flight"
+                "an admitted commit must complete even when revocation began mid-flight"
             );
         } else {
             assert_eq!(
                 title, "Before Retirement",
-                "a write refused at admission must leave the admitted file untouched"
+                "a refused write must leave the admitted file untouched"
             );
         }
+        registry.shutdown().wait().await;
+    }
+
+    /// Ejecting while a tag save is still copying must not wait for the
+    /// save: the disconnect returns while the writer is held before staging,
+    /// and the released writer is then refused at its commit, leaving the
+    /// file and its directory untouched.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_does_not_wait_for_a_tag_write_that_is_still_staging() {
+        let registry = registry();
+        let mount = tempfile::tempdir().expect("temporary removable mount");
+        let leaf = "eject-during-save.flac";
+        let path = mount.path().join(leaf);
+        write_tagged_removable_fixture(&path, "Before Eject", "Fixture Artist", None);
+        let source_id =
+            SourceId::removable("registry:test:eject-during-save").expect("removable source");
+        let claim = registry
+            .claim_provenance(source_id, SourceProvenance::Removable)
+            .expect("claim removable source");
+        registry
+            .connect_removable(source_id, mount.path().to_path_buf(), |_| {})
+            .expect("removable connection admitted");
+        let (_, session_epoch) = wait_for_catalogue(&registry, source_id).await;
+        let track_id = registry
+            .snapshot(source_id)
+            .and_then(|snapshot| snapshot.catalogue)
+            .and_then(|catalogue| catalogue.value.tracks().first().cloned())
+            .and_then(|track| track.native_track_id)
+            .expect("accepted track identity");
+        let target = registry
+            .resolve_mutation_target(source_id, session_epoch, track_id)
+            .await
+            .expect("resolve retained mutation target");
+
+        let (staging_tx, staging_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let release_rx = Mutex::new(release_rx);
+        let mut outcome = None;
+        crate::local::tag_writer::with_pre_staging_interpose(
+            Box::new(move |held| {
+                if held.relative_path() != std::path::Path::new(leaf) {
+                    return;
+                }
+                let _ = staging_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }),
+            || {
+                let writer_target = target.clone();
+                let writer = std::thread::spawn(move || {
+                    writer_target.write_tags(&crate::local::tag_writer::TagEdits {
+                        title: Some("After Eject".to_string()),
+                        ..Default::default()
+                    })
+                });
+                staging_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the writer reached staging");
+
+                let disconnecting = registry.clone();
+                let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+                let disconnect = std::thread::spawn(move || {
+                    let waiter = disconnecting.disconnect(source_id);
+                    let _ = returned_tx.send(());
+                    waiter
+                });
+                let returned_while_held = returned_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+                release_tx.send(()).expect("release the held writer");
+                let waiter = disconnect.join().expect("disconnect thread");
+                let write = writer.join().expect("writer thread");
+                outcome = Some((returned_while_held, waiter, write));
+            },
+        );
+        let (returned_while_held, waiter, write) = outcome.expect("interposed run completed");
+
+        assert!(
+            returned_while_held,
+            "disconnect must not wait for a tag save that is still staging"
+        );
+        assert!(!target.is_active());
+        write.expect_err("a write reaching its commit after revocation must be refused");
+        waiter.expect("disconnect admitted").wait().await;
+
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::Accessor;
+        let tagged = lofty::read_from_path(&path).expect("reopen fixture");
+        assert_eq!(
+            tagged
+                .primary_tag()
+                .expect("primary tag")
+                .title()
+                .as_deref(),
+            Some("Before Eject"),
+            "the refused write must leave the file untouched"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(mount.path())
+            .expect("list mount")
+            .filter_map(Result::ok)
+            .filter(|entry| crate::local::tag_writer::is_tag_write_temp_file(&entry.path()))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the refused write leaves no staged copy"
+        );
+
+        assert!(registry.release_provenance(source_id, claim));
+        wait_until_pruned(&registry, source_id).await;
         registry.shutdown().wait().await;
     }
 

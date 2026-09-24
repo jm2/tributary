@@ -3,8 +3,6 @@
 //! Only the subset of fields Tributary actually uses are deserialized;
 //! unknown fields are silently ignored (`#[serde(default)]`).
 
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 // ── Top-level envelope ──────────────────────────────────────────────────
@@ -21,10 +19,6 @@ pub struct SubsonicResponse {
     #[serde(default)]
     pub error: Option<SubsonicError>,
 
-    // ping.view
-    #[serde(default)]
-    pub version: Option<String>,
-
     // getArtists.view
     #[serde(default)]
     pub artists: Option<ArtistsWrapper>,
@@ -36,10 +30,6 @@ pub struct SubsonicResponse {
     // getAlbum.view
     #[serde(default)]
     pub album: Option<AlbumDetail>,
-
-    // search3.view
-    #[serde(default, rename = "searchResult3")]
-    pub search_result3: Option<SearchResult3>,
 
     // getPlaylists.view
     #[serde(default)]
@@ -53,7 +43,6 @@ pub struct SubsonicResponse {
 #[derive(Debug, Deserialize)]
 pub struct SubsonicError {
     pub code: i32,
-    pub message: String,
 }
 
 // ── getArtists ──────────────────────────────────────────────────────────
@@ -75,10 +64,6 @@ pub struct ArtistIndex {
 pub struct ArtistEntry {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub album_count: Option<u32>,
-    #[serde(default)]
-    pub cover_art: Option<String>,
 }
 
 // ── getArtist (detail with albums) ──────────────────────────────────────
@@ -86,8 +71,6 @@ pub struct ArtistEntry {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtistDetail {
-    pub id: String,
-    pub name: String,
     #[serde(default)]
     pub album: Vec<AlbumEntry>,
 }
@@ -97,22 +80,6 @@ pub struct ArtistDetail {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlbumDetail {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub artist: Option<String>,
-    #[serde(default)]
-    pub artist_id: Option<String>,
-    #[serde(default)]
-    pub year: Option<i32>,
-    #[serde(default)]
-    pub genre: Option<String>,
-    #[serde(default)]
-    pub cover_art: Option<String>,
-    #[serde(default)]
-    pub song_count: Option<u32>,
-    #[serde(default)]
-    pub duration: Option<u64>,
     #[serde(default)]
     pub song: Vec<SongEntry>,
 }
@@ -122,20 +89,6 @@ pub struct AlbumDetail {
 pub struct AlbumEntry {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub artist: Option<String>,
-    #[serde(default)]
-    pub artist_id: Option<String>,
-    #[serde(default)]
-    pub year: Option<i32>,
-    #[serde(default)]
-    pub genre: Option<String>,
-    #[serde(default)]
-    pub cover_art: Option<String>,
-    #[serde(default)]
-    pub song_count: Option<u32>,
-    #[serde(default)]
-    pub duration: Option<u64>,
 }
 
 // ── Song / Child ────────────────────────────────────────────────────────
@@ -149,11 +102,7 @@ pub struct SongEntry {
     #[serde(default)]
     pub artist: Option<String>,
     #[serde(default)]
-    pub artist_id: Option<String>,
-    #[serde(default)]
     pub album: Option<String>,
-    #[serde(default)]
-    pub album_id: Option<String>,
     #[serde(default)]
     pub track: Option<u32>,
     #[serde(default)]
@@ -180,19 +129,6 @@ pub struct SongEntry {
     #[serde(default)]
     #[serde(rename = "displayComposer")]
     pub display_composer: Option<String>,
-}
-
-// ── search3 ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchResult3 {
-    #[serde(default)]
-    pub artist: Vec<ArtistEntry>,
-    #[serde(default)]
-    pub album: Vec<AlbumEntry>,
-    #[serde(default)]
-    pub song: Vec<SongEntry>,
 }
 
 // ── getPlaylists / getPlaylist ──────────────────────────────────────

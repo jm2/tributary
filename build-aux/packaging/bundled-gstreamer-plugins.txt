@@ -1,0 +1,57 @@
+# GStreamer plugins that the Windows and macOS release bundles may contain.
+# Everything else in the packager's plugin directory is left out, and the
+# finished bundle is rejected if its plugin directory holds anything unlisted.
+#
+# One plugin per line: the name between "libgst" and ".dll" / ".dylib",
+# optionally followed by the single platform ("windows" or "macos") that ships
+# it. Native libraries are not listed here: each bundler copies the dependency
+# closure of these plugins and the application.
+
+# Core elements (filesrc, fakesink, identity, capsfilter, queue) and typefinding.
+coreelements
+typefindfunctions
+
+# playbin3, decodebin3, uridecodebin3 and appsrc/appsink.
+playback
+app
+
+# Conversion, volume, metering, the equalizer chain and its rglimiter.
+audioconvert
+audioresample
+volume
+level
+equalizer
+replaygain
+autodetect
+
+# HTTP source for the loopback relay and direct streams, plus internet-radio
+# ICY metadata and HLS stations.
+soup
+icydemux
+adaptivedemux2
+mpegtsdemux
+
+# Tag readers, parsers and demuxers for the supported formats: MP3, FLAC,
+# AAC/M4A/ALAC, Ogg Vorbis/Opus, WAV, AIFF and WMA.
+id3demux
+apetag
+audioparsers
+wavparse
+aiff
+isomp4
+matroska
+ogg
+asf
+
+# Decoders. libav supplies AAC, ALAC and WMA; FDK AAC is denied by the
+# forbidden-component policy because its license is GPL-incompatible.
+flac
+mpg123
+vorbis
+opus
+libav
+
+# Platform audio output.
+wasapi2 windows
+directsound windows
+osxaudio macos

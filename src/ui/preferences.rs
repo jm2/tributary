@@ -890,7 +890,7 @@ pub fn show_preferences(
         .icon_name("list-add-symbolic")
         .halign(gtk::Align::End)
         .css_classes(["flat", "circular"])
-        .tooltip_text("Add folder")
+        .tooltip_text(rust_i18n::t!("preferences.add_folder").as_ref())
         .build();
 
     // Hint shown once the user adds or removes a folder. The running
@@ -1052,7 +1052,7 @@ pub fn show_preferences(
         .build();
 
     let album_artist_check = gtk::CheckButton::builder()
-        .label("Group by Album Artist")
+        .label(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
         .active(cfg.group_by_album_artist)
         .hexpand(true)
         .halign(gtk::Align::Start)
@@ -1513,7 +1513,7 @@ fn build_library_path_row(
         .icon_name("list-remove-symbolic")
         .valign(gtk::Align::Center)
         .css_classes(["flat", "circular"])
-        .tooltip_text("Remove folder")
+        .tooltip_text(rust_i18n::t!("preferences.remove_folder").as_ref())
         .build();
 
     let reauthorize_btn = gtk::Button::builder()

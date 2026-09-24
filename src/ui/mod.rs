@@ -8,12 +8,13 @@ pub mod browser;
 mod confirm_dialog;
 pub mod context_menu;
 pub mod discovery_handler;
-pub mod dummy_data;
 pub mod equalizer_panel;
 pub mod folder_browser;
 pub mod header_bar;
+mod l10n;
 pub mod lastfm_settings;
 mod library_commands;
+mod local_row_batch;
 pub mod objects;
 pub mod open_files;
 pub mod output_dialogs;
@@ -60,15 +61,14 @@ pub mod window_state;
 // second GTK-initializing `#[test]` still runs on its own worker thread
 // and, seeing `gtk::is_initialized()` already true, would skip init and
 // construct widgets off the initializing thread — tripping gtk-rs
-// main-thread checks (2026-09-09 review rejection, PR #179). The crate
-// therefore keeps exactly ONE GTK-initializing `#[test]` (the consolidated
-// widget-contracts test in `browser.rs`); a new GTK-touching contract must
-// join that test's body as a helper, never become a second `#[test]`.
+// main-thread checks. The crate therefore keeps exactly ONE
+// GTK-initializing `#[test]` (the consolidated widget-contracts test in
+// `browser.rs`); a new GTK-touching contract must join that test's body as
+// a helper, never become a second `#[test]`.
 //
-// Q1 (`tr-sptyt`, issue #274) turns that documented rule into an enforced
-// gate. `with_session` now records the thread that ran `gtk::init` and
-// FAILS LOUDLY if a later call from a different thread tries to reuse the
-// initialized session. It also honors strict mode —
+// That rule is enforced (#274): `with_session` records the thread that ran
+// `gtk::init` and FAILS LOUDLY if a later call from a different thread
+// tries to reuse the initialized session. It also honors strict mode —
 // `TRIBUTARY_GTK_GATE=require` from the real-display CI job, or
 // `TRIBUTARY_WIDGET_TESTS_FAIL_CLOSED` from the acceptance harness — which
 // converts every would-be skip (no display session, or GTK unavailable)

@@ -1,0 +1,28 @@
+Tributary third-party notices
+=============================
+
+Tributary is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License, version 3 or (at your option) any
+later version. The license text is in licenses/common/GPL-3.0.txt.
+
+This package also contains the third-party components listed below. They were
+built by @PACKAGER@.
+Each entry gives the component's version, the license its packager declares,
+and any license files the component ships. The GNU license texts that many of
+these components use are in licenses/common/.
+
+Source code offer
+-----------------
+Some of these components are licensed under the GNU GPL or LGPL. Each entry's
+"Source" line points to the source code of the exact version shipped. The
+packager's build recipes and patches are published at
+@RECIPES@.
+For at least three years after this release, the Tributary maintainers will
+also provide the complete corresponding source code of any GPL- or
+LGPL-licensed component in this package on request at
+https://github.com/jm2/tributary/issues, for no more than the cost of
+physically performing the source distribution. Tributary's own source code is
+at https://github.com/jm2/tributary.
+
+Components
+----------

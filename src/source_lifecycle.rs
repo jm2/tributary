@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use futures::FutureExt;
 use tokio::runtime::Handle;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
@@ -144,6 +144,7 @@ struct ConstructedAdapter<A: ?Sized> {
     adapter: Arc<A>,
 }
 
+#[cfg(test)]
 impl<A> ConstructedAdapter<A> {
     fn new(adapter: A) -> Self {
         Self {
@@ -297,8 +298,8 @@ pub struct OperationCorrelation {
     pub session_epoch: Option<u64>,
 }
 
-/// Snapshot-safe failure annotation. A lagged/dropped observer event can
-/// resynchronize this exact generation instead of clearing a newer retry.
+/// Snapshot-safe failure annotation. The exact operation correlation lets a
+/// stale attempt be told apart from a newer retry instead of clearing it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CorrelatedFailure {
     pub correlation: OperationCorrelation,
@@ -353,78 +354,6 @@ pub enum SourceState {
 pub enum RefreshLane {
     Catalogue,
     View(ViewOrigin),
-}
-
-/// Failure annotation location in a typed lifecycle change.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum FailureLane {
-    Session,
-    Refresh(RefreshLane),
-}
-
-/// Typed observer event. Every accepted event has a strictly newer revision.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LifecycleChange {
-    ProvenanceChanged {
-        contributions: ProvenanceSet,
-        visibility: SourceVisibility,
-        retention: Retention,
-    },
-    StateChanged {
-        from: SourceState,
-        to: SourceState,
-        session_epoch: Option<u64>,
-    },
-    ConnectStarted {
-        generation: u64,
-    },
-    RefreshStarted {
-        lane: RefreshLane,
-        generation: u64,
-        session_epoch: u64,
-    },
-    OperationCancelled {
-        lane: RefreshLane,
-        generation: u64,
-    },
-    ConnectCancelled {
-        generation: u64,
-    },
-    SessionAdopted {
-        session_epoch: u64,
-        replaced_epoch: Option<u64>,
-    },
-    CatalogueAccepted {
-        generation: u64,
-        session_epoch: u64,
-    },
-    ViewAccepted {
-        view: ViewOrigin,
-        generation: u64,
-        session_epoch: u64,
-    },
-    ViewRemoved {
-        view: ViewOrigin,
-    },
-    SnapshotsCleared,
-    FailureChanged {
-        lane: FailureLane,
-        correlation: OperationCorrelation,
-        failure: Option<SourceFailure>,
-    },
-    SessionRetired {
-        session_epoch: u64,
-        failure: Option<SourceFailure>,
-    },
-    Pruned,
-}
-
-/// One typed event with total ordering inside this registry incarnation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RevisionedLifecycleChange {
-    pub revision: u64,
-    pub source_id: SourceId,
-    pub change: LifecycleChange,
 }
 
 struct CancellationSwitch {
@@ -592,10 +521,12 @@ pub struct ShutdownBarrier {
 }
 
 impl ShutdownBarrier {
+    #[cfg(test)]
     pub fn is_complete(&self) -> bool {
         self.tracker.active() == 0
     }
 
+    #[cfg(test)]
     pub fn pending_operations(&self) -> usize {
         self.tracker.active()
     }
@@ -634,7 +565,6 @@ pub struct LatestAcceptedView<T> {
 pub struct CurrentAcceptedCatalogue<T> {
     pub generation: u64,
     pub session_epoch: u64,
-    pub authority: MediaLease,
     pub value: T,
 }
 
@@ -657,6 +587,7 @@ pub struct CatalogueCommitRequest<K> {
 /// permit. Callers must not retain it while asking the lifecycle registry to
 /// replace or disconnect one of the admitted sources.
 pub struct CatalogueCommitAuthority {
+    #[allow(dead_code)] // Retention through Drop is the authority operation.
     permits: Vec<MediaLeasePermit>,
 }
 
@@ -710,7 +641,7 @@ impl<S> Clone for AcceptedSnapshot<S> {
     }
 }
 
-/// Immutable source state read by observers that subscribe after an event.
+/// Immutable source state that observers re-read after an invalidation.
 #[derive(Clone)]
 pub struct LifecycleSnapshot<S> {
     pub revision: u64,
@@ -837,6 +768,7 @@ impl<A: ?Sized, S> Entry<A, S> {
         self.views.insert(view, accepted);
     }
 
+    #[cfg(test)]
     fn remove_view(&mut self, view: &ViewOrigin) -> bool {
         let Some(removed) = self.views.get(view) else {
             return false;
@@ -948,6 +880,7 @@ impl RetirementWaiter {
         self
     }
 
+    #[cfg(test)]
     pub const fn retirement_id(&self) -> Option<u64> {
         self.retirement_id
     }
@@ -1014,7 +947,6 @@ struct RegistryInner<A: LifecycleAdapter + ?Sized, S> {
     incarnation: Uuid,
     runtime: Handle,
     tracker: Arc<OperationTracker>,
-    changes: broadcast::Sender<RevisionedLifecycleChange>,
     invalidations: watch::Sender<u64>,
     state: Mutex<RegistryState<A, S>>,
     external_handles: AtomicUsize,
@@ -1046,6 +978,7 @@ impl<A: ?Sized> SessionHandle<A> {
         Arc::clone(&self.adapter)
     }
 
+    #[cfg(test)]
     pub fn lease(&self) -> MediaLease {
         self.lease.clone()
     }
@@ -1175,12 +1108,9 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         state.next_session_epoch
     }
 
-    fn publish_locked(
-        &self,
-        state: &mut RegistryState<A, S>,
-        source_id: SourceId,
-        change: LifecycleChange,
-    ) {
+    /// Advance the global revision for an observable change to one source,
+    /// stamp that source's row, and wake invalidation observers.
+    fn publish_locked(&self, state: &mut RegistryState<A, S>, source_id: SourceId) {
         state.revision = state
             .revision
             .checked_add(1)
@@ -1189,11 +1119,6 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         if let Some(entry) = state.entries.get_mut(&source_id) {
             entry.revision = state.revision;
         }
-        let _ = self.changes.send(RevisionedLifecycleChange {
-            revision: state.revision,
-            source_id,
-            change,
-        });
     }
 
     fn source_is_prunable(state: &RegistryState<A, S>, source_id: SourceId) -> bool {
@@ -1216,11 +1141,14 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         })
     }
 
+    /// Remove one inert, provenance-free retired entry. Late owners carry the
+    /// registry incarnation and global generation, so a submission after
+    /// pruning can only enter rejected-adapter retirement.
     fn prune_source_locked(&self, state: &mut RegistryState<A, S>, source_id: SourceId) -> bool {
         if !Self::source_is_prunable(state, source_id) {
             return false;
         }
-        self.publish_locked(state, source_id, LifecycleChange::Pruned);
+        self.publish_locked(state, source_id);
         if let Some(entry) = state.entries.get_mut(&source_id) {
             entry.revoke_snapshots();
         }
@@ -1234,30 +1162,14 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         source_id: SourceId,
         next: SourceState,
     ) {
-        let Some((previous, session_epoch)) = state
-            .entries
-            .get(&source_id)
-            .map(|entry| (entry.state, entry.session_epoch()))
-        else {
+        let Some(entry) = state.entries.get_mut(&source_id) else {
             return;
         };
-        if previous == next {
+        if entry.state == next {
             return;
         }
-        state
-            .entries
-            .get_mut(&source_id)
-            .expect("entry checked above")
-            .state = next;
-        self.publish_locked(
-            state,
-            source_id,
-            LifecycleChange::StateChanged {
-                from: previous,
-                to: next,
-                session_epoch,
-            },
-        );
+        entry.state = next;
+        self.publish_locked(state, source_id);
     }
 
     fn set_session_failure_locked(
@@ -1282,15 +1194,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             .get_mut(&source_id)
             .expect("entry checked above")
             .failure = retained;
-        self.publish_locked(
-            state,
-            source_id,
-            LifecycleChange::FailureChanged {
-                lane: FailureLane::Session,
-                correlation,
-                failure,
-            },
-        );
+        self.publish_locked(state, source_id);
     }
 
     fn set_refresh_failure_locked(
@@ -1314,21 +1218,13 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
         }
         match retained {
             Some(value) => {
-                entry.refresh_failures.insert(lane.clone(), value);
+                entry.refresh_failures.insert(lane, value);
             }
             None => {
                 entry.refresh_failures.remove(&lane);
             }
         }
-        self.publish_locked(
-            state,
-            source_id,
-            LifecycleChange::FailureChanged {
-                lane: FailureLane::Refresh(lane),
-                correlation,
-                failure,
-            },
-        );
+        self.publish_locked(state, source_id);
     }
 
     fn cancel_pending(operation: PendingOperation) {
@@ -1468,16 +1364,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             );
         }
         if removed_association {
-            if let Some(session_epoch) = record.session_epoch {
-                self.publish_locked(
-                    &mut state,
-                    record.source_id,
-                    LifecycleChange::SessionRetired {
-                        session_epoch,
-                        failure,
-                    },
-                );
-            }
+            self.publish_locked(&mut state, record.source_id);
         }
         if foreground_disconnect {
             let next = if state.gate == RegistryGate::ShuttingDown {
@@ -1496,7 +1383,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             self.transition_locked(&mut state, record.source_id, next);
         }
         // End shutdown-barrier participation only after all entry bookkeeping,
-        // typed events, and the terminal state transition are visible, then
+        // revisions, and the terminal state transition are visible, then
         // publish waiter completion. A waiter waking on another runtime thread
         // may therefore immediately snapshot the finalized row and observe a
         // complete shutdown barrier.
@@ -1622,11 +1509,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             return false;
         };
         Self::cancel_pending(operation);
-        self.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::ConnectCancelled { generation },
-        );
+        self.publish_locked(&mut state, source_id);
         let next = state
             .entries
             .get(&source_id)
@@ -1749,18 +1632,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
                 session_epoch: Some(session_epoch),
             },
         );
-        let change = match lane {
-            RefreshLane::Catalogue => LifecycleChange::CatalogueAccepted {
-                generation,
-                session_epoch,
-            },
-            RefreshLane::View(view) => LifecycleChange::ViewAccepted {
-                view: view.clone(),
-                generation,
-                session_epoch,
-            },
-        };
-        self.publish_locked(&mut state, source_id, change);
+        self.publish_locked(&mut state, source_id);
         let next = state
             .entries
             .get(&source_id)
@@ -1843,14 +1715,7 @@ impl<A: LifecycleAdapter + ?Sized, S> RegistryInner<A, S> {
             .remove(lane)
             .expect("current refresh exists");
         Self::cancel_pending(operation);
-        self.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::OperationCancelled {
-                lane: lane.clone(),
-                generation,
-            },
-        );
+        self.publish_locked(&mut state, source_id);
         let next = state
             .entries
             .get(&source_id)
@@ -1886,14 +1751,12 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     /// Construct a registry whose operation and retirement tasks run on the
     /// supplied process-owned runtime.
     pub fn new(runtime: Handle) -> Self {
-        let (changes, _receiver) = broadcast::channel(256);
         let (invalidations, _receiver) = watch::channel(0);
         Self {
             inner: Arc::new(RegistryInner {
                 incarnation: Uuid::new_v4(),
                 runtime,
                 tracker: OperationTracker::new(),
-                changes,
                 invalidations,
                 state: Mutex::new(RegistryState::default()),
                 external_handles: AtomicUsize::new(1),
@@ -1901,19 +1764,11 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RevisionedLifecycleChange> {
-        self.inner.changes.subscribe()
-    }
-
-    /// Subscribe to the registry-wide invalidation revision. Unlike the
-    /// source-scoped diagnostic event stream, this also advances when the
-    /// global admission gate closes with no live source rows.
+    /// Subscribe to the registry-wide invalidation revision. It advances on
+    /// every observable source change and also when the global admission gate
+    /// closes with no live source rows.
     pub fn subscribe_invalidations(&self) -> watch::Receiver<u64> {
         self.inner.invalidations.subscribe()
-    }
-
-    pub fn revision(&self) -> u64 {
-        lock(&self.inner.state).revision
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -1968,21 +1823,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 vacant.insert(Entry::new(claim_id, contribution));
             }
         }
-        let provenance = state
-            .entries
-            .get(&source_id)
-            .expect("entry inserted")
-            .provenance
-            .clone();
-        self.inner.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::ProvenanceChanged {
-                contributions: provenance.clone(),
-                visibility: provenance.visibility(),
-                retention: provenance.retention(),
-            },
-        );
+        self.inner.publish_locked(&mut state, source_id);
         if reactivate {
             self.inner
                 .transition_locked(&mut state, source_id, SourceState::Dormant);
@@ -2019,17 +1860,9 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         if *claim_count == 0 {
             entry.provenance.0.remove(&contribution);
         }
-        let provenance = entry.provenance.clone();
-        self.inner.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::ProvenanceChanged {
-                visibility: provenance.visibility(),
-                retention: provenance.retention(),
-                contributions: provenance.clone(),
-            },
-        );
-        if provenance.is_empty() {
+        let released_last_claim = entry.provenance.is_empty();
+        self.inner.publish_locked(&mut state, source_id);
+        if released_last_claim {
             jobs.extend(self.disconnect_locked(&mut state, source_id, true));
         }
         drop(state);
@@ -2351,12 +2184,12 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         Some(CurrentAcceptedCatalogue {
             generation,
             session_epoch,
-            authority,
             value,
         })
     }
 
     /// Select from one exact accepted catalogue identity.
+    #[cfg(test)]
     pub(crate) fn resolve_exact_accepted_catalogue<T, Select>(
         &self,
         source_id: SourceId,
@@ -2512,6 +2345,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     }
 
     /// Validate one accepted catalogue identity without cloning its value.
+    #[cfg(test)]
     pub fn is_current_catalogue(
         &self,
         source_id: SourceId,
@@ -2923,52 +2757,11 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         })
     }
 
-    /// Resolve one protected HTTP locator through the exact expected adapter
-    /// epoch, then recheck its epoch and lease before attaching the production
+    /// Resolve one heterogeneous adapter stream through the exact expected
+    /// adapter epoch, then recheck its epoch and lease before attaching the
     /// `MediaLease`. Requiring the caller's captured epoch prevents a queued
-    /// reference from being resolved against a later same-source session.
-    /// This is the migration seam that replaces the standard resolver map and
-    /// DAAP lease map without introducing a second lookup authority.
-    pub async fn resolve_http<F, Fut>(
-        &self,
-        source_id: SourceId,
-        expected_session_epoch: u64,
-        resolve: F,
-    ) -> BackendResult<ResolvedHttpRequest>
-    where
-        S: Send + Sync,
-        F: FnOnce(Arc<A>) -> Fut + Send,
-        Fut: Future<Output = BackendResult<ResolvedHttpRequest>> + Send,
-    {
-        let (request, lease) = self
-            .resolve_exact_session(source_id, expected_session_epoch, resolve)
-            .await?;
-        Ok(request.with_lease(lease))
-    }
-
-    /// Resolve one exact retained file through the same adapter, expected
-    /// epoch, and pre/post lease checks used for protected HTTP. The attached
-    /// lease is checked again immediately before and after every file-handle
-    /// clone, so retirement cannot retarget a queued external identity.
-    pub async fn resolve_file<F, Fut>(
-        &self,
-        source_id: SourceId,
-        expected_session_epoch: u64,
-        resolve: F,
-    ) -> BackendResult<ResolvedFileMedia>
-    where
-        S: Send + Sync,
-        F: FnOnce(Arc<A>) -> Fut + Send,
-        Fut: Future<Output = BackendResult<ResolvedFileMedia>> + Send,
-    {
-        let (media, lease) = self
-            .resolve_exact_session(source_id, expected_session_epoch, resolve)
-            .await?;
-        Ok(media.with_lease(lease))
-    }
-
-    /// Resolve one heterogeneous adapter stream without ever exposing its
-    /// source lease as a separable value.
+    /// reference from being resolved against a later same-source session, and
+    /// the source lease is never exposed as a separable value.
     pub(crate) async fn resolve_stream<F, Fut>(
         &self,
         source_id: SourceId,
@@ -2986,7 +2779,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         Ok(stream.with_lease(lease))
     }
 
-    /// Optional-artwork form of [`Self::resolve_http`] with the same exact
+    /// Optional-artwork form of [`Self::resolve_stream`] with the same exact
     /// pre-resolution expected-epoch check and post-resolution epoch/lease
     /// recheck.
     pub async fn resolve_optional_http<F, Fut>(
@@ -3055,7 +2848,6 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         entry
             .connect_settlements
             .retain(|_, settlement| settlement.active() != 0);
-        let displaced_generation = entry.connect.as_ref().map(|operation| operation.generation);
         if let Some(previous) = entry.connect.take() {
             RegistryInner::<A, S>::cancel_pending(previous);
         }
@@ -3073,13 +2865,6 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             settlement: Some(Arc::clone(&settlement)),
         });
         let session_epoch = entry.session_epoch();
-        if let Some(generation) = displaced_generation {
-            self.inner.publish_locked(
-                &mut state,
-                source_id,
-                LifecycleChange::ConnectCancelled { generation },
-            );
-        }
         self.inner.set_session_failure_locked(
             &mut state,
             source_id,
@@ -3089,11 +2874,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 session_epoch,
             },
         );
-        self.inner.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::ConnectStarted { generation },
-        );
+        self.inner.publish_locked(&mut state, source_id);
         self.inner
             .transition_locked(&mut state, source_id, SourceState::Connecting);
         Some(ConnectOwner {
@@ -3110,7 +2891,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     /// Synchronously adopt one already-constructed stateless built-in source.
     ///
     /// The normal connect/adopt path still mints its generation, session
-    /// epoch, lease, events, and replacement retirement. No caller callback
+    /// epoch, lease, revision, and replacement retirement. No caller callback
     /// runs while lifecycle or outer installation state is locked.
     pub(crate) fn adopt_stateless_session(
         &self,
@@ -3127,7 +2908,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         let submission = owner.submit_constructed(ConstructedAdapter::from_box(adapter), snapshot);
         self.remove_inactive_connect_settlement(source_id, generation, &settlement);
         match submission {
-            ConnectSubmission::Adopted { session_epoch, .. } => Some((generation, session_epoch)),
+            ConnectSubmission::Adopted { session_epoch } => Some((generation, session_epoch)),
             ConnectSubmission::Rejected => None,
         }
     }
@@ -3194,10 +2975,6 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         ) {
             return None;
         }
-        let displaced_generation = entry
-            .refreshes
-            .get(&lane)
-            .map(|operation| operation.generation);
         if let Some(previous) = entry.refreshes.remove(&lane) {
             RegistryInner::<A, S>::cancel_pending(previous);
         }
@@ -3213,25 +2990,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 settlement: None,
             },
         );
-        if let Some(generation) = displaced_generation {
-            self.inner.publish_locked(
-                &mut state,
-                source_id,
-                LifecycleChange::OperationCancelled {
-                    lane: lane.clone(),
-                    generation,
-                },
-            );
-        }
-        self.inner.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::RefreshStarted {
-                lane: lane.clone(),
-                generation,
-                session_epoch,
-            },
-        );
+        self.inner.publish_locked(&mut state, source_id);
         let next = state
             .entries
             .get(&source_id)
@@ -3252,6 +3011,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
     }
 
     /// Cancel one current refresh without recording a user-visible failure.
+    #[cfg(test)]
     pub fn cancel_refresh(&self, source_id: SourceId, lane: &RefreshLane) -> bool {
         let mut state = lock(&self.inner.state);
         let Some(operation) = state
@@ -3261,16 +3021,8 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         else {
             return false;
         };
-        let generation = operation.generation;
         RegistryInner::<A, S>::cancel_pending(operation);
-        self.inner.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::OperationCancelled {
-                lane: lane.clone(),
-                generation,
-            },
-        );
+        self.inner.publish_locked(&mut state, source_id);
         let next = state
             .entries
             .get(&source_id)
@@ -3281,6 +3033,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
 
     /// Cancel a view refresh and remove only that view's accepted generation,
     /// snapshot, and failure annotation.
+    #[cfg(test)]
     pub fn remove_view(&self, source_id: SourceId, view: &ViewOrigin) -> bool {
         let lane = RefreshLane::View(view.clone());
         let mut state = lock(&self.inner.state);
@@ -3306,11 +3059,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 removed_failure.correlation,
             );
         }
-        self.inner.publish_locked(
-            &mut state,
-            source_id,
-            LifecycleChange::ViewRemoved { view: view.clone() },
-        );
+        self.inner.publish_locked(&mut state, source_id);
         let next = state
             .entries
             .get(&source_id)
@@ -3375,18 +3124,6 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             self.inner.spawn_retirement(job);
         }
         Some(waiter)
-    }
-
-    /// Return a join-only waiter for an already-started foreground
-    /// disconnect. This never cancels a successor operation or initiates a new
-    /// disconnect, so production pruning can safely race reappearance.
-    pub fn current_disconnect_waiter(&self, source_id: SourceId) -> Option<RetirementWaiter> {
-        let state = lock(&self.inner.state);
-        state
-            .entries
-            .get(&source_id)
-            .and_then(|entry| entry.disconnect_waiter.clone())
-            .filter(|waiter| !waiter.is_complete())
     }
 
     /// Arrange lifecycle-owned cleanup after the disconnect already started
@@ -3470,8 +3207,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
             .map(|(lane, failure)| (lane.clone(), failure.correlation))
             .collect();
         if had_snapshots {
-            self.inner
-                .publish_locked(state, source_id, LifecycleChange::SnapshotsCleared);
+            self.inner.publish_locked(state, source_id);
         }
         if let Some(session_failure) = session_failure {
             self.inner.set_session_failure_locked(
@@ -3600,8 +3336,7 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
                 )
             };
             if had_snapshots {
-                self.inner
-                    .publish_locked(&mut state, source_id, LifecycleChange::SnapshotsCleared);
+                self.inner.publish_locked(&mut state, source_id);
             }
             if let Some(session_failure) = session_failure {
                 self.inner.set_session_failure_locked(
@@ -3648,34 +3383,12 @@ impl<A: LifecycleAdapter + ?Sized, S> SourceLifecycleRegistry<A, S> {
         }
         barrier
     }
-
-    /// Remove only inert, provenance-free retired entries. Late owners carry
-    /// the registry incarnation and global generation, so a submission after
-    /// pruning can only enter rejected-adapter retirement.
-    pub fn prune_retired(&self) -> usize {
-        let mut state = lock(&self.inner.state);
-        let candidates: Vec<_> = state
-            .entries
-            .keys()
-            .filter_map(|source_id| {
-                RegistryInner::source_is_prunable(&state, *source_id).then_some(*source_id)
-            })
-            .collect();
-        for source_id in &candidates {
-            let pruned = self.inner.prune_source_locked(&mut state, *source_id);
-            debug_assert!(pruned);
-        }
-        candidates.len()
-    }
 }
 
 /// Result of consuming one constructed adapter under connect authority.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum ConnectSubmission {
-    Adopted {
-        session_epoch: u64,
-        lease: MediaLease,
-    },
+    Adopted { session_epoch: u64 },
     Rejected,
 }
 
@@ -3686,6 +3399,7 @@ pub enum AdapterTaskResult<A: LifecycleAdapter + ?Sized> {
     Cancelled,
 }
 
+#[cfg(test)]
 impl<A: LifecycleAdapter> AdapterTaskResult<A> {
     pub fn constructed(adapter: A) -> Self {
         Self::Constructed(Box::new(adapter))
@@ -3705,6 +3419,7 @@ pub enum RefreshTaskResult<S> {
 /// task retains its join participation, so callers need no keepalive map.
 /// Explicit abort and registry supersession/shutdown still clean up the exact
 /// owner moved into the task.
+#[cfg_attr(not(test), allow(dead_code))] // Production drops the handle; tests abort and join through it.
 pub struct OperationAbort {
     abort: Option<AbortHandle>,
     request_cancellation: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -3714,12 +3429,14 @@ impl OperationAbort {
     /// Request cancellation through registry policy. During a protected
     /// sessionful constructor this only signals cancellation; once the
     /// adapter has been staged, the registry may abort the task safely.
+    #[cfg(test)]
     pub fn abort(mut self) {
         if let Some(request) = self.request_cancellation.take() {
             request();
         }
     }
 
+    #[cfg(test)]
     pub fn is_finished(&self) -> bool {
         self.abort.as_ref().is_none_or(AbortHandle::is_finished)
     }
@@ -3737,10 +3454,6 @@ pub struct ConnectOwner<A: LifecycleAdapter + ?Sized, S> {
 }
 
 impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
-    pub const fn source_id(&self) -> SourceId {
-        self.source_id
-    }
-
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -3804,14 +3517,12 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
             for refresh in refreshes {
                 RegistryInner::<A, S>::cancel_pending(refresh);
             }
-            let replaced_epoch = predecessor.as_ref().map(|session| session.epoch);
             if let Some(predecessor) = predecessor.as_ref() {
                 // Lock-free consumers must lose predecessor authority before
                 // any successor state is installed. Retirement repeats this
                 // idempotent revocation when it takes close ownership.
                 predecessor.lease.revoke();
             }
-            let lease = MediaLease::new();
             let accepted_snapshot = AcceptedSnapshot::new(self.generation, session_epoch, snapshot);
             {
                 let entry = state
@@ -3822,7 +3533,7 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                 entry.active = Some(ActiveSession {
                     epoch: session_epoch,
                     adapter,
-                    lease: lease.clone(),
+                    lease: MediaLease::new(),
                 });
                 entry.catalogue = Some(accepted_snapshot);
             }
@@ -3857,28 +3568,10 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                     },
                 );
             }
-            self.inner.publish_locked(
-                &mut state,
-                self.source_id,
-                LifecycleChange::SessionAdopted {
-                    session_epoch,
-                    replaced_epoch,
-                },
-            );
-            self.inner.publish_locked(
-                &mut state,
-                self.source_id,
-                LifecycleChange::CatalogueAccepted {
-                    generation: self.generation,
-                    session_epoch,
-                },
-            );
+            self.inner.publish_locked(&mut state, self.source_id);
             self.inner
                 .transition_locked(&mut state, self.source_id, SourceState::Ready);
-            ConnectSubmission::Adopted {
-                session_epoch,
-                lease,
-            }
+            ConnectSubmission::Adopted { session_epoch }
         } else {
             let mut job = self.inner.prepare_retirement_locked(
                 &mut state,
@@ -3973,13 +3666,7 @@ impl<A: LifecycleAdapter + ?Sized, S> ConnectOwner<A, S> {
                     },
                 );
             } else {
-                self.inner.publish_locked(
-                    &mut state,
-                    self.source_id,
-                    LifecycleChange::ConnectCancelled {
-                        generation: self.generation,
-                    },
-                );
+                self.inner.publish_locked(&mut state, self.source_id);
             }
             let next = if failure.is_some()
                 && state
@@ -4210,20 +3897,8 @@ pub struct RefreshOwner<A: LifecycleAdapter + ?Sized, S> {
 }
 
 impl<A: LifecycleAdapter + ?Sized, S> RefreshOwner<A, S> {
-    pub const fn source_id(&self) -> SourceId {
-        self.source_id
-    }
-
-    pub fn lane(&self) -> &RefreshLane {
-        &self.lane
-    }
-
     pub const fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub const fn session_epoch(&self) -> u64 {
-        self.session_epoch
     }
 
     pub fn cancellation(&self) -> CancellationObserver {
@@ -4521,11 +4196,25 @@ mod tests {
     ) -> (u64, MediaLease) {
         let owner = registry.begin_connect(source_id).expect("connect owner");
         match owner.submit_constructed(adapter.take(), snapshot) {
-            ConnectSubmission::Adopted {
+            ConnectSubmission::Adopted { session_epoch } => (
                 session_epoch,
-                lease,
-            } => (session_epoch, lease),
+                registry.session(source_id).expect("adopted session").lease,
+            ),
             ConnectSubmission::Rejected => panic!("initial adapter rejected"),
+        }
+    }
+
+    fn http_request(stream: AdapterStream) -> ResolvedHttpRequest {
+        match stream {
+            AdapterStream::ProtectedHttp(request) => *request,
+            AdapterStream::File(_) => panic!("expected an HTTP stream"),
+        }
+    }
+
+    fn file_media(stream: AdapterStream) -> ResolvedFileMedia {
+        match stream {
+            AdapterStream::File(media) => media,
+            AdapterStream::ProtectedHttp(_) => panic!("expected a file stream"),
         }
     }
 
@@ -4608,13 +4297,12 @@ mod tests {
             adopt(&registry, source_id, &mut predecessor, vec!["first"]);
         let replacement = registry.begin_connect(source_id).expect("replacement");
 
-        let ConnectSubmission::Adopted {
-            session_epoch,
-            lease: successor_lease,
-        } = replacement.submit_constructed(successor.take(), vec!["second"])
+        let ConnectSubmission::Adopted { session_epoch } =
+            replacement.submit_constructed(successor.take(), vec!["second"])
         else {
             panic!("replacement rejected");
         };
+        let successor_lease = registry.session(source_id).expect("successor").lease;
 
         assert_ne!(first_epoch, session_epoch);
         assert!(!predecessor_lease.is_active());
@@ -4622,7 +4310,6 @@ mod tests {
         assert_eq!(predecessor.probe.calls(), 1);
         let before_close = registry.snapshot(source_id).expect("source");
         assert_eq!(before_close.pending_retirements, 1);
-        let mut changes = registry.subscribe();
         assert!(successor.matches(&registry.session(source_id).expect("successor")));
         predecessor.allow_close();
         predecessor.probe.wait_for_completions(1).await;
@@ -4640,17 +4327,6 @@ mod tests {
         assert!(after_close.revision > before_close.revision);
         assert_eq!(after_close.state, SourceState::Ready);
         assert!(after_close.failure.is_none());
-        let mut retirement_event = false;
-        while let Ok(change) = changes.try_recv() {
-            retirement_event |= matches!(
-                change.change,
-                LifecycleChange::SessionRetired {
-                    session_epoch,
-                    failure: None,
-                } if session_epoch == first_epoch
-            );
-        }
-        assert!(retirement_event);
 
         shutdown_immediate(&registry).await;
         assert_eq!(predecessor.probe.calls(), 1);
@@ -4883,7 +4559,7 @@ mod tests {
             SourceState::Dormant
         );
         assert!(registry.release_provenance(source_id, reactivated_claim));
-        assert_eq!(registry.prune_retired(), 1);
+        registry.schedule_prune_after_current_retirement(source_id);
         assert!(registry.snapshot(source_id).is_none());
         assert!(registry.shutdown().is_complete());
     }
@@ -5080,7 +4756,8 @@ mod tests {
         let discovery_claim = claim(&registry, source_id, SourceProvenance::Discovery);
         let stale = registry.begin_connect(source_id).expect("stale owner");
         assert!(registry.release_provenance(source_id, discovery_claim));
-        assert_eq!(registry.prune_retired(), 1);
+        registry.schedule_prune_after_current_retirement(source_id);
+        assert!(registry.snapshot(source_id).is_none());
         claim(&registry, source_id, SourceProvenance::Saved);
         let mut current_adapter = AdapterFixture::immediate();
         let current = registry.begin_connect(source_id).expect("current owner");
@@ -5684,7 +5361,7 @@ mod tests {
         let source_id = SourceId::random();
         let first_claim = claim(&registry, source_id, SourceProvenance::Discovery);
         let mut predecessor = AdapterFixture::held();
-        let (predecessor_epoch, _) = adopt(&registry, source_id, &mut predecessor, vec!["old"]);
+        adopt(&registry, source_id, &mut predecessor, vec!["old"]);
 
         assert!(registry.release_provenance(source_id, first_claim));
         predecessor.probe.wait_for_calls(1).await;
@@ -5707,7 +5384,6 @@ mod tests {
         ));
         let before_close = registry.snapshot(source_id).expect("successor");
         assert_eq!(before_close.pending_retirements, 1);
-        let mut changes = registry.subscribe();
 
         predecessor.allow_close();
         predecessor.probe.wait_for_completions(1).await;
@@ -5726,17 +5402,6 @@ mod tests {
         assert_eq!(ready.state, SourceState::Ready);
         assert!(ready.failure.is_none());
         assert!(successor.matches(&registry.session(source_id).expect("successor")));
-        let mut retirement_event = false;
-        while let Ok(change) = changes.try_recv() {
-            retirement_event |= matches!(
-                change.change,
-                LifecycleChange::SessionRetired {
-                    session_epoch,
-                    failure: None,
-                } if session_epoch == predecessor_epoch
-            );
-        }
-        assert!(retirement_event);
 
         assert!(registry.release_provenance(source_id, second_claim));
         successor.probe.wait_for_completions(1).await;
@@ -5768,14 +5433,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn retirement_waiter_wakes_only_after_snapshot_and_events_are_finalized() {
+    async fn retirement_waiter_wakes_only_after_snapshot_is_finalized() {
         let registry = registry();
         let source_id = SourceId::random();
         claim(&registry, source_id, SourceProvenance::Saved);
         let mut fixture = AdapterFixture::held();
-        let (session_epoch, _) = adopt(&registry, source_id, &mut fixture, Vec::new());
-        let mut changes = registry.subscribe();
+        adopt(&registry, source_id, &mut fixture, Vec::new());
         let waiter = registry.disconnect(source_id).expect("disconnect");
+        let disconnecting = registry.snapshot(source_id).expect("source");
+        assert_eq!(disconnecting.state, SourceState::Disconnecting);
 
         fixture.allow_close();
         assert_eq!(waiter.wait().await, None);
@@ -5783,37 +5449,7 @@ mod tests {
         assert_eq!(finalized.state, SourceState::Dormant);
         assert_eq!(finalized.pending_retirements, 0);
         assert!(finalized.failure.is_none());
-
-        let mut observed = Vec::new();
-        while let Ok(change) = changes.try_recv() {
-            observed.push(change);
-        }
-        let retired = observed
-            .iter()
-            .position(|change| {
-                matches!(
-                    change.change,
-                    LifecycleChange::SessionRetired {
-                        session_epoch: observed_epoch,
-                        failure: None,
-                    } if observed_epoch == session_epoch
-                )
-            })
-            .expect("session-retired event visible before waiter return");
-        let dormant = observed
-            .iter()
-            .position(|change| {
-                matches!(
-                    change.change,
-                    LifecycleChange::StateChanged {
-                        to: SourceState::Dormant,
-                        ..
-                    }
-                )
-            })
-            .expect("dormant transition visible before waiter return");
-        assert!(retired < dormant);
-        assert!(observed[dormant].revision <= finalized.revision);
+        assert!(finalized.revision > disconnecting.revision);
         assert!(registry.shutdown().is_complete());
     }
 
@@ -5943,15 +5579,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supersession_events_cancel_old_generation_before_new_start() {
+    async fn supersession_cancels_old_generation_and_tracks_new_one() {
         let registry = registry();
         let source_id = SourceId::random();
         claim(&registry, source_id, SourceProvenance::Saved);
-        let mut changes = registry.subscribe();
         let first_connect = registry.begin_connect(source_id).expect("first connect");
-        let first_connect_generation = first_connect.generation();
+        let first_connect_cancellation = first_connect.cancellation();
         let second_connect = registry.begin_connect(source_id).expect("second connect");
-        let second_connect_generation = second_connect.generation();
+        assert!(first_connect_cancellation.is_cancelled());
+        assert_eq!(
+            registry
+                .snapshot(source_id)
+                .expect("source")
+                .pending_connect,
+            Some(second_connect.generation())
+        );
         let mut fixture = AdapterFixture::immediate();
         assert!(matches!(
             second_connect.submit_constructed(fixture.take(), Vec::new()),
@@ -5962,69 +5604,29 @@ mod tests {
         let first_refresh = registry
             .begin_refresh(source_id, RefreshLane::Catalogue)
             .expect("first refresh");
-        let first_refresh_generation = first_refresh.generation();
+        let first_refresh_cancellation = first_refresh.cancellation();
         let second_refresh = registry
             .begin_refresh(source_id, RefreshLane::Catalogue)
             .expect("second refresh");
-        let second_refresh_generation = second_refresh.generation();
+        assert!(first_refresh_cancellation.is_cancelled());
+        assert_eq!(
+            registry
+                .snapshot(source_id)
+                .expect("source")
+                .pending_refreshes
+                .get(&RefreshLane::Catalogue),
+            Some(&second_refresh.generation())
+        );
         drop(first_refresh);
         drop(second_refresh);
-
-        let mut observed = Vec::new();
-        while let Ok(change) = changes.try_recv() {
-            observed.push(change.change);
-        }
-        let connect_cancelled = observed
-            .iter()
-            .position(|change| {
-                matches!(
-                    change,
-                    LifecycleChange::ConnectCancelled { generation }
-                        if *generation == first_connect_generation
-                )
-            })
-            .expect("old connect cancellation");
-        let connect_started = observed
-            .iter()
-            .position(|change| {
-                matches!(
-                    change,
-                    LifecycleChange::ConnectStarted { generation }
-                        if *generation == second_connect_generation
-                )
-            })
-            .expect("new connect start");
-        assert!(connect_cancelled < connect_started);
-        let refresh_cancelled = observed
-            .iter()
-            .position(|change| {
-                matches!(
-                    change,
-                    LifecycleChange::OperationCancelled { generation, .. }
-                        if *generation == first_refresh_generation
-                )
-            })
-            .expect("old refresh cancellation");
-        let refresh_started = observed
-            .iter()
-            .position(|change| {
-                matches!(
-                    change,
-                    LifecycleChange::RefreshStarted { generation, .. }
-                        if *generation == second_refresh_generation
-                )
-            })
-            .expect("new refresh start");
-        assert!(refresh_cancelled < refresh_started);
         shutdown_immediate(&registry).await;
     }
 
     #[tokio::test]
-    async fn failure_events_are_correlated_and_stale_attempt_cannot_clear_retry() {
+    async fn failures_are_correlated_and_stale_attempt_cannot_clear_retry() {
         let registry = registry();
         let source_id = SourceId::random();
         claim(&registry, source_id, SourceProvenance::Saved);
-        let mut changes = registry.subscribe();
         let stale = registry.begin_connect(source_id).expect("stale");
         let failed = registry.begin_connect(source_id).expect("failed");
         let failed_generation = failed.generation();
@@ -6042,32 +5644,11 @@ mod tests {
         );
 
         let retry = registry.begin_connect(source_id).expect("retry");
-        let retry_generation = retry.generation();
         assert!(registry
             .snapshot(source_id)
             .expect("source")
             .failure
             .is_none());
-        let mut observed = Vec::new();
-        while let Ok(change) = changes.try_recv() {
-            observed.push(change.change);
-        }
-        assert!(observed.iter().any(|change| matches!(
-            change,
-            LifecycleChange::FailureChanged {
-                correlation: OperationCorrelation { generation, .. },
-                failure: Some(SourceFailure { .. }),
-                ..
-            } if *generation == failed_generation
-        )));
-        assert!(observed.iter().any(|change| matches!(
-            change,
-            LifecycleChange::FailureChanged {
-                correlation: OperationCorrelation { generation, .. },
-                failure: None,
-                ..
-            } if *generation == retry_generation
-        )));
         drop(retry);
         assert!(registry.shutdown().is_complete());
     }
@@ -6080,14 +5661,18 @@ mod tests {
         let mut predecessor = AdapterFixture::held();
         let (predecessor_epoch, _) = adopt(&registry, source_id, &mut predecessor, Vec::new());
 
-        let request = registry
-            .resolve_http(source_id, predecessor_epoch, |_adapter| async {
-                ResolvedHttpRequest::new(
-                    url::Url::parse("http://example.test/stream").expect("URL"),
-                )
-            })
-            .await
-            .expect("request");
+        let request = http_request(
+            registry
+                .resolve_stream(source_id, predecessor_epoch, |_adapter| async {
+                    Ok(AdapterStream::ProtectedHttp(Box::new(
+                        ResolvedHttpRequest::new(
+                            url::Url::parse("http://example.test/stream").expect("URL"),
+                        )?,
+                    )))
+                })
+                .await
+                .expect("request"),
+        );
         assert!(request.is_active());
 
         let delayed_registry = registry.clone();
@@ -6095,12 +5680,14 @@ mod tests {
         let (release_resolution, release_resolution_rx) = oneshot::channel();
         let delayed = tokio::spawn(async move {
             delayed_registry
-                .resolve_http(source_id, predecessor_epoch, move |_adapter| async move {
+                .resolve_stream(source_id, predecessor_epoch, move |_adapter| async move {
                     let _ = resolution_started.send(());
                     let _ = release_resolution_rx.await;
-                    ResolvedHttpRequest::new(
-                        url::Url::parse("http://example.test/delayed").expect("URL"),
-                    )
+                    Ok(AdapterStream::ProtectedHttp(Box::new(
+                        ResolvedHttpRequest::new(
+                            url::Url::parse("http://example.test/delayed").expect("URL"),
+                        )?,
+                    )))
                 })
                 .await
         });
@@ -6239,7 +5826,6 @@ mod tests {
             .expect("accepted predecessor catalogue");
         assert_eq!(initial.session_epoch, epoch);
         assert_eq!(initial.value, "predecessor");
-        assert!(initial.authority.is_active());
 
         let replacement = registry
             .begin_connect(source_id)
@@ -6279,7 +5865,6 @@ mod tests {
             .expect("catalogue refresh");
         let refreshed_generation = refresh.generation();
         assert!(refresh.submit(vec!["refreshed"]));
-        assert!(!initial.authority.is_active());
         assert!(registry
             .resolve_exact_accepted_catalogue(source_id, initial.generation, epoch, |_| Some(()),)
             .is_none());
@@ -6602,12 +6187,13 @@ mod tests {
         let invoked = Arc::new(AtomicBool::new(false));
         let stale_invoked = Arc::clone(&invoked);
         assert!(registry
-            .resolve_file(
+            .resolve_stream(
                 source_id,
                 session_epoch.wrapping_add(1),
                 move |_adapter| async move {
                     stale_invoked.store(true, Ordering::Release);
                     ResolvedFileMedia::from_open_regular_file(file, None)
+                        .map(AdapterStream::File)
                         .map_err(crate::architecture::error::BackendError::Io)
                 },
             )
@@ -6616,13 +6202,16 @@ mod tests {
         assert!(!invoked.load(Ordering::Acquire));
 
         let file = std::fs::File::open(&path).expect("reopen retained file");
-        let media = registry
-            .resolve_file(source_id, session_epoch, move |_adapter| async move {
-                ResolvedFileMedia::from_open_regular_file(file, None)
-                    .map_err(crate::architecture::error::BackendError::Io)
-            })
-            .await
-            .expect("resolve exact retained file");
+        let media = file_media(
+            registry
+                .resolve_stream(source_id, session_epoch, move |_adapter| async move {
+                    ResolvedFileMedia::from_open_regular_file(file, None)
+                        .map(AdapterStream::File)
+                        .map_err(crate::architecture::error::BackendError::Io)
+                })
+                .await
+                .expect("resolve exact retained file"),
+        );
         assert!(media.is_active());
         media
             .try_clone_file()
@@ -6662,11 +6251,13 @@ mod tests {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let stream_calls_in_resolver = Arc::clone(&stream_calls);
         let stream = registry
-            .resolve_http(source_id, predecessor_epoch, move |_adapter| async move {
+            .resolve_stream(source_id, predecessor_epoch, move |_adapter| async move {
                 stream_calls_in_resolver.fetch_add(1, Ordering::AcqRel);
-                ResolvedHttpRequest::new(
-                    url::Url::parse("http://example.test/stale-stream").expect("URL"),
-                )
+                Ok(AdapterStream::ProtectedHttp(Box::new(
+                    ResolvedHttpRequest::new(
+                        url::Url::parse("http://example.test/stale-stream").expect("URL"),
+                    )?,
+                )))
             })
             .await;
         assert!(stream.is_err());
@@ -6792,40 +6383,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observer_revisions_are_strict_and_changes_are_typed() {
+    async fn observed_revisions_are_strict_and_stamp_the_changed_source() {
         let registry = registry();
         let source_id = SourceId::random();
-        let mut changes = registry.subscribe();
+        let initial = registry.snapshot_all().revision;
         claim(&registry, source_id, SourceProvenance::Saved);
+        let claimed = registry.snapshot(source_id).expect("source").revision;
         let mut adapter = AdapterFixture::immediate();
         adopt(&registry, source_id, &mut adapter, vec!["catalogue"]);
+        let adopted = registry.snapshot_all();
 
-        let mut observed = Vec::new();
-        while let Ok(change) = changes.try_recv() {
-            observed.push(change);
-        }
-        assert!(observed.len() >= 4);
-        assert!(observed
-            .windows(2)
-            .all(|pair| pair[0].revision < pair[1].revision));
-        assert!(observed.iter().all(|change| change.source_id == source_id));
-        assert!(observed
-            .iter()
-            .any(|change| matches!(change.change, LifecycleChange::ProvenanceChanged { .. })));
-        assert!(observed
-            .iter()
-            .any(|change| matches!(change.change, LifecycleChange::SessionAdopted { .. })));
-        assert!(observed
-            .iter()
-            .any(|change| matches!(change.change, LifecycleChange::CatalogueAccepted { .. })));
+        assert!(initial < claimed);
+        assert!(claimed < adopted.revision);
+        assert_eq!(adopted.sources.len(), 1);
+        assert_eq!(adopted.sources[0].0, source_id);
+        assert_eq!(adopted.sources[0].1.revision, adopted.revision);
         shutdown_immediate(&registry).await;
     }
 
     #[tokio::test]
-    async fn subscribe_then_atomic_baseline_covers_queued_changes_and_next_revision() {
+    async fn invalidation_watch_then_atomic_baseline_covers_next_revision() {
         let registry = registry();
         let source_id = SourceId::random();
-        let mut changes = registry.subscribe();
+        let mut invalidations = registry.subscribe_invalidations();
         claim(&registry, source_id, SourceProvenance::Saved);
 
         let baseline = registry.snapshot_all();
@@ -6836,22 +6416,21 @@ mod tests {
             .1
             .provenance
             .contains(SourceProvenance::Saved));
-
-        let queued: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
-        assert!(!queued.is_empty());
-        assert!(queued
-            .iter()
-            .all(|change| change.revision <= baseline.revision));
+        assert_eq!(*invalidations.borrow_and_update(), baseline.revision);
 
         let owner = registry.begin_connect(source_id).expect("next connect");
-        let next = changes.recv().await.expect("post-baseline change");
-        assert!(next.revision > baseline.revision);
+        invalidations
+            .changed()
+            .await
+            .expect("post-baseline invalidation");
+        let next = *invalidations.borrow_and_update();
+        assert!(next > baseline.revision);
         drop(owner);
 
         let barrier = registry.shutdown();
         let shutdown = registry.snapshot_all();
         assert!(shutdown.shutting_down);
-        assert!(shutdown.revision >= next.revision);
+        assert!(shutdown.revision > next);
         barrier.wait().await;
     }
 
@@ -6901,84 +6480,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_publishes_new_revision_and_authoritative_absence() {
-        let registry = registry();
-        let source_id = SourceId::random();
-        let claim = claim(&registry, source_id, SourceProvenance::Discovery);
-        let mut changes = registry.subscribe();
-        assert!(registry.release_provenance(source_id, claim));
-        let before_prune = registry.snapshot_all().revision;
-
-        assert_eq!(registry.prune_retired(), 1);
-        let after_prune = registry.snapshot_all();
-        assert!(after_prune.revision > before_prune);
-        assert!(after_prune.sources.is_empty());
-
-        let observed: Vec<_> = std::iter::from_fn(|| changes.try_recv().ok()).collect();
-        assert!(observed.iter().any(|change| {
-            change.source_id == source_id
-                && change.revision == after_prune.revision
-                && matches!(change.change, LifecycleChange::Pruned)
-        }));
-        assert!(registry.shutdown().is_complete());
-    }
-
-    #[tokio::test]
-    async fn read_only_disconnect_waiter_cannot_cancel_reappearing_successor() {
-        let registry = registry();
-        let source_id = SourceId::random();
-        let saved = claim(&registry, source_id, SourceProvenance::Saved);
-        let mut predecessor = AdapterFixture::held();
-        adopt(&registry, source_id, &mut predecessor, vec!["predecessor"]);
-
-        assert!(registry.release_provenance(source_id, saved));
-        predecessor.probe.wait_for_calls(1).await;
-        let waiter = registry
-            .current_disconnect_waiter(source_id)
-            .expect("existing close waiter");
-
-        let discovery = claim(&registry, source_id, SourceProvenance::Discovery);
-        let successor = registry
-            .begin_connect(source_id)
-            .expect("successor connect");
-        assert!(registry.current_disconnect_waiter(source_id).is_none());
-        assert_eq!(registry.prune_retired(), 0);
-
-        let mut successor_adapter = AdapterFixture::immediate();
-        assert!(matches!(
-            successor.submit_constructed(successor_adapter.take(), vec!["successor"]),
-            ConnectSubmission::Adopted { .. }
-        ));
-        predecessor.allow_close();
-        waiter.wait().await;
-
-        let snapshot = registry.snapshot(source_id).expect("successor retained");
-        assert_eq!(snapshot.state, SourceState::Ready);
-        assert_eq!(
-            snapshot
-                .catalogue
-                .expect("successor catalogue")
-                .value
-                .as_ref(),
-            &vec!["successor"]
-        );
-        assert_eq!(registry.prune_retired(), 0);
-
-        assert!(registry.release_provenance(source_id, discovery));
-        successor_adapter.probe.wait_for_completions(1).await;
-        assert_eq!(registry.prune_retired(), 1);
-        assert!(registry.shutdown().is_complete());
-    }
-
-    #[tokio::test]
     async fn lifecycle_owned_prune_removes_inert_final_claim_immediately() {
         let registry = registry();
         let source_id = SourceId::random();
         let claim = claim(&registry, source_id, SourceProvenance::Discovery);
 
         assert!(registry.release_provenance(source_id, claim));
+        let before_prune = registry.snapshot_all().revision;
         registry.schedule_prune_after_current_retirement(source_id);
 
+        let after_prune = registry.snapshot_all();
+        assert!(after_prune.revision > before_prune);
+        assert!(after_prune.sources.is_empty());
         assert!(registry.snapshot(source_id).is_none());
         assert!(registry.shutdown().is_complete());
     }

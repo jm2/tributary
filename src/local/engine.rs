@@ -221,10 +221,6 @@ impl RootReauthorizationRequest {
         }
     }
 
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
     pub fn old_path(&self) -> &Path {
         &self.old_path
     }
@@ -972,6 +968,7 @@ async fn forget_tracks_outside_library_roots(
     Ok(forgotten.len())
 }
 
+#[cfg(test)]
 async fn resolve_root_reauthorization(
     db: &DatabaseConnection,
     request: &RootReauthorizationRequest,
@@ -1604,12 +1601,11 @@ enum ScanDiscoveryStage {
     /// await. Regression seam for the suspended-mid-transaction state the
     /// command-service selector must not switch branches at.
     CommitGuard,
-    /// Parked at the root-status boundary's command-settlement wait, before
-    /// the write transaction opens. Regression seam for the post-settlement
-    /// admission re-check (PR #286 round-4 finding j9j81). Signalled, not
-    /// held: the scan parks itself at the reciprocal settlement wait
-    /// immediately after, so holding here would deadlock every scan
-    /// regression that does not release this stage.
+    /// Parked at the root-status boundary's command-settlement wait, before the
+    /// write transaction opens. Regression seam for the post-settlement
+    /// admission re-check. Signalled, not held: the scan parks itself at the
+    /// reciprocal settlement wait immediately after, so holding here would
+    /// deadlock every scan regression that does not release this stage.
     CommandSettlement,
 }
 
@@ -1701,16 +1697,16 @@ impl ScanDiscoveryHold {
 /// `select!` disables the command branch entirely and keeps polling the scan
 /// until the transaction settles: servicing a library command meanwhile would
 /// queue its write behind the open transaction and fail at the production
-/// five-second busy timeout (PR #286 finding jq5lG).
+/// five-second busy timeout.
 ///
-/// `command_in_flight` is the reciprocal invariant (PR #286 round-3 finding
-/// cid 4051684281): it is held while *dispatched* command work is still
-/// settling inside the selector's interleave. The scan's write boundaries
-/// consult it just before opening a write transaction and park THERE — still
-/// polled, never holding a connection — until the work settles. Without it,
-/// the scan could cross a write boundary after a command was dispatched, park
-/// across a retained-authority probe, and hold the writer while the command's
-/// own DB write queued at the same five-second busy timeout.
+/// `command_in_flight` is the reciprocal invariant: it is held while
+/// *dispatched* command work is still settling inside the selector's
+/// interleave. The scan's write boundaries consult it just before opening a
+/// write transaction and park THERE — still polled, never holding a connection
+/// — until the work settles. Without it, the scan could cross a write boundary
+/// after a command was dispatched, park across a retained-authority probe, and
+/// hold the writer while the command's own DB write queued at the same
+/// five-second busy timeout.
 ///
 /// The scan and the command selector share one engine task, so both flags can
 /// only change while the selector is polling the scan.
@@ -1831,14 +1827,14 @@ async fn wait_for_command_settlement(gate: &ScanWriteTxnGate) {
 /// settles. A command arriving mid-transaction is therefore deferred to the
 /// transaction boundary — never raced into the open SQLite write, where its
 /// own connection acquisition would queue behind the scan's lock and fail at
-/// the busy timeout (PR #286 finding jq5lG).
+/// the busy timeout.
 ///
 /// The channel receive future is created once and retained across polls.
 /// `async_channel::Recv` only keeps its channel listener alive while the
 /// future lives, so constructing it fresh inside `poll` would unregister the
 /// listener every time the poll returned `Pending`: a command sent while the
 /// scan branch was parked could not wake this branch at all, and service
-/// would stall until the scan's next own wake (PR #286 thread jq0TgN).
+/// would stall until the scan's next own wake.
 struct GatedCommandRecv<'a> {
     // `+ Send`: the engine run future is spawned on the multi-thread GTK
     // bridge runtime (src/ui/window.rs), so every future it composes must
@@ -2371,6 +2367,7 @@ fn scan_root(root: PathBuf) -> RootScan {
     )
 }
 
+#[cfg(test)]
 fn scan_root_with_identity_probe<F>(root: PathBuf, identity_probe: F) -> RootScan
 where
     F: FnMut(&Path) -> std::io::Result<String>,
@@ -3003,6 +3000,7 @@ fn reconciliation_is_authoritative(
 /// unconfirmed until an explicit-trust UX can resolve the intended volume:
 /// even a complete path/size/mtime clone cannot prove physical identity. A
 /// different device never silently replaces a confirmed identity.
+#[cfg(test)]
 fn scan_confirms_identity(
     scan: &RootScan,
     previous: Option<&library_root::Model>,
@@ -4238,24 +4236,23 @@ async fn process_library_commands_without_watcher(
 ///
 /// A scan write transaction is the one exception. Some scan mutations keep a
 /// SQLite write transaction open across an await point — the retained-authority
-/// probes inside a track upsert, root-status persist, or stale-row delete —
-/// and a library command serviced at that moment would queue its own write
-/// behind the open transaction and fail at the production five-second busy
-/// timeout (PR #286 finding jq5lG). `scan_write_txn` is held exactly over
-/// those spans; while it is open the command branch is disabled entirely and
-/// the loop keeps polling the scan until the transaction settles. The flag can
-/// only change while the scan is being polled, so a command that arrives during
-/// a transaction is serviced immediately after it commits — never lost, never
-/// starved behind a stuck one.
+/// probes inside a track upsert, root-status persist, or stale-row delete — and
+/// a library command serviced at that moment would queue its own write behind
+/// the open transaction and fail at the production five-second busy timeout.
+/// `scan_write_txn` is held exactly over those spans; while it is open the
+/// command branch is disabled entirely and the loop keeps polling the scan
+/// until the transaction settles. The flag can only change while the scan is
+/// being polled, so a command that arrives during a transaction is serviced
+/// immediately after it commits — never lost, never starved behind a stuck one.
 ///
 /// The invariant is reciprocal. A command dispatched while the scan is between
 /// write boundaries keeps its `command_in_flight` arm held for as long as its
 /// work settles, and every scan write boundary parks there — still polled,
 /// holding no connection — instead of opening a transaction the in-flight
-/// work's own writes would queue behind (PR #286 round-3 finding
-/// cid 4051684281). Command service and scan mutations therefore never hold
-/// competing SQLite write transactions in either direction, and the wait
-/// always resolves because dispatched command work is finite.
+/// work's own writes would queue behind. Command service and scan mutations
+/// therefore never hold competing SQLite write transactions in either
+/// direction, and the wait always resolves because dispatched command work is
+/// finite.
 ///
 /// `Flush` is the reserved drain marker. By the time the loop receives it,
 /// every earlier admitted command has settled in FIFO order, so the loop waits
@@ -4310,19 +4307,17 @@ where
                 // scan's queued acquire; a grant held inside a future that is
                 // no longer polled would trap the connection and starve the
                 // command at the acquire timeout (observed as a 30s sqlx pool
-                // timeout in the jq5lG regression). Interleave both futures;
-                // if the scan settles first, the pool is idle and the
-                // Remaining work finishes alone before the scan result is
-                // returned.
+                // timeout). Interleave both futures; if the scan settles first,
+                // the pool is idle and the Remaining work finishes alone before
+                // the scan result is returned.
                 //
                 // Hold the reciprocal write-boundary invariant for the whole
-                // interleave (PR #286 round-3 finding cid 4051684281): while
-                // this work is still settling, the scan's write boundaries
-                // park instead of opening a transaction the work's own writes
-                // would queue behind. Declared before `work` so the guard
-                // outlives it and clears — waking any parked boundary — on
-                // every exit path, including the scan-settled-first
-                // abandonment below.
+                // interleave: while this work is still settling, the scan's
+                // write boundaries park instead of opening a transaction the
+                // work's own writes would queue behind. Declared before `work`
+                // so the guard outlives it and clears — waking any parked
+                // boundary — on every exit path, including the
+                // scan-settled-first abandonment below.
                 let _command_in_flight_guard = CommandInFlightGuard::arm(scan_write_txn);
                 let mut work = Box::pin(async {
                     if let Some(pending) = process_library_command(
@@ -4830,12 +4825,12 @@ async fn initial_scan_with_control(
         // durable device identity for the next startup.
         //
         // Admission is re-checked before EVERY root-status mutation, not once
-        // before the loop (PR #286 finding jq5ld): when shutdown is observed
-        // mid-loop — for example while an earlier root's persist was settling
-        // — the remaining roots must not receive status writes that would
-        // present them as freshly checked. Fail the remaining scans closed
-        // (marked cancelled) and stop without an error: the close drain
-        // acknowledges cancelled scans that committed nothing.
+        // before the loop: when shutdown is observed mid-loop — for example
+        // while an earlier root's persist was settling — the remaining roots
+        // must not receive status writes that would present them as freshly
+        // checked. Fail the remaining scans closed (marked cancelled) and stop
+        // without an error: the close drain acknowledges cancelled scans that
+        // committed nothing.
         if !admit_scan_mutation(cancellation) {
             let root_display = scan.root.display().to_string();
             mark_scan_cancelled(
@@ -4849,23 +4844,21 @@ async fn initial_scan_with_control(
             return Ok(());
         }
         // The status persist opens a SQLite write transaction across an await
-        // point (the marker probe inside). Hold the write-transaction gate
-        // over the whole span so the command-service selector does not
-        // dispatch a library command into the open transaction (jq5lG). The
-        // RootStatus rendezvous is a test-only seam parked at this boundary.
-        // Reciprocal invariant: if a command was already dispatched, park
-        // here — outside the transaction — until its work settles instead of
-        // making its own writes queue behind this transaction (cid 4051684281).
-        // The CommandSettlement seam is a test-only signal fired at this
-        // boundary, before the wait: a regression driver learns the pre-wait
-        // admission check passed and the scan is about to park on the
-        // reciprocal settlement wait (PR #286 round-4 finding j9j81).
+        // point (the marker probe inside). Hold the write-transaction gate over
+        // the whole span so the command-service selector does not dispatch a
+        // library command into the open transaction. The RootStatus rendezvous
+        // is a test-only seam parked at this boundary. Reciprocal invariant: if
+        // a command was already dispatched, park here — outside the transaction
+        // — until its work settles instead of making its own writes queue
+        // behind this transaction. The CommandSettlement seam is a test-only
+        // signal fired at this boundary, before the wait: a regression driver
+        // learns the pre-wait admission check passed and the scan is about to
+        // park on the reciprocal settlement wait.
         discovery.signal(ScanDiscoveryStage::CommandSettlement);
         wait_for_command_settlement(scan_write_txn).await;
-        // Re-check admission once the wait resolves (PR #286 round-4 finding
-        // j9j81): the park can span the shutdown cancellation, so refusing
-        // only before the wait would still open a post-cancellation write
-        // transaction and delay the close drain.
+        // Re-check admission once the wait resolves: the park can span the
+        // shutdown cancellation, so refusing only before the wait would still
+        // open a post-cancellation write transaction and delay the close drain.
         if !admit_scan_mutation(cancellation) {
             let root_display = scan.root.display().to_string();
             mark_scan_cancelled(
@@ -5192,14 +5185,13 @@ async fn initial_scan_with_control(
                     // the commit guard probes the retained authority handle, so
                     // the write-transaction gate spans the whole call: the
                     // command-service selector defers library commands until the
-                    // transaction commits or rolls back (jq5lG). Reciprocally,
-                    // park here while a dispatched command's work is still in
-                    // flight (cid 4051684281).
+                    // transaction commits or rolls back. Reciprocally, park here
+                    // while a dispatched command's work is still in flight.
                     wait_for_command_settlement(scan_write_txn).await;
-                    // Re-check admission once the wait resolves (PR #286
-                    // round-4 finding j9j81): the park can span the shutdown
-                    // cancellation, so refusing only before the wait would
-                    // still open a post-cancellation write transaction.
+                    // Re-check admission once the wait resolves: the park can
+                    // span the shutdown cancellation, so refusing only before
+                    // the wait would still open a post-cancellation write
+                    // transaction.
                     if !admit_scan_mutation(cancellation) {
                         mark_scan_cancelled(
                             &mut root_scans,
@@ -5355,6 +5347,7 @@ async fn initial_scan_with_control(
     // snapshot instead of re-querying. A failed individual delete is logged and
     // skipped rather than aborting the whole scan, so a transient DB hiccup
     // can't discard the FullSync/ScanComplete that follow.
+    let mut removed_paths = Vec::new();
     if content_mutations_allowed {
         for row in &existing_tracks {
             let row_path = Path::new(&row.file_path);
@@ -5372,14 +5365,13 @@ async fn initial_scan_with_control(
             // The absence proof is read-only blocking filesystem work against a
             // possibly removable or network root; the kernel call can block
             // well past window close. It therefore obeys the shutdown settle
-            // budget like the traversal and parse jobs (PR #286 finding jq5lT):
-            // when the budget is exhausted, abandon the probe, fail the scan
-            // closed, and PRESERVE the row — an unproven absence never deletes.
+            // budget like the traversal and parse jobs: when the budget is
+            // exhausted, abandon the probe, fail the scan closed, and PRESERVE
+            // the row — an unproven absence never deletes.
             let absence = match await_readonly_blocking(
                 cancellation,
                 spawn_authority_probe(move || {
-                    // Test-only seam: park the probe the way a hung kernel call
-                    // would (jq5lT regression).
+                    // Test-only seam: park the probe the way a hung kernel call would.
                     #[cfg(test)]
                     tests::hold_stale_absence_probe(&proof_path);
                     proof_lease.prove_absent(&proof_path).map(Arc::new)
@@ -5450,13 +5442,11 @@ async fn initial_scan_with_control(
             let mut authority_task_failed = false;
             // The delete keeps its SQLite write transaction open while the
             // commit guard revalidates the absence proof and the root lease, so
-            // the write-transaction gate spans the whole call (jq5lG).
-            // Reciprocally, park here while a dispatched command's work is
-            // still in flight (cid 4051684281).
+            // the write-transaction gate spans the whole call. Reciprocally,
+            // park here while a dispatched command's work is still in flight.
             wait_for_command_settlement(scan_write_txn).await;
-            // Re-check admission once the wait resolves (PR #286 round-4
-            // finding j9j81): the park can span the shutdown cancellation, so
-            // refusing only before the wait would still open a
+            // Re-check admission once the wait resolves: the park can span the shutdown
+            // cancellation, so refusing only before the wait would still open a
             // post-cancellation write transaction and delay the close drain.
             if !admit_scan_mutation(cancellation) {
                 mark_scan_cancelled(
@@ -5502,9 +5492,7 @@ async fn initial_scan_with_control(
             .await
             {
                 Ok(GuardedTrackDeleteOutcome::Deleted) => {
-                    let _ = tx
-                        .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
-                        .await;
+                    removed_paths.push(row.file_path.clone());
                 }
                 Ok(GuardedTrackDeleteOutcome::Missing) => {}
                 Ok(GuardedTrackDeleteOutcome::GuardRejected) => {
@@ -5531,7 +5519,16 @@ async fn initial_scan_with_control(
     // Send full sync. A transient failure here is logged but still lets the
     // scan finish (reconcile + ScanComplete) so the UI settles into a synced
     // state instead of hanging on the spinner with no completion signal.
-    send_library_snapshot(db, tx).await;
+    //
+    // The snapshot already omits every stale row deleted above, so those rows
+    // are not also announced one by one: each per-row removal costs the UI a
+    // pass over the whole library. They go out individually only when no
+    // snapshot could be read.
+    if send_library_snapshot(db, tx).await == LibrarySnapshotPublication::StorageUnavailable {
+        for path in removed_paths {
+            let _ = tx.send(LibraryEvent::TrackRemoved(path)).await;
+        }
+    }
 
     // Reconcile orphaned playlist entries with newly-discovered tracks.
     let playlist_mgr = super::playlist_manager::PlaylistManager::new(db.clone());
@@ -5646,10 +5643,6 @@ impl WatcherRootCache {
             .enumerate()
             .find(|(_, entry)| path.starts_with(&entry.root))
             .map(|(index, entry)| (index, entry.root.clone(), entry.state.clone()))
-    }
-
-    fn exact_root(&self, root: &Path) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.root == root)
     }
 
     fn authority_lease(&self, index: usize) -> Option<Arc<RootAuthorityLease>> {
@@ -12101,6 +12094,65 @@ mod tests {
         );
     }
 
+    /// The stale pass announces its deletions through the FullSync that
+    /// follows it, not as one `TrackRemoved` per row: each per-row event
+    /// costs the UI a pass over the whole library.
+    #[tokio::test]
+    async fn stale_deletions_are_published_by_the_full_sync_not_per_row() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("stale-full-sync");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+        let missing = directory.path().join("missing.wav");
+        write_minimal_wav(&missing);
+        let music_dirs = [directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+
+        // The first scan enrolls the root and indexes both files; the second
+        // is authoritative and finds one of them gone.
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("enrolling scan");
+        std::fs::remove_file(&missing).expect("remove indexed file");
+        while event_rx.try_recv().is_ok() {}
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("reconciling scan");
+
+        let missing = missing.to_string_lossy();
+        let remaining = track::Entity::find().all(&db).await.expect("query tracks");
+        assert_eq!(remaining.len(), 1, "the scan deletes the stale row");
+        assert_ne!(remaining[0].file_path, missing.as_ref());
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LibraryEvent::TrackRemoved(_))),
+            "stale deletions must not be announced row by row: {events:?}"
+        );
+        let full_sync = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::FullSync(tracks) => Some(tracks),
+                _ => None,
+            })
+            .expect("the scan publishes a FullSync");
+        assert_eq!(full_sync.len(), 1);
+        assert!(full_sync
+            .iter()
+            .all(|track| track.file_path.as_deref() != Some(missing.as_ref())));
+    }
+
     /// A parser that settles inside its shutdown grace is *kept* by the
     /// read-only isolation contract, but the explicit durable-mutation
     /// admission boundary still refuses to begin new work from it (R2).
@@ -17556,11 +17608,11 @@ mod tests {
         use std::collections::HashMap;
         use std::time::Instant;
 
-        use crate::architecture::models::{Rating, SortField, SortOrder};
+        use crate::architecture::models::Rating;
 
         use super::super::perf_fixtures::{
-            catalogue_bytes, expected_album_count, expected_artist_count, track_count_from_env,
-            DelayedBackend, ResponsivenessReport, SyntheticLibrary,
+            catalogue_bytes, catalogue_fan_out, expected_album_count, expected_artist_count,
+            track_count_from_env, DelayedBackend, ResponsivenessReport, SyntheticLibrary,
         };
 
         struct ParseDelayGuard {
@@ -17626,22 +17678,19 @@ mod tests {
         // Unknown-Artist/Unknown-Album row pair. Assert BEFORE any metric is
         // recorded so a collapsed catalogue cannot pass as measurement
         // output.
-        let catalogue_backend = LocalBackend::new(db.clone());
-        let scanned_albums = catalogue_backend
-            .list_albums(SortField::Title, SortOrder::Ascending)
-            .await
-            .expect("list albums for cardinality proof");
-        let scanned_artists = catalogue_backend
-            .list_artists()
-            .await
-            .expect("list artists for cardinality proof");
+        let (scanned_albums, scanned_artists) = catalogue_fan_out(
+            &LocalBackend::new(db.clone())
+                .list_tracks()
+                .await
+                .expect("list tracks for cardinality proof"),
+        );
         assert_eq!(
-            scanned_albums.len(),
+            scanned_albums,
             expected_album_count(track_count),
             "persisted catalogue must fan out to one album group per 12 fixture tracks"
         );
         assert_eq!(
-            scanned_artists.len(),
+            scanned_artists,
             expected_artist_count(track_count),
             "persisted catalogue must fan out to one artist group per 4 fixture albums"
         );
@@ -17662,16 +17711,11 @@ mod tests {
             baseline_parses as f64,
             "parses",
         );
-        report.record(
-            "scan_albums",
-            track_count,
-            scanned_albums.len() as f64,
-            "albums",
-        );
+        report.record("scan_albums", track_count, scanned_albums as f64, "albums");
         report.record(
             "scan_artists",
             track_count,
-            scanned_artists.len() as f64,
+            scanned_artists as f64,
             "artists",
         );
         report.record_ms("scan_elapsed", track_count, scan_elapsed);
@@ -17697,32 +17741,6 @@ mod tests {
             catalogue_bytes(&catalogue) as f64,
             "bytes",
         );
-
-        let albums_started = Instant::now();
-        backend
-            .list_albums(SortField::Title, SortOrder::Ascending)
-            .await
-            .expect("list albums");
-        report.record_ms("backend_list_albums", track_count, albums_started.elapsed());
-
-        let artists_started = Instant::now();
-        backend.list_artists().await.expect("list artists");
-        report.record_ms(
-            "backend_list_artists",
-            track_count,
-            artists_started.elapsed(),
-        );
-
-        let search_started = Instant::now();
-        backend
-            .search("Track0001", 50)
-            .await
-            .expect("search catalogue");
-        report.record_ms("backend_search", track_count, search_started.elapsed());
-
-        let stats_started = Instant::now();
-        backend.get_stats().await.expect("read library stats");
-        report.record_ms("backend_get_stats", track_count, stats_started.elapsed());
 
         // Rating mutations over the same catalogue: first directly through the
         // backend seam, then through the production engine command FIFO with a
@@ -17866,22 +17884,19 @@ mod tests {
                     // The delayed pass must reproduce the same real catalogue
                     // fan-out, not a collapsed Unknown-Artist/Unknown-Album
                     // row pair.
-                    let delayed_backend = LocalBackend::new(delayed_db.clone());
-                    let delayed_albums = delayed_backend
-                        .list_albums(SortField::Title, SortOrder::Ascending)
-                        .await
-                        .expect("list albums in delayed pass for cardinality proof");
-                    let delayed_artists = delayed_backend
-                        .list_artists()
-                        .await
-                        .expect("list artists in delayed pass for cardinality proof");
+                    let (delayed_albums, delayed_artists) = catalogue_fan_out(
+                        &LocalBackend::new(delayed_db.clone())
+                            .list_tracks()
+                            .await
+                            .expect("list tracks in delayed pass for cardinality proof"),
+                    );
                     assert_eq!(
-                        delayed_albums.len(),
+                        delayed_albums,
                         expected_album_count(track_count),
                         "delayed scan must persist the full album fan-out"
                     );
                     assert_eq!(
-                        delayed_artists.len(),
+                        delayed_artists,
                         expected_artist_count(track_count),
                         "delayed scan must persist the full artist fan-out"
                     );
@@ -17927,10 +17942,9 @@ mod tests {
     /// any metric.
     #[tokio::test]
     async fn q4_fixture_scan_produces_real_catalogue_fan_out() {
-        use crate::architecture::models::{SortField, SortOrder};
-
         use super::super::perf_fixtures::{
-            expected_album_count, expected_artist_count, SyntheticLibrary,
+            album_title_for, artist_name_for, catalogue_fan_out, expected_album_count,
+            expected_artist_count, SyntheticLibrary,
         };
 
         const TRACKS: usize = 100;
@@ -17950,41 +17964,41 @@ mod tests {
             .len();
         assert_eq!(persisted, TRACKS, "one row per fixture file");
 
-        let backend = LocalBackend::new(db);
-        let albums = backend
-            .list_albums(SortField::Title, SortOrder::Ascending)
+        let tracks = LocalBackend::new(db)
+            .list_tracks()
             .await
-            .expect("list fixture albums");
-        let artists = backend.list_artists().await.expect("list fixture artists");
+            .expect("list fixture tracks");
+        let (albums, artists) = catalogue_fan_out(&tracks);
         assert_eq!(
-            albums.len(),
+            albums,
             expected_album_count(TRACKS),
-            "fixture tags must become distinct album rows (100 tracks -> 9 albums)"
+            "fixture tags must become distinct albums (100 tracks -> 9 albums)"
         );
         assert_eq!(
-            artists.len(),
+            artists,
             expected_artist_count(TRACKS),
-            "fixture tags must become distinct artist rows (9 albums -> 3 artists)"
+            "fixture tags must become distinct artists (9 albums -> 3 artists)"
         );
 
         // Spot-check attribution: tracks 96..100 form the final partial
         // album group (4 tracks); the 9 albums split 4/4/1 across artists,
         // so the final artist owns exactly that one album.
-        let last_album = albums
+        let last_album: Vec<_> = tracks
             .iter()
-            .find(|album| album.title == super::super::perf_fixtures::album_title_for(8))
-            .expect("final album group present");
-        assert_eq!(last_album.track_count, 4);
-        assert_eq!(
-            last_album.artist_name,
-            super::super::perf_fixtures::artist_name_for(2)
-        );
-        let last_artist = artists
+            .filter(|track| track.album_title == album_title_for(8))
+            .collect();
+        assert_eq!(last_album.len(), 4);
+        assert!(last_album
             .iter()
-            .find(|artist| artist.name == super::super::perf_fixtures::artist_name_for(2))
-            .expect("final artist group present");
-        assert_eq!(last_artist.album_count, 1);
-        assert_eq!(last_artist.track_count, 4);
+            .all(|track| track.artist_name == artist_name_for(2)));
+        let last_artist: Vec<_> = tracks
+            .iter()
+            .filter(|track| track.artist_name == artist_name_for(2))
+            .collect();
+        assert_eq!(last_artist.len(), 4);
+        assert!(last_artist
+            .iter()
+            .all(|track| track.album_title == album_title_for(8)));
     }
 
     // ── Root availability, rescans and engine edge cases ──────────────
@@ -18013,6 +18027,8 @@ mod tests {
         }
     }
 
+    // Its only caller removes a watched root, which Windows forbids.
+    #[cfg(not(windows))]
     async fn wait_for_root_status(events: &async_channel::Receiver<LibraryEvent>, available: bool) {
         loop {
             if let LibraryEvent::RootStatusChanged(statuses) =

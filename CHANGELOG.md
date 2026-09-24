@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **License notices in Windows and macOS downloads** — Each download now includes a
+  `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
+  offer of their source code.
   distinct identities for multiple roots, lazy navigation, and a visible notice when a
   root is unavailable.
 - **Album artwork in the browser** — The Album pane can show cover art for local and server
@@ -36,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Smaller Windows and macOS downloads** — The downloads now contain only the audio plugins
+  Tributary uses, leaving out video, streaming, and encoder plugins and the FDK AAC library,
+  whose license does not allow it to ship with Tributary.
 - **AirPlay outputs need a sender** — AirPlay receivers appear in the output selector only when
   the installed GStreamer can send to them, so builds without that support no longer list rows that
   fail on play. The README explains how to reach AirPlay speakers through your operating system.
@@ -45,10 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asks for confirmation first, with Cancel as the default.
 - **Maintenance** — Dependencies were refreshed, the fuzz tests now cover more file and network
   parsers, and CI runs the interface tests on a real display, checks one shared lockfile, and
-  auto-merges only patch-level dependency updates.
+  auto-merges only patch-level dependency updates. Unused internal code and placeholder data no
+  longer ship in the app.
 
 ### Fixed
 
+- **Single instance on Windows** — Starting Tributary again, or opening a file with it, while
+  it is already running now hands off to the running window instead of starting a second copy.
+- **Fewer freezes** — Album artwork is decoded in the background at the size it is shown, ejecting a
+  drive while a tag edit is saving no longer freezes the window (the save is cancelled and the file
+  left unchanged), and moving or deleting many library files updates the track list in one step.
+- **Pausing while a track starts** — Play/Pause now works while a track is still buffering instead
+  of being ignored.
 - **Safer library upgrades** — Tributary now copies the library database to a `backups` folder
   before upgrading it, keeping the three newest copies, and an upgrade interrupted partway can
   be retried. An older version opened on a newer library now says so and points to the copies,
@@ -139,6 +153,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rating column in other languages** — The Rating column no longer stays hidden when Tributary
   runs in a language other than English. Column titles are now translated, and saved column
   settings carry over.
+- **More of the app in your language** — Properties, the smart playlist editor, the status bar,
+  the main menu, the browser panes, Preferences, and the library folder trust prompts no longer
+  show English in other languages. Song counts and durations use the right plural forms and
+  decimal separator, and a rejected number in Properties is now highlighted.
 - **Column reordering** — A reordered column is saved once the drag finishes, so an interrupted
   save can't lose it.
 - **Very large playlist selections** — Adding or removing more than about 32,000 tracks at once no
@@ -163,9 +181,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receivers or Chromecasts that share a name no longer hide each other.
 - **macOS playback of protected streams** — The macOS app now bundles the HTTP support that server
   streams need, so they play on Macs without Homebrew.
+- **Server libraries load more reliably** — A Jellyfin server no longer fails to connect, and a
+  Plex library section is no longer skipped, when the server can't list its albums or artists;
+  Tributary now loads only the tracks. Large iTunes (DAAP) shares use less memory while loading.
+- **Internet radio when a directory server is down** — Radio views now try another Radio-Browser
+  server when one is unavailable, instead of always using the same one.
 
 ### Security
 
+- **AirPlay receiver names** — A receiver's advertised host name can no longer change the AirPlay
+  playback pipeline Tributary builds for it.
 - **Release builds** — Release packages are built from exact, reviewed versions of the build
   actions, Rust compiler, and packaging tools, and each published file has a GitHub
   build-provenance attestation that `gh attestation verify` can check.
@@ -181,6 +206,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named by `SSLKEYLOGFILE`.
 - **TLS library update** — The TLS library was updated to fix a TLS 1.3 handshake-validation
   advisory (RUSTSEC-2026-0285).
+- **Jellyfin discovery and account names in logs** — A device on the network can no longer flood
+  the sidebar with fake Jellyfin servers or stop real ones from being marked as gone, and each
+  reply is checked against the address it advertises. Server account names and IDs are no longer
+  written to the log.
 
 ## [0.6.2] — 2026-09-01
 

@@ -5,8 +5,6 @@
 //! Tributary actually uses are deserialized; unknown fields are silently
 //! ignored via `serde(default)`.
 
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 // ── POST https://plex.tv/users/sign_in.json ─────────────────────────────
@@ -22,10 +20,6 @@ pub struct PlexSignInResponse {
 pub struct PlexSignInUser {
     #[serde(rename = "authToken")]
     pub auth_token: String,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub title: Option<String>,
 }
 
 // ── GET https://plex.tv/api/v2/resources ────────────────────────────────
@@ -106,14 +100,6 @@ pub struct PlexDirectory {
     /// photo libraries report `"photo"`.
     #[serde(rename = "type")]
     pub section_type: String,
-
-    /// Unique identifier for this library section.
-    #[serde(default)]
-    pub uuid: Option<String>,
-
-    /// The scanner agent used for this library.
-    #[serde(default)]
-    pub agent: Option<String>,
 }
 
 // ── GET /library/sections/{key}/all?type=10 (tracks) ────────────────────
@@ -128,17 +114,10 @@ pub struct PlexTracksResponse {
 /// The `MediaContainer` wrapper for track listings.
 #[derive(Debug, Deserialize)]
 pub struct PlexTracksContainer {
-    #[serde(default)]
-    pub size: u32,
-
     /// Total number of items across all pages.  Plex reports this on a
     /// paginated container; absent when the endpoint does not paginate.
     #[serde(rename = "totalSize", default)]
     pub total_size: Option<u32>,
-
-    /// Zero-based offset of the first item in this page.
-    #[serde(default)]
-    pub offset: Option<u32>,
 
     #[serde(rename = "Metadata", default)]
     pub metadata: Vec<PlexTrack>,
@@ -219,10 +198,6 @@ pub struct PlexMedia {
     #[serde(default)]
     pub bitrate: Option<u32>,
 
-    /// Number of audio channels.
-    #[serde(rename = "audioChannels", default)]
-    pub audio_channels: Option<u32>,
-
     /// Audio codec (e.g. "flac", "mp3", "aac").
     #[serde(rename = "audioCodec", default)]
     pub audio_codec: Option<String>,
@@ -243,132 +218,9 @@ pub struct PlexPart {
     #[serde(default)]
     pub key: Option<String>,
 
-    /// File size in bytes.
-    #[serde(default)]
-    pub size: Option<u64>,
-
     /// Container format.
     #[serde(default)]
     pub container: Option<String>,
-}
-
-// ── GET /library/sections/{key}/all?type=9 (albums) ─────────────────────
-
-/// Response from `/library/sections/{key}/all?type=9`.
-#[derive(Debug, Deserialize)]
-pub struct PlexAlbumsResponse {
-    #[serde(rename = "MediaContainer")]
-    pub media_container: PlexAlbumsContainer,
-}
-
-/// The `MediaContainer` wrapper for album listings.
-#[derive(Debug, Deserialize)]
-pub struct PlexAlbumsContainer {
-    #[serde(default)]
-    pub size: u32,
-
-    /// Total number of items across all pages.  Plex reports this on a
-    /// paginated container; absent when the endpoint does not paginate.
-    #[serde(rename = "totalSize", default)]
-    pub total_size: Option<u32>,
-
-    /// Zero-based offset of the first item in this page.
-    #[serde(default)]
-    pub offset: Option<u32>,
-
-    #[serde(rename = "Metadata", default)]
-    pub metadata: Vec<PlexAlbum>,
-}
-
-/// A single album from the Plex library.
-#[derive(Debug, Deserialize)]
-pub struct PlexAlbum {
-    /// Unique rating key.
-    #[serde(rename = "ratingKey")]
-    pub rating_key: String,
-
-    /// Album title.
-    #[serde(default)]
-    pub title: Option<String>,
-
-    /// Artist name (parent in Plex's hierarchy).
-    #[serde(rename = "parentTitle", default)]
-    pub parent_title: Option<String>,
-
-    /// Artist rating key.
-    #[serde(rename = "parentRatingKey", default)]
-    pub parent_rating_key: Option<String>,
-
-    /// Release year.
-    #[serde(default)]
-    pub year: Option<i32>,
-
-    /// Number of tracks in this album.
-    #[serde(rename = "leafCount", default)]
-    pub leaf_count: Option<u32>,
-
-    /// Total duration in milliseconds.
-    #[serde(default)]
-    pub duration: Option<u64>,
-
-    /// Thumbnail path.
-    #[serde(default)]
-    pub thumb: Option<String>,
-
-    /// Genre tags.
-    #[serde(rename = "Genre", default)]
-    pub genre: Vec<PlexTag>,
-}
-
-/// A tag object (used for genres, etc.).
-#[derive(Debug, Deserialize)]
-pub struct PlexTag {
-    #[serde(default)]
-    pub tag: Option<String>,
-}
-
-// ── GET /library/sections/{key}/all?type=8 (artists) ────────────────────
-
-/// Response from `/library/sections/{key}/all?type=8`.
-#[derive(Debug, Deserialize)]
-pub struct PlexArtistsResponse {
-    #[serde(rename = "MediaContainer")]
-    pub media_container: PlexArtistsContainer,
-}
-
-/// The `MediaContainer` wrapper for artist listings.
-#[derive(Debug, Deserialize)]
-pub struct PlexArtistsContainer {
-    #[serde(default)]
-    pub size: u32,
-
-    /// Total number of items across all pages.  Plex reports this on a
-    /// paginated container; absent when the endpoint does not paginate.
-    #[serde(rename = "totalSize", default)]
-    pub total_size: Option<u32>,
-
-    /// Zero-based offset of the first item in this page.
-    #[serde(default)]
-    pub offset: Option<u32>,
-
-    #[serde(rename = "Metadata", default)]
-    pub metadata: Vec<PlexArtist>,
-}
-
-/// A single artist from the Plex library.
-#[derive(Debug, Deserialize)]
-pub struct PlexArtist {
-    /// Unique rating key.
-    #[serde(rename = "ratingKey")]
-    pub rating_key: String,
-
-    /// Artist name.
-    #[serde(default)]
-    pub title: Option<String>,
-
-    /// Thumbnail path.
-    #[serde(default)]
-    pub thumb: Option<String>,
 }
 
 // ── GET /identity ───────────────────────────────────────────────────────

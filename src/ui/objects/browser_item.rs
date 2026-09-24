@@ -67,10 +67,6 @@ mod imp {
         /// and artist panes leave it empty so their lightweight labels
         /// carry no per-row art cost.
         pub artwork_candidate: RefCell<Option<super::AlbumArtCandidate>>,
-        /// Whether this item is the synthetic "All" row. The "All" row is
-        /// never decorated with artwork; the bind factory uses this to skip
-        /// the artwork fetch path and stick to the existing text label.
-        pub is_all_row: Cell<bool>,
         /// Typed identity of a folder-pane row ([`super::FolderRowKind`]).
         /// Non-folder rows keep the `Status` default, which the folder
         /// navigation never activates.
@@ -117,8 +113,14 @@ impl BrowserItem {
         let obj: Self = glib::Object::builder().build();
         obj.imp().label.replace(label.to_string());
         obj.imp().count.set(count);
-        obj.imp().is_all_row.set(label == "All");
         obj
+    }
+
+    /// The synthetic "All" row heading a browser pane. It carries no
+    /// artwork candidate, and panes recognize it by position, never by its
+    /// translated label.
+    pub fn all_row(count: u32) -> Self {
+        Self::new(&rust_i18n::t!("browser.all"), count)
     }
 
     /// Construct a folder-pane row carrying its typed identity
@@ -135,7 +137,6 @@ impl BrowserItem {
         let obj: Self = glib::Object::builder().build();
         obj.imp().label.replace(label.to_string());
         obj.imp().count.set(count);
-        obj.imp().is_all_row.set(false);
         obj.imp().artwork_candidate.replace(Some(candidate));
         obj
     }
@@ -145,9 +146,6 @@ impl BrowserItem {
     }
     pub fn count(&self) -> u32 {
         self.imp().count.get()
-    }
-    pub fn is_all_row(&self) -> bool {
-        self.imp().is_all_row.get()
     }
     /// The row's typed folder identity. Non-folder rows report
     /// [`FolderRowKind::Status`].

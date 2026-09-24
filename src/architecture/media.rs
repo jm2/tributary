@@ -87,26 +87,6 @@ impl AdvertisedHttpRoute {
         })
     }
 
-    /// Union two advertisements only when they describe the same exact
-    /// origin. The result is recanonicalized and remains bounded.
-    pub(crate) fn merged_same_origin(&self, other: &Self) -> Option<Self> {
-        if self.scheme != other.scheme || self.hostname != other.hostname || self.port != other.port
-        {
-            return None;
-        }
-
-        let addresses = canonical_addresses(
-            self.addresses.iter().chain(other.addresses.iter()).copied(),
-            self.port,
-        );
-        Some(Self {
-            scheme: self.scheme,
-            hostname: self.hostname.clone(),
-            port: self.port,
-            addresses,
-        })
-    }
-
     /// Whether `other` routes the same origin and still offers every address
     /// this route offered, so nothing connected through this route lost its
     /// address.
@@ -324,6 +304,7 @@ impl ResolvedPublicHttpRequest {
         Ok(self.endpoint.cloned_url())
     }
 
+    #[cfg(test)]
     fn is_active(&self) -> bool {
         self.lease.is_active()
             && self.authority.upgrade().is_some_and(|authority| {
@@ -347,6 +328,7 @@ pub enum MediaRequest {
 }
 
 impl MediaRequest {
+    #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         match self {
             Self::ProtectedHttp(request) => request.is_active(),
@@ -354,9 +336,6 @@ impl MediaRequest {
         }
     }
 }
-
-/// Compatibility-neutral name used at the playback boundary.
-pub type ResolvedStream = MediaRequest;
 
 impl MediaLease {
     pub(crate) fn new() -> Self {
@@ -438,6 +417,13 @@ impl Drop for MediaLeasePermit {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MediaStreamKind {
     /// Unbounded live source (for example an internet radio relay).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "no protected source resolves a live stream yet; Chromecast LOAD already honours the kind"
+        )
+    )]
     Live,
     /// Finite, seekable track bytes.
     Buffered,
@@ -554,18 +540,11 @@ pub struct MediaRepresentation {
 
 impl MediaRepresentation {
     /// A buffered stream with a validated container.
+    #[cfg(test)]
     pub fn buffered(container: MediaContainer) -> Self {
         Self {
             container: Some(container),
             stream: MediaStreamKind::Buffered,
-        }
-    }
-
-    /// A live stream with a validated container.
-    pub fn live(container: MediaContainer) -> Self {
-        Self {
-            container: Some(container),
-            stream: MediaStreamKind::Live,
         }
     }
 
@@ -578,6 +557,7 @@ impl MediaRepresentation {
     }
 
     /// A live stream whose container is explicitly unknown.
+    #[cfg(test)]
     pub fn live_unknown() -> Self {
         Self {
             container: None,
@@ -599,6 +579,7 @@ impl MediaRepresentation {
     }
 
     /// The validated container, or `None` when explicitly unknown.
+    #[cfg(test)]
     pub fn container(&self) -> Option<MediaContainer> {
         self.container
     }
@@ -1193,31 +1174,6 @@ mod tests {
             [SocketAddrV6::new(link_local.ip().to_owned(), 1, 0, 0).into()]
         )
         .is_none());
-    }
-
-    #[test]
-    fn advertised_routes_merge_only_within_the_same_origin() {
-        let implicit = Url::parse("https://music.local").unwrap();
-        let explicit = Url::parse("https://music.local:443/base").unwrap();
-        let first =
-            AdvertisedHttpRoute::new(&implicit, [SocketAddr::from(([192, 0, 2, 2], 443))]).unwrap();
-        let second =
-            AdvertisedHttpRoute::new(&explicit, [SocketAddr::from(([192, 0, 2, 1], 1))]).unwrap();
-        let merged = first.merged_same_origin(&second).expect("same origin");
-        assert_eq!(
-            merged.addresses(),
-            [
-                SocketAddr::from(([192, 0, 2, 1], 443)),
-                SocketAddr::from(([192, 0, 2, 2], 443)),
-            ]
-        );
-
-        let http = AdvertisedHttpRoute::new(
-            &Url::parse("http://music.local:443").unwrap(),
-            [SocketAddr::from(([192, 0, 2, 3], 443))],
-        )
-        .unwrap();
-        assert!(first.merged_same_origin(&http).is_none());
     }
 
     #[test]

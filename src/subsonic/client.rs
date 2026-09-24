@@ -183,7 +183,6 @@ impl SubsonicClient {
 
         info!(
             server = %redact_url_secrets(base_url.as_str()),
-            user = %username,
             "Subsonic client created"
         );
 

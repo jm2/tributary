@@ -40,6 +40,8 @@ use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 use uuid::Uuid;
 
+use crate::architecture::media::MediaLease;
+
 use super::root_authority::{
     resolve_ancestor_chain, resolve_final_symlink, ContentRevision, MountedMutationCommit,
     MountedMutationTarget, MountedRootAuthority, ObjectIdentity, SelectionLocationEvidence,
@@ -159,6 +161,19 @@ impl TagEdits {
         parse_tag_number("Track #", self.track_number.as_deref())?;
         parse_tag_number("Disc #", self.disc_number.as_deref())?;
         Ok(())
+    }
+
+    /// The first numeric field [`Self::validate`] rejects, named like the
+    /// struct field (`year`, `track_number`, or `disc_number`).
+    pub fn invalid_number_field(&self) -> Option<&'static str> {
+        [
+            ("year", &self.year),
+            ("track_number", &self.track_number),
+            ("disc_number", &self.disc_number),
+        ]
+        .into_iter()
+        .find(|(_, raw)| parse_tag_number("", raw.as_deref()).is_err())
+        .map(|(name, _)| name)
     }
 }
 
@@ -564,8 +579,7 @@ fn unlink_bound_private_name(
 /// the sole link at the private name, plant a foreign entry, and make the
 /// count fall to zero for the plant — can still counterfeit the
 /// post-condition. The window is not fully closed; POSIX offers no
-/// unlink-by-fd. A strictly atomic identity-conditional unlink remains
-/// the recorded operator/coordinator decision (PR #237 precedent).
+/// unlink-by-fd, so this residual is deliberately accepted.
 ///
 /// [`unlinkat`]: rustix::fs::unlinkat
 // The `u64::from` is load-bearing on macOS (`st_nlink` is `u16` there) and
@@ -652,6 +666,7 @@ impl TempFile {
     /// Error contexts name the target by `target_label`, never by `target`:
     /// an authority-based caller's target is a native mount path that must
     /// not leak into logs (see `replacement_path`).
+    #[cfg(any(test, not(unix)))]
     fn create_beside(target: &Path, target_label: &str) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
 
@@ -794,6 +809,7 @@ impl TempFile {
     /// Atomically move the temp file onto `target`, disarming the cleanup.
     ///
     /// On failure `self` is dropped, so the temp file is still removed.
+    #[cfg(any(test, not(unix)))]
     fn persist_to(&mut self, target: &Path) -> Result<()> {
         std::fs::rename(&self.path, target).with_context(|| {
             format!(
@@ -818,6 +834,7 @@ impl TempFile {
     /// A capability check is successful only when cleanup succeeds. Returning
     /// success while leaving a private sibling behind would make merely
     /// opening Properties mutate the library indefinitely.
+    #[cfg(any(test, not(unix)))]
     fn remove(mut self) -> Result<()> {
         std::fs::remove_file(&self.path).with_context(|| {
             format!(
@@ -891,6 +908,7 @@ pub fn supports_tag_writes(path: &Path) -> bool {
 /// Batch callers should validate every distinct track, run
 /// [`preflight_tag_write_target_access`] for every track, then call
 /// [`preflight_tag_write_directory`] once per distinct parent directory.
+#[cfg(any(test, not(unix)))]
 pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightError> {
     if !supports_tag_writes(path) {
         return Err(TagWritePreflightError::UnsupportedFormat);
@@ -922,6 +940,7 @@ pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightErr
 /// validation above because permissions are applied after tagging.
 ///
 /// This performs blocking filesystem I/O and must not run on the GTK thread.
+#[cfg(any(test, not(unix)))]
 pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePreflightError> {
     validate_tag_write_target(path)?;
 
@@ -973,6 +992,7 @@ pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePref
 /// grants, ACLs, FUSE filesystems, or Windows access rules.
 ///
 /// This performs blocking filesystem I/O and must not run on the GTK thread.
+#[cfg(any(test, not(unix)))]
 pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePreflightError> {
     validate_tag_write_target(path)?;
 
@@ -1015,6 +1035,7 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
 }
 
 /// Check whether the complete atomic tag writer can currently operate.
+#[cfg(any(test, not(unix)))]
 pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
     preflight_tag_write_target_access(path)?;
     preflight_tag_write_directory(path)
@@ -1482,6 +1503,7 @@ impl LocalMutationTarget {
             edits,
             Some(&evidence.revision),
             Some(&evidence.location()),
+            None,
         ) {
             Ok(()) => Ok(()),
             Err(error) => Err(classify_local_write_failure(&target, &evidence, error)),
@@ -1691,6 +1713,7 @@ fn classify_local_write_failure(
 /// whatever the path currently names. The properties dialog uses
 /// [`LocalMutationTarget`] instead, so a file replaced after selection is
 /// refused rather than silently rewritten.
+#[cfg(test)]
 pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
@@ -1737,11 +1760,17 @@ pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
 /// rename, and the rename runs relative to the retained parent directory so
 /// no pathname resolution can retarget it. Every failure leaves the target
 /// untouched. This is a blocking operation — call from a background thread.
+///
+/// `commit_lease` is the owning session's lease. A permit is held only across
+/// the commit itself, so a revocation waits for at most one in-progress
+/// rename, and a write that reaches its commit after revocation began is
+/// refused with the target untouched.
 pub fn write_tags_with_mutation_target(
     target: &MountedMutationTarget,
     edits: &TagEdits,
+    commit_lease: &MediaLease,
 ) -> Result<()> {
-    write_tags_with_mutation_target_revision(target, edits, None, None)
+    write_tags_with_mutation_target_revision(target, edits, None, None, Some(commit_lease))
 }
 
 /// Write tag edits through a retained authority with an optional content
@@ -1765,11 +1794,15 @@ pub fn write_tags_with_mutation_target(
 /// otherwise be adopted because the parent object, the leaf identity, and
 /// the revision all still match. The refusal leaves the selection and every
 /// competing file untouched.
+///
+/// When `commit_lease` is supplied, the commit acquires one of its permits
+/// and holds it across the rename; a revoked lease refuses the commit.
 pub fn write_tags_with_mutation_target_revision(
     target: &MountedMutationTarget,
     edits: &TagEdits,
     expected_revision: Option<&ContentRevision>,
     selection: Option<&SelectionLocationEvidence>,
+    commit_lease: Option<&MediaLease>,
 ) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
@@ -1806,6 +1839,7 @@ pub fn write_tags_with_mutation_target_revision(
         edits,
         expected_revision,
         selection,
+        commit_lease,
     )
 }
 
@@ -1827,6 +1861,7 @@ fn write_tag_edits_for_commit(
     edits: &TagEdits,
     expected_revision: Option<&ContentRevision>,
     selection: Option<&SelectionLocationEvidence>,
+    commit_lease: Option<&MediaLease>,
 ) -> Result<()> {
     // Anchor the staging at the retained parent before anything is staged:
     // the pinned parent identity makes staging and the later install agree
@@ -1850,6 +1885,7 @@ fn write_tag_edits_for_commit(
                 Some(expected_staged),
                 expected_revision,
                 selection,
+                commit_lease,
             )
         },
     )
@@ -1867,6 +1903,7 @@ fn write_tag_edits_for_commit(
     edits: &TagEdits,
     expected_revision: Option<&ContentRevision>,
     selection: Option<&SelectionLocationEvidence>,
+    commit_lease: Option<&MediaLease>,
 ) -> Result<()> {
     let replacement_path = target.replacement_path().to_path_buf();
     atomic_tag_replacement(
@@ -1874,7 +1911,16 @@ fn write_tag_edits_for_commit(
         &replacement_path,
         "the retained mutation target",
         edits,
-        |temp| finish_committed_tag_replacement(commit, temp, None, expected_revision, selection),
+        |temp| {
+            finish_committed_tag_replacement(
+                commit,
+                temp,
+                None,
+                expected_revision,
+                selection,
+                commit_lease,
+            )
+        },
     )
 }
 
@@ -1898,13 +1944,24 @@ fn write_tag_edits_for_commit(
 /// ancestor chain of the selection in the same pre-displacement window —
 /// the save-start proof cannot cover the save window itself, and on unix
 /// the retained binding pins only the immediate parent directory.
+/// `commit_lease`, when supplied, must admit the commit: its permit is held
+/// until the rename and re-anchor finish, so a revocation either waits for
+/// this short section or has already refused it.
 fn finish_committed_tag_replacement(
     commit: &mut MountedMutationCommit<'_>,
     temp: &mut TempFile,
     expected_staged_identity: Option<&ObjectIdentity>,
     expected_revision: Option<&ContentRevision>,
     selection: Option<&SelectionLocationEvidence>,
+    commit_lease: Option<&MediaLease>,
 ) -> Result<()> {
+    let _commit_permit = commit_lease
+        .map(|lease| {
+            lease
+                .try_acquire()
+                .ok_or_else(|| anyhow::anyhow!("The removable media source is no longer active"))
+        })
+        .transpose()?;
     commit
         .commit_replacement_checked(
             temp.path(),
@@ -2089,6 +2146,7 @@ fn create_retained_sibling_exclusive(
 /// target is a native mount path that must not leak into logs, so contexts
 /// name the target by `target_label` instead. Path-based callers pass the
 /// user-visible pathname's own text.
+#[cfg(any(test, not(unix)))]
 fn atomic_tag_replacement(
     source: File,
     target_path: &Path,
@@ -2186,6 +2244,7 @@ fn copy_source_into_destination(
 /// object whose bytes were copied — never from a lookup at the target's name,
 /// which an external writer can retarget between admission and commit. Error
 /// contexts name the target by `target_label`, never by its native pathname.
+#[cfg(any(test, not(unix)))]
 fn flush_and_prepare_tagged_copy(
     temp: &TempFile,
     target_label: &str,
@@ -2215,6 +2274,7 @@ fn flush_and_prepare_tagged_copy(
 /// `FlushFileBuffers`, which requires `GENERIC_WRITE`, so syncing through a
 /// read-only handle fails with access-denied and would break every tag write on
 /// that platform.
+#[cfg(any(test, not(unix)))]
 fn flush_to_disk(path: &Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
@@ -2229,6 +2289,7 @@ fn flush_to_disk(path: &Path) -> std::io::Result<()> {
 /// the target's own directory — a native mount directory for
 /// authority-based callers — and formatting it would leak exactly the
 /// location the redacted label exists to protect.
+#[cfg(any(test, not(unix)))]
 fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Result<()> {
     let mut tagged_file = lofty::read_from_path(temp_path)
         .with_context(|| format!("Failed to read tags from {target_label}"))?;
@@ -2428,7 +2489,7 @@ fn apply_comment_edit(tag: &mut Tag, edits: &TagEdits) {
 /// ancestor's old name here and assert the staged copy never appears on the
 /// other side.
 #[cfg(all(test, unix))]
-type PreStagingInterpose = dyn Fn(&MountedMutationTarget) + Send + Sync;
+pub type PreStagingInterpose = dyn Fn(&MountedMutationTarget) + Send + Sync;
 
 #[cfg(all(test, unix))]
 static PRE_STAGING_INTERPOSE: std::sync::Mutex<Option<Box<PreStagingInterpose>>> =
@@ -2446,7 +2507,7 @@ fn run_pre_staging_interpose(target: &MountedMutationTarget) {
 
 /// Serialize tests that use the pre-staging interposition seam.
 #[cfg(all(test, unix))]
-fn with_pre_staging_interpose(interpose: Box<PreStagingInterpose>, run: impl FnOnce()) {
+pub fn with_pre_staging_interpose(interpose: Box<PreStagingInterpose>, run: impl FnOnce()) {
     let _serial = PRE_STAGING_INTERPOSE_SERIAL.lock().unwrap();
     *PRE_STAGING_INTERPOSE.lock().unwrap() = Some(interpose);
     run();
@@ -2596,13 +2657,15 @@ mod tests {
         assert!(year("2026").validate().is_ok());
         assert!(year("").validate().is_ok());
         assert!(TagEdits::default().validate().is_ok());
+        assert_eq!(year("2026").invalid_number_field(), None);
     }
 
     #[test]
     fn a_malformed_number_is_rejected_and_names_the_field() {
-        for (label, edits) in [
+        for (label, field, edits) in [
             (
                 "Year",
+                "year",
                 TagEdits {
                     year: Some("2026a".to_string()),
                     ..Default::default()
@@ -2610,6 +2673,7 @@ mod tests {
             ),
             (
                 "Track #",
+                "track_number",
                 TagEdits {
                     track_number: Some("one".to_string()),
                     ..Default::default()
@@ -2617,6 +2681,7 @@ mod tests {
             ),
             (
                 "Disc #",
+                "disc_number",
                 TagEdits {
                     disc_number: Some("-1".to_string()),
                     ..Default::default()
@@ -2628,6 +2693,7 @@ mod tests {
                 .expect_err("a malformed number must be rejected")
                 .to_string();
             assert!(error.contains(label), "error should name {label}: {error}");
+            assert_eq!(edits.invalid_number_field(), Some(field));
         }
     }
 
@@ -3122,7 +3188,7 @@ mod tests {
             .open_mutation_target(Path::new("silence.flac"))
             .expect("open mutation target");
 
-        write_tags_with_mutation_target(&target, &year("2026"))
+        write_tags_with_mutation_target(&target, &year("2026"), &MediaLease::new())
             .expect("write through the retained authority");
         assert!(
             directory.temp_files().is_empty(),
@@ -3132,7 +3198,7 @@ mod tests {
         // The replacement retired the copied-from object; the in-section
         // re-anchor must have re-bound the target, so a second edit through
         // the same retained authority is still authorized.
-        write_tags_with_mutation_target(&target, &year("2027"))
+        write_tags_with_mutation_target(&target, &year("2027"), &MediaLease::new())
             .expect("follow-up write after the re-anchor");
 
         let tagged_file = lofty::read_from_path(&track).expect("reopen tagged FLAC");
@@ -3171,7 +3237,7 @@ mod tests {
         std::fs::rename(&track, &displaced).expect("displace the admitted file");
         std::fs::write(&track, b"not the admitted file").expect("install different bytes");
 
-        write_tags_with_mutation_target(&target, &year("2026"))
+        write_tags_with_mutation_target(&target, &year("2026"), &MediaLease::new())
             .expect_err("the pathname no longer names the admitted file; the commit must refuse");
 
         assert_eq!(
@@ -4008,7 +4074,7 @@ mod tests {
         std::fs::create_dir(&album).expect("install impostor parent");
         std::fs::write(&track, b"impostor audio").expect("install impostor file");
 
-        write_tags_with_mutation_target(&target, &year("2026"))
+        write_tags_with_mutation_target(&target, &year("2026"), &MediaLease::new())
             .expect("staging and replacement run through the retained parent");
 
         // The replacement landed beside the admitted file in the retained
@@ -4082,7 +4148,7 @@ mod tests {
                     .expect("install symlink impostor at the old name");
             }),
             || {
-                write_tags_with_mutation_target(&target, &year("2026"))
+                write_tags_with_mutation_target(&target, &year("2026"), &MediaLease::new())
                     .expect("anchored staging must land the write through the retained parent");
             },
         );
