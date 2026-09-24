@@ -163,6 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receivers or Chromecasts that share a name no longer hide each other.
 - **macOS playback of protected streams** — The macOS app now bundles the HTTP support that server
   streams need, so they play on Macs without Homebrew.
+- **Fewer freezes** — Album artwork is decoded in the background at the size it is shown, ejecting a
+  drive while a tag edit is saving no longer freezes the window (the save is cancelled and the file
+  left unchanged), and moving or deleting many library files updates the track list in one step.
+- **Pausing while a track starts** — Play/Pause now works while a track is still buffering instead
+  of being ignored.
 
 ### Security
 
@@ -179,6 +184,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages and logs no longer quote parts of the response, which could contain private details.
 - **Chromecast connections** — Tributary no longer writes Chromecast TLS session keys to the file
   named by `SSLKEYLOGFILE`.
+- **AirPlay receiver names** — A receiver's advertised host name can no longer change the AirPlay
+  playback pipeline Tributary builds for it.
 - **TLS library update** — The TLS library was updated to fix a TLS 1.3 handshake-validation
   advisory (RUSTSEC-2026-0285).
 
