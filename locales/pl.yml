@@ -277,6 +277,16 @@ download:
   progress: "Pobieranie %{done} z %{total}…"
   finished: "Pobieranie zakończone. Pobrane: %{downloaded}, pominięte: %{skipped}, nieudane: %{failed}."
   cancelled: "Pobieranie anulowane. Pobrane: %{downloaded}, pominięte: %{skipped}, nieudane: %{failed}."
+  refused:
+    one: "Serwer odrzucił %{count} pobranie."
+    other: "Serwer odrzucił %{count} pobrania."
+    few: "Serwer odrzucił %{count} pobrania."
+    many: "Serwer odrzucił %{count} pobrań."
+  refused_permission:
+    one: "Serwer odrzucił %{count} pobranie. Poproś administratora serwera o zezwolenie na pobieranie dla tego konta."
+    other: "Serwer odrzucił %{count} pobrania. Poproś administratora serwera o zezwolenie na pobieranie dla tego konta."
+    few: "Serwer odrzucił %{count} pobrania. Poproś administratora serwera o zezwolenie na pobieranie dla tego konta."
+    many: "Serwer odrzucił %{count} pobrań. Poproś administratora serwera o zezwolenie na pobieranie dla tego konta."
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "Kopiuj na urządzenie"

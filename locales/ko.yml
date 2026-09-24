@@ -273,6 +273,12 @@ download:
   progress: "%{total}곡 중 %{done}곡 다운로드 중…"
   finished: "다운로드를 마쳤습니다. 다운로드됨: %{downloaded}, 건너뜀: %{skipped}, 실패: %{failed}."
   cancelled: "다운로드를 취소했습니다. 다운로드됨: %{downloaded}, 건너뜀: %{skipped}, 실패: %{failed}."
+  refused:
+    one: "서버가 %{count}곡의 다운로드를 거부했습니다."
+    other: "서버가 %{count}곡의 다운로드를 거부했습니다."
+  refused_permission:
+    one: "서버가 %{count}곡의 다운로드를 거부했습니다. 서버 관리자에게 이 계정의 다운로드를 허용해 달라고 요청하세요."
+    other: "서버가 %{count}곡의 다운로드를 거부했습니다. 서버 관리자에게 이 계정의 다운로드를 허용해 달라고 요청하세요."
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "장치로 복사"

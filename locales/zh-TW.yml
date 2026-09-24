@@ -273,6 +273,12 @@ download:
   progress: "正在下載（%{done}/%{total}）…"
   finished: "下載已完成。已下載：%{downloaded}，已略過：%{skipped}，失敗：%{failed}。"
   cancelled: "下載已取消。已下載：%{downloaded}，已略過：%{skipped}，失敗：%{failed}。"
+  refused:
+    one: "伺服器拒絕了 %{count} 首曲目的下載。"
+    other: "伺服器拒絕了 %{count} 首曲目的下載。"
+  refused_permission:
+    one: "伺服器拒絕了 %{count} 首曲目的下載。請要求伺服器管理員為此帳號開放下載權限。"
+    other: "伺服器拒絕了 %{count} 首曲目的下載。請要求伺服器管理員為此帳號開放下載權限。"
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "複製到裝置"

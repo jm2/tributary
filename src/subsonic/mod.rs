@@ -9,6 +9,7 @@ mod api;
 mod backend;
 mod client;
 
+pub use api::is_refusal_body;
 pub use backend::SubsonicBackend;
 
 #[cfg(test)]

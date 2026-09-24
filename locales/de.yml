@@ -273,6 +273,12 @@ download:
   progress: "%{done} von %{total} werden heruntergeladen…"
   finished: "Downloads abgeschlossen. Heruntergeladen: %{downloaded}, übersprungen: %{skipped}, fehlgeschlagen: %{failed}."
   cancelled: "Downloads abgebrochen. Heruntergeladen: %{downloaded}, übersprungen: %{skipped}, fehlgeschlagen: %{failed}."
+  refused:
+    one: "Der Server hat %{count} Download abgelehnt."
+    other: "Der Server hat %{count} Downloads abgelehnt."
+  refused_permission:
+    one: "Der Server hat %{count} Download abgelehnt. Bitten Sie den Serveradministrator, Downloads für dieses Konto zu erlauben."
+    other: "Der Server hat %{count} Downloads abgelehnt. Bitten Sie den Serveradministrator, Downloads für dieses Konto zu erlauben."
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "Auf Gerät kopieren"
