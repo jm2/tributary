@@ -183,7 +183,7 @@ pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
         );
     }
     let content = String::from_utf8(bytes).map_err(|_| anyhow!("XSPF file is not UTF-8"))?;
-    let tracks = parse_xspf(&content)?;
+    let tracks = parse_xspf(&content, Some(path))?;
 
     info!(
         path = %path.display(),
@@ -228,8 +228,16 @@ fn empty_imported_track() -> ImportedTrack {
 }
 
 /// Parse XSPF document text: the file-independent core of [`import_xspf`].
-pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
+///
+/// `playlist_path` is the file the document was read from. As the XSPF
+/// specification requires, relative `<location>` references resolve against
+/// it; without one they yield no path.
+pub fn parse_xspf(
+    content: &str,
+    playlist_path: Option<&Path>,
+) -> anyhow::Result<Vec<ImportedTrack>> {
     validate_xml_10_text(content)?;
+    let base = playlist_path.and_then(playlist_base_url);
 
     let mut reader = NsReader::from_str(content.trim_start_matches('\u{feff}'));
     reader.config_mut().check_comments = true;
@@ -316,6 +324,7 @@ pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                                 .ok_or_else(|| anyhow!("malformed XSPF: field outside a track"))?,
                             field,
                             &value,
+                            base.as_ref(),
                         );
                     }
                     XspfNode::Playlist => root_closed = true,
@@ -334,6 +343,7 @@ pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                                 .ok_or_else(|| anyhow!("malformed XSPF: field outside a track"))?,
                             field,
                             &value,
+                            base.as_ref(),
                         );
                     }
                     XspfNode::Track => {
@@ -589,10 +599,10 @@ fn resolve_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> anyhow:
         .ok_or_else(|| anyhow!("unsupported XSPF entity reference: &{name};"))
 }
 
-fn apply_xspf_field(track: &mut ImportedTrack, field: XspfField, value: &str) {
+fn apply_xspf_field(track: &mut ImportedTrack, field: XspfField, value: &str, base: Option<&Url>) {
     match field {
         XspfField::Location if track.file_path.is_empty() => {
-            let file_path = uri_to_file_path(value.trim());
+            let file_path = uri_to_file_path(value.trim(), base);
             if !file_path.is_empty() {
                 track.file_path = file_path;
             }
@@ -823,14 +833,26 @@ fn file_path_to_uri(path: &str) -> String {
     )
 }
 
-/// Convert a `file://` URI back to a filesystem path.
+/// The playlist file's own URI: the base relative `<location>` references
+/// resolve against.
+fn playlist_base_url(playlist_path: &Path) -> Option<Url> {
+    std::path::absolute(playlist_path)
+        .ok()
+        .and_then(|path| Url::from_file_path(path).ok())
+}
+
+/// Convert a `<location>` URI reference to a filesystem path.
 ///
-/// Uses `Url::to_file_path`, which percent-decodes the path and keeps the
-/// leading slash on Unix absolute paths (the old `strip_prefix("file:///")`
-/// dropped it). Non-`file`, malformed, and non-local inputs deliberately yield
-/// no path so a web URL can never be retained as a local-library identity.
-fn uri_to_file_path(uri: &str) -> String {
-    let Ok(url) = Url::parse(uri) else {
+/// A relative reference resolves against `base`, the playlist file's URI.
+/// `Url::to_file_path` percent-decodes the result. Non-`file`, malformed, and
+/// non-local inputs deliberately yield no path so a web URL can never be
+/// retained as a local-library identity.
+fn uri_to_file_path(uri: &str, base: Option<&Url>) -> String {
+    // An empty reference would resolve to the playlist file itself.
+    if uri.is_empty() {
+        return String::new();
+    }
+    let Ok(url) = base.map_or_else(|| Url::parse(uri), |base| base.join(uri)) else {
         return String::new();
     };
     if url.scheme() != "file" {
@@ -875,8 +897,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        export_xspf, import_xspf, match_imported_track, serialize_xspf, temporary_file_prefix,
-        ImportedTrack, MAX_XSPF_IMPORT_BYTES,
+        export_xspf, import_xspf, match_imported_track, parse_xspf, serialize_xspf,
+        temporary_file_prefix, ImportedTrack, MAX_XSPF_IMPORT_BYTES,
     };
     use crate::db::entities::track;
 
@@ -1116,7 +1138,7 @@ mod tests {
             "<playlist version='1' xmlns='http://xspf.org/ns/0/'><trackList>",
             "<track><location>https://example.test/watch/1</location>",
             "<title>Web</title><creator>Artist</creator></track>",
-            "<track><location>not a URI</location>",
+            "<track><location>https://[not-an-ip]/song.flac</location>",
             "<title>Malformed</title><creator>Artist</creator></track>",
             "<track><location>https://example.test/not-local</location>",
             "<location>file:///C:/music/Local%20Song.flac</location>",
@@ -1133,6 +1155,43 @@ mod tests {
         assert!(!tracks[2].file_path.starts_with("file:"));
         assert!(!tracks[2].file_path.contains("Other.flac"));
         assert!(tracks[3].file_path.is_empty());
+    }
+
+    #[test]
+    fn relative_locations_resolve_against_the_playlist_directory() {
+        let document = concat!(
+            "<playlist version='1' xmlns='http://xspf.org/ns/0/'><trackList>",
+            "<track><location>Song.flac</location></track>",
+            "<track><location>sub/My%20Song.flac</location></track>",
+            "<track><location>../Up One.flac</location></track>",
+            "<track><location>Query.flac?token=private</location></track>",
+            "<track><location> </location></track>",
+            "</trackList></playlist>"
+        );
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let lists = directory.path().join("lists");
+        fs::create_dir(&lists).expect("create playlist directory");
+        let playlist = lists.join("mix.xspf");
+        fs::write(&playlist, document).expect("write XSPF fixture");
+
+        let tracks = import_xspf(&playlist).expect("parse relative locations");
+
+        assert_eq!(tracks.len(), 5);
+        assert_eq!(Path::new(&tracks[0].file_path), lists.join("Song.flac"));
+        assert_eq!(
+            Path::new(&tracks[1].file_path),
+            lists.join("sub").join("My Song.flac")
+        );
+        assert_eq!(
+            Path::new(&tracks[2].file_path),
+            directory.path().join("Up One.flac")
+        );
+        assert!(tracks[3].file_path.is_empty());
+        assert!(tracks[4].file_path.is_empty());
+
+        // Without a playlist file there is no base to resolve against.
+        let unanchored = parse_xspf(document, None).expect("parse without a base");
+        assert!(unanchored.iter().all(|track| track.file_path.is_empty()));
     }
 
     #[test]
