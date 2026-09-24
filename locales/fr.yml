@@ -2,6 +2,9 @@
 app:
   not_playing: "Rien en lecture"
   scanning: "Analyse de la bibliothèque…"
+  unsupported_file_names_skipped:
+    one: "%{count} fichier audio ignoré : son nom n’est pas en UTF-8 valide"
+    other: "%{count} fichiers audio ignorés : leurs noms ne sont pas en UTF-8 valide"
   live: "EN DIRECT"
 
 # ── Header bar ─────────────────────────────────────────────────────

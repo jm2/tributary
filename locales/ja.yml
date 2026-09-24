@@ -2,6 +2,9 @@
 app:
   not_playing: "再生停止中"
   scanning: "ライブラリをスキャン中…"
+  unsupported_file_names_skipped:
+    one: "%{count} 件のオーディオファイルをスキップしました: ファイル名が有効な UTF-8 ではありません"
+    other: "%{count} 件のオーディオファイルをスキップしました: ファイル名が有効な UTF-8 ではありません"
   live: "ライブ"
 
 # ── Header bar ─────────────────────────────────────────────────────

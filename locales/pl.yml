@@ -2,6 +2,11 @@
 app:
   not_playing: "Brak odtwarzania"
   scanning: "Skanowanie biblioteki…"
+  unsupported_file_names_skipped:
+    one: "Pominięto %{count} plik audio: nazwa nie jest poprawnym UTF-8"
+    other: "Pominięto %{count} pliku audio: nazwy nie są poprawnym UTF-8"
+    few: "Pominięto %{count} pliki audio: nazwy nie są poprawnym UTF-8"
+    many: "Pominięto %{count} plików audio: nazwy nie są poprawnym UTF-8"
   live: "NA ŻYWO"
 
 # ── Header bar ─────────────────────────────────────────────────────

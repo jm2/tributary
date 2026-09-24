@@ -2,6 +2,9 @@
 app:
   not_playing: "Nessuna riproduzione"
   scanning: "Scansione della libreria…"
+  unsupported_file_names_skipped:
+    one: "%{count} file audio ignorato: il nome non è UTF-8 valido"
+    other: "%{count} file audio ignorati: i nomi non sono UTF-8 validi"
   live: "DAL VIVO"
 
 # ── Header bar ─────────────────────────────────────────────────────

@@ -2,6 +2,9 @@
 app:
   not_playing: "Not Playing"
   scanning: "Scanning library…"
+  unsupported_file_names_skipped:
+    one: "%{count} audio file skipped: its name isn’t valid UTF-8"
+    other: "%{count} audio files skipped: their names aren’t valid UTF-8"
   live: "LIVE"
 
 # ── Header bar ─────────────────────────────────────────────────────

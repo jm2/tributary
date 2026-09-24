@@ -2,6 +2,9 @@
 app:
   not_playing: "Keine Wiedergabe"
   scanning: "Bibliothek wird durchsucht…"
+  unsupported_file_names_skipped:
+    one: "%{count} Audiodatei übersprungen: Ihr Name ist kein gültiges UTF-8"
+    other: "%{count} Audiodateien übersprungen: Ihre Namen sind kein gültiges UTF-8"
   live: "LIVE"
 
 # ── Header bar ─────────────────────────────────────────────────────

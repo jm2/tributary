@@ -2,6 +2,9 @@
 app:
   not_playing: "未在播放"
   scanning: "正在掃描音樂庫…"
+  unsupported_file_names_skipped:
+    one: "已略過 %{count} 個音訊檔案：檔案名稱不是有效的 UTF-8"
+    other: "已略過 %{count} 個音訊檔案：檔案名稱不是有效的 UTF-8"
   live: "直播"
 
 # ── Header bar ─────────────────────────────────────────────────────

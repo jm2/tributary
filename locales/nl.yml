@@ -2,6 +2,9 @@
 app:
   not_playing: "Niets afspelen"
   scanning: "Bibliotheek scannen…"
+  unsupported_file_names_skipped:
+    one: "%{count} audiobestand overgeslagen: de naam is geen geldige UTF-8"
+    other: "%{count} audiobestanden overgeslagen: de namen zijn geen geldige UTF-8"
   live: "LIVE"
 
 # ── Header bar ─────────────────────────────────────────────────────
