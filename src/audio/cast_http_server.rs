@@ -49,6 +49,11 @@
 //!   but every later lookup receives the same 404 as an unknown or revoked
 //!   ticket. Legacy explicit-file routes keep their server-lifetime contract;
 //!   playback-time local-authority routes are revoked with their owning load.
+//! - **Bounded concurrent work**: each server serves at most
+//!   [`MAX_CONCURRENT_RELAY_RESPONSES`] media responses at once. A request
+//!   beyond that gets `503 Service Unavailable` with `Retry-After: 1` before
+//!   any file, blocking worker, or upstream fetch is started, so a
+//!   misbehaving device on the network cannot pile up unbounded work.
 //! - **OS-assigned port**: Uses port 0 for dynamic assignment.
 //! - **Graceful shutdown**: Can be stopped when no longer needed.
 
@@ -67,6 +72,7 @@ use axum::Router;
 use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info};
 use url::Url;
 use uuid::Uuid;
@@ -98,6 +104,16 @@ const UPSTREAM_RESPONSE_HEADER_DEADLINE: Duration = Duration::from_secs(10);
 /// GStreamer source's own blocking-I/O timeout.
 const UPSTREAM_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ROUTED_UPSTREAM_CLIENTS: usize = 64;
+
+/// Most media responses one relay server serves at once.
+///
+/// A receiver normally has only a few requests open per track: the current
+/// stream plus a seek or a preload. Sixteen leaves wide headroom for that while
+/// bounding the blocking workers, open files, and upstream fetches that
+/// receivers can hold at once. Each server has its own budget, so a device on
+/// the network holding the Chromecast or MPD relay's permits can never starve
+/// the loopback relay that local and AirPlay playback use.
+const MAX_CONCURRENT_RELAY_RESPONSES: usize = 16;
 
 const STAGE_INBOUND_TICKET: &str = "inbound_ticket";
 const STAGE_TICKET_REGISTRATION: &str = "ticket_registration";
@@ -404,6 +420,10 @@ struct ServerState {
     /// redirect policy, so a hostile redirect cannot walk the credential to
     /// another host or downgrade it to plaintext.
     upstream: UpstreamMediaClient,
+    /// This server's media-response admission permits, sized by
+    /// [`MAX_CONCURRENT_RELAY_RESPONSES`]; one permit is held for the whole
+    /// life of one response's work.
+    permits: Arc<Semaphore>,
 }
 
 /// Whether an IPv6 address can serve as a portable LAN bind target.
@@ -546,6 +566,7 @@ impl CastHttpServer {
         let state = ServerState {
             media: media.clone(),
             upstream,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_RESPONSES)),
         };
 
         let app = Router::new()
@@ -750,6 +771,10 @@ impl Drop for CastHttpServer {
 /// indistinguishable: all return 404. Resolving clones the source before any
 /// I/O, so a response admitted before expiration may finish afterward while
 /// subsequent lookups fail.
+///
+/// A live ticket is then admitted only while a response permit is free. With
+/// [`MAX_CONCURRENT_RELAY_RESPONSES`] responses already in flight, the request
+/// gets `503` with `Retry-After: 1` and starts no work at all.
 async fn serve_media(
     State(state): State<ServerState>,
     Path(id): Path<String>,
@@ -758,19 +783,44 @@ async fn serve_media(
     let Some(source) = resolve_media_with_clock(&state.media, &id, Instant::now) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Ok(permit) = Arc::clone(&state.permits).try_acquire_owned() else {
+        debug!("Cast relay is at its concurrent response limit; refusing a request");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response();
+    };
 
     match source {
-        MediaSource::LocalPath(path) => serve_local_file(&path, &headers).await,
-        MediaSource::LocalAuthority(media) => serve_authorized_local_file(media, &headers).await,
+        MediaSource::LocalPath(path) => serve_local_file(&path, &headers, permit).await,
+        MediaSource::LocalAuthority(media) => {
+            serve_authorized_local_file(media, &headers, permit).await
+        }
         MediaSource::Upstream { request, .. } => {
             debug!(
                 stage = STAGE_INBOUND_TICKET,
                 category = CATEGORY_ACCEPTED,
                 "Protected media proxy stage"
             );
-            proxy_upstream(&state.upstream, &request, &headers).await
+            proxy_upstream(&state.upstream, &request, &headers, permit).await
         }
     }
+}
+
+/// Keep a response permit for exactly as long as the response body exists.
+///
+/// Hyper drops a body once it has been sent in full or has failed, and when the
+/// receiver disconnects mid-body, so each of those endings returns the permit.
+fn hold_permit<S>(stream: S, permit: OwnedSemaphorePermit) -> impl futures::Stream<Item = S::Item>
+where
+    S: futures::Stream,
+{
+    stream.map(move |item| {
+        // Naming the permit moves it into the closure, which the stream owns.
+        let _ = &permit;
+        item
+    })
 }
 
 /// Fetch an authenticated stream and relay it to the receiver.
@@ -782,10 +832,14 @@ async fn serve_media(
 /// Transport errors are classified without formatting them because a
 /// `reqwest` error may retain the complete
 /// credential-bearing URL.
+///
+/// `permit` is held through the upstream fetch and then by the relayed body; a
+/// fetch that fails before streaming releases it on return.
 async fn proxy_upstream(
     client: &UpstreamMediaClient,
     upstream_request: &UpstreamRequest,
     receiver_headers: &HeaderMap,
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     if !upstream_request.is_active() {
         return StatusCode::NOT_FOUND.into_response();
@@ -903,9 +957,9 @@ async fn proxy_upstream(
     }
 
     response
-        .body(Body::from_stream(upstream_body_with_idle_timeout(
-            upstream.bytes_stream(),
-            client.timeouts.body_idle,
+        .body(Body::from_stream(hold_permit(
+            upstream_body_with_idle_timeout(upstream.bytes_stream(), client.timeouts.body_idle),
+            permit,
         )))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -963,7 +1017,11 @@ where
 }
 
 /// Stream a local file, honoring `Range` requests so the receiver can seek.
-async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Response {
+async fn serve_local_file(
+    path: &std::path::Path,
+    headers: &HeaderMap,
+    permit: OwnedSemaphorePermit,
+) -> Response {
     let path = path.to_path_buf();
     let file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
@@ -980,22 +1038,29 @@ async fn serve_local_file(path: &std::path::Path, headers: &HeaderMap) -> Respon
         }
     };
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    serve_open_local_file(file, file_size, extension, headers).await
+    serve_open_local_file(file, file_size, extension, headers, permit).await
 }
 
 /// Stream a playback-time authorized file from its retained handle.
-async fn serve_authorized_local_file(media: ResolvedLocalMedia, headers: &HeaderMap) -> Response {
+///
+/// The permit rides inside the blocking authority job, so a job that outlives
+/// its timeout keeps occupying the relay's capacity until it actually returns.
+async fn serve_authorized_local_file(
+    media: ResolvedLocalMedia,
+    headers: &HeaderMap,
+    permit: OwnedSemaphorePermit,
+) -> Response {
     let extension = media.extension().unwrap_or("").to_string();
     let opened = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(move || {
             let file = media.try_clone_file()?;
             let file_size = file.metadata()?.len();
-            Ok::<_, std::io::Error>((file, file_size))
+            Ok::<_, std::io::Error>((file, file_size, permit))
         }),
     )
     .await;
-    let (file, file_size) = match opened {
+    let (file, file_size, permit) = match opened {
         Ok(Ok(Ok(opened))) => opened,
         Ok(Ok(Err(error))) => {
             error!(
@@ -1013,7 +1078,7 @@ async fn serve_authorized_local_file(media: ResolvedLocalMedia, headers: &Header
             return StatusCode::GATEWAY_TIMEOUT.into_response();
         }
     };
-    serve_open_authorized_file(file, file_size, &extension, headers)
+    serve_open_authorized_file(file, file_size, &extension, headers, permit)
 }
 
 /// Serve an authorized handle with position-independent reads.
@@ -1028,6 +1093,7 @@ fn serve_open_authorized_file(
     file_size: u64,
     extension: &str,
     headers: &HeaderMap,
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     let requested_range = headers
         .get(header::RANGE)
@@ -1051,11 +1117,16 @@ fn serve_open_authorized_file(
         response = response.header(header::CONTENT_RANGE, content_range);
     }
     response
-        .body(authorized_file_body(file, start, length))
+        .body(authorized_file_body(file, start, length, permit))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn authorized_file_body(file: std::fs::File, start: u64, length: u64) -> Body {
+fn authorized_file_body(
+    file: std::fs::File,
+    start: u64,
+    length: u64,
+    permit: OwnedSemaphorePermit,
+) -> Body {
     const CHUNK_BYTES: usize = 64 * 1024;
     const BUFFERED_CHUNKS: usize = 2;
 
@@ -1091,6 +1162,11 @@ fn authorized_file_body(file: std::fs::File, start: u64, length: u64) -> Body {
                 }
             }
         }
+        // The producer gives its permit back when it stops: after the last
+        // chunk, on a read error, or once the receiver disconnects and closes
+        // the channel. Releasing it before the sender drops means a body that
+        // has ended has always returned its capacity.
+        drop(permit);
     }));
     Body::from_stream(receiver)
 }
@@ -1136,6 +1212,7 @@ async fn serve_open_local_file(
     file_size: u64,
     extension: &str,
     headers: &HeaderMap,
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     let content_type = local_content_type(extension);
 
@@ -1153,7 +1230,7 @@ async fn serve_open_local_file(
                 }
 
                 let stream = tokio_util::io::ReaderStream::new(file.take(length));
-                let body = Body::from_stream(stream);
+                let body = Body::from_stream(hold_permit(stream, permit));
 
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
@@ -1171,7 +1248,7 @@ async fn serve_open_local_file(
     }
 
     let stream = tokio_util::io::ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(hold_permit(stream, permit));
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1302,6 +1379,7 @@ mod tests {
         let state = ServerState {
             media: registry,
             upstream: UpstreamMediaClient::new().expect("test upstream client"),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_RESPONSES)),
         };
         let legacy_path = root.path().join("legacy.flac");
         std::fs::write(&legacy_path, b"legacy").expect("write legacy explicit file");
@@ -1515,6 +1593,7 @@ mod tests {
         let state = ServerState {
             media: Arc::clone(&media),
             upstream: UpstreamMediaClient::new().expect("test upstream client"),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_RESPONSES)),
         };
 
         replace_upstream_at(
@@ -1754,6 +1833,25 @@ mod tests {
             .expect("typed capture response")
     }
 
+    /// Upstream that sends one chunk and then keeps its body open, like a
+    /// long track that the receiver has not finished reading.
+    async fn capture_held_request(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<(Uri, HeaderMap)>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Response {
+        let _ = tx.send((uri, headers));
+        let body = futures::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"media"))
+        })
+        .chain(futures::stream::pending());
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "audio/mpeg")
+            .body(Body::from_stream(body))
+            .expect("held capture response")
+    }
+
     const GZIP_MEDIA_BODY: &[u8] = &[
         0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x4d, 0x4d, 0xc9, 0x4c,
         0x04, 0x00, 0x0c, 0xa1, 0x2c, 0x6a, 0x05, 0x00, 0x00, 0x00,
@@ -1788,6 +1886,7 @@ mod tests {
             .route("/compressed/stream", get(capture_compressed_range))
             .route("/untyped/stream", get(capture_untyped_request))
             .route("/typed/stream", get(capture_typed_flac_request))
+            .route("/held/stream", get(capture_held_request))
             .with_state(tx);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1831,7 +1930,7 @@ mod tests {
     ) {
         let mut receiver_headers = HeaderMap::new();
         receiver_headers.insert(header::RANGE, HeaderValue::from_static("bytes=7-31"));
-        let response = proxy_upstream(client, request, &receiver_headers).await;
+        let response = proxy_upstream(client, request, &receiver_headers, test_permit()).await;
 
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         for (name, expected) in [
@@ -2090,6 +2189,7 @@ mod tests {
             &client,
             &UpstreamRequest::Resolved(Box::new(request)),
             &receiver_headers,
+            test_permit(),
         )
         .await;
         assert!(response.status().is_success());
@@ -2300,6 +2400,7 @@ mod tests {
             &capture.client,
             &UpstreamRequest::Resolved(Box::new(request)),
             &receiver_headers,
+            test_permit(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2326,6 +2427,7 @@ mod tests {
             &capture.client,
             &UpstreamRequest::Resolved(Box::new(request)),
             &HeaderMap::new(),
+            test_permit(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2371,6 +2473,7 @@ mod tests {
             &client,
             &UpstreamRequest::Resolved(Box::new(resolved)),
             &HeaderMap::new(),
+            test_permit(),
         )
         .await;
 
@@ -2382,6 +2485,14 @@ mod tests {
         );
         let _ = captures.recv().await.expect("captured request");
         upstream_abort.abort();
+    }
+
+    /// A permit from a private pool, for tests that call a serving function
+    /// directly instead of going through [`serve_media`]'s admission.
+    fn test_permit() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("fresh test permit")
     }
 
     fn test_upstream_client(
@@ -2426,7 +2537,7 @@ mod tests {
             "http://{addr}/stream?token=accepted-no-headers-secret"
         ));
         let started = Instant::now();
-        let response = proxy_upstream(&client, &request, &HeaderMap::new()).await;
+        let response = proxy_upstream(&client, &request, &HeaderMap::new(), test_permit()).await;
         let elapsed = started.elapsed();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -2471,7 +2582,7 @@ mod tests {
         };
         let request =
             legacy("http://transport-failure.invalid/stream?token=transport-failure-secret");
-        let response = proxy_upstream(&client, &request, &HeaderMap::new()).await;
+        let response = proxy_upstream(&client, &request, &HeaderMap::new(), test_permit()).await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
@@ -2499,7 +2610,7 @@ mod tests {
         let request = legacy(&format!(
             "http://{addr}/stream?token=status-preservation-secret"
         ));
-        let response = proxy_upstream(&client, &request, &HeaderMap::new()).await;
+        let response = proxy_upstream(&client, &request, &HeaderMap::new(), test_permit()).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         server.abort();
@@ -2577,5 +2688,300 @@ mod tests {
             started.elapsed() > idle_timeout,
             "the idle timeout must reset rather than cap total stream lifetime"
         );
+    }
+
+    // ── Concurrent response cap ────────────────────────────────────────
+
+    fn write_root_marker(root: &std::path::Path) -> String {
+        let marker = format!("marker:v1:{}", Uuid::new_v4());
+        std::fs::write(root.join(".tributary-root-id"), format!("{marker}\n"))
+            .expect("write root marker");
+        marker
+    }
+
+    /// One retained-authority file and one legacy explicit file with the same
+    /// bytes. Both are larger than the producer's two buffered chunks, so a
+    /// response nobody reads keeps its producer, descriptor, and permit.
+    fn capped_relay_fixture(
+        root: &std::path::Path,
+    ) -> (Arc<DashMap<String, MediaSource>>, Vec<u8>) {
+        let marker = write_root_marker(root);
+        let content: Vec<u8> = (0..=250_u8).cycle().take(1024 * 1024).collect();
+        let authorized = root.join("authorized.flac");
+        std::fs::write(&authorized, &content).expect("write authorized media");
+        let legacy_path = root.join("legacy.flac");
+        std::fs::write(&legacy_path, &content).expect("write legacy media");
+        let media = ResolvedLocalMedia::from_authorized_path_for_test(root, &marker, &authorized)
+            .expect("retain local media authority");
+
+        let registry = Arc::new(DashMap::new());
+        registry.insert(
+            "authorized.flac".to_string(),
+            MediaSource::LocalAuthority(media),
+        );
+        registry.insert(
+            "legacy.flac".to_string(),
+            MediaSource::LocalPath(legacy_path),
+        );
+        (registry, content)
+    }
+
+    /// Wait for a blocking body producer to notice its closed channel and
+    /// return its permit.
+    async fn wait_for_free_permits(permits: &Semaphore, expected: usize) {
+        let returned = tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.available_permits() != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            returned.is_ok(),
+            "expected {expected} free relay permits, found {}",
+            permits.available_permits()
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_refuses_requests_beyond_the_cap_and_recovers_capacity() {
+        let root = tempfile::tempdir().expect("temporary library root");
+        let (registry, content) = capped_relay_fixture(root.path());
+        let (upstream_addr, mut captures, upstream_abort) = start_capture_server().await;
+        replace_upstream_at(
+            &registry,
+            "upstream".to_string(),
+            legacy(&format!(
+                "http://{upstream_addr}/held/stream?token=cap-secret"
+            )),
+            Instant::now(),
+            UPSTREAM_TICKET_TTL,
+        );
+        let permits = Arc::new(Semaphore::new(3));
+        let state = ServerState {
+            media: registry,
+            upstream: test_upstream_client(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+            ),
+            permits: Arc::clone(&permits),
+        };
+        let request = |ticket: &str| {
+            serve_media(
+                State(state.clone()),
+                Path(ticket.to_string()),
+                HeaderMap::new(),
+            )
+        };
+
+        // One held-open response on each serving path fills the cap.
+        let authorized = request("authorized.flac").await;
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let legacy_file = request("legacy.flac").await;
+        assert_eq!(legacy_file.status(), StatusCode::OK);
+        let upstream = request("upstream").await;
+        assert_eq!(upstream.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(2), captures.recv())
+            .await
+            .expect("admitted upstream fetch")
+            .expect("captured admitted request");
+        assert_eq!(permits.available_permits(), 0);
+
+        for ticket in ["authorized.flac", "legacy.flac", "upstream"] {
+            let refused = request(ticket).await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{ticket}"
+            );
+            assert_eq!(
+                refused.headers().get(header::RETRY_AFTER),
+                Some(&HeaderValue::from_static("1")),
+                "{ticket}"
+            );
+        }
+        // An admitted fetch reaches the capture before its response headers
+        // return, so an empty channel here means no refused request fetched.
+        assert!(
+            captures.try_recv().is_err(),
+            "a refused request must not start an upstream fetch"
+        );
+        assert_eq!(
+            request("unknown").await.status(),
+            StatusCode::NOT_FOUND,
+            "admission must not change how an unknown ticket is answered"
+        );
+
+        // A response that runs to completion returns its permit.
+        let body = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+            .await
+            .expect("complete authorized body");
+        assert_eq!(body.as_ref(), content.as_slice());
+        assert_eq!(permits.available_permits(), 1);
+
+        // So does a response whose receiver goes away mid-body.
+        let mut legacy_body = legacy_file.into_body().into_data_stream();
+        legacy_body
+            .next()
+            .await
+            .expect("first legacy chunk")
+            .expect("legacy chunk");
+        drop(legacy_body);
+        assert_eq!(permits.available_permits(), 2);
+        let mut upstream_body = upstream.into_body().into_data_stream();
+        assert_eq!(
+            upstream_body
+                .next()
+                .await
+                .expect("first upstream chunk")
+                .expect("upstream chunk")
+                .as_ref(),
+            b"media"
+        );
+        drop(upstream_body);
+        assert_eq!(permits.available_permits(), 3);
+
+        let readmitted = request("upstream").await;
+        assert_eq!(readmitted.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(2), captures.recv())
+            .await
+            .expect("readmitted upstream fetch")
+            .expect("captured readmitted request");
+        drop(readmitted);
+        assert_eq!(permits.available_permits(), 3);
+        upstream_abort.abort();
+    }
+
+    #[tokio::test]
+    async fn receiver_disconnect_mid_body_returns_relay_capacity() {
+        // Far more than loopback socket buffers hold, so the producer is still
+        // running when the receiver hangs up. The file is sparse: nothing is
+        // written, and reading it back yields zeros.
+        const LONG_TRACK_BYTES: u64 = 256 * 1024 * 1024;
+
+        let root = tempfile::tempdir().expect("temporary library root");
+        let marker = write_root_marker(root.path());
+        let path = root.path().join("long.flac");
+        std::fs::File::create(&path)
+            .and_then(|file| file.set_len(LONG_TRACK_BYTES))
+            .expect("create long sparse media");
+        let media = ResolvedLocalMedia::from_authorized_path_for_test(root.path(), &marker, &path)
+            .expect("retain local media authority");
+        let registry = Arc::new(DashMap::new());
+        registry.insert("long.flac".to_string(), MediaSource::LocalAuthority(media));
+        let permits = Arc::new(Semaphore::new(1));
+        let state = ServerState {
+            media: registry,
+            upstream: UpstreamMediaClient::new().expect("test upstream client"),
+            permits: Arc::clone(&permits),
+        };
+        let app = Router::new()
+            .route("/cast/{id}", get(serve_media))
+            .with_state(state);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("relay listener");
+        let addr = listener.local_addr().expect("relay address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("relay server");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("receiver client");
+        let url = format!("http://{addr}/cast/long.flac");
+
+        let mut held = client.get(&url).send().await.expect("held request");
+        assert_eq!(held.status(), reqwest::StatusCode::OK);
+        assert!(held.chunk().await.expect("first chunk").is_some());
+        assert_eq!(permits.available_permits(), 0);
+
+        let refused = client.get(&url).send().await.expect("refused request");
+        assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refused.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+
+        // Dropping a response mid-body closes the connection; the relay's
+        // producer sees the closed channel and gives the permit back.
+        drop(held);
+        wait_for_free_permits(&permits, 1).await;
+
+        let readmitted = client.get(&url).send().await.expect("readmitted request");
+        assert_eq!(readmitted.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            readmitted.content_length(),
+            Some(LONG_TRACK_BYTES),
+            "a readmitted response is the ordinary full response"
+        );
+        drop(readmitted);
+        wait_for_free_permits(&permits, 1).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_range_requests_below_the_cap_are_served_unchanged() {
+        let root = tempfile::tempdir().expect("temporary library root");
+        let (registry, content) = capped_relay_fixture(root.path());
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_RESPONSES));
+        let state = ServerState {
+            media: registry,
+            upstream: UpstreamMediaClient::new().expect("test upstream client"),
+            permits: Arc::clone(&permits),
+        };
+        let total = content.len();
+        let ranges = [
+            (0, 99),
+            (65_530, 65_545),
+            (300_000, 700_000),
+            (total - 576, total - 1),
+        ];
+        let requests = ["authorized.flac", "legacy.flac"]
+            .into_iter()
+            .flat_map(|ticket| ranges.map(|range| (ticket, range)))
+            .map(|(ticket, (start, end))| {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::RANGE,
+                    HeaderValue::from_str(&format!("bytes={start}-{end}")).expect("range header"),
+                );
+                let response = serve_media(State(state.clone()), Path(ticket.to_string()), headers);
+                async move { (ticket, start, end, response.await) }
+            });
+        let responses = futures::future::join_all(requests).await;
+        // A short range may already be fully buffered, its producer finished
+        // and its permit returned; no response ever holds more than one.
+        assert!(permits.available_permits() >= MAX_CONCURRENT_RELAY_RESPONSES - responses.len());
+
+        for (ticket, start, end, response) in responses {
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{ticket}");
+            let expected_range = format!("bytes {start}-{end}/{total}");
+            let expected_length = (end - start + 1).to_string();
+            for (name, expected) in [
+                (header::CONTENT_RANGE, expected_range.as_str()),
+                (header::CONTENT_LENGTH, expected_length.as_str()),
+                (header::ACCEPT_RANGES, "bytes"),
+                (header::CONTENT_TYPE, "audio/flac"),
+            ] {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(&name)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected),
+                    "{ticket} {name}"
+                );
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("range body");
+            assert_eq!(
+                body.as_ref(),
+                &content[start..=end],
+                "{ticket} {start}-{end}"
+            );
+        }
+        wait_for_free_permits(&permits, MAX_CONCURRENT_RELAY_RESPONSES).await;
     }
 }
