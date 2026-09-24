@@ -18115,7 +18115,10 @@ mod tests {
 
     /// A root missing when watching starts is picked up by the periodic
     /// probe: watched, scanned and reported available. When it goes away it
-    /// is reported unavailable and its tracks are kept.
+    /// is reported unavailable and its tracks are kept. Not on Windows: a
+    /// watched directory is held open there, so the fixture cannot remove the
+    /// root out from under the live watcher the way an unmount does.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn root_probe_scans_a_late_root_and_keeps_its_rows_when_it_leaves() {
         let db = Arc::new(rename_test_database().await);

@@ -3212,11 +3212,21 @@ pub mod tests {
         assert!(admissions.is_current(second));
     }
 
+    /// A `file://` URI for `name` that converts to a local path on this
+    /// platform (`Url::to_file_path` requires a drive letter on Windows).
+    fn native_music_uri(name: &str) -> String {
+        if cfg!(windows) {
+            format!("file:///C:/music/{name}")
+        } else {
+            format!("file:///music/{name}")
+        }
+    }
+
     #[test]
     fn properties_evidence_needs_every_row_to_be_editable() {
         let store = gtk::gio::ListStore::new::<TrackObject>();
-        store.append(&local_ctx_track("local-0", "file:///music/zero.flac"));
-        store.append(&local_ctx_track("local-1", "file:///music/one.flac"));
+        store.append(&local_ctx_track("local-0", &native_music_uri("zero.flac")));
+        store.append(&local_ctx_track("local-1", &native_music_uri("one.flac")));
         store.append(&local_ctx_track(
             "streamed",
             "https://example.test/song.flac",
@@ -3235,7 +3245,7 @@ pub mod tests {
             0,
             0,
             "",
-            "file:///music/unowned.flac",
+            &native_music_uri("unowned.flac"),
         );
         store.append(&unowned);
         let no_devices = std::collections::HashSet::new();
