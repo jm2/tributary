@@ -10,28 +10,37 @@ use crate::local::smart_rules::*;
 
 // ── Field metadata ──────────────────────────────────────────────────
 
-/// Field display names in dropdown order.
-const FIELD_NAMES: &[&str] = &[
-    "Title",
-    "Artist",
-    "Album Artist",
-    "Album",
-    "Genre",
-    "Composer",
-    "Year",
-    "Track Number",
-    "Disc Number",
-    "Duration (sec)",
-    "Bitrate (kbps)",
-    "Sample Rate (Hz)",
-    "Format",
-    "Play Count",
-    "Last Played",
-    "Date Added",
-    "Date Modified",
-    "File Size (bytes)",
-    "Rating (1–100)",
+/// Catalog keys of the field labels, in dropdown order.
+const FIELD_KEYS: &[&str] = &[
+    "smart_playlist.field.title",
+    "smart_playlist.field.artist",
+    "smart_playlist.field.album_artist",
+    "smart_playlist.field.album",
+    "smart_playlist.field.genre",
+    "smart_playlist.field.composer",
+    "smart_playlist.field.year",
+    "smart_playlist.field.track_number",
+    "smart_playlist.field.disc_number",
+    "smart_playlist.field.duration_seconds",
+    "smart_playlist.field.bitrate_kbps",
+    "smart_playlist.field.sample_rate_hz",
+    "smart_playlist.field.format",
+    "smart_playlist.field.play_count",
+    "smart_playlist.field.last_played",
+    "smart_playlist.field.date_added",
+    "smart_playlist.field.date_modified",
+    "smart_playlist.field.file_size_bytes",
+    "smart_playlist.field.rating_range",
 ];
+
+/// A dropdown model of the catalog strings `keys` names, in order.
+fn string_list(keys: &[&str], locale: &str) -> gtk::StringList {
+    let labels: Vec<String> = keys
+        .iter()
+        .map(|key| rust_i18n::t!(*key, locale = locale).into_owned())
+        .collect();
+    gtk::StringList::new(&labels.iter().map(String::as_str).collect::<Vec<_>>())
+}
 
 /// Map dropdown index to `RuleField`.
 fn index_to_field(idx: u32) -> RuleField {
@@ -108,29 +117,35 @@ fn field_type(field: &RuleField) -> FieldType {
     }
 }
 
-/// Text operator names.
+/// Text operator label keys.
 const TEXT_OPS: &[&str] = &[
-    "is",
-    "is not",
-    "contains",
-    "does not contain",
-    "starts with",
-    "ends with",
+    "smart_playlist.operator.is",
+    "smart_playlist.operator.is_not",
+    "smart_playlist.operator.contains",
+    "smart_playlist.operator.does_not_contain",
+    "smart_playlist.operator.starts_with",
+    "smart_playlist.operator.ends_with",
 ];
 
-/// Numeric operator names.
-const NUM_OPS: &[&str] = &["is", "is not", "greater than", "less than", "in range"];
+/// Numeric operator label keys.
+const NUM_OPS: &[&str] = &[
+    "smart_playlist.operator.is",
+    "smart_playlist.operator.is_not",
+    "smart_playlist.operator.greater_than",
+    "smart_playlist.operator.less_than",
+    "smart_playlist.operator.in_range",
+];
 
 /// Rating operators retain the numeric operator indexes and append explicit
 /// presence predicates. This keeps existing editor mappings stable.
 const RATING_OPS: &[&str] = &[
-    "is",
-    "is not",
-    "greater than",
-    "less than",
-    "in range",
-    "is rated",
-    "is unrated",
+    "smart_playlist.operator.is",
+    "smart_playlist.operator.is_not",
+    "smart_playlist.operator.greater_than",
+    "smart_playlist.operator.less_than",
+    "smart_playlist.operator.in_range",
+    "smart_playlist.operator.is_rated",
+    "smart_playlist.operator.is_unrated",
 ];
 
 fn index_to_rating_operator(idx: u32) -> RuleOperator {
@@ -355,11 +370,11 @@ fn is_range_operator(field: &RuleField, op_index: u32) -> bool {
 }
 
 /// Placeholder for the value entry, which shows the expected input form.
-fn value_placeholder(field: &RuleField, op_index: u32) -> &'static str {
+fn value_placeholder(field: &RuleField, op_index: u32, locale: &str) -> String {
     match field_type(field) {
-        FieldType::Rating => "1–100",
-        FieldType::Date if !is_relative_date_index(op_index) => "YYYY-MM-DD",
-        _ => "value",
+        FieldType::Rating => "1–100".to_owned(),
+        FieldType::Date if !is_relative_date_index(op_index) => "YYYY-MM-DD".to_owned(),
+        _ => rust_i18n::t!("smart_playlist.value_placeholder", locale = locale).into_owned(),
     }
 }
 
@@ -475,18 +490,22 @@ fn refresh_rule_validation(dialog: &adw::AlertDialog, rules_box: &gtk::Box) -> b
     valid
 }
 
-/// Date operator names.
+/// Date operator label keys.
 const DATE_OPS: &[&str] = &[
-    "is",
-    "is not",
-    "is before",
-    "is after",
-    "is in the last",
-    "is not in the last",
+    "smart_playlist.operator.is",
+    "smart_playlist.operator.is_not",
+    "smart_playlist.operator.is_before",
+    "smart_playlist.operator.is_after",
+    "smart_playlist.operator.is_in_the_last",
+    "smart_playlist.operator.is_not_in_the_last",
 ];
 
-/// Relative-date unit names.
-const DATE_UNITS: &[&str] = &["days", "weeks", "months"];
+/// Relative-date unit label keys.
+const DATE_UNITS: &[&str] = &[
+    "smart_playlist.date_unit.days",
+    "smart_playlist.date_unit.weeks",
+    "smart_playlist.date_unit.months",
+];
 
 fn index_to_date_unit(idx: u32) -> DateUnit {
     match idx {
@@ -526,26 +545,32 @@ fn relative_date_operator(op_index: u32, amount: u32, unit: DateUnit) -> Option<
     }
 }
 
-/// Limit unit names.
-const LIMIT_UNITS: &[&str] = &["items", "minutes", "hours", "MB", "GB"];
+/// Limit unit label keys.
+const LIMIT_UNITS: &[&str] = &[
+    "smart_playlist.limit_unit.items",
+    "smart_playlist.limit_unit.minutes",
+    "smart_playlist.limit_unit.hours",
+    "smart_playlist.limit_unit.megabytes",
+    "smart_playlist.limit_unit.gigabytes",
+];
 
-/// Limit sort-by names.
+/// Limit sort-by label keys.
 const LIMIT_SORTS: &[&str] = &[
-    "Random",
-    "Title",
-    "Album",
-    "Artist",
-    "Genre",
-    "Year",
-    "Bitrate",
-    "Most Played",
-    "Least Played",
-    "Most Recently Added",
-    "Least Recently Added",
-    "Most Recently Played",
-    "Least Recently Played",
-    "Highest Rated",
-    "Lowest Rated",
+    "smart_playlist.limit_sort.random",
+    "smart_playlist.field.title",
+    "smart_playlist.field.album",
+    "smart_playlist.field.artist",
+    "smart_playlist.field.genre",
+    "smart_playlist.field.year",
+    "smart_playlist.field.bitrate",
+    "smart_playlist.limit_sort.most_played",
+    "smart_playlist.limit_sort.least_played",
+    "smart_playlist.limit_sort.most_recently_added",
+    "smart_playlist.limit_sort.least_recently_added",
+    "smart_playlist.limit_sort.most_recently_played",
+    "smart_playlist.limit_sort.least_recently_played",
+    "smart_playlist.limit_sort.highest_rated",
+    "smart_playlist.limit_sort.lowest_rated",
 ];
 
 fn index_to_limit_sort(idx: u32) -> LimitSort {
@@ -602,22 +627,35 @@ pub fn show_smart_playlist_editor(
     existing_rules: Option<&SmartRules>,
     on_save: impl Fn(SmartRules) + 'static,
 ) {
+    let locale: std::rc::Rc<str> = std::rc::Rc::from(&*rust_i18n::locale());
     let dialog = adw::AlertDialog::builder()
         .heading(if existing_rules.is_some() {
-            format!("Edit Smart Playlist: {playlist_name}")
+            rust_i18n::t!(
+                "smart_playlist.edit_title",
+                locale = &*locale,
+                name = playlist_name
+            )
         } else {
-            "New Smart Playlist".to_string()
+            rust_i18n::t!("smart_playlist.new_title", locale = &*locale)
         })
         .close_response("cancel")
         .default_response("ok")
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("ok", "OK");
+    dialog.add_response(
+        "cancel",
+        &rust_i18n::t!("dialogs.cancel", locale = &*locale),
+    );
+    dialog.add_response("ok", &rust_i18n::t!("dialogs.ok", locale = &*locale));
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
 
+    let label = |key: &str| gtk::Label::new(Some(&rust_i18n::t!(key, locale = &*locale)));
+
     // ── Match mode ──────────────────────────────────────────────────
-    let match_model = gtk::StringList::new(&["All", "Any"]);
+    let match_model = string_list(
+        &["smart_playlist.match_all", "smart_playlist.match_any"],
+        &locale,
+    );
     let match_dropdown = gtk::DropDown::builder()
         .model(&match_model)
         .selected(match existing_rules {
@@ -630,9 +668,9 @@ pub fn show_smart_playlist_editor(
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
         .build();
-    match_row.append(&gtk::Label::new(Some("Match")));
+    match_row.append(&label("smart_playlist.match_label"));
     match_row.append(&match_dropdown);
-    match_row.append(&gtk::Label::new(Some("of the following rules:")));
+    match_row.append(&label("smart_playlist.match_suffix"));
 
     // ── Rules list ──────────────────────────────────────────────────
     let rules_box = gtk::Box::builder()
@@ -653,7 +691,12 @@ pub fn show_smart_playlist_editor(
     });
 
     for rule in &initial_rules {
-        let row = build_rule_row(Some(rule), rules_box_weak.clone(), dialog_weak.clone());
+        let row = build_rule_row(
+            Some(rule),
+            &locale,
+            rules_box_weak.clone(),
+            dialog_weak.clone(),
+        );
         rules_box.append(&row);
     }
     refresh_rule_validation(&dialog, &rules_box);
@@ -662,16 +705,17 @@ pub fn show_smart_playlist_editor(
     let add_btn = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .css_classes(["flat", "circular"])
-        .tooltip_text("Add rule")
+        .tooltip_text(rust_i18n::t!("smart_playlist.add_rule", locale = &*locale).as_ref())
         .build();
     {
         let rules_box = rules_box_weak.clone();
         let dialog = dialog_weak.clone();
+        let locale = locale.clone();
         add_btn.connect_clicked(move |_| {
             let (Some(rules_box), Some(dialog)) = (rules_box.upgrade(), dialog.upgrade()) else {
                 return;
             };
-            let row = build_rule_row(None, rules_box.downgrade(), dialog.downgrade());
+            let row = build_rule_row(None, &locale, rules_box.downgrade(), dialog.downgrade());
             rules_box.append(&row);
             refresh_rule_validation(&dialog, &rules_box);
         });
@@ -679,7 +723,7 @@ pub fn show_smart_playlist_editor(
 
     // ── Limit section ───────────────────────────────────────────────
     let limit_check = gtk::CheckButton::builder()
-        .label("Limit to")
+        .label(rust_i18n::t!("smart_playlist.limit_to", locale = &*locale).as_ref())
         .active(existing_rules.is_some_and(|r| r.limit.is_some()))
         .build();
 
@@ -691,7 +735,7 @@ pub fn show_smart_playlist_editor(
             .unwrap_or(25.0),
     );
 
-    let limit_unit_model = gtk::StringList::new(LIMIT_UNITS);
+    let limit_unit_model = string_list(LIMIT_UNITS, &locale);
     let limit_unit_dropdown = gtk::DropDown::builder()
         .model(&limit_unit_model)
         .selected(
@@ -708,7 +752,7 @@ pub fn show_smart_playlist_editor(
         )
         .build();
 
-    let limit_sort_model = gtk::StringList::new(LIMIT_SORTS);
+    let limit_sort_model = string_list(LIMIT_SORTS, &locale);
     let limit_sort_dropdown = gtk::DropDown::builder()
         .model(&limit_sort_model)
         .selected(
@@ -726,7 +770,7 @@ pub fn show_smart_playlist_editor(
     limit_row.append(&limit_check);
     limit_row.append(&limit_value);
     limit_row.append(&limit_unit_dropdown);
-    limit_row.append(&gtk::Label::new(Some("selected by")));
+    limit_row.append(&label("smart_playlist.selected_by"));
     limit_row.append(&limit_sort_dropdown);
 
     // ── Layout ──────────────────────────────────────────────────────
@@ -756,7 +800,7 @@ pub fn show_smart_playlist_editor(
 
     // ── Sort order section ──────────────────────────────────────────
     let sort_label = gtk::Label::builder()
-        .label("Sort by:")
+        .label(rust_i18n::t!("smart_playlist.sort_by", locale = &*locale).as_ref())
         .halign(gtk::Align::Start)
         .margin_top(4)
         .build();
@@ -774,23 +818,24 @@ pub fn show_smart_playlist_editor(
         .map(|r| r.sort_order.clone())
         .unwrap_or_default();
     for criterion in &initial_sort {
-        let row = build_sort_row(Some(criterion), sort_box_weak.clone());
+        let row = build_sort_row(Some(criterion), &locale, sort_box_weak.clone());
         sort_box.append(&row);
     }
 
     let add_sort_btn = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .css_classes(["flat", "circular"])
-        .tooltip_text("Add sort level")
+        .tooltip_text(rust_i18n::t!("smart_playlist.add_sort_level", locale = &*locale).as_ref())
         .halign(gtk::Align::End)
         .build();
     {
         let sort_box = sort_box_weak.clone();
+        let locale = locale.clone();
         add_sort_btn.connect_clicked(move |_| {
             let Some(sort_box) = sort_box.upgrade() else {
                 return;
             };
-            let row = build_sort_row(None, sort_box.downgrade());
+            let row = build_sort_row(None, &locale, sort_box.downgrade());
             sort_box.append(&row);
         });
     }
@@ -885,6 +930,7 @@ pub fn show_smart_playlist_editor(
 
 fn update_rule_operator_widgets(
     field_idx: u32,
+    locale: &str,
     op_model: &gtk::StringList,
     op_dropdown: &gtk::DropDown,
     value: &gtk::Entry,
@@ -903,11 +949,11 @@ fn update_rule_operator_widgets(
         op_model.remove(0);
     }
     for op in ops {
-        op_model.append(op);
+        op_model.append(&rust_i18n::t!(*op, locale = locale));
     }
     op_dropdown.set_selected(0);
     value.set_visible(true);
-    value.set_placeholder_text(Some(value_placeholder(&field, 0)));
+    value.set_placeholder_text(Some(&value_placeholder(&field, 0, locale)));
     value2.set_visible(false);
     date_unit.set_visible(false);
 }
@@ -915,6 +961,7 @@ fn update_rule_operator_widgets(
 /// Build a single rule row with field, operator, and value widgets.
 fn build_rule_row(
     existing: Option<&SmartRule>,
+    locale: &str,
     rules_box: gtk::glib::WeakRef<gtk::Box>,
     dialog: gtk::glib::WeakRef<adw::AlertDialog>,
 ) -> gtk::Box {
@@ -924,7 +971,7 @@ fn build_rule_row(
         .build();
 
     // Field dropdown.
-    let field_model = gtk::StringList::new(FIELD_NAMES);
+    let field_model = string_list(FIELD_KEYS, locale);
     let field_dropdown = gtk::DropDown::builder()
         .model(&field_model)
         .selected(existing.map(|r| field_to_index(&r.field)).unwrap_or(0))
@@ -939,14 +986,18 @@ fn build_rule_row(
 
     // Value entry.
     let value_entry = gtk::Entry::builder()
-        .placeholder_text("value")
+        .placeholder_text(
+            rust_i18n::t!("smart_playlist.value_placeholder", locale = locale).as_ref(),
+        )
         .hexpand(true)
         .width_chars(12)
         .build();
 
     // Second value entry (for "in range").
     let value2_entry = gtk::Entry::builder()
-        .placeholder_text("to")
+        .placeholder_text(
+            rust_i18n::t!("smart_playlist.range_end_placeholder", locale = locale).as_ref(),
+        )
         .width_chars(8)
         .visible(false)
         .build();
@@ -954,7 +1005,7 @@ fn build_rule_row(
     // Unit selector for relative date operators. It remains part of every
     // row so switching fields/operators cannot lose a previously selected
     // Weeks/Months value, but is visible only for the two relative modes.
-    let date_unit_model = gtk::StringList::new(DATE_UNITS);
+    let date_unit_model = string_list(DATE_UNITS, locale);
     let date_unit_dropdown = gtk::DropDown::builder()
         .model(&date_unit_model)
         .selected(
@@ -978,7 +1029,7 @@ fn build_rule_row(
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
         .css_classes(["flat", "circular"])
-        .tooltip_text("Remove rule")
+        .tooltip_text(rust_i18n::t!("smart_playlist.remove_rule", locale = locale).as_ref())
         .build();
 
     row.append(&field_dropdown);
@@ -1010,6 +1061,7 @@ fn build_rule_row(
         // Initial population.
         update_rule_operator_widgets(
             field_dropdown.selected(),
+            locale,
             &op_model,
             &op_dropdown,
             &value_entry,
@@ -1022,6 +1074,7 @@ fn build_rule_row(
         let value = value_entry.downgrade();
         let value2 = value2_entry.downgrade();
         let date_unit = date_unit_dropdown.downgrade();
+        let locale = locale.to_owned();
         field_dropdown.connect_selected_notify(move |dd| {
             let (Some(op_model), Some(op_dropdown), Some(value), Some(value2), Some(date_unit)) = (
                 op_model.upgrade(),
@@ -1034,6 +1087,7 @@ fn build_rule_row(
             };
             update_rule_operator_widgets(
                 dd.selected(),
+                &locale,
                 &op_model,
                 &op_dropdown,
                 &value,
@@ -1049,6 +1103,7 @@ fn build_rule_row(
         let value = value_entry.downgrade();
         let field_dd = field_dropdown.downgrade();
         let date_unit = date_unit_dropdown.downgrade();
+        let locale = locale.to_owned();
         op_dropdown.connect_selected_notify(move |dd| {
             let (Some(value2), Some(value), Some(field_dd), Some(date_unit)) = (
                 value2.upgrade(),
@@ -1061,7 +1116,7 @@ fn build_rule_row(
             let field = index_to_field(field_dd.selected());
             let field_type = field_type(&field);
             value2.set_visible(is_range_operator(&field, dd.selected()));
-            value.set_placeholder_text(Some(value_placeholder(&field, dd.selected())));
+            value.set_placeholder_text(Some(&value_placeholder(&field, dd.selected(), &locale)));
             let is_rating_presence = matches!(field_type, FieldType::Rating)
                 && matches!(
                     index_to_rating_operator(dd.selected()),
@@ -1202,25 +1257,25 @@ fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
 
 // ── Sort row builder ────────────────────────────────────────────────
 
-/// Sort field names for the dropdown (must match `SortField` enum order).
-const SORT_FIELD_NAMES: &[&str] = &[
-    "Artist",
-    "Album Artist",
-    "Album",
-    "Title",
-    "Composer",
-    "Year",
-    "Track Number",
-    "Disc Number",
-    "Genre",
-    "Duration",
-    "Bitrate",
-    "Play Count",
-    "Last Played",
-    "Date Added",
-    "Date Modified",
-    "Track ID",
-    "Rating",
+/// Sort field label keys for the dropdown (must match `SortField` enum order).
+const SORT_FIELD_KEYS: &[&str] = &[
+    "smart_playlist.field.artist",
+    "smart_playlist.field.album_artist",
+    "smart_playlist.field.album",
+    "smart_playlist.field.title",
+    "smart_playlist.field.composer",
+    "smart_playlist.field.year",
+    "smart_playlist.field.track_number",
+    "smart_playlist.field.disc_number",
+    "smart_playlist.field.genre",
+    "smart_playlist.field.duration",
+    "smart_playlist.field.bitrate",
+    "smart_playlist.field.play_count",
+    "smart_playlist.field.last_played",
+    "smart_playlist.field.date_added",
+    "smart_playlist.field.date_modified",
+    "smart_playlist.field.track_id",
+    "smart_playlist.field.rating",
 ];
 
 /// Map dropdown index to `SortField`.
@@ -1273,6 +1328,7 @@ fn sort_field_to_index(field: SortField) -> u32 {
 /// Build a single sort criterion row with field dropdown and direction toggle.
 fn build_sort_row(
     existing: Option<&SortCriterion>,
+    locale: &str,
     sort_box: gtk::glib::WeakRef<gtk::Box>,
 ) -> gtk::Box {
     let row = gtk::Box::builder()
@@ -1280,14 +1336,20 @@ fn build_sort_row(
         .spacing(4)
         .build();
 
-    let field_model = gtk::StringList::new(SORT_FIELD_NAMES);
+    let field_model = string_list(SORT_FIELD_KEYS, locale);
     let field_dropdown = gtk::DropDown::builder()
         .model(&field_model)
         .selected(existing.map(|c| sort_field_to_index(c.field)).unwrap_or(0))
         .hexpand(true)
         .build();
 
-    let dir_model = gtk::StringList::new(&["Ascending", "Descending"]);
+    let dir_model = string_list(
+        &[
+            "smart_playlist.sort_direction.ascending",
+            "smart_playlist.sort_direction.descending",
+        ],
+        locale,
+    );
     let dir_dropdown = gtk::DropDown::builder()
         .model(&dir_model)
         .selected(
@@ -1300,7 +1362,7 @@ fn build_sort_row(
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
         .css_classes(["flat", "circular"])
-        .tooltip_text("Remove sort level")
+        .tooltip_text(rust_i18n::t!("smart_playlist.remove_sort_level", locale = locale).as_ref())
         .build();
 
     row.append(&field_dropdown);
@@ -1366,7 +1428,7 @@ pub mod widget_tests {
         let dialog = adw::AlertDialog::new(None, None);
         dialog.add_response("ok", "OK");
         let rules_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let row = build_rule_row(None, rules_box.downgrade(), dialog.downgrade());
+        let row = build_rule_row(None, "en", rules_box.downgrade(), dialog.downgrade());
         rules_box.append(&row);
         let widgets = RuleRowWidgets::find(&row).expect("rule row widgets");
         (dialog, rules_box, widgets)
@@ -1413,6 +1475,50 @@ pub mod widget_tests {
         widgets.value.set_text("3");
         assert!(dialog.is_response_enabled("ok"));
     }
+
+    fn items(dropdown: &gtk::DropDown) -> Vec<String> {
+        let model = dropdown
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .expect("string list model");
+        (0..model.n_items())
+            .filter_map(|index| model.string(index))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Rule and sort rows take every label from the locale they are built
+    /// for, without touching the process-wide locale.
+    pub fn rows_are_labelled_for_the_locale_they_are_built_for() {
+        let dialog = adw::AlertDialog::new(None, None);
+        let rules_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let row = build_rule_row(None, "de", rules_box.downgrade(), dialog.downgrade());
+        let widgets = RuleRowWidgets::find(&row).expect("rule row widgets");
+        assert_eq!(items(&widgets.field)[0], "Titel");
+        assert_eq!(
+            items(&widgets.operator),
+            [
+                "ist",
+                "ist nicht",
+                "enthält",
+                "enthält nicht",
+                "beginnt mit",
+                "endet mit"
+            ]
+        );
+        assert_eq!(widgets.value.placeholder_text().as_deref(), Some("Wert"));
+        widgets.field.set_selected(field_to_index(&RuleField::Year));
+        assert_eq!(items(&widgets.operator)[2], "größer als");
+
+        let sort_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let sort_row = build_sort_row(None, "de", sort_box.downgrade());
+        let direction = sort_row
+            .first_child()
+            .and_then(|field| field.next_sibling())
+            .and_downcast::<gtk::DropDown>()
+            .expect("sort direction dropdown");
+        assert_eq!(items(&direction), ["Aufsteigend", "Absteigend"]);
+    }
 }
 
 #[cfg(test)]
@@ -1422,6 +1528,10 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+
+    fn english(key: &str) -> String {
+        rust_i18n::t!(key, locale = "en").into_owned()
+    }
 
     #[derive(Debug, Deserialize)]
     struct RatingRuleCatalog {
@@ -1472,7 +1582,7 @@ mod tests {
             assert_eq!(index_to_field(field_to_index(&field)), field);
         }
         assert_eq!(
-            FIELD_NAMES[field_to_index(&RuleField::LastPlayed) as usize],
+            english(FIELD_KEYS[field_to_index(&RuleField::LastPlayed) as usize]),
             "Last Played"
         );
         assert!(matches!(
@@ -1480,7 +1590,7 @@ mod tests {
             FieldType::Date
         ));
         assert_eq!(
-            FIELD_NAMES[field_to_index(&RuleField::Rating) as usize],
+            english(FIELD_KEYS[field_to_index(&RuleField::Rating) as usize]),
             "Rating (1–100)"
         );
         assert!(matches!(field_type(&RuleField::Rating), FieldType::Rating));
@@ -1489,7 +1599,10 @@ mod tests {
     #[test]
     fn every_sort_field_round_trips_through_the_editor_mapping() {
         assert_eq!(
-            SORT_FIELD_NAMES,
+            SORT_FIELD_KEYS
+                .iter()
+                .map(|key| english(key))
+                .collect::<Vec<_>>(),
             [
                 "Artist",
                 "Album Artist",
@@ -1534,11 +1647,11 @@ mod tests {
             assert_eq!(index_to_sort_field(sort_field_to_index(field)), field);
         }
         assert_eq!(
-            SORT_FIELD_NAMES[sort_field_to_index(SortField::LastPlayed) as usize],
+            english(SORT_FIELD_KEYS[sort_field_to_index(SortField::LastPlayed) as usize]),
             "Last Played"
         );
         assert_eq!(
-            SORT_FIELD_NAMES[sort_field_to_index(SortField::Rating) as usize],
+            english(SORT_FIELD_KEYS[sort_field_to_index(SortField::Rating) as usize]),
             "Rating"
         );
     }
@@ -1570,19 +1683,19 @@ mod tests {
             );
         }
         assert_eq!(
-            LIMIT_SORTS[limit_sort_to_index(LimitSort::MostRecentlyPlayed) as usize],
+            english(LIMIT_SORTS[limit_sort_to_index(LimitSort::MostRecentlyPlayed) as usize]),
             "Most Recently Played"
         );
         assert_eq!(
-            LIMIT_SORTS[limit_sort_to_index(LimitSort::LeastRecentlyPlayed) as usize],
+            english(LIMIT_SORTS[limit_sort_to_index(LimitSort::LeastRecentlyPlayed) as usize]),
             "Least Recently Played"
         );
         assert_eq!(
-            LIMIT_SORTS[limit_sort_to_index(LimitSort::HighestRated) as usize],
+            english(LIMIT_SORTS[limit_sort_to_index(LimitSort::HighestRated) as usize]),
             "Highest Rated"
         );
         assert_eq!(
-            LIMIT_SORTS[limit_sort_to_index(LimitSort::LowestRated) as usize],
+            english(LIMIT_SORTS[limit_sort_to_index(LimitSort::LowestRated) as usize]),
             "Lowest Rated"
         );
     }
@@ -1618,7 +1731,13 @@ mod tests {
             assert!(matches!(presence.value, RuleValue::Number(1)));
         }
 
-        assert_eq!(RATING_OPS[5..], ["is rated", "is unrated"]);
+        assert_eq!(
+            RATING_OPS[5..]
+                .iter()
+                .map(|key| english(key))
+                .collect::<Vec<_>>(),
+            ["is rated", "is unrated"]
+        );
     }
 
     #[test]
@@ -1814,8 +1933,12 @@ mod tests {
             );
             assert!(matches!(&rule.value, RuleValue::Date(day) if day == "2024-01-15"));
         }
-        assert_eq!(value_placeholder(&RuleField::DateAdded, 0), "YYYY-MM-DD");
-        assert_eq!(value_placeholder(&RuleField::DateAdded, 4), "value");
+        assert_eq!(
+            value_placeholder(&RuleField::DateAdded, 0, "en"),
+            "YYYY-MM-DD"
+        );
+        assert_eq!(value_placeholder(&RuleField::DateAdded, 4, "en"), "value");
+        assert_eq!(value_placeholder(&RuleField::DateAdded, 4, "de"), "Wert");
     }
 
     #[test]
@@ -1855,6 +1978,12 @@ mod tests {
             }
         }
 
-        assert_eq!(DATE_UNITS, ["days", "weeks", "months"]);
+        assert_eq!(
+            DATE_UNITS
+                .iter()
+                .map(|key| english(key))
+                .collect::<Vec<_>>(),
+            ["days", "weeks", "months"]
+        );
     }
 }

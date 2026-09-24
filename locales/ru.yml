@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "Нет воспроизведения"
   scanning: "Сканирование библиотеки…"
   live: "ПРЯМОЙ ЭФИР"
@@ -21,6 +20,10 @@ header:
   playback_position: "Позиция воспроизведения"
   volume: "Громкость"
   rescan_library: "Пересканировать библиотеку"
+  my_computer: "Мой компьютер"
+  preferences_menu: "_Настройки"
+  about_menu: "_О программе Tributary"
+  quit_menu: "_Завершить"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "Устройства"
   usb_device: "USB-устройство"
   add_server: "Добавить сервер"
-  new_playlist: "Новый плейлист"
   remove_server: "Удалить сервер"
   disconnect: "Отключить"
   new_playlist_menu: "Новый плейлист"
@@ -53,6 +55,13 @@ browser:
   all: "Все"
   folder_root_unavailable: "%{name} (недоступна)"
   folder_unavailable_notice: "Эта папка сейчас недоступна"
+  unknown_genre: "Неизвестно"
+  folder_no_sources: "Просмотр папок доступен только для источников локальной медиатеки"
+  folder_no_roots: "Папки медиатеки не настроены"
+  album_artwork: "Обложки в панели альбомов"
+  album_artwork_size_small: "Маленький"
+  album_artwork_size_medium: "Средний"
+  album_artwork_size_large: "Большой"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -93,8 +102,6 @@ ratings:
 preferences:
   title: "Настройки"
   library_location: "Расположение библиотеки"
-  music_folder: "Папка с музыкой"
-  browse: "Обзор…"
   select_music_folder: "Выбрать папку с музыкой"
   library_restart_hint: "Перезапустите Tributary, чтобы применить изменения папок с музыкой."
   reauthorize_folder: "Повторно авторизовать…"
@@ -121,6 +128,9 @@ preferences:
   privacy: "Конфиденциальность"
   location_title: "Местоположение для станций поблизости"
   location_subtitle: "Определять примерное местоположение по IP-адресу с помощью ipapi.co, ipwho.is или freeipapi.com."
+  add_folder: "Добавить папку"
+  remove_folder: "Удалить папку"
+  group_by_album_artist: "Группировать по исполнителю альбома"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -210,6 +220,34 @@ playlist_io:
   export_unchanged_body: "%{error}\n\nФайл назначения не изменён; все временные файлы удалены."
   export_worker_failed_body: "Процесс экспорта остановился до получения результата: %{error}"
 
+# ── Library root trust ──────────────────────────────────────────────
+library_root_trust:
+  legacy_heading: "Доверять этой папке медиатеки?"
+  legacy_body: "Tributary хранит сведения о треках в %{path} (запомненных треков: %{count}), но эта папка была добавлена до появления проверок идентичности медиатеки. Доверяйте ей, только если это та же медиатека, которой вы пользовались раньше. До тех пор сохранённые метаданные остаются нетронутыми, но Tributary не будет индексировать изменения и удалять из медиатеки отсутствующие треки этой папки. После установления доверия последующая полная сверка может удалить запомненные треки, которые по-прежнему отсутствуют."
+  replacement_heading: "Идентичность папки медиатеки изменилась"
+  replacement_body: "Не удалось подтвердить, что папка %{path} — это медиатека, которой Tributary доверял ранее (запомненных треков: %{count}). Используйте эту папку, только если вы намеренно заменили или переместили ту медиатеку. Пока устанавливается доверие, Tributary сохраняет запомненные метаданные; последующая полная сверка может удалить треки, которые по-прежнему отсутствуют в этой папке."
+  empty_new_heading: "Настроить эту папку медиатеки?"
+  empty_new_body: "Tributary не нашёл поддерживаемых аудиофайлов в %{path}. Возможно, это новая пустая медиатека, но это также может означать, что съёмный диск или сетевой ресурс не смонтирован. Продолжайте, только если это и есть нужное расположение медиатеки."
+  empty_heading: "Поддерживаемые аудиофайлы не найдены"
+  empty_body: "Tributary не нашёл поддерживаемых аудиофайлов в %{path}, но хранит сведения о треках в этом расположении (запомненных треков: %{count}). Это может означать, что съёмный диск или сетевой ресурс не смонтирован. Продолжайте, только если это нужный том медиатеки и поддерживаемые аудиофайлы на нём отсутствуют намеренно."
+  empty_new_final_heading: "Подтвердить это расположение медиатеки?"
+  empty_new_final_body: "Сейчас в %{path} не видно поддерживаемых аудиофайлов. Подтвердите, что это нужное расположение медиатеки, а не несмонтированный диск или сетевой ресурс. Будущие полные сканирования будут учитывать файлы, добавленные сюда или удалённые отсюда; Tributary никогда не удаляет сами аудиофайлы."
+  empty_final_heading: "Всё равно доверять этой папке медиатеки?"
+  empty_final_body: "Сейчас в %{path} не видно поддерживаемых аудиофайлов. Возможно, этот путь — лишь пустая точка монтирования без смонтированного тома, а не нужная медиатека. Сканирование при регистрации сохраняет все запомненные треки (%{count}), но последующее полное окончательное сканирование может удалить каждый запомненный трек, который по-прежнему отсутствует в этой папке. Tributary никогда не удаляет сами аудиофайлы."
+  not_now: "Не сейчас"
+  keep_existing: "Оставить текущую медиатеку"
+  trust_folder: "Доверять папке"
+  use_folder: "Использовать эту папку"
+  review_empty_risk: "Оценить риск"
+  trust_empty_anyway: "Всё равно доверять папке"
+  pending_toast: "Проверка папки медиатеки перед установлением доверия…"
+  trusted_toast: "Папка медиатеки отмечена как доверенная и активна."
+  replacement_trusted_toast: "Новая папка медиатеки отмечена как доверенная и активна."
+  empty_trusted_toast: "Папка медиатеки отмечена как доверенная и активна."
+  unavailable_toast: "Не удалось установить доверие: папка недоступна или её сканирование не было завершено. Запомненные метаданные остаются защищёнными."
+  stale_toast: "Папка изменилась до того, как удалось установить доверие. Она остаётся недоступной, а запомненные метаданные — защищёнными."
+  failed_toast: "Tributary не удалось завершить установление доверия к этой папке медиатеки. Она остаётся недоступной, а запомненные метаданные — защищёнными."
+
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Свойства…"
@@ -237,11 +275,12 @@ regular_playlist:
 # ── Properties dialog ──────────────────────────────────────────────
 properties:
   heading_single: "Свойства — %{title}"
-  heading_batch: "Свойства — %{count} треков"
+  heading_batch: "Свойства — треков: %{count}"
   field_title: "Название"
   field_artist: "Исполнитель"
   field_album: "Альбом"
   field_genre: "Жанр"
+  field_composer: "Композитор"
   field_year: "Год"
   field_track_number: "Номер трека"
   field_disc_number: "Номер диска"
@@ -273,14 +312,16 @@ properties:
   mixed_cleared: "Будет очищено во всех треках"
   musicbrainz_applied: "Заполнено по релизу MusicBrainz «%{release}». Проверьте поля перед сохранением."
   musicbrainz_title_only: "Ни один релиз MusicBrainz не совпал с альбомом, поэтому заполнены только название и исполнитель."
+  invalid_number_heading: "Проверьте выделенное поле"
+  invalid_number_body: "Поле «%{field}» должно содержать целое число."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "Новый умный плейлист"
   edit_title: "Редактировать умный плейлист: %{name}"
-  match_label: "Соответствие"
-  match_all: "Все"
-  match_any: "Любое"
+  match_label: "Соответствует"
+  match_all: "всем"
+  match_any: "любому"
   add_rule: "Добавить правило"
   remove_rule: "Удалить правило"
   limit_to: "Ограничить до"
@@ -288,6 +329,76 @@ smart_playlist:
   rule_reversed_range: "Первое значение не должно превышать второе."
   rule_not_positive: "Введите целое число не меньше 1."
   rule_invalid_date: "Введите дату в формате YYYY-MM-DD, например 2024-01-15."
+  match_suffix: "из следующих правил:"
+  selected_by: "с выбором по"
+  sort_by: "Сортировать по:"
+  add_sort_level: "Добавить уровень сортировки"
+  remove_sort_level: "Удалить уровень сортировки"
+  value_placeholder: "значение"
+  range_end_placeholder: "до"
+  field:
+    title: "Название"
+    artist: "Исполнитель"
+    album_artist: "Исполнитель альбома"
+    album: "Альбом"
+    genre: "Жанр"
+    composer: "Композитор"
+    year: "Год"
+    track_number: "Номер трека"
+    disc_number: "Номер диска"
+    duration: "Длительность"
+    duration_seconds: "Длительность (с)"
+    bitrate: "Битрейт"
+    bitrate_kbps: "Битрейт (кбит/с)"
+    sample_rate_hz: "Частота дискретизации (Гц)"
+    format: "Формат"
+    play_count: "Число воспроизведений"
+    last_played: "Последнее воспроизведение"
+    date_added: "Дата добавления"
+    date_modified: "Дата изменения"
+    file_size_bytes: "Размер файла (байты)"
+    rating: "Оценка"
+    rating_range: "Оценка (1–100)"
+    track_id: "ID трека"
+  operator:
+    is: "равно"
+    is_not: "не равно"
+    contains: "содержит"
+    does_not_contain: "не содержит"
+    starts_with: "начинается с"
+    ends_with: "заканчивается на"
+    greater_than: "больше"
+    less_than: "меньше"
+    in_range: "в диапазоне"
+    is_rated: "имеет оценку"
+    is_unrated: "не имеет оценки"
+    is_before: "раньше"
+    is_after: "позже"
+    is_in_the_last: "за последние"
+    is_not_in_the_last: "не за последние"
+  date_unit:
+    days: "дн."
+    weeks: "нед."
+    months: "мес."
+  limit_unit:
+    items: "шт."
+    minutes: "мин"
+    hours: "ч"
+    megabytes: "МБ"
+    gigabytes: "ГБ"
+  limit_sort:
+    random: "Случайно"
+    most_played: "Чаще всего воспроизводимые"
+    least_played: "Реже всего воспроизводимые"
+    most_recently_added: "Недавно добавленные"
+    least_recently_added: "Давно добавленные"
+    most_recently_played: "Недавно воспроизведённые"
+    least_recently_played: "Давно воспроизведённые"
+    highest_rated: "С наивысшей оценкой"
+    lowest_rated: "С наименьшей оценкой"
+  sort_direction:
+    ascending: "По возрастанию"
+    descending: "По убыванию"
 
 # ── Серверные плейлисты ────────────────────────────────────────────
 server_playlists:
@@ -341,6 +452,8 @@ errors:
     invalid_response: "%{backend} вернул недопустимый ответ"
     authentication_method_unsupported: "Метод аутентификации %{backend} не поддерживается"
     source_failed: "Сбой источника %{backend}"
+    removable_backend: "Съёмный носитель"
+    generic_backend: "Удалённый сервер"
   playback:
     network_request_failed: "Сбой сетевого запроса аудио"
     decoder_failed: "Сбой аудиодекодера"
@@ -360,15 +473,24 @@ errors:
     unsupported_location: "Не удаётся открыть это расположение. Tributary может открывать только файлы на этом компьютере."
     closing: "Tributary закрывается. Откройте его снова после закрытия."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} треков, %{hours} часов"
-  songs_minutes: "%{count} треков, %{minutes} минут"
+  songs:
+    one: "%{count} трек"
+    few: "%{count} трека"
+    many: "%{count} треков"
+    other: "%{count} трека"
+  hours:
+    one: "%{hours} час"
+    few: "%{hours} часа"
+    many: "%{hours} часов"
+    other: "%{hours} часа"
+  minutes:
+    one: "%{minutes} минута"
+    few: "%{minutes} минуты"
+    many: "%{minutes} минут"
+    other: "%{minutes} минуты"
+  summary: "%{songs}, %{duration}"
 
 # ── Миграция из Rhythmbox ─────────────────────────────────────────
 rhythmbox_migration:

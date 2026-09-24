@@ -115,10 +115,8 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .build();
 
     let repeat_mode: Rc<Cell<RepeatMode>> = Rc::new(Cell::new(RepeatMode::Off));
-    let btn_repeat = gtk::ToggleButton::builder()
-        .icon_name("media-playlist-repeat-symbolic")
-        .tooltip_text(rust_i18n::t!("header.repeat_off").as_ref())
-        .build();
+    let btn_repeat = gtk::ToggleButton::new();
+    apply_repeat_mode(&btn_repeat, RepeatMode::Off);
 
     // Cycle Off → All → One on each click.
     // We use a ToggleButton for the highlight but manage `active` manually.
@@ -135,26 +133,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
                 RepeatMode::One => RepeatMode::Off,
             };
             mode.set(next);
-            let (icon, tooltip, active) = match next {
-                RepeatMode::Off => (
-                    "media-playlist-repeat-symbolic",
-                    rust_i18n::t!("header.repeat_off"),
-                    false,
-                ),
-                RepeatMode::All => (
-                    "media-playlist-repeat-symbolic",
-                    rust_i18n::t!("header.repeat_all"),
-                    true,
-                ),
-                RepeatMode::One => (
-                    "media-playlist-repeat-song-symbolic",
-                    rust_i18n::t!("header.repeat_one"),
-                    true,
-                ),
-            };
-            btn.set_icon_name(icon);
-            btn.set_tooltip_text(Some(tooltip.as_ref()));
-            btn.set_active(active);
+            apply_repeat_mode(&btn, next);
         });
     }
 
@@ -182,7 +161,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .build();
 
     let title_label = gtk::Label::builder()
-        .label("Not Playing")
+        .label(rust_i18n::t!("app.not_playing").as_ref())
         .css_classes(["heading"])
         .halign(Align::Start)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -286,7 +265,11 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .build();
 
     // Default "My Computer" row — always present, always first.
-    let local_row = build_output_row("My Computer", "audio-speakers-symbolic", true);
+    let local_row = build_output_row(
+        &rust_i18n::t!("header.my_computer"),
+        "audio-speakers-symbolic",
+        true,
+    );
     output_list.append(&local_row);
 
     let add_output_btn = gtk::Button::builder()
@@ -316,24 +299,10 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .valign(Align::Center)
         .build();
 
-    // Modern GNOME primary menu (Ptyxis-style)
-    let menu = gtk::gio::Menu::new();
-    let section1 = gtk::gio::Menu::new();
-    section1.append(
-        Some(rust_i18n::t!("header.rescan_library").as_ref()),
-        Some("win.rescan-library"),
-    );
-    section1.append(Some("_Preferences"), Some("win.show-preferences"));
-    section1.append(Some("_About Tributary"), Some("app.about"));
-    menu.append_section(None, &section1);
-    let section2 = gtk::gio::Menu::new();
-    section2.append(Some("_Quit"), Some("app.quit"));
-    menu.append_section(None, &section2);
-
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .menu_model(&menu)
-        .tooltip_text("Main Menu")
+        .menu_model(&primary_menu(&rust_i18n::locale()))
+        .tooltip_text(rust_i18n::t!("header.main_menu").as_ref())
         .primary(true)
         .valign(Align::Center)
         .build();
@@ -374,6 +343,46 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         output_button,
         output_list,
     }
+}
+
+/// The primary menu (Ptyxis-style), labelled for `locale`.
+fn primary_menu(locale: &str) -> gtk::gio::Menu {
+    let menu = gtk::gio::Menu::new();
+    let section = gtk::gio::Menu::new();
+    for (key, action) in [
+        ("header.rescan_library", "win.rescan-library"),
+        ("header.preferences_menu", "win.show-preferences"),
+        ("header.about_menu", "app.about"),
+    ] {
+        section.append(
+            Some(rust_i18n::t!(key, locale = locale).as_ref()),
+            Some(action),
+        );
+    }
+    menu.append_section(None, &section);
+    let section = gtk::gio::Menu::new();
+    section.append(
+        Some(rust_i18n::t!("header.quit_menu", locale = locale).as_ref()),
+        Some("app.quit"),
+    );
+    menu.append_section(None, &section);
+    menu
+}
+
+/// Show `mode` on the repeat button: its icon, tooltip, and highlight.
+pub fn apply_repeat_mode(button: &gtk::ToggleButton, mode: RepeatMode) {
+    let (icon, tooltip, active) = match mode {
+        RepeatMode::Off => ("media-playlist-repeat-symbolic", "header.repeat_off", false),
+        RepeatMode::All => ("media-playlist-repeat-symbolic", "header.repeat_all", true),
+        RepeatMode::One => (
+            "media-playlist-repeat-song-symbolic",
+            "header.repeat_one",
+            true,
+        ),
+    };
+    button.set_icon_name(icon);
+    button.set_tooltip_text(Some(rust_i18n::t!(tooltip).as_ref()));
+    button.set_active(active);
 }
 
 // ── Output selector helpers ─────────────────────────────────────────────
@@ -445,6 +454,31 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+
+    #[test]
+    fn primary_menu_is_labelled_for_the_given_locale() {
+        let menu = primary_menu("de");
+        let labels: Vec<String> = (0..menu.n_items())
+            .filter_map(|index| menu.item_link(index, gtk::gio::MENU_LINK_SECTION))
+            .flat_map(|section| {
+                (0..section.n_items())
+                    .filter_map(|index| {
+                        section.item_attribute_value(index, gtk::gio::MENU_ATTRIBUTE_LABEL, None)
+                    })
+                    .filter_map(|label| label.get::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Bibliothek neu einlesen",
+                "_Einstellungen",
+                "_Über Tributary",
+                "_Beenden"
+            ]
+        );
+    }
 
     #[derive(Debug, Deserialize)]
     struct AccessibilityCatalog {

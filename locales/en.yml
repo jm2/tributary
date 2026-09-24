@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "Not Playing"
   scanning: "Scanning library…"
   live: "LIVE"
@@ -21,6 +20,10 @@ header:
   playback_position: "Playback position"
   volume: "Volume"
   rescan_library: "Rescan Library"
+  my_computer: "My Computer"
+  preferences_menu: "_Preferences"
+  about_menu: "_About Tributary"
+  quit_menu: "_Quit"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "Devices"
   usb_device: "USB Device"
   add_server: "Add server"
-  new_playlist: "New playlist"
   remove_server: "Remove server"
   disconnect: "Disconnect"
   new_playlist_menu: "New Playlist"
@@ -53,6 +55,9 @@ browser:
   all: "All"
   folder_root_unavailable: "%{name} (unavailable)"
   folder_unavailable_notice: "This folder is currently unavailable"
+  unknown_genre: "Unknown"
+  folder_no_sources: "Folder browsing follows the local library sources"
+  folder_no_roots: "No library folders configured"
   # Album-pane artwork toggle labels. The browser key set ships in
   # every locale at the `browser:` level; artwork controls live under
   # preferences to match the existing grouping-toggle placement.
@@ -100,8 +105,6 @@ ratings:
 preferences:
   title: "Preferences"
   library_location: "Library Location"
-  music_folder: "Music folder"
-  browse: "Browse…"
   select_music_folder: "Select Music Folder"
   library_restart_hint: "Restart Tributary to apply library folder changes."
   reauthorize_folder: "Reauthorize…"
@@ -128,6 +131,9 @@ preferences:
   privacy: "Privacy"
   location_title: "Location for Stations Near Me"
   location_subtitle: "Look up your approximate location from your IP address with ipapi.co, ipwho.is, or freeipapi.com."
+  add_folder: "Add folder"
+  remove_folder: "Remove folder"
+  group_by_album_artist: "Group by Album Artist"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -281,6 +287,7 @@ properties:
   field_artist: "Artist"
   field_album: "Album"
   field_genre: "Genre"
+  field_composer: "Composer"
   field_year: "Year"
   field_track_number: "Track #"
   field_disc_number: "Disc #"
@@ -312,6 +319,8 @@ properties:
   mixed_cleared: "Will be cleared on all tracks"
   musicbrainz_applied: "Filled in from the MusicBrainz release “%{release}”. Check the fields before saving."
   musicbrainz_title_only: "No MusicBrainz release matched the album, so only the title and artist were filled in."
+  invalid_number_heading: "Check the Highlighted Field"
+  invalid_number_body: "%{field} must be a whole number."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -327,6 +336,76 @@ smart_playlist:
   rule_reversed_range: "The first value must not exceed the second."
   rule_not_positive: "Enter a whole number of 1 or more."
   rule_invalid_date: "Enter a date as YYYY-MM-DD, for example 2024-01-15."
+  match_suffix: "of the following rules:"
+  selected_by: "selected by"
+  sort_by: "Sort by:"
+  add_sort_level: "Add sort level"
+  remove_sort_level: "Remove sort level"
+  value_placeholder: "value"
+  range_end_placeholder: "to"
+  field:
+    title: "Title"
+    artist: "Artist"
+    album_artist: "Album Artist"
+    album: "Album"
+    genre: "Genre"
+    composer: "Composer"
+    year: "Year"
+    track_number: "Track Number"
+    disc_number: "Disc Number"
+    duration: "Duration"
+    duration_seconds: "Duration (sec)"
+    bitrate: "Bitrate"
+    bitrate_kbps: "Bitrate (kbps)"
+    sample_rate_hz: "Sample Rate (Hz)"
+    format: "Format"
+    play_count: "Play Count"
+    last_played: "Last Played"
+    date_added: "Date Added"
+    date_modified: "Date Modified"
+    file_size_bytes: "File Size (bytes)"
+    rating: "Rating"
+    rating_range: "Rating (1–100)"
+    track_id: "Track ID"
+  operator:
+    is: "is"
+    is_not: "is not"
+    contains: "contains"
+    does_not_contain: "does not contain"
+    starts_with: "starts with"
+    ends_with: "ends with"
+    greater_than: "greater than"
+    less_than: "less than"
+    in_range: "in range"
+    is_rated: "is rated"
+    is_unrated: "is unrated"
+    is_before: "is before"
+    is_after: "is after"
+    is_in_the_last: "is in the last"
+    is_not_in_the_last: "is not in the last"
+  date_unit:
+    days: "days"
+    weeks: "weeks"
+    months: "months"
+  limit_unit:
+    items: "items"
+    minutes: "minutes"
+    hours: "hours"
+    megabytes: "MB"
+    gigabytes: "GB"
+  limit_sort:
+    random: "Random"
+    most_played: "Most Played"
+    least_played: "Least Played"
+    most_recently_added: "Most Recently Added"
+    least_recently_added: "Least Recently Added"
+    most_recently_played: "Most Recently Played"
+    least_recently_played: "Least Recently Played"
+    highest_rated: "Highest Rated"
+    lowest_rated: "Lowest Rated"
+  sort_direction:
+    ascending: "Ascending"
+    descending: "Descending"
 
 # ── Server playlists ───────────────────────────────────────────────
 server_playlists:
@@ -380,6 +459,8 @@ errors:
     invalid_response: "%{backend} returned an invalid response"
     authentication_method_unsupported: "%{backend} authentication method is unsupported"
     source_failed: "%{backend} source failed"
+    removable_backend: "Removable media"
+    generic_backend: "Remote"
   playback:
     network_request_failed: "Audio network request failed"
     decoder_failed: "Audio decoder failed"
@@ -399,15 +480,18 @@ errors:
     unsupported_location: "Can’t open this location. Tributary can only open files on this computer."
     closing: "Tributary is closing. Open it again once it has closed."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} songs, %{hours} hours"
-  songs_minutes: "%{count} songs, %{minutes} minutes"
+  songs:
+    one: "%{count} song"
+    other: "%{count} songs"
+  hours:
+    one: "%{hours} hour"
+    other: "%{hours} hours"
+  minutes:
+    one: "%{minutes} minute"
+    other: "%{minutes} minutes"
+  summary: "%{songs}, %{duration}"
 
 # ── Rhythmbox migration ───────────────────────────────────────────
 rhythmbox_migration:

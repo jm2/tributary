@@ -707,14 +707,14 @@ fn restore_visible_sidebar_selection(context: &SourceReducerContext) {
     }
 }
 
-fn remote_backend_label(source: Option<&SourceObject>) -> &'static str {
+fn remote_backend_label(source: Option<&SourceObject>) -> std::borrow::Cow<'static, str> {
     match source.map(SourceObject::backend_type).as_deref() {
-        Some("subsonic") => "Subsonic",
-        Some("jellyfin") => "Jellyfin",
-        Some("plex") => "Plex",
-        Some("daap") => "DAAP",
-        Some("usb-device") => "Removable media",
-        _ => "Remote",
+        Some("subsonic") => "Subsonic".into(),
+        Some("jellyfin") => "Jellyfin".into(),
+        Some("plex") => "Plex".into(),
+        Some("daap") => "DAAP".into(),
+        Some("usb-device") => rust_i18n::t!("errors.remote.removable_backend"),
+        _ => rust_i18n::t!("errors.remote.generic_backend"),
     }
 }
 
@@ -937,7 +937,7 @@ fn reconcile_remote_failure(
 
     let ui_category = remote_failure_category(category);
     let backend = if source_id == crate::architecture::SourceId::radio_browser() {
-        "Radio-Browser"
+        "Radio-Browser".into()
     } else {
         remote_backend_label(row.as_ref().map(|(_, source)| source))
     };
@@ -950,7 +950,7 @@ fn reconcile_remote_failure(
     if show_status {
         context
             .status_label
-            .set_text(&ui_category.user_message(backend));
+            .set_text(&ui_category.user_message(&backend));
     }
 }
 
@@ -1658,7 +1658,7 @@ pub(crate) fn build_window(
 
     let scan_spinner = gtk::Spinner::builder()
         .spinning(true)
-        .tooltip_text("Scanning library…")
+        .tooltip_text(rust_i18n::t!("app.scanning").as_ref())
         .build();
     hb.header.pack_end(&scan_spinner);
 
@@ -1686,14 +1686,7 @@ pub(crate) fn build_window(
     {
         let saved_repeat = load_repeat_mode();
         hb.repeat_mode.set(saved_repeat);
-        let (icon, tooltip, active) = match saved_repeat {
-            RepeatMode::Off => ("media-playlist-repeat-symbolic", "Repeat: Off", false),
-            RepeatMode::All => ("media-playlist-repeat-symbolic", "Repeat: All", true),
-            RepeatMode::One => ("media-playlist-repeat-song-symbolic", "Repeat: One", true),
-        };
-        hb.repeat_button.set_icon_name(icon);
-        hb.repeat_button.set_tooltip_text(Some(tooltip));
-        hb.repeat_button.set_active(active);
+        header_bar::apply_repeat_mode(&hb.repeat_button, saved_repeat);
 
         hb.shuffle_button.set_active(load_shuffle());
     }
@@ -2689,7 +2682,7 @@ pub(crate) fn build_window(
         Rc::new(move || {
             buffering_tracker.invalidate();
             header_bar::show_play_button_state(&play_button, false);
-            title_label.set_label("Not Playing");
+            title_label.set_label(&rust_i18n::t!("app.not_playing"));
             title_label.set_tooltip_text(Option::<&str>::None);
             artist_label.set_label("");
             artist_label.set_tooltip_text(Option::<&str>::None);
@@ -5053,13 +5046,17 @@ fn track_to_object(
     uri: &str,
     artwork_reference: Option<&str>,
 ) -> TrackObject {
+    let genre = t.genre.as_deref().map_or_else(
+        || rust_i18n::t!("browser.unknown_genre"),
+        std::borrow::Cow::Borrowed,
+    );
     let obj = TrackObject::new(
         t.track_number.unwrap_or(0),
         &t.title,
         t.duration_secs.unwrap_or(0),
         &t.artist_name,
         &t.album_title,
-        t.genre.as_deref().unwrap_or("Unknown"),
+        &genre,
         t.composer.as_deref().unwrap_or(""),
         t.year.unwrap_or(0),
         &t.date_modified

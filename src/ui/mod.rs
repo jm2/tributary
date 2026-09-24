@@ -12,6 +12,7 @@ pub mod dummy_data;
 pub mod equalizer_panel;
 pub mod folder_browser;
 pub mod header_bar;
+mod l10n;
 pub mod lastfm_settings;
 mod library_commands;
 mod local_row_batch;

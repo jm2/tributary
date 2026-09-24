@@ -310,45 +310,8 @@ struct PlaylistMutationFailedCopy {
     body: String,
 }
 
-/// CLDR plural category for the whole-number counts the playlist toast carries.
-///
-/// `rust-i18n` interpolates `count` but does not choose plural forms, so the
-/// form is selected here. Only the categories the shipped catalogs use are
-/// modelled: every catalog carries `one`/`other`, and Polish and Russian add
-/// `few`/`many`. Counts are integers, so the fractional `other` branch of
-/// those two languages never applies.
-fn plural_category(locale: &str, count: usize) -> &'static str {
-    let language: String = locale
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect();
-    match language.as_str() {
-        "pl" => few_many_category(count, count == 1),
-        "ru" => few_many_category(count, count % 10 == 1 && count % 100 != 11),
-        _ if count == 1 => "one",
-        _ => "other",
-    }
-}
-
-/// `one`/`few`/`many` split shared by Polish and Russian for whole numbers;
-/// only the `one` rule differs, so the caller supplies it.
-fn few_many_category(count: usize, one: bool) -> &'static str {
-    let tens = count % 10;
-    let hundreds = count % 100;
-    if one {
-        "one"
-    } else if (2..=4).contains(&tens) && !(12..=14).contains(&hundreds) {
-        "few"
-    } else {
-        "many"
-    }
-}
-
 fn playlist_add_success_message(locale: &str, count: usize, playlist_name: &str) -> String {
-    let key = format!(
-        "context.playlist_add_success.{}",
-        plural_category(locale, count)
-    );
+    let key = super::l10n::plural_key("context.playlist_add_success", locale, &count.to_string());
     // `AdwToast` titles are Pango markup by default. Keep the user-controlled
     // name escaped on the same path that selects and renders the translation.
     rust_i18n::t!(
@@ -2494,18 +2457,17 @@ pub mod tests {
         for locale in rust_i18n::available_locales!() {
             let one = playlist_add_success_message(&locale, 1, "R&B <Mix>");
             let other = playlist_add_success_message(&locale, 2, "R&B <Mix>");
+            let one_key = crate::ui::l10n::plural_key("context.playlist_add_success", &locale, "1");
             let expected_one = rust_i18n::t!(
-                "context.playlist_add_success.one",
+                one_key.as_str(),
                 locale = locale,
                 count = 1,
                 playlist = "R&amp;B &lt;Mix&gt;"
             );
             // Count 2 is `other` in most catalogs but `few` in Polish and
             // Russian; the catalog form must match whatever the selector picks.
-            let other_key = format!(
-                "context.playlist_add_success.{}",
-                plural_category(&locale, 2)
-            );
+            let other_key =
+                crate::ui::l10n::plural_key("context.playlist_add_success", &locale, "2");
             let expected_other = rust_i18n::t!(
                 other_key.as_str(),
                 locale = locale,
@@ -2530,20 +2492,6 @@ pub mod tests {
 
     #[test]
     fn playlist_add_success_uses_locale_plural_categories() {
-        assert_eq!(plural_category("pl", 1), "one");
-        assert_eq!(plural_category("pl", 2), "few");
-        assert_eq!(plural_category("pl", 5), "many");
-        assert_eq!(plural_category("pl", 12), "many");
-        assert_eq!(plural_category("pl", 22), "few");
-        assert_eq!(plural_category("ru", 1), "one");
-        assert_eq!(plural_category("ru", 21), "one");
-        assert_eq!(plural_category("ru", 11), "many");
-        assert_eq!(plural_category("ru", 3), "few");
-        assert_eq!(plural_category("ru", 5), "many");
-        assert_eq!(plural_category("en", 21), "other");
-        assert_eq!(plural_category("pt-BR", 1), "one");
-        assert_eq!(plural_category("zh-CN", 2), "other");
-
         assert_eq!(
             playlist_add_success_message("pl", 3, "Mix"),
             "Dodano 3 utwory do Mix."
