@@ -1643,6 +1643,38 @@ fn seaorm_runtime_and_migration_dependencies_move_as_one_unit() {
 }
 
 #[test]
+fn tls_compiles_only_the_aws_lc_rs_crypto_provider() {
+    let dependencies = &manifest()["dependencies"];
+    let features = |name: &str| -> Vec<String> {
+        dependencies[name]["features"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} must list its features"))
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+
+    assert_eq!(features("rustls"), ["aws_lc_rs"]);
+    assert_eq!(
+        dependencies["rustls"]["default-features"].as_bool(),
+        Some(false),
+        "rustls defaults must not re-enable a provider implicitly"
+    );
+    assert!(features("reqwest")
+        .iter()
+        .any(|feature| feature == "rustls"));
+    for name in ["sea-orm", "sea-orm-migration"] {
+        let features = features(name);
+        assert!(
+            features.iter().any(|feature| feature == "runtime-tokio")
+                && !features.iter().any(|feature| feature.contains("tls")),
+            "SQLite needs no TLS, so {name} must use the plain tokio runtime: {features:?}"
+        );
+    }
+}
+
+#[test]
 fn fuzz_harness_shares_the_root_lockfile_without_joining_default_builds() {
     let workspace = &manifest()["workspace"];
     assert_eq!(
