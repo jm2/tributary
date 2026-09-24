@@ -2136,6 +2136,33 @@ fn ci_security_audit_runs_only_the_advisory_audit() {
 }
 
 #[test]
+fn ci_runs_windows_tests_natively_on_both_architectures() {
+    let jobs = ci_jobs();
+    let windows = &jobs["build-windows"];
+    let aarch64 = windows["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("the Windows matrix must list its architectures")
+        .iter()
+        .find(|leg| leg["arch"].as_str() == Some("aarch64"))
+        .expect("the Windows matrix must build aarch64");
+    assert_eq!(
+        aarch64["runner"].as_str(),
+        Some("windows-11-arm"),
+        "Windows aarch64 must build on a native runner so its tests can execute"
+    );
+    let tests = windows["steps"]
+        .as_sequence()
+        .expect("Windows steps must be a sequence")
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Run tests"))
+        .expect("the Windows job must run the test suite");
+    assert!(
+        tests.get("if").is_none(),
+        "the Windows test step must run on every architecture"
+    );
+}
+
+#[test]
 fn ci_documentation_only_changes_still_report_every_platform_check() {
     let jobs = ci_jobs();
     let fail_open_gate = "${{ !cancelled() && needs.changes.outputs.code != 'false' }}";

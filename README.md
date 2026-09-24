@@ -127,8 +127,8 @@ registry seam in detail.
 
 - **Intel Macs are not supported.** There is no x86_64 macOS build, so the `.dmg` does not run on
   Intel Macs.
-- **Windows on ARM** builds are compiled and packaged by CI, but CI runs the test suite only on
-  x86_64, so the aarch64 build is less tested.
+- **Windows on ARM** is built, tested, and packaged natively on Windows 11 ARM64, like the x86_64
+  build.
 - **Native Linux packages** need GTK 4.16 or newer and libadwaita 1.6 or newer, which Debian 12,
   Ubuntu 24.04, and Linux Mint 22.x don't provide. Use the Flatpak (GNOME 50 runtime) there.
 - **The `.deb` is built on Debian unstable**, so its binary needs a recent glibc: the 0.6.2 `.deb`
