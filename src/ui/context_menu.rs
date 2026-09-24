@@ -2858,11 +2858,10 @@ pub mod tests {
     /// but does not give them thread affinity, so a second GTK-touching
     /// `#[test]` would run on a different libtest worker thread than the
     /// one that ran `gtk::init` and construct widgets off the
-    /// initializing thread, tripping gtk-rs main-thread checks
-    /// (2026-09-09 review rejection, PR #179). It is instead invoked from
-    /// the crate's single consolidated GTK test in `browser.rs`, whose
-    /// `with_session` call owns the display gate, the single `gtk::init`,
-    /// and the serialization lock across this body.
+    /// initializing thread, tripping gtk-rs main-thread checks.
+    /// It is instead invoked from the crate's single consolidated GTK test in
+    /// `browser.rs`, whose `with_session` call owns the display gate, the
+    /// single `gtk::init`, and the serialization lock across this body.
     #[cfg(not(target_os = "macos"))]
     pub fn popover_from_menu_model_attaches_a_visible_child_widget() {
         assert_track_drags_start_only_from_the_data_row_area();
@@ -3113,10 +3112,10 @@ pub mod tests {
         // position timers and debounced saves there, and tests never run a
         // main loop). Dispatching one of those here — on this test's
         // worker thread — trips glib's ThreadGuard inside a non-unwinding
-        // C trampoline and aborts the whole test binary (tr-8wtab). The
-        // session context only ever holds sources this same thread
-        // scheduled, so pumping it is safe; the expect documents the
-        // invariant that this helper runs inside a widget test session.
+        // C trampoline and aborts the whole test binary. The session context
+        // only ever holds sources this same thread scheduled, so pumping it is
+        // safe; the expect documents the invariant that this helper runs
+        // inside a widget test session.
         let context = glib::MainContext::thread_default()
             .expect("widget_test_session::with_session pushes a thread-default context");
         while context.pending() {
@@ -3615,7 +3614,7 @@ pub mod tests {
     /// the pump below acquire the context, and the full parallel suite runs
     /// this module's tests concurrently with the widget session's GTK init,
     /// so two tests contending for the shared default context fail
-    /// intermittently with "already acquired by another thread" (tr-i6rhbx).
+    /// intermittently with "already acquired by another thread".
     fn deliver_admission_and_resolve_completion(
         context: &glib::MainContext,
         evidence: PropertiesSelectionEvidence,
@@ -3669,9 +3668,9 @@ pub mod tests {
         // does `MainContext::default().acquire()` and panics with "default
         // main context already acquired by another thread" whenever another
         // test holds that shared context), which is exactly the intermittent
-        // full-suite failure this test used to hit (tr-i6rhbx). A fresh
-        // context always acquires: nothing else owns it, so the spawn and
-        // the dispatching loop below never contend with another test.
+        // full-suite failure this test used to hit. A fresh context always
+        // acquires: nothing else owns it, so the spawn and the dispatching
+        // loop below never contend with another test.
         let pending_path = PathBuf::from("/definitely/not/here.flac");
         let (release, worker) = parked_admission_worker(vec![pending_path.clone()]);
 
@@ -3711,7 +3710,7 @@ pub mod tests {
             media_keys: vec![device_media_key(&device_a)],
         };
         // Dedicated context, never the process-global default: the parallel
-        // suite acquires that shared context concurrently (tr-i6rhbx).
+        // suite acquires that shared context concurrently.
         let outcome = deliver_admission_and_resolve_completion(
             &glib::MainContext::new(),
             evidence,
@@ -3743,7 +3742,7 @@ pub mod tests {
         let admission = admitted_by_path(&pending_path);
         assert_eq!(admission.locals.len(), 1, "admission must admit by path");
         // Dedicated context, never the process-global default: the parallel
-        // suite acquires that shared context concurrently (tr-i6rhbx).
+        // suite acquires that shared context concurrently.
         let outcome = deliver_admission_and_resolve_completion(
             &glib::MainContext::new(),
             evidence,
@@ -4682,7 +4681,7 @@ pub mod tests {
         // Same constraint as `realized_tracklist_for_drag_test`: never pump
         // the process-global default context from a widget test thread.
         // Parallel non-widget tests leave thread-affine glib sources pending
-        // on the global default context (tr-8wtab), and dispatching one of
+        // on the global default context, and dispatching one of
         // those on this thread trips glib's ThreadGuard inside a
         // non-unwinding C trampoline and aborts the whole test binary. The
         // widget session's thread-default context only ever holds sources

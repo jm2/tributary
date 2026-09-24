@@ -218,22 +218,6 @@ fn detection_confirmation(locale: &str) -> String {
     rust_i18n::t!("dialogs.output_detection_confirmation", locale = locale).into_owned()
 }
 
-/// Remove an output from `outputs.json` by host:port.
-#[allow(dead_code)]
-pub fn remove_saved_output(host: &str, port: u16) -> std::io::Result<()> {
-    let Some(path) = outputs_json_path() else {
-        return Ok(());
-    };
-    let (mut outputs, _) = load_saved_outputs_from(&path);
-    let before = outputs.len();
-    outputs.retain(|o| !(o.host == host && o.port == port));
-    if outputs.len() != before {
-        save_outputs_to(&path, &outputs)?;
-        info!(host = %host, port, "Output removed from outputs.json");
-    }
-    Ok(())
-}
-
 /// Present the "Add Output" dialog.
 ///
 /// Currently supports MPD outputs only.  The dialog collects a display

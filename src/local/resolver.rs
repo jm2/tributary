@@ -31,15 +31,13 @@ const MAX_CONCURRENT_AUTHORITY_PROBES: usize = 8;
 /// Reserved capacity for **playback-critical** retained-authority probes.
 ///
 /// Playback resolution must never be starved by speculative pane work, so it
-/// draws on a gate of its own instead of sharing [`SPECULATIVE_PROBE_GATE`]
-/// (2026-09-14 N5 review finding).
+/// draws on a gate of its own instead of sharing [`SPECULATIVE_PROBE_GATE`].
 const RESERVED_PLAYBACK_PROBES: usize = 8;
 
 /// Which consumer is acquiring retained-authority probe capacity.
 ///
 /// The two classes draw on independent gates so that a saturated album-pane
-/// lane cannot delay a playback resolution waiting for capacity
-/// (2026-09-14 N5 review finding).
+/// lane cannot delay a playback resolution waiting for capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeClass {
     /// Speculative work (album-pane thumbnails). Bounded by
@@ -58,11 +56,11 @@ pub enum ProbeClass {
 /// it starts, and dropping its `JoinHandle` detaches rather than cancels it,
 /// so a caller that cancels a pending resolution (the album pane's
 /// `run_until_revoked`) would otherwise let recycled rows accumulate
-/// expensive probes without bound on Tokio's shared blocking pool
-/// (2026-09-14 review finding). The permit is acquired *before* the probe is
-/// submitted and moved INTO the blocking closure, so it is released only
-/// when the probe actually completes — never early on task abort — and at
-/// most [`MAX_CONCURRENT_AUTHORITY_PROBES`] speculative probes can ever be in
+/// expensive probes without bound on Tokio's shared blocking pool.
+/// The permit is acquired *before* the probe is submitted and moved INTO the
+/// blocking closure, so it is released only when the probe actually completes
+/// — never early on task abort — and at most
+/// [`MAX_CONCURRENT_AUTHORITY_PROBES`] speculative probes can ever be in
 /// flight.
 static SPECULATIVE_PROBE_GATE: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_AUTHORITY_PROBES);
@@ -71,9 +69,9 @@ static SPECULATIVE_PROBE_GATE: tokio::sync::Semaphore =
 ///
 /// Kept separate from [`SPECULATIVE_PROBE_GATE`] so that eight stuck
 /// album-pane probes can never consume the capacity a playback resolution
-/// needs (2026-09-14 N5 review finding). Playback is user-paced and
-/// superseded one track at a time, so this bound is a safety cap on
-/// blocking-pool growth rather than a scheduling choke point.
+/// needs. Playback is user-paced and superseded one track at a time, so this
+/// bound is a safety cap on blocking-pool growth rather than a scheduling
+/// choke point.
 static PLAYBACK_PROBE_GATE: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(RESERVED_PLAYBACK_PROBES);
 
@@ -424,7 +422,7 @@ pub async fn resolve_track(
 /// [`resolve_track`] is the speculative convenience wrapper used by
 /// album-pane artwork. Playback-critical callers pass
 /// [`ProbeClass::Playback`] so their probe capacity is reserved and cannot be
-/// starved by pane work (2026-09-14 N5 review finding).
+/// starved by pane work.
 pub async fn resolve_track_with_class(
     class: ProbeClass,
     db: &DatabaseConnection,
@@ -536,7 +534,7 @@ async fn select_authorized_root(
 ///
 /// Speculative (album-pane) and playback-critical callers acquire from
 /// independent gates, so a panes-only saturation cannot delay a playback
-/// resolution here (2026-09-14 N5 review finding).
+/// resolution here.
 #[cfg_attr(not(test), allow(unused_variables))]
 async fn acquire_authority_probe(
     class: ProbeClass,
@@ -562,7 +560,7 @@ async fn acquire_authority_probe(
         tokio::task::spawn_blocking(move || {
             // Hold the gate permit for the entire blocking closure so an
             // aborted async caller cannot release it while this probe is
-            // still queued or running (2026-09-14 review finding).
+            // still queued or running.
             let _probe_permit = probe_permit;
             #[cfg(test)]
             let probe_park_guard = probe_park::enter_if_watched(&probe_track_id);
@@ -637,7 +635,7 @@ mod probe_park {
         /// inside that window -- still holding `waiting` -- until poked,
         /// simulating preemption between the predicate read and the condvar
         /// registration where an unsynchronized [`release`](fn.release)
-        /// used to be lost (2026-09-17 audit rejection).
+        /// used to be lost.
         gap: Mutex<Gap>,
         gap_signal: Condvar,
     }
@@ -690,7 +688,7 @@ mod probe_park {
         // can never be lost. Without this lock the flip lands between the
         // waiter's last true predicate read and its wait registration: the
         // parked probe never wakes, and the test runtime waiting on it
-        // hangs forever (2026-09-17 audit rejection).
+        // hangs forever.
         let wait_lock = state.waiting.lock().expect("probe park release");
         state.enabled.store(false, Ordering::SeqCst);
         drop(wait_lock);
@@ -1401,15 +1399,14 @@ mod tests {
         wait_for_probe_count(0, "parked pane probes did not finish after release").await;
     }
 
-    /// The 2026-09-17 audit rejection: `release()` used to flip `enabled`
-    /// and notify without acquiring the waiter mutex, so a release landing
-    /// between the waiter's last true predicate read and its
-    /// `Condvar::wait` registration was lost and the parked probe -- plus
-    /// the test runtime joining it -- hung forever. Force that exact
-    /// interleaving deterministically: the waiter pauses inside the
-    /// predicate-to-wait window while holding the wait mutex, and release
-    /// must block behind it, complete once the waiter registers, and wake
-    /// it. Bounded even on failure: the poke guard drops before the park
+    /// `release()` must flip `enabled` and notify while holding the waiter
+    /// mutex: otherwise a release landing between the waiter's last true
+    /// predicate read and its `Condvar::wait` registration is lost and the
+    /// parked probe -- plus the test runtime joining it -- hangs forever.
+    /// Force that exact interleaving deterministically: the waiter pauses
+    /// inside the predicate-to-wait window while holding the wait mutex, and
+    /// release must block behind it, complete once the waiter registers, and
+    /// wake it. Bounded even on failure: the poke guard drops before the park
     /// guard, so a failing assertion can never strand `release()` behind a
     /// held wait mutex.
     #[tokio::test]

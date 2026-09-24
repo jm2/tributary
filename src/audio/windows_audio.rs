@@ -4,14 +4,13 @@
 //! playback pipeline, but the application must feed default-device changes
 //! from `GstDeviceMonitor` back into the sink.  Keeping one explicit sink also
 //! keeps its per-stream volume cache alive across endpoint replacement.
-
-// Compile the integration during test builds on every platform so CI catches
-// GStreamer Rust API drift even when no Windows runner is available.
-#![cfg_attr(test, allow(dead_code))]
+//!
+//! The device-independent helpers are also compiled in test builds so their
+//! unit tests run on every platform.
 
 #[cfg(any(target_os = "windows", test))]
 use std::cell::Cell;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 use std::rc::Rc;
 
 #[cfg(any(target_os = "windows", test))]
@@ -20,20 +19,22 @@ use gst::prelude::*;
 use gstreamer as gst;
 #[cfg(any(target_os = "windows", test))]
 use gtk::glib;
+#[cfg(target_os = "windows")]
+use tracing::info;
 #[cfg(any(target_os = "windows", test))]
-use tracing::{info, warn};
+use tracing::warn;
 
 #[cfg(any(target_os = "windows", test))]
 const WASAPI2_FACTORY: &str = "wasapi2sink";
 const WASAPI2_API: &str = "wasapi2";
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 pub(super) struct WindowsAudioRoute {
     monitor: gst::DeviceMonitor,
     _monitor_watch: gst::bus::BusWatchGuard,
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 impl WindowsAudioRoute {
     pub(super) fn install(
         playbin: &gst::Element,
@@ -69,7 +70,7 @@ impl WindowsAudioRoute {
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn configured_wasapi2_sink() -> Option<gst::Element> {
     let sink = match gst::ElementFactory::make(WASAPI2_FACTORY).build() {
         Ok(sink) => sink,
@@ -90,7 +91,7 @@ fn configured_wasapi2_sink() -> Option<gst::Element> {
     Some(sink)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn default_audio_monitor() -> Option<gst::DeviceMonitor> {
     let monitor = gst::DeviceMonitor::new();
     if monitor.add_filter(Some("Audio/Sink"), None).is_none() {
@@ -102,7 +103,7 @@ fn default_audio_monitor() -> Option<gst::DeviceMonitor> {
     Some(monitor)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn watch_default_audio_endpoint(
     monitor: &gst::DeviceMonitor,
     sink: &gst::Element,
@@ -148,7 +149,7 @@ fn default_wasapi2_endpoint_from_message(message: &gst::MessageRef) -> Option<St
     default_wasapi2_endpoint_id(device.properties().as_deref())
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 impl Drop for WindowsAudioRoute {
     fn drop(&mut self) {
         self.monitor.stop();
@@ -159,7 +160,7 @@ impl Drop for WindowsAudioRoute {
 ///
 /// Feature detection keeps source builds with an older system GStreamer on the
 /// automatic sink path instead of assuming live replacement is available.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 pub(super) fn configure_wasapi2_sink(sink: &gst::Element) -> bool {
     let is_wasapi2 = sink
         .factory()

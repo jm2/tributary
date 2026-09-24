@@ -15,9 +15,8 @@ use resolver::{
 /// (source id + session epoch + attached registry) must resolve
 /// retained authority — the former code returned the raw file:// URI
 /// and freshly opened its pathname, silently bypassing retained
-/// removable-media authority (2026-09-10 review finding). This
-/// decision seam is the gate: the raw path is unreachable for
-/// identity rows.
+/// removable-media authority. This decision seam is the gate: the raw path is
+/// unreachable for identity rows.
 #[test]
 fn pane_file_rows_with_source_identity_resolve_retained_authority() {
     assert_eq!(
@@ -42,7 +41,7 @@ fn pane_file_rows_without_identity_keep_the_transitional_direct_path() {
 
 /// The built-in local library row (`SourceId::local()`, no epoch) is
 /// neither external nor denied: it resolves through the built-in
-/// local retained authority (2026-09-12 review finding).
+/// local retained authority.
 #[test]
 fn pane_local_library_rows_resolve_builtin_local_authority() {
     assert_eq!(
@@ -179,8 +178,7 @@ fn placeholder_icon_name_is_a_stable_string_constant() {
 // constructs every adopted-session row with an empty URI, and
 // `populate_albums` copies that into the `AlbumArtCandidate`. The pane
 // resolver must therefore choose the retained-file route from the live
-// adapter's authoritative capability, not the row's raw locator
-// (2026-09-14 review finding).
+// adapter's authoritative capability, not the row's raw locator.
 // ---------------------------------------------------------------------
 
 use crate::source_lifecycle::SourceProvenance;
@@ -281,9 +279,8 @@ fn pane_candidate_for(
         .expect("album row must carry an artwork candidate")
 }
 
-/// The P2 regression (2026-09-14 review finding; production shape from the
-/// 2026-09-17 review finding): a mounted removable album reaches the pane as
-/// a production registry row with an empty URI. Its retained-file capability
+/// Regression: a mounted removable album reaches the pane as a production
+/// registry row with an empty URI. Its retained-file capability
 /// must route it to the retained file extractor, and the embedded art must
 /// come back through the exact retained capability — never through a raw
 /// path.
@@ -354,7 +351,7 @@ fn pathless_removable_album_row_resolves_retained_embedded_art_from_glib_context
 /// A retained-file-capable registry row whose token was revoked before its
 /// fetch was driven must fail closed: the runtime resolution is refused at
 /// admission, so no authority probe is scheduled for a row that can no
-/// longer paint (2026-09-17 review finding).
+/// longer paint.
 #[test]
 fn pre_revoked_removable_registry_row_fails_closed() {
     let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");
@@ -400,8 +397,7 @@ fn pre_revoked_removable_registry_row_fails_closed() {
 
 /// A retained-file-capable registry row with no attached application
 /// runtime must fail closed: the retained route polls Tokio time/blocking
-/// APIs, so resolving it on the runtime-less main context would panic
-/// (2026-09-17 review finding).
+/// APIs, so resolving it on the runtime-less main context would panic.
 #[test]
 fn removable_registry_row_without_runtime_fails_closed() {
     let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");

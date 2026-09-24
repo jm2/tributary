@@ -54,10 +54,9 @@ const MAX_PENDING_WORKER_COMMANDS: usize = 64;
 ///
 /// This is the ONLY grant. No amount of clean observation can promote an
 /// output into authority: MPD offers no ownership lock, lease, token, or
-/// atomic conditional partition mutation (2026-07-17 P2.10 / PR #112), so an
-/// automatically granted "detected exclusive" mode is infeasible by
-/// construction. Observation exists purely to revoke (see
-/// [`SupervisionState`]).
+/// atomic conditional partition mutation, so an automatically granted
+/// "detected exclusive" mode is infeasible by construction. Observation exists
+/// purely to revoke (see [`SupervisionState`]).
 ///
 /// Legacy entries persisted before this mode existed always deserialize as
 /// `Unconfirmed`; that gate preserves the invariant that no MPD command can
@@ -262,7 +261,7 @@ fn supervision_authorizes(plan: MpdControlPlan, supervision: &Mutex<SupervisionS
 }
 
 pub struct MpdOutput {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read only through AudioOutput::name")]
     display_name: String,
     event_tx: async_channel::Sender<PlayerEvent>,
     event_generation: AtomicU64,
@@ -275,7 +274,6 @@ pub struct MpdOutput {
     /// Revoke-only supervision state shared with the worker. The field
     /// itself is retained so callers (and the test harness) can inspect or
     /// seed the supervisor; the worker is the only writer.
-    #[allow(dead_code)]
     supervision: Arc<Mutex<SupervisionState>>,
 }
 
@@ -4742,7 +4740,6 @@ mod tests {
         events: async_channel::Receiver<PlayerEvent>,
         proxy: ProxyServices,
         worker: Option<std::thread::JoinHandle<()>>,
-        #[allow(dead_code)]
         supervision: Arc<Mutex<SupervisionState>>,
     }
 
@@ -6487,18 +6484,17 @@ mod tests {
 
     #[test]
     fn supervised_stop_cleanup_refused_when_status_round_trip_fails_with_usable_ack() {
-        // Connection-usable-failure sibling of the two refusals above
-        // (adjudicated P1, PR #173 thread 3989340443): the cleanup status
-        // round-trip itself fails with a synchronized ACK error — the stream
-        // stays usable, but ownership is indeterminate. The unreadable reply
-        // is a blind window over the partition, so the supervised output
-        // lapses BEFORE the mutation decisions; execution then fell through
-        // to the targeted-delete authority gate, which returned `Completed`,
-        // and the Stop caller published a successful stopped state even
-        // though neither the stop nor the deleteid ran and the owned song
-        // may still be playing. The kind-aware gate must refuse instead:
-        // zero mutations reach MPD and the UI sees the exclusive-control
-        // error — never a silent successful stopped state.
+        // Connection-usable-failure sibling of the two refusals above: the
+        // cleanup status round-trip itself fails with a synchronized ACK error
+        // — the stream stays usable, but ownership is indeterminate. The
+        // unreadable reply is a blind window over the partition, so the
+        // supervised output lapses BEFORE the mutation decisions; execution
+        // then fell through to the targeted-delete authority gate, which
+        // returned `Completed`, and the Stop caller published a successful
+        // stopped state even though neither the stop nor the deleteid ran and
+        // the owned song may still be playing. The kind-aware gate must refuse
+        // instead: zero mutations reach MPD and the UI sees the
+        // exclusive-control error — never a silent successful stopped state.
         let shared = FakeShared::new();
         let proxy_shared = FakeProxyShared::new();
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");

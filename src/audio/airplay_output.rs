@@ -12,12 +12,10 @@
 //! `uridecodebin ! audioconvert ! avenc_alac ! raopsink`.
 //!
 //! `raopsink` is the only transmitter.  There is deliberately no
-//! fallback: the one this module used to have piped decoded PCM into a
-//! spawned `shairport-sync`, which is an AirPlay *receiver* — it
-//! ignored the device the user selected and could never reach it
-//! (review finding M3, tracker item P2.9).  A missing `raopsink` now
-//! fails the load with a localized, honest unsupported message instead
-//! of silently spawning a subprocess that cannot work.
+//! fallback: piping decoded PCM into `shairport-sync` cannot work, because
+//! that is an AirPlay *receiver* and never reaches the selected device.
+//! A missing `raopsink` fails the load with a localized unsupported
+//! message instead.
 //!
 //! A bus watch on the dedicated pipeline forwards EOS / errors / state
 //! changes into the same `PlayerEvent` channel the rest of the app
@@ -69,8 +67,7 @@ struct Session {
 /// AirPlay audio output — streams to a RAOP receiver.
 pub struct AirPlayOutput {
     /// Human-readable name from mDNS discovery (e.g. "Living Room").
-    /// Read by the `AudioOutput::name` trait method.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read only through AudioOutput::name")]
     display_name: String,
     /// Receiver hostname or IP address.
     host: String,

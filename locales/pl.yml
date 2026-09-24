@@ -2,6 +2,11 @@
 app:
   not_playing: "Brak odtwarzania"
   scanning: "Skanowanie biblioteki…"
+  unsupported_file_names_skipped:
+    one: "Pominięto %{count} plik audio: nazwa nie jest poprawnym UTF-8"
+    other: "Pominięto %{count} pliku audio: nazwy nie są poprawnym UTF-8"
+    few: "Pominięto %{count} pliki audio: nazwy nie są poprawnym UTF-8"
+    many: "Pominięto %{count} plików audio: nazwy nie są poprawnym UTF-8"
   live: "NA ŻYWO"
 
 # ── Header bar ─────────────────────────────────────────────────────
@@ -204,6 +209,7 @@ playlist_io:
   import_success_heading: "Zaimportowano listę XSPF"
   import_warning_heading: "Zaimportowano listę XSPF z ostrzeżeniami"
   import_success_body: "Zaimportowano „%{name}”.\n\nDopasowane: %{matched}\nNiedopasowane (zachowane): %{unmatched}\nNieudane (niezaimportowane): %{failed}"
+  import_skipped_unsupported_names: "Pominięte (nazwa pliku nie jest poprawnym UTF-8): %{count}"
   import_failed_heading: "Nie można zaimportować listy XSPF"
   import_rollback_body: "%{error}\n\nNie zatwierdzono listy ani żadnych wpisów; wszystkie zmiany w bazie danych zostały wycofane."
   import_worker_failed_body: "Proces importu zatrzymał się przed zgłoszeniem wyniku: %{error}\n\nNie opublikowano żadnej zatwierdzonej listy."

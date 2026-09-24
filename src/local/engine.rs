@@ -84,6 +84,10 @@ pub enum LibraryEvent {
     ScanProgress(u64, u64),
     /// Initial scan complete.
     ScanComplete,
+    /// A scan or the watcher refused this many audio files, not reported
+    /// before in this session, because their names are not valid UTF-8 and
+    /// so cannot be stored as an exact library path.
+    UnsupportedFileNamesSkipped(usize),
     /// Playlists and their authoritative editability/link presentation loaded
     /// from one joined database snapshot.
     PlaylistsLoaded(PlaylistSidebarSnapshot),
@@ -632,6 +636,7 @@ impl LibraryEngine {
             &command_rx,
             &mut completed_commands,
             &playlist_sidebar_refresh,
+            None,
         )
         .await;
         if let Err(e) = scan_result {
@@ -1471,6 +1476,8 @@ struct RootScan {
     audio_files: Vec<(PathBuf, String)>,
     /// Private siblings an interrupted tag save left behind.
     tag_write_debris: Vec<PathBuf>,
+    /// Audio files refused because their names are not valid UTF-8.
+    unsupported_names: Vec<PathBuf>,
     errors: Vec<String>,
     device_id: Option<String>,
     mount_generation: Option<u64>,
@@ -2410,6 +2417,7 @@ where
             root,
             audio_files: Vec::new(),
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             device_id: None,
             mount_generation: None,
             authority_lease: None,
@@ -2429,6 +2437,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 tag_write_debris: Vec::new(),
+                unsupported_names: Vec::new(),
                 device_id: None,
                 mount_generation: None,
                 authority_lease: None,
@@ -2455,6 +2464,7 @@ where
                         root,
                         audio_files: Vec::new(),
                         tag_write_debris: Vec::new(),
+                        unsupported_names: Vec::new(),
                         device_id,
                         mount_generation: None,
                         authority_lease: None,
@@ -2478,6 +2488,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 tag_write_debris: Vec::new(),
+                unsupported_names: Vec::new(),
                 device_id,
                 mount_generation: None,
                 authority_lease,
@@ -2499,6 +2510,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 tag_write_debris: Vec::new(),
+                unsupported_names: Vec::new(),
                 device_id,
                 mount_generation: Some(mount_generation),
                 authority_lease,
@@ -2520,8 +2532,12 @@ where
         }
     };
 
-    let (audio_files, tag_write_debris, traversal_errors) =
-        enumerate_audio_files(&root, root_boundary, exclusions);
+    let AudioFileEnumeration {
+        audio_files,
+        private_siblings: tag_write_debris,
+        unsupported_names,
+        errors: traversal_errors,
+    } = enumerate_audio_files(&root, root_boundary, exclusions);
     errors.extend(traversal_errors);
     let audio_files = audio_files
         .into_iter()
@@ -2566,6 +2582,7 @@ where
         root,
         audio_files,
         tag_write_debris,
+        unsupported_names,
         errors,
         device_id,
         mount_generation: Some(mount_generation),
@@ -2575,8 +2592,61 @@ where
     }
 }
 
+/// What one traversal found under a library scope.
+#[derive(Debug, Default)]
+struct AudioFileEnumeration {
+    /// Indexable audio files.
+    audio_files: Vec<PathBuf>,
+    /// Private siblings an interrupted tag save left behind.
+    private_siblings: Vec<PathBuf>,
+    /// Audio files refused because their names are not valid UTF-8.
+    unsupported_names: Vec<PathBuf>,
+    errors: Vec<String>,
+}
+
+/// Whether the library can index `path`.
+///
+/// A library row stores its path as UTF-8 text, and that text is the file's
+/// identity for scanning, playback, and tag writes. A native name that is not
+/// valid UTF-8 has no exact text form: a lossy conversion would collapse
+/// distinct names into one row, or alias a file literally named with U+FFFD.
+/// Such a file is refused rather than indexed under a false identity.
+fn is_indexable_library_path(path: &Path) -> bool {
+    path.to_str().is_some()
+}
+
+/// Unsupported names already logged and reported in this session, so repeated
+/// scans and watcher events report each file once.
+static REPORTED_UNSUPPORTED_NAMES: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Log each unsupported name not reported before in this session and return
+/// how many were new. A name is logged only in its escaped debug form, so no
+/// raw non-UTF-8 bytes reach the log.
+fn register_unsupported_names<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> usize {
+    let mut reported = REPORTED_UNSUPPORTED_NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut newly_reported = 0;
+    for path in paths {
+        if reported.insert(path.clone()) {
+            warn!(
+                path = ?path,
+                "Skipping an audio file whose name is not valid UTF-8; the library cannot index it"
+            );
+            newly_reported += 1;
+        }
+    }
+    newly_reported
+}
+
 /// Enumerate the audio files under `directory` using the one indexing policy
 /// every scope shares, together with any private tag-write siblings.
+///
+/// An audio file whose name is not valid UTF-8 is never returned as indexable
+/// (see [`is_indexable_library_path`]); it is listed in `unsupported_names` so
+/// the caller can report it. That refusal is policy, not a traversal error, so
+/// it leaves the scope's completeness unchanged.
 ///
 /// Symlinks are never followed: the notify watcher does not follow them either,
 /// so following here would index files that are never watched for changes, and
@@ -2593,7 +2663,7 @@ fn enumerate_audio_files(
     directory: &Path,
     boundary: Option<u64>,
     exclusions: &[PathBuf],
-) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+) -> AudioFileEnumeration {
     enumerate_audio_files_with_observer(directory, boundary, exclusions, |_| Ok(()))
 }
 
@@ -2606,13 +2676,12 @@ fn enumerate_audio_files_with_observer<F>(
     boundary: Option<u64>,
     exclusions: &[PathBuf],
     mut observe: F,
-) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>)
+) -> AudioFileEnumeration
 where
     F: FnMut(&Path) -> Result<(), String>,
 {
-    let mut audio_files = Vec::new();
-    let mut private_siblings = Vec::new();
-    let mut errors = Vec::new();
+    let mut found = AudioFileEnumeration::default();
+    let errors = &mut found.errors;
 
     let mut entries = WalkDir::new(directory).follow_links(false).into_iter();
     while let Some(entry) = entries.next() {
@@ -2652,21 +2721,25 @@ where
                 }
             }
             Ok(entry) if entry.file_type().is_file() && is_private_write_sibling(entry.path()) => {
-                private_siblings.push(entry.into_path());
+                found.private_siblings.push(entry.into_path());
             }
             Ok(entry) if entry.file_type().is_file() && tag_parser::is_audio_file(entry.path()) => {
                 let path = entry.into_path();
+                if !is_indexable_library_path(&path) {
+                    found.unsupported_names.push(path);
+                    continue;
+                }
                 if let Err(error) = observe(&path) {
                     errors.push(error);
                 }
-                audio_files.push(path);
+                found.audio_files.push(path);
             }
             Ok(_) => {}
             Err(error) => errors.push(error.to_string()),
         }
     }
 
-    (audio_files, private_siblings, errors)
+    found
 }
 
 /// Traversal of the destination of a paired directory rename.
@@ -2769,22 +2842,27 @@ fn scan_renamed_directory(
     // No exclusions: a pair whose subtree owns another scan scope is rejected
     // before it reaches this traversal (`subtree_owns_another_scope`).
     let mut observed_files = HashMap::new();
-    let (audio_files, _, mut errors) =
-        enumerate_audio_files_with_observer(directory, Some(boundary), &[], |path| {
-            let bound_file = lease.open_regular_file(path).map_err(|error| {
-                format!(
-                    "failed to bind renamed file beneath its retained root {}: {error}",
-                    path.display()
-                )
-            })?;
-            let key = path.to_string_lossy().into_owned();
-            if observed_files.insert(key.clone(), bound_file).is_some() {
-                return Err(format!(
-                    "multiple renamed files collapse to the persisted path key: {key}"
-                ));
-            }
-            Ok(())
-        });
+    // Files refused for unsupported names were never indexed, so no row can
+    // follow them here; the scan that first met them already reported them.
+    let AudioFileEnumeration {
+        audio_files,
+        mut errors,
+        ..
+    } = enumerate_audio_files_with_observer(directory, Some(boundary), &[], |path| {
+        let bound_file = lease.open_regular_file(path).map_err(|error| {
+            format!(
+                "failed to bind renamed file beneath its retained root {}: {error}",
+                path.display()
+            )
+        })?;
+        let key = path.to_string_lossy().into_owned();
+        if observed_files.insert(key.clone(), bound_file).is_some() {
+            return Err(format!(
+                "multiple renamed files collapse to the persisted path key: {key}"
+            ));
+        }
+        Ok(())
+    });
     if destination.validate(lease).is_err() {
         errors.push(format!(
             "renamed directory changed during traversal: {}",
@@ -4225,7 +4303,28 @@ async fn process_library_commands_without_watcher(
     }
 }
 
-/// Service admitted library commands while the initial scan runs.
+/// Commands a watcher reconciliation hands back to the watcher loop instead of
+/// servicing them while it scans.
+#[derive(Default)]
+struct HandedBackCommands {
+    /// A root-trust command, unprocessed. The loop runs it after the
+    /// reconciliation, with its backlog discard and authority scan, exactly as
+    /// if it had arrived at a loop boundary.
+    root_trust: Option<LibraryCommand>,
+    /// A rescan request. The loop reprobes the roots before rescanning.
+    rescan: bool,
+}
+
+/// The watcher loop's library-command service, lent to its reconciliation
+/// scans so ratings and history settle while one runs.
+struct WatcherCommands<'a> {
+    rx: &'a async_channel::Receiver<LibraryCommand>,
+    completed: &'a mut HashMap<Uuid, CompletedRootTrustCommand>,
+    handed_back: HandedBackCommands,
+}
+
+/// Service admitted library commands while a library scan runs: the startup
+/// scan, or a watcher reconciliation when `hand_back` is `Some`.
 ///
 /// The scan's read-only traversal and parsing run on blocking workers that
 /// cannot be cancelled while the window is open. Driving command service from
@@ -4258,6 +4357,12 @@ async fn process_library_commands_without_watcher(
 /// every earlier admitted command has settled in FIFO order, so the loop waits
 /// for the (cancelled) scan to reach settlement before acknowledging. That
 /// keeps the close drain behind every already admitted durable mutation.
+///
+/// During the startup scan a root-trust command runs here to completion,
+/// authority scan included, and a rescan request is dropped because the
+/// running scan covers it. A watcher reconciliation instead hands both back
+/// through `hand_back`. After taking a root-trust command it stops taking
+/// commands, so every later command keeps its FIFO place behind that one.
 #[allow(clippy::too_many_arguments)]
 async fn service_commands_while_scanning<F>(
     scan: F,
@@ -4268,6 +4373,7 @@ async fn service_commands_while_scanning<F>(
     command_rx: &async_channel::Receiver<LibraryCommand>,
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    mut hand_back: Option<&mut HandedBackCommands>,
 ) -> F::Output
 where
     F: std::future::Future<Output = anyhow::Result<()>>,
@@ -4286,8 +4392,8 @@ where
             result = scan.as_mut() => return result,
             command = GatedCommandRecv::new(command_rx, scan_write_txn) => command,
         };
-        match next {
-            Ok(LibraryCommand::Flush { completion }) => {
+        match (next, hand_back.as_deref_mut()) {
+            (Ok(LibraryCommand::Flush { completion }), _) => {
                 // Reserved drain: let the cancelled scan settle (admitted
                 // durable work completes; held read-only work is abandoned
                 // under budget) before acknowledging the writer.
@@ -4295,12 +4401,17 @@ where
                 let _ = completion.send(()).await;
                 return result;
             }
-            Ok(LibraryCommand::Rescan) => {
+            (Ok(LibraryCommand::Rescan), None) => {
                 info!(
                     "Library rescan requested during the startup scan; the running scan covers it"
                 );
             }
-            Ok(command) => {
+            (Ok(LibraryCommand::Rescan), Some(hand_back)) => hand_back.rescan = true,
+            (Ok(command @ LibraryCommand::ConfirmRootTrust(_)), Some(hand_back)) => {
+                hand_back.root_trust = Some(command);
+                commands_open = false;
+            }
+            (Ok(command), _) => {
                 // Service the command while KEEPING THE SCAN POLLED. The
                 // command's own DB work pends on the connection pool, and the
                 // pool may have granted its only connection to the parked
@@ -4358,7 +4469,7 @@ where
                     }
                 }
             }
-            Err(_) => commands_open = false,
+            (Err(_), _) => commands_open = false,
         }
     }
 }
@@ -5548,6 +5659,19 @@ async fn initial_scan_with_control(
             .send(LibraryEvent::RootTrustRequired(trust_requests))
             .await;
     }
+    // Only a root whose content this scan could index has files it refused;
+    // an unauthorized root indexes nothing, whatever its names.
+    let skipped = register_unsupported_names(
+        root_scans
+            .iter()
+            .filter(|scan| scan.content_authorized)
+            .flat_map(|scan| &scan.unsupported_names),
+    );
+    if skipped > 0 {
+        let _ = tx
+            .send(LibraryEvent::UnsupportedFileNamesSkipped(skipped))
+            .await;
+    }
     let _ = tx.send(LibraryEvent::ScanComplete).await;
 
     info!(scanned, "Initial scan complete");
@@ -6333,6 +6457,9 @@ struct WatcherBatch {
     /// exact destination replacement invalidates every descendant mapping.
     dirty_directory_scopes: HashSet<PathBuf>,
     identity_changed_roots: HashSet<PathBuf>,
+    /// Audio files seen under names that are not valid UTF-8. They never
+    /// enter the sets above (see [`WatcherBatch::admit_indexable_path`]).
+    unsupported_names: HashSet<PathBuf>,
     tracked_rename_from: HashMap<usize, PathBuf>,
     adjacent_untracked_rename_from: Option<PathBuf>,
     reconciliation_required: bool,
@@ -6359,6 +6486,7 @@ impl WatcherBatch {
                 true
             }
         });
+        event.paths.retain(|path| self.admit_indexable_path(path));
         if event.paths.is_empty() {
             self.adjacent_untracked_rename_from = None;
             return;
@@ -6472,6 +6600,31 @@ impl WatcherBatch {
             }
             _ => {}
         }
+    }
+
+    /// Keep only paths the library can index (see
+    /// [`is_indexable_library_path`]), so no rename, removal, or upsert is
+    /// ever keyed by a lossy rendering of a native name.
+    ///
+    /// A refused audio file is remembered for the user-facing report. A
+    /// refused directory may hold audio files the report should count, so it
+    /// asks for the scan that finds them. Anything else — a vanished name, or
+    /// a non-audio file — has nothing to index or report. A rename with one
+    /// refused side never pairs: its supported side is handled on its own, as
+    /// a removal, an upsert, or a reconciliation scan, which is exact because
+    /// the refused name never had a row.
+    fn admit_indexable_path(&mut self, path: &Path) -> bool {
+        if is_indexable_library_path(path) {
+            return true;
+        }
+        match watcher_upsert_path_kind(path) {
+            Ok(WatcherUpsertPathKind::Directory) => self.reconciliation_required = true,
+            Ok(WatcherUpsertPathKind::RegularFile) if tag_parser::is_audio_file(path) => {
+                self.unsupported_names.insert(path.to_path_buf());
+            }
+            _ => {}
+        }
+        false
     }
 
     fn record_remove(&mut self, path: PathBuf) {
@@ -6917,22 +7070,36 @@ fn discard_watcher_backlog(rx: &mut mpsc::Receiver<notify::Result<notify::Event>
 
 /// The watcher's authoritative fallback: an ordinary library scan, bounded by
 /// the window-close cancellation like the startup scan so closing the window
-/// never waits for a whole-library rescan.
+/// never waits for a whole-library rescan. Library commands are serviced
+/// while it runs, as during the startup scan, except those it hands back.
 async fn reconcile_watched_library(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
+    discovery: &ScanDiscoveryHold,
+    commands: &mut WatcherCommands<'_>,
 ) -> anyhow::Result<()> {
-    initial_scan_shutdown_aware(
+    let scan_write_txn = ScanWriteTxnGate::default();
+    service_commands_while_scanning(
+        initial_scan_shutdown_aware(
+            db,
+            music_dirs,
+            tx,
+            playlist_sidebar_refresh,
+            cancellation,
+            discovery,
+            &scan_write_txn,
+        ),
+        &scan_write_txn,
         db,
         music_dirs,
         tx,
+        commands.rx,
+        commands.completed,
         playlist_sidebar_refresh,
-        cancellation,
-        &ScanDiscoveryHold::none(),
-        &ScanWriteTxnGate::default(),
+        Some(&mut commands.handed_back),
     )
     .await
 }
@@ -6944,6 +7111,7 @@ async fn reconcile_unreliable_watcher_stream(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
     rx: &mut mpsc::Receiver<notify::Result<notify::Event>>,
+    commands: &mut WatcherCommands<'_>,
 ) -> bool {
     // The queued backlog belongs to the same stream gap and cannot be applied
     // incrementally. Events racing with this drain may be discarded too; the
@@ -6952,8 +7120,16 @@ async fn reconcile_unreliable_watcher_stream(
     // loop iteration.
     discard_watcher_backlog(rx);
     info!("Reconciling library after filesystem watcher stream loss");
-    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
-        .await
+    match reconcile_watched_library(
+        db,
+        music_dirs,
+        tx,
+        playlist_sidebar_refresh,
+        cancellation,
+        &ScanDiscoveryHold::none(),
+        commands,
+    )
+    .await
     {
         Ok(()) => true,
         Err(error) => {
@@ -6970,6 +7146,7 @@ async fn reconcile_root_marker_mutations(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
     roots: &HashSet<PathBuf>,
+    commands: &mut WatcherCommands<'_>,
 ) -> bool {
     // Invalidate persisted authorization before any asynchronous traversal.
     // A marker created by the bootstrap scan is restored to available by this
@@ -6978,8 +7155,16 @@ async fn reconcile_root_marker_mutations(
         mark_root_path_unavailable(db, root).await;
     }
     info!("Reconciling library after library root marker mutation");
-    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
-        .await
+    match reconcile_watched_library(
+        db,
+        music_dirs,
+        tx,
+        playlist_sidebar_refresh,
+        cancellation,
+        &ScanDiscoveryHold::none(),
+        commands,
+    )
+    .await
     {
         Ok(()) => true,
         Err(error) => {
@@ -7062,6 +7247,12 @@ async fn process_directory_events(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     scan_cancellation: &CancellationToken,
 ) -> anyhow::Result<()> {
+    let mut commands = WatcherCommands {
+        rx: command_rx,
+        completed: completed_commands,
+        handed_back: HandedBackCommands::default(),
+    };
+
     // ── Debounced event processing ──────────────────────────────
     // Collect filesystem events for a short window, deduplicate by
     // path, then process the batch. This collapses the 3-5 duplicate
@@ -7088,17 +7279,33 @@ async fn process_directory_events(
                 music_dirs,
                 tx,
                 playlist_sidebar_refresh,
-                completed_commands,
+                commands.completed,
                 pending,
             )
             .await;
             continue;
         }
 
+        // A root-trust command a reconciliation handed back was admitted
+        // before anything still queued, so it runs first.
+        if let Some(command) = commands.handed_back.root_trust.take() {
+            pending_trust_scan = process_library_command(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                commands.completed,
+                command,
+            )
+            .await;
+            continue;
+        }
+        rescan_requested |= std::mem::take(&mut commands.handed_back.rescan);
+
         // Each UI mutation is one serialized engine command. Drain at most one
         // per batch boundary so it cannot interleave with a watcher mutation.
         if commands_open {
-            match command_rx.try_recv() {
+            match commands.rx.try_recv() {
                 Ok(LibraryCommand::Rescan) => {
                     rescan_requested = true;
                     continue;
@@ -7109,7 +7316,7 @@ async fn process_directory_events(
                         music_dirs,
                         tx,
                         playlist_sidebar_refresh,
-                        completed_commands,
+                        commands.completed,
                         command,
                     )
                     .await;
@@ -7141,6 +7348,7 @@ async fn process_directory_events(
                 playlist_sidebar_refresh,
                 scan_cancellation,
                 &mut watcher.rx,
+                &mut commands,
             )
             .await;
             if reconciliation_pending {
@@ -7153,7 +7361,7 @@ async fn process_directory_events(
         // batch. A closed command channel must not stop filesystem watching.
         let wake = tokio::select! {
             biased;
-            command = command_rx.recv(), if commands_open => WatcherWake::Command(command),
+            command = commands.rx.recv(), if commands_open => WatcherWake::Command(command),
             _ = root_probe.tick() => WatcherWake::RootProbe,
             first = watcher.rx.recv() => WatcherWake::Event(first),
         };
@@ -7168,7 +7376,7 @@ async fn process_directory_events(
                     music_dirs,
                     tx,
                     playlist_sidebar_refresh,
-                    completed_commands,
+                    commands.completed,
                     command,
                 )
                 .await;
@@ -7223,6 +7431,13 @@ async fn process_directory_events(
             continue;
         }
 
+        let skipped = register_unsupported_names(&batch.unsupported_names);
+        if skipped > 0 {
+            let _ = tx
+                .send(LibraryEvent::UnsupportedFileNamesSkipped(skipped))
+                .await;
+        }
+
         if batch.is_empty() {
             continue;
         }
@@ -7239,6 +7454,7 @@ async fn process_directory_events(
                 playlist_sidebar_refresh,
                 scan_cancellation,
                 &batch.identity_changed_roots,
+                &mut commands,
             )
             .await;
             if reconciliation_pending {
@@ -7916,6 +8132,8 @@ async fn process_directory_events(
                 tx,
                 playlist_sidebar_refresh,
                 scan_cancellation,
+                &ScanDiscoveryHold::none(),
+                &mut commands,
             )
             .await
             {
@@ -8248,11 +8466,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    // Rows are persisted through `to_string_lossy`, so a non-UTF-8 name never
-    // round-trips back to its original bytes. Matching in the database's own
-    // lossy namespace keeps those rows reachable; matching through `Path` keeps
-    // the prefix component-wise, so `/music/Album` cannot capture the sibling
-    // `/music/Album2`.
+    // The watcher pairs only indexable paths, which are valid UTF-8, so this
+    // text is exact. Matching through `Path` keeps the prefix component-wise,
+    // so `/music/Album` cannot capture the sibling `/music/Album2`.
     let from_prefix = PathBuf::from(from.to_string_lossy().into_owned());
     let to_prefix = PathBuf::from(to.to_string_lossy().into_owned());
     if from_prefix.starts_with(&to_prefix) || to_prefix.starts_with(&from_prefix) {
@@ -10263,12 +10479,326 @@ mod tests {
         std::fs::write(&track, b"audio").expect("create public audio path");
         std::fs::write(&sibling, b"copy").expect("create private tag sibling");
 
-        let (audio_files, private_siblings, errors) =
-            enumerate_audio_files(library.path(), None, &[]);
+        let found = enumerate_audio_files(library.path(), None, &[]);
 
-        assert!(errors.is_empty());
-        assert_eq!(audio_files, vec![track]);
-        assert_eq!(private_siblings, vec![sibling]);
+        assert!(found.errors.is_empty());
+        assert_eq!(found.audio_files, vec![track]);
+        assert_eq!(found.private_siblings, vec![sibling]);
+    }
+
+    /// `stem` followed by one byte that can never appear in UTF-8, then
+    /// `.extension`: a native name with no exact text form.
+    #[cfg(target_os = "linux")]
+    fn non_utf8_name(stem: &str, invalid_byte: u8, extension: &str) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = stem.as_bytes().to_vec();
+        bytes.push(invalid_byte);
+        bytes.push(b'.');
+        bytes.extend_from_slice(extension.as_bytes());
+        std::ffi::OsString::from_vec(bytes)
+    }
+
+    /// Two names that differ only in an invalid byte collapse to the same
+    /// lossy text, which is also the exact text of a third file literally
+    /// named with U+FFFD. Only that literal name is exact, so only it is
+    /// indexable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enumeration_refuses_names_that_are_not_utf8_but_keeps_a_literal_replacement_character() {
+        let library = TestDirectory::new("unsupported-names-enumeration");
+        let first = library.path().join(non_utf8_name("a", 0xff, "wav"));
+        let second = library.path().join(non_utf8_name("a", 0xfe, "wav"));
+        let literal = library.path().join("a\u{FFFD}.wav");
+        for path in [&first, &second, &literal] {
+            write_minimal_wav(path);
+        }
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_eq!(first.to_string_lossy(), literal.to_string_lossy());
+
+        let mut found = enumerate_audio_files(library.path(), None, &[]);
+        found.unsupported_names.sort();
+
+        assert!(
+            found.errors.is_empty(),
+            "a refusal is not a traversal error"
+        );
+        assert_eq!(found.audio_files, vec![literal]);
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(found.unsupported_names, expected);
+    }
+
+    /// End to end through the scanner: neither colliding invalid name gets a
+    /// row, the literal U+FFFD file is indexed under its exact path, and the
+    /// UI hears about the two refusals once per session, before the scan
+    /// completes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scan_indexes_no_unsupported_name_and_reports_each_once() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("unsupported-names-scan");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join(non_utf8_name("a", 0xff, "wav")));
+        write_minimal_wav(&directory.path().join(non_utf8_name("a", 0xfe, "wav")));
+        let literal = directory.path().join("a\u{FFFD}.wav");
+        write_minimal_wav(&literal);
+        let music_dirs = [directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("first scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        let paths: Vec<&str> = rows.iter().map(|row| row.file_path.as_str()).collect();
+        assert_eq!(paths, vec![literal.to_str().expect("UTF-8 literal name")]);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let reported = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::UnsupportedFileNamesSkipped(2)))
+            .unwrap_or_else(|| panic!("the scan reports both refusals: {events:?}"));
+        let completed = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::ScanComplete))
+            .expect("the scan completes");
+        assert!(reported < completed);
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("second scan");
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LibraryEvent::UnsupportedFileNamesSkipped(_))),
+            "names already reported this session are not reported again: {events:?}"
+        );
+        assert_eq!(
+            track::Entity::find()
+                .all(&db)
+                .await
+                .expect("query tracks")
+                .len(),
+            1
+        );
+    }
+
+    /// Canonically equivalent names in different Unicode normalization forms
+    /// are distinct files on Linux. Each is valid UTF-8, so each keeps its
+    /// own exact row; nothing is normalized into a shared identity.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scan_keeps_differently_normalized_names_as_distinct_tracks() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("normalization-scan");
+        create_root_marker(directory.path()).expect("create root marker");
+        let composed = directory.path().join("caf\u{e9}.wav");
+        let decomposed = directory.path().join("cafe\u{301}.wav");
+        write_minimal_wav(&composed);
+        write_minimal_wav(&decomposed);
+        let (event_tx, _event_rx) = async_channel::unbounded();
+
+        initial_scan(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        let paths: HashSet<&str> = rows.iter().map(|row| row.file_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            HashSet::from([
+                composed.to_str().expect("UTF-8 name"),
+                decomposed.to_str().expect("UTF-8 name"),
+            ])
+        );
+    }
+
+    /// An earlier build stored an invalid name through a lossy conversion.
+    /// The file is still there, but the stored text names no file, and the
+    /// refused name no longer keeps that row alive as playable: the next
+    /// authoritative scan removes it like any other missing track.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_authoritative_scan_removes_a_legacy_lossy_row() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("unsupported-names-legacy-row");
+        create_root_marker(directory.path()).expect("create root marker");
+        let present = directory.path().join("present.wav");
+        write_minimal_wav(&present);
+        let invalid = directory.path().join(non_utf8_name("legacy", 0xff, "wav"));
+        write_minimal_wav(&invalid);
+        let music_dirs = [directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("enrolling scan");
+        let lossy = invalid.to_string_lossy().into_owned();
+        insert_rename_test_track(&db, "legacy-lossy", &lossy, "Legacy", 4).await;
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("reconciling scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        let paths: Vec<&str> = rows.iter().map(|row| row.file_path.as_str()).collect();
+        assert_eq!(paths, vec![present.to_str().expect("UTF-8 fixture")]);
+    }
+
+    /// The watcher applies the same boundary: an invalid name never reaches
+    /// the upsert, removal, or rename sets, so no row is keyed by its lossy
+    /// text; a rename with one refused side degrades to the other side on its
+    /// own; and a refused directory asks for the scan that reports its files.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_batch_refuses_names_that_are_not_utf8() {
+        use notify::event::{CreateKind, RenameMode};
+
+        let library = TestDirectory::new("unsupported-names-watcher");
+        let invalid = library.path().join(non_utf8_name("a", 0xff, "flac"));
+        let literal = library.path().join("a\u{FFFD}.flac");
+        std::fs::write(&invalid, b"audio").expect("create invalid name");
+        std::fs::write(&literal, b"audio").expect("create literal name");
+
+        let mut created = WatcherBatch::default();
+        for path in [&invalid, &literal] {
+            created.collect(
+                notify::Event::new(notify::EventKind::Create(CreateKind::File))
+                    .add_path(path.clone()),
+            );
+        }
+        created.finish();
+        assert_eq!(created.upsert_paths, HashSet::from([literal.clone()]));
+        assert_eq!(created.unsupported_names, HashSet::from([invalid.clone()]));
+        assert!(!created.reconciliation_required);
+
+        let song = library.path().join("song.flac");
+        let renamed = library.path().join(non_utf8_name("song", 0xfe, "flac"));
+        std::fs::write(&renamed, b"audio").expect("create renamed file");
+        let mut rename = WatcherBatch::default();
+        let mut from = rename_event(RenameMode::From, &[], Some(9));
+        from = from.add_path(song.clone());
+        let mut to = rename_event(RenameMode::To, &[], Some(9));
+        to = to.add_path(renamed.clone());
+        rename.collect(from);
+        rename.collect(to);
+        rename.finish();
+        assert!(rename.rename_pairs.is_empty());
+        assert_eq!(rename.remove_paths, HashSet::from([song]));
+        assert_eq!(rename.unsupported_names, HashSet::from([renamed]));
+        assert!(!rename.reconciliation_required);
+
+        let folder = library.path().join(non_utf8_name("album", 0xff, "d"));
+        std::fs::create_dir(&folder).expect("create invalid folder");
+        let mut directory = WatcherBatch::default();
+        directory.collect(
+            notify::Event::new(notify::EventKind::Create(CreateKind::Folder)).add_path(folder),
+        );
+        directory.finish();
+        assert!(directory.reconciliation_required);
+        assert!(directory.deferred_paths.is_empty() && directory.unsupported_names.is_empty());
+    }
+
+    /// End to end through the watcher loop: a new file with an invalid name
+    /// is reported to the UI without a row, an upsert, or a library rescan.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn watcher_reports_an_unsupported_name_without_indexing_or_rescanning() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("unsupported-names-watcher-loop");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+        let invalid = root.join(non_utf8_name("new", 0xff, "flac"));
+        std::fs::write(
+            &invalid,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write track with an invalid name");
+
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(idle_backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: event_rx,
+            ingress_overflowed: Arc::new(AtomicBool::new(false)),
+            watched_directories: HashSet::new(),
+            root_presence: HashMap::new(),
+            root_probe_interval: ROOT_PROBE_INTERVAL,
+        };
+        event_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(invalid)))
+            .await
+            .expect("queue create event");
+        drop(event_tx);
+
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let mut completed_commands = HashMap::new();
+        process_directory_events(
+            &db,
+            std::slice::from_ref(&root),
+            &library_events,
+            &command_rx,
+            &mut completed_commands,
+            watcher,
+            &test_playlist_sidebar_refresh(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("watcher loop exits cleanly");
+
+        let events: Vec<LibraryEvent> =
+            std::iter::from_fn(|| library_event_rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [LibraryEvent::UnsupportedFileNamesSkipped(1)]
+            ),
+            "{events:?}"
+        );
+        assert!(track::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("query tracks")
+            .is_empty());
     }
 
     #[test]
@@ -12423,7 +12953,7 @@ mod tests {
         );
     }
 
-    /// Deterministic R1 regression: hold a real initial scan inside read-only
+    /// Deterministic regression: hold a real initial scan inside read-only
     /// traversal, then admit a rating edit. The edit must settle while the
     /// discovery step is still held, because command service is driven
     /// independently of the scan's read-only work.
@@ -12471,6 +13001,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             control
@@ -12518,6 +13049,176 @@ mod tests {
         assert_eq!(rated.rating, Some(80));
     }
 
+    /// A watcher-triggered reconciliation services commands like the startup
+    /// scan: a rating admitted while its traversal is held settles before the
+    /// reconciliation can finish.
+    #[tokio::test]
+    async fn watcher_reconciliation_services_a_rating_while_discovery_is_held() {
+        let db = rename_test_database().await;
+        // Outside the scan root, so the reconciliation never touches the row.
+        let rating_path = std::env::temp_dir().join("tributary-reconcile-rating.flac");
+        insert_rename_test_track(
+            &db,
+            "reconcile-rating-track",
+            rating_path.to_string_lossy().as_ref(),
+            "Reconciled",
+            0,
+        )
+        .await;
+        let directory = TestDirectory::new("reconcile-held-discovery");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let mut completed = HashMap::new();
+        let mut commands = WatcherCommands {
+            rx: &command_rx,
+            completed: &mut completed,
+            handed_back: HandedBackCommands::default(),
+        };
+
+        let reconciliation = reconcile_watched_library(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &refresh,
+            &cancellation,
+            &hold,
+            &mut commands,
+        );
+        let driver = async {
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("reconcile-rating-track").expect("valid track ID"),
+                    rating: Some(Rating::new(60).expect("valid rating")),
+                })
+                .await
+                .expect("admit the rating command");
+            // Deadlocks (and times out) unless the rating settles while the
+            // traversal is still held.
+            loop {
+                let event = event_rx.recv().await.expect("event channel stays open");
+                if matches!(event, LibraryEvent::TrackRatingUpdated(_)) {
+                    break;
+                }
+            }
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::PostParse);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::CommitGuard);
+        };
+
+        let (result, ()) = tokio::join!(reconciliation, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the held reconciliation must service the rating");
+        });
+        result.expect("reconciliation completes after the hold is released");
+
+        let rated = track::Entity::find_by_id("reconcile-rating-track")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track exists");
+        assert_eq!(rated.rating, Some(60));
+        assert!(commands.handed_back.root_trust.is_none());
+        assert!(!commands.handed_back.rescan);
+    }
+
+    /// A reconciliation hands root-trust and rescan commands back to the
+    /// watcher loop unprocessed, and takes nothing after the root-trust
+    /// command, so a later rating keeps its FIFO place behind it.
+    #[tokio::test]
+    async fn watcher_reconciliation_hands_back_root_trust_and_rescan() {
+        let db = rename_test_database().await;
+        let trust_directory = TestDirectory::new("reconcile-handback-trust");
+        create_root_marker(trust_directory.path()).expect("create adoptable marker");
+        let trust_scan = scan_root(trust_directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &trust_scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed marker");
+        let request = build_root_trust_request(&trust_scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build adoption request");
+        let request_id = request.request_id();
+
+        let directory = TestDirectory::new("reconcile-handback");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let mut completed = HashMap::new();
+        let mut commands = WatcherCommands {
+            rx: &command_rx,
+            completed: &mut completed,
+            handed_back: HandedBackCommands::default(),
+        };
+
+        let reconciliation = reconcile_watched_library(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &refresh,
+            &cancellation,
+            &hold,
+            &mut commands,
+        );
+        let driver = async {
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            for command in [
+                LibraryCommand::Rescan,
+                LibraryCommand::ConfirmRootTrust(request),
+                LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("absent-track").expect("valid track ID"),
+                    rating: Some(Rating::new(20).expect("valid rating")),
+                },
+            ] {
+                command_tx.send(command).await.expect("admit the command");
+            }
+            while command_rx.len() > 1 {
+                tokio::task::yield_now().await;
+            }
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::PostParse);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::CommitGuard);
+        };
+
+        let (result, ()) = tokio::join!(reconciliation, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the held reconciliation must take the queued commands");
+        });
+        result.expect("reconciliation completes after the hold is released");
+
+        assert!(commands.handed_back.rescan);
+        assert!(matches!(
+            commands.handed_back.root_trust,
+            Some(LibraryCommand::ConfirmRootTrust(ref handed)) if handed.request_id() == request_id
+        ));
+        assert!(commands.completed.is_empty(), "root trust ran early");
+        assert!(
+            matches!(
+                command_rx.try_recv(),
+                Ok(LibraryCommand::SetTrackRating { .. })
+            ),
+            "the rating stays queued behind the handed-back command"
+        );
+    }
+
     /// Deterministic reserved-drain regression: a `Flush` admitted after an
     /// earlier rating is acknowledged only once the held scan settles, so no
     /// already-admitted command can be reported drained while discovery still
@@ -12556,6 +13257,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             control
@@ -12649,6 +13351,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             // Let the read-only phases through uncaptured (traversal, the
@@ -12713,7 +13416,7 @@ mod tests {
         );
     }
 
-    /// Round-3 regression: a command deferred behind an open scan write
+    /// Regression: a command deferred behind an open scan write
     /// transaction must settle PROMPTLY once that transaction commits — its
     /// write runs against an idle database, far below the production
     /// five-second busy timeout. Fail-closed: if the reciprocal gate ever
@@ -12761,6 +13464,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             control.release(ScanDiscoveryStage::Traversal);
@@ -12825,16 +13529,15 @@ mod tests {
         );
     }
 
-    /// Round-4 regression (PR #286 finding j9j81): cancellation that arrives
-    /// WHILE the scan is parked at a write boundary's command-settlement wait
-    /// must still refuse to open a write transaction. The pre-wait admission
-    /// check cannot observe a shutdown that lands mid-park, so the boundary
-    /// must re-check admission after the wait resolves — refusing exactly as
-    /// the pre-wait check does, keeping the write-transaction gate closed,
-    /// admitting no durable mutation, and letting the close drain settle
-    /// promptly. Fail-closed: a regression to the pre-round-4 behavior opens
-    /// the transaction here and the engine future never settles inside the
-    /// join timeout.
+    /// Regression: cancellation that arrives WHILE the scan is parked at a
+    /// write boundary's command-settlement wait must still refuse to open a
+    /// write transaction. The pre-wait admission check cannot observe a
+    /// shutdown that lands mid-park, so the boundary must re-check admission
+    /// after the wait resolves — refusing exactly as the pre-wait check does,
+    /// keeping the write-transaction gate closed, admitting no durable
+    /// mutation, and letting the close drain settle promptly. Fail-closed:
+    /// without the re-check the boundary opens the transaction here and the
+    /// engine future never settles inside the join timeout.
     #[tokio::test]
     async fn scan_cancelled_during_command_settlement_wait_never_opens_write_txn() {
         let db = rename_test_database().await;
@@ -12875,6 +13578,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             // Read-only phases pass uncaptured; the seam this test cares
@@ -12938,14 +13642,14 @@ mod tests {
         let _ = event_rx.try_recv();
     }
 
-    /// Round-3 reciprocal regression (cid 4051684281): dispatched command work
-    /// that is still in flight must hold the scan AT its write boundaries —
-    /// the scan may not open a write transaction the work's own writes would
-    /// queue behind. Ordering proof: the rating is dispatched while the scan
-    /// is parked at the post-parse rendezvous, and by the time the scan
-    /// reaches the in-transaction CommitGuard rendezvous the rating has
-    /// already settled, because every boundary crossing requires the in-flight
-    /// flag to be clear.
+    /// Reciprocal regression: dispatched command work that is still in flight
+    /// must hold the scan AT its write boundaries — the scan may not open a
+    /// write transaction the work's own writes would queue behind. Ordering
+    /// proof: the rating is dispatched while the scan is parked at the
+    /// post-parse rendezvous, and by the time the scan reaches the
+    /// in-transaction CommitGuard rendezvous the rating has already settled,
+    /// because every boundary crossing requires the in-flight flag to be
+    /// clear.
     #[tokio::test]
     async fn scan_write_boundary_defers_while_dispatched_command_work_is_in_flight() {
         let db = rename_test_database().await;
@@ -12988,6 +13692,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             // Hold the scan at the per-file post-parse rendezvous — still
@@ -13199,6 +13904,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let (flush_tx, flush_rx) = async_channel::bounded(1);
         let driver = async {
@@ -16142,6 +16848,7 @@ mod tests {
             root: nested.clone(),
             audio_files: Vec::new(),
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             errors: vec!["simulated permission error".to_string()],
             device_id: Some("simulated-device".to_string()),
             mount_generation: Some(0),
@@ -16319,6 +17026,7 @@ mod tests {
             root: root.clone(),
             audio_files: Vec::new(),
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             errors: Vec::new(),
             device_id: Some("underlying-mountpoint".to_string()),
             mount_generation: Some(0),
@@ -16340,6 +17048,7 @@ mod tests {
             root: root.clone(),
             audio_files: vec![(root.join("song.mp3"), String::new())],
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             errors: Vec::new(),
             device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
             mount_generation: Some(0),
@@ -17118,16 +17827,15 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Q4 engine-loop/GTK responsiveness lane (tr-am6qr).
+    // Q4 engine-loop/GTK responsiveness lane.
     //
     // Measurement harness for the engine-side startup endpoints this lane
     // owns: time to publish the startup snapshot (FullSync / ScanComplete)
     // and cancellation settlement of the FIFO barrier when commands and the
     // shutdown Flush are admitted while the initial scan is still in
     // flight. The GTK-side publication/stall endpoints are measured by the
-    // env-gated helper in `ui::browser::tests` (see that module). Sibling
-    // lane tr-7nguk owns the shared fixture/parse-delay seam; until it
-    // lands this harness stands alone on committed fixture bytes.
+    // env-gated helper in `ui::browser::tests` (see that module). This
+    // harness stands alone on committed fixture bytes.
     //
     // The harness is `#[ignore]`d because it is an explicit measurement
     // run (budgets are recorded per runner in
@@ -17226,11 +17934,11 @@ mod tests {
                     // before it acks the Flush barrier, so when the collector
                     // is polled with both channels ready the queued events
                     // must be stamped ahead of the ack. Polling the flush arm
-                    // first let the ack win that race: the loop broke, the
-                    // post-loop drain stamped ScanComplete AFTER flush_ack_us,
-                    // and the bench's `scan_complete_us <= flush_ack_us`
-                    // settlement assert panicked (tr-kcfmsh, reproduced on
-                    // main fc5d0d6a).
+                    // first would let the ack win that race: the loop would
+                    // break, the post-loop drain would stamp ScanComplete
+                    // AFTER flush_ack_us, and the bench's
+                    // `scan_complete_us <= flush_ack_us` settlement assert
+                    // would panic.
                     event = event_rx.recv() => {
                         match event {
                             Ok(event) => {
@@ -17270,12 +17978,11 @@ mod tests {
         timeline
     }
 
-    /// Regression (PR #291 review Correction 1): the startup-timeline
-    /// sampler must stamp each event when it ARRIVES, not when the
-    /// `select!` wait began. Feed two events at known post-entry delays
-    /// and require the recorded `*_us` values to reflect those delays —
-    /// the defective sampler stamped the first event with ~0 µs (loop
-    /// entry) because it sampled before blocking on the empty channel.
+    /// Regression: the startup-timeline sampler must stamp each event when
+    /// it ARRIVES, not when the `select!` wait began. Feed two events at
+    /// known post-entry delays and require the recorded `*_us` values to
+    /// reflect those delays — sampling before blocking on the empty channel
+    /// would stamp the first event with ~0 µs (loop entry).
     /// Cheap by construction: no fixture tree, no engine, no `#[ignore]`.
     #[tokio::test]
     async fn q4_startup_timeline_stamps_arrival_not_wait_start() {
@@ -17334,7 +18041,7 @@ mod tests {
         // stamp is floored at the second delay. The event arm is polled
         // first under `biased;`, so a queued FullSync is stamped before
         // the ack even when both channels are ready at the same poll —
-        // the ack never preempts already-published events (tr-kcfmsh).
+        // the ack never preempts already-published events.
         let flush_ack_us = timeline.flush_ack_us.expect("flush ack recorded");
         assert!(
             flush_ack_us >= SECOND_DELAY_MS * 1_000,
@@ -17346,19 +18053,18 @@ mod tests {
         );
     }
 
-    /// Regression (tr-kcfmsh): the settlement sampler must drain
-    /// already-published events BEFORE selecting the Flush ack. Pre-load
-    /// the event channel with a large queue whose LAST entry is
-    /// ScanComplete, and ack the Flush barrier before the sampler is ever
-    /// polled, so both channels are ready at its first `select!`. Under
-    /// the old flush-first bias the ack won that race immediately and the
-    /// post-loop drain stamped ScanComplete milliseconds AFTER the ack,
-    /// panicking the Q4 bench (`scan_complete_us <= flush_ack_us`). With
-    /// event-first bias every queued event is consumed in-loop and the
-    /// ack is stamped last. The queue is sized so the defective ordering
-    /// fails the assert by a wide, deterministic margin rather than a
-    /// clock-granularity flake. Cheap by construction: no fixture tree,
-    /// no engine, no `#[ignore]`.
+    /// Regression: the settlement sampler must drain already-published events
+    /// BEFORE selecting the Flush ack. Pre-load the event channel with a large
+    /// queue whose LAST entry is ScanComplete, and ack the Flush barrier
+    /// before the sampler is ever polled, so both channels are ready at its
+    /// first `select!`. Under the old flush-first bias the ack won that race
+    /// immediately and the post-loop drain stamped ScanComplete milliseconds
+    /// AFTER the ack, panicking the Q4 bench (`scan_complete_us <=
+    /// flush_ack_us`). With event-first bias every queued event is consumed
+    /// in-loop and the ack is stamped last. The queue is sized so the
+    /// defective ordering fails the assert by a wide, deterministic margin
+    /// rather than a clock-granularity flake. Cheap by construction: no
+    /// fixture tree, no engine, no `#[ignore]`.
     #[tokio::test]
     async fn q4_startup_timeline_acks_only_after_queued_events_drain() {
         let (event_tx, event_rx) = async_channel::unbounded();
@@ -17421,12 +18127,12 @@ mod tests {
     /// scan-settle wait it used to block on is the R9 delay this engine
     /// removed), and the FIFO barrier acks only after the scan drains —
     /// nothing admitted during the scan is lost or reordered.
-    #[ignore = "explicit Q4 measurement harness; run with --ignored (tr-am6qr)"]
+    #[ignore = "explicit Q4 measurement harness; run with --ignored"]
     // The parse-delay window inside intentionally holds a std::MutexGuard
     // across the engine-run awaits — exclusivity with the sibling
-    // large-library harness is the point (refinery F2, PR #285). This
-    // current-thread tokio test cannot deadlock on it; only sibling
-    // test-harness threads block, which is the required serialization.
+    // large-library harness is the point. This current-thread tokio test
+    // cannot deadlock on it; only sibling test-harness threads block, which is
+    // the required serialization.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn q4_engine_startup_and_during_scan_admission_benchmark() {
@@ -17499,10 +18205,9 @@ mod tests {
         // Serialize the engine run against any concurrent parse-delay
         // window: both opt-in Q4 tests share the process-wide seam, and an
         // overlapping armed delay would distort this timeline and pollute
-        // the invocation counter (refinery F2, PR #285). Released after the
-        // abort below, mirroring the production teardown shape. (The
-        // function-level `allow` covers the intentional hold across the
-        // timeline awaits.)
+        // the invocation counter. Released after the abort below, mirroring
+        // the production teardown shape. (The function-level `allow` covers
+        // the intentional hold across the timeline awaits.)
         let parse_delay_window = super::TEST_ONLY_PARSE_DELAY_WINDOW
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17617,9 +18322,8 @@ mod tests {
 
         struct ParseDelayGuard {
             /// Held for the guard's whole window so a concurrent harness
-            /// cannot arm, poll, or reset the shared seam under us
-            /// (refinery F2, PR #285). Released after the delay static is
-            /// disarmed in `Drop`.
+            /// cannot arm, poll, or reset the shared seam under us.
+            /// Released after the delay static is disarmed in `Drop`.
             _window: std::sync::MutexGuard<'static, ()>,
         }
 

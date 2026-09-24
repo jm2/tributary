@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   have Tributary watch the partition. If another client changes the song or the playback options,
   or Tributary loses contact with the partition, it stops controlling that output until you
   select it again.
+- **Seek bar and artwork in the system media controls** — The desktop's media controls (MPRIS on
+  Linux, the Windows media overlay, and macOS Now Playing) now show the track's length, position,
+  and cover art, and seeking there moves playback.
 - **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure and
   connecting or disconnecting an account. Current release builds don't include Last.fm
   application credentials, so the group shows the feature as unavailable.
@@ -57,13 +60,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dividers and dimmed item counts, and screen readers announce each browser row once.
 - **Confirm before deleting** — Deleting a playlist or removing a saved server from the sidebar now
   asks for confirmation first, with Cancel as the default.
+- **GPU rendering in the Flatpak** — The Flatpak can now use the graphics card, so the interface
+  is drawn with hardware acceleration instead of in software.
 - **Maintenance** — Dependencies were refreshed, the fuzz tests now cover more file and network
   parsers, and CI runs the interface tests on a real display, checks one shared lockfile, and
   auto-merges only patch-level dependency updates. Unused internal code and placeholder data no
-  longer ship in the app.
+  longer ship in the app. Builds compile one TLS crypto library instead of two, and CI now runs
+  the test suite on Windows on ARM.
 
 ### Fixed
 
+- **Files with non-UTF-8 names** — On Linux and other Unix systems, audio files whose names
+  aren't valid UTF-8 are now skipped with a notice saying how many, instead of being stored under
+  a garbled name that could merge distinct files into one track or never play. XSPF imports skip
+  and count entries that point at such names, and tracks stored that way by earlier versions are
+  removed by the next complete library scan.
 - **Single instance on Windows** — Starting Tributary again, or opening a file with it, while
   it is already running now hands off to the running window instead of starting a second copy.
 - **Fewer freezes** — Album artwork is decoded in the background at the size it is shown, ejecting a
@@ -146,6 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rescan to finish.
 - **Playlist edits during a scan** — Creating, renaming, deleting, importing, or editing playlists
   while a scan is running now waits briefly instead of failing with "database is locked".
+- **Edits during library refreshes** — Ratings and play counts no longer wait for a library refresh
+  that file changes started, such as after syncing music into a library folder.
 - **Upgrading libraries from 0.5.x** — A deleted song with a blank artist tag in an old playlist no
   longer stops the upgrade and leaves the library empty. If the library database can't be opened
   or upgraded, Tributary now shows an error instead of an empty library.
@@ -172,6 +185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **XSPF import and export** — Exports keep an existing file's permissions, new exports are readable
   by other programs, and exporting over a symbolic link updates the file it points to. A playlist
   with one bad duration still imports, and files over 64 MiB are refused with a clear message.
+- **Relative XSPF locations** — Importing an XSPF playlist now uses track locations written
+  relative to the playlist file instead of ignoring them.
 - **Playlist housekeeping** — Deleted default smart playlists no longer come back, Rhythmbox imports
   keep their playlist order, and file changes no longer re-read the whole library when some playlist
   entries are unmatched.

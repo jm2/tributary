@@ -1,15 +1,12 @@
 //! Isolated built-in-local artwork resolution tests.
 //!
-//! R1 (2026-09-17 refinery audit): the replaced
-//! `builtin_local_artwork_resolves_on_the_application_runtime` fixture
-//! called the production `init_db()` seam, so a normal `cargo test`
-//! run created, migrated, and opened the real user library at
-//! `dirs::data_dir()/tributary/library.db`; its single `NoArtwork`
-//! assertion also accepted a database error, so the test could pass
-//! without exercising the retained-authority work at all. These tests
-//! resolve through the [`super::LocalLibrary::Injected`] seam against
-//! a private in-memory library and an authorized temporary root whose
-//! track carries real embedded artwork.
+//! These tests never reach the production `init_db()` seam, which would
+//! create, migrate, and open the real user library at
+//! `dirs::data_dir()/tributary/library.db`. They resolve through the
+//! [`super::LocalLibrary::Injected`] seam against a private in-memory
+//! library and an authorized temporary root whose track carries real
+//! embedded artwork, and they tell a missing row apart from a database
+//! error.
 
 use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
 use sea_orm_migration::MigratorTrait;
@@ -132,10 +129,9 @@ fn resolve_from_glib_without_runtime(
     .expect("pane resolution thread")
 }
 
-/// R1 correction (2026-09-17 refinery audit): the built-in local arm
-/// must resolve a real track successfully through the retained
-/// authority on the application runtime — driven from a GLib main
-/// context with no entered runtime — and the embedded artwork must
+/// The built-in local arm must resolve a real track successfully
+/// through the retained authority on the application runtime — driven from a
+/// GLib main context with no entered runtime — and the embedded artwork must
 /// extract through the retained file capability. The fixture track
 /// exists only in the injected in-memory library, so a successful
 /// retained-file resolution is itself the proof that no library
@@ -175,8 +171,7 @@ fn builtin_local_artwork_resolves_retained_embedded_art_on_the_application_runti
 /// The missing-track failure path, isolated: a built-in local row whose
 /// id is absent from the injected fixture library leaves the
 /// placeholder, and the failure is deterministic (row missing, not a
-/// database error) — the former R1 fixture could not distinguish the
-/// two because it also accepted a database error.
+/// database error).
 #[test]
 fn missing_builtin_local_track_leaves_the_placeholder() {
     let runtime = tokio::runtime::Runtime::new().expect("application tokio runtime");

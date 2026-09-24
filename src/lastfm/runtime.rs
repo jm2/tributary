@@ -1187,7 +1187,7 @@ struct ActiveAccount {
     last_delivery_generation: LastFmDeliveryGeneration,
     last_now_playing_generation: LastFmNowPlayingGeneration,
     delivery: Option<DeliveryRuntime>,
-    #[allow(dead_code)] // Retains the runtime's primary vault-generation share.
+    /// Retains the runtime's primary vault-generation share.
     vault_lease: Option<SharedVaultLifecycleLease>,
 }
 

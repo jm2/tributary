@@ -52,10 +52,8 @@ pub type MutationTargetFuture =
     Pin<Box<dyn Future<Output = BackendResult<MountedMutationTarget>> + Send + 'static>>;
 // Record C intentionally stops at an internally tested authority foundation;
 // Record D is the first non-test caller of the server-playlist surface.
-#[cfg_attr(not(test), allow(dead_code))]
 pub type ServerPlaylistListFuture =
     Pin<Box<dyn Future<Output = BackendResult<Vec<ServerPlaylistSummary>>> + Send + 'static>>;
-#[cfg_attr(not(test), allow(dead_code))]
 pub type ServerPlaylistSnapshotFuture =
     Pin<Box<dyn Future<Output = BackendResult<ServerPlaylistSnapshot>> + Send + 'static>>;
 
@@ -218,7 +216,6 @@ pub enum RegularPlaylistCapability {
 /// catalogue does not publish, but it never grants playlist membership or
 /// playback authority by itself.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum ServerPlaylistCapability {
     #[default]
     Unsupported,
@@ -443,7 +440,6 @@ impl std::fmt::Debug for PlaybackAttributionProfile {
 /// The receipt stays private and retains no lease or adapter. Callers can
 /// derive only a presence selection or exact absence evidence; they cannot
 /// extract an epoch or forge a commit admission from list contents.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistListing {
     source_id: SourceId,
     receipt: SessionOperationReceipt<dyn ManagedSourceAdapter>,
@@ -471,7 +467,6 @@ impl ServerPlaylistCommitBinding {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ServerPlaylistListing {
     pub const fn source_id(&self) -> SourceId {
         self.source_id
@@ -512,7 +507,6 @@ impl ServerPlaylistListing {
 /// Opaque proof that one exact native playlist was present in a successful
 /// complete listing. It is consumed by the detail request and has no public
 /// identity, epoch, adapter, or authority accessors.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistSelection {
     source_id: SourceId,
     native_id: NativePlaylistId,
@@ -521,7 +515,6 @@ pub struct ServerPlaylistSelection {
 
 /// One successfully fetched detail snapshot with an exact-session receipt for
 /// final persistence admission.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistPull {
     source_id: SourceId,
     snapshot: ServerPlaylistSnapshot,
@@ -529,12 +522,12 @@ pub struct ServerPlaylistPull {
     commit_binding: ServerPlaylistCommitBinding,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ServerPlaylistPull {
     pub const fn source_id(&self) -> SourceId {
         self.source_id
     }
 
+    #[cfg(test)]
     pub fn native_id(&self) -> &NativePlaylistId {
         self.snapshot.native_id()
     }
@@ -556,7 +549,6 @@ impl ServerPlaylistPull {
 /// This type deliberately has no `Debug` implementation: its typed native ID
 /// is exposed only to the persistence boundary that must compare and retain
 /// it, never to diagnostics or commit authority.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistAbsenceEvidence {
     source_id: SourceId,
     native_id: NativePlaylistId,
@@ -564,7 +556,6 @@ pub struct ServerPlaylistAbsenceEvidence {
     commit_binding: ServerPlaylistCommitBinding,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ServerPlaylistAbsenceEvidence {
     pub const fn source_id(&self) -> SourceId {
         self.source_id
@@ -587,7 +578,6 @@ impl ServerPlaylistAbsenceEvidence {
 /// Raw adapter errors, response bodies, credentials, locators, and native
 /// identities never cross this boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum ServerPlaylistError {
     #[error("server playlists are unsupported for this source")]
     UnsupportedSource,
@@ -649,7 +639,6 @@ impl PartialEq for PlaybackReferenceBinding {
 impl Eq for PlaybackReferenceBinding {}
 
 #[derive(Clone, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum PlaybackSourceReferenceKind {
     Session {
         media_key: MediaKey,
@@ -803,14 +792,12 @@ pub struct RegularPlaylistTrackMetadata {
     composer: Option<String>,
     genre: Option<String>,
     year: Option<i32>,
-    date_added: Option<chrono::DateTime<chrono::Utc>>,
     date_modified: Option<chrono::DateTime<chrono::Utc>>,
     bitrate_kbps: Option<u32>,
     sample_rate_hz: Option<u32>,
     format: Option<String>,
     play_count: Option<u32>,
     rating: crate::architecture::models::TrackRating,
-    last_played: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl RegularPlaylistTrackMetadata {
@@ -826,14 +813,12 @@ impl RegularPlaylistTrackMetadata {
             composer: track.composer.clone(),
             genre: track.genre.clone(),
             year: track.year,
-            date_added: track.date_added,
             date_modified: track.date_modified,
             bitrate_kbps: track.bitrate_kbps,
             sample_rate_hz: track.sample_rate_hz,
             format: track.format.clone(),
             play_count: track.play_count,
             rating: track.rating,
-            last_played: track.last_played,
         }
     }
 
@@ -877,13 +862,6 @@ impl RegularPlaylistTrackMetadata {
         self.year
     }
 
-    // Kept in the explicit catalogue whitelist for future source-aware sort
-    // projections; Record B does not yet expose a Date Added column.
-    #[allow(dead_code)]
-    pub fn date_added(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.date_added
-    }
-
     pub fn date_modified(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.date_modified
     }
@@ -906,13 +884,6 @@ impl RegularPlaylistTrackMetadata {
 
     pub const fn rating(&self) -> crate::architecture::models::TrackRating {
         self.rating
-    }
-
-    // Remote history is intentionally read-only. The value may cross this
-    // sanitized boundary even though local-only history UI does not consume it.
-    #[allow(dead_code)]
-    pub fn last_played(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.last_played
     }
 }
 
@@ -1169,12 +1140,10 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
     /// Explicit opt-in for pull-only server-native playlist snapshots.
     /// Implementations remain denied unless their protocol adapter is
     /// reviewed for bounded exact native IDs and read-only request semantics.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn server_playlist_capability(&self) -> ServerPlaylistCapability {
         ServerPlaylistCapability::Unsupported
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn list_server_playlists(self: Arc<Self>) -> ServerPlaylistListFuture {
         Box::pin(async {
             Err(BackendError::Unsupported {
@@ -1183,7 +1152,6 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn get_server_playlist(
         self: Arc<Self>,
         _native_id: NativePlaylistId,
@@ -1299,12 +1267,10 @@ where
     RegularPlaylistCapability::SourceScopedEntries
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 mod server_playlist_sealed {
     pub trait Adapter {}
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn server_playlist_capability<A>() -> ServerPlaylistCapability
 where
     A: server_playlist_sealed::Adapter,
@@ -1655,7 +1621,6 @@ impl RegularPlaylistCommitAuthority {
 /// lifecycle permit is declared before the registry owner so final-handle
 /// teardown cannot wait on a permit owned by the value being destroyed.
 #[must_use = "server-playlist commit authority must be retained through the database commit"]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct ServerPlaylistCommitAuthority {
     #[allow(dead_code)] // Retention through Drop is the authority operation.
     authority: SessionCommitAuthority,
@@ -1969,7 +1934,6 @@ impl SourceRegistry {
 
     /// Mint one opaque attribution reference from an exact accepted
     /// source-wide catalogue and its live session.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mint_regular_playlist_playback_source(
         &self,
         media_key: MediaKey,
@@ -2447,7 +2411,7 @@ impl SourceRegistry {
     /// with the session epoch. A replacement, disconnect, retirement, or
     /// shutdown completed while the request is in flight discards either its
     /// value or its backend error and reports unavailable authority.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub async fn list_server_playlists(
         &self,
         source_id: SourceId,
@@ -2504,7 +2468,6 @@ impl SourceRegistry {
     /// catalogue: endpoint membership is import/synchronization input, while
     /// regular-playlist projection and playback retain their independent
     /// catalogue authority checks.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_server_playlist(
         &self,
         selection: ServerPlaylistSelection,
@@ -2544,7 +2507,6 @@ impl SourceRegistry {
     /// successful detail snapshot. The pull remains the sole carrier of its
     /// native identity; the returned authority contains only a session permit
     /// and registry owner.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn acquire_server_playlist_pull_commit_authority(
         &self,
         pull: &ServerPlaylistPull,
@@ -2555,7 +2517,6 @@ impl SourceRegistry {
     /// Acquire commit-scoped authority for exact absence proven by a
     /// successful complete listing. A detail/backend failure has no evidence
     /// type and therefore cannot call this boundary.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn acquire_server_playlist_absence_commit_authority(
         &self,
         evidence: &ServerPlaylistAbsenceEvidence,
@@ -2832,7 +2793,7 @@ impl SourceRegistry {
     /// Playback callers use [`Self::resolve_stream`], which draws on the
     /// reserved playback capacity. The album pane calls this with
     /// [`StreamResolutionClass::Speculative`] so its mounted probes are
-    /// bounded and isolated from playback (2026-09-14 review finding).
+    /// bounded and isolated from playback.
     pub async fn resolve_stream_classified(
         &self,
         source_id: SourceId,
@@ -3281,7 +3242,6 @@ fn regular_playlist_media_error(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn server_playlist_error(error: SessionOperationError) -> ServerPlaylistError {
     match error {
         SessionOperationError::Unavailable => ServerPlaylistError::Unavailable,
@@ -8966,8 +8926,7 @@ mod tests {
     /// for the exact live session epoch of a retained-file-capable adapter,
     /// and false for a superseded epoch, an absent source, or a retired
     /// session — so a pathless row never probes a mount it has no authority
-    /// to read and never mints a stream credential to infer the source kind
-    /// (2026-09-14 review finding).
+    /// to read and never mints a stream credential to infer the source kind.
     #[tokio::test]
     async fn retains_file_streams_is_true_only_for_the_exact_live_removable_session() {
         let registry = registry();

@@ -36,7 +36,7 @@ pub(super) struct PaneFetch {
     /// scheduled. The built-in local library's retained authority polls
     /// Tokio time/blocking APIs, which panic on the runtime-less GTK main
     /// context the pane fetch runs on, so that arm is executed on this
-    /// handle (2026-09-13 review finding).
+    /// handle.
     pub(super) rt_handle: Option<tokio::runtime::Handle>,
     /// Configured library roots, snapshotted on the main thread when the
     /// fetch was scheduled. The built-in local library's retained
@@ -48,9 +48,8 @@ pub(super) struct PaneFetch {
 }
 
 /// The spawned half of one pane fetch: resolve, paint, and install the
-/// cache probe. Split out of `spawn_fetch` (Codacy function-size limit) —
-/// the liveness/generation gates in [`finish_pane_fetch`] are the
-/// post-await half of the rebind contract documented at the bind
+/// cache probe. The liveness/generation gates in [`finish_pane_fetch`] are
+/// the post-await half of the rebind contract documented at the bind
 /// factory's `revoke` call.
 ///
 /// Deliberately a synchronous function that spawns the async body onto
@@ -73,9 +72,9 @@ pub(super) fn orchestrate_pane_fetch(
     // dispatching the paint, so a FullSync that landed during that await
     // labelled a texture resolved from the OLD catalogue with the NEW
     // generation — exactly the schedule-time/admission-time disagreement
-    // `CacheAdmission` documents against (2026-09-12 review finding). The
-    // schedule-time generation is carried through paint and admission, and
-    // admission additionally rejects the result if the generation moved.
+    // `CacheAdmission` documents against. The schedule-time generation is
+    // carried through paint and admission, and admission additionally rejects
+    // the result if the generation moved.
     let content_generation = fetch.cache.content_generation();
     glib::MainContext::default().spawn_local(async move {
         // Step 1: resolve the artwork path. The decision tree mirrors
@@ -90,8 +89,7 @@ pub(super) fn orchestrate_pane_fetch(
             fetch.configured_roots.clone(),
             fetch.rt_handle.clone(),
             // Production resolves against the process-wide shared
-            // library; tests inject a private connection instead (R1,
-            // 2026-09-17 refinery audit).
+            // library; tests inject a private connection instead.
             LocalLibrary::Shared,
             &candidate,
             &liveness,
@@ -183,7 +181,7 @@ fn finish_pane_fetch(
 /// fetch was scheduled. Every arm passes it through so the decoded texture
 /// is downscaled to the preference before painting (and before the cache
 /// probe charges its retained surface): `set_pixel_size` alone does not
-/// bound an installed `gdk::Texture` (2026-09-13 review finding).
+/// bound an installed `gdk::Texture`.
 fn paint_resolved_art(
     resolved: ResolvedArtKind,
     image: &gtk::Image,
@@ -231,7 +229,7 @@ struct CacheAdmission {
     /// FullSync that lands mid-flight bumps the cache's generation, and
     /// this older-generation texture then inserts under a key the new
     /// generation can never query — changed covers re-resolve instead of
-    /// serving the pre-sync pixels (2026-09-10 review finding).
+    /// serving the pre-sync pixels.
     content_generation: u64,
     pub(super) album_key: String,
     pub(super) pixel_size: i32,
@@ -277,8 +275,7 @@ pub(super) fn disconnect_paintable_listener(image: &gtk::Image, cell_state: &Alb
 /// so a texture decoded from the pre-sync candidate must not enter the
 /// cache under the new catalogue: equality is required. The row still
 /// displays the texture it received; only its cache retention is
-/// declined, and the next bind re-resolves against the new catalogue
-/// (2026-09-12 review finding).
+/// declined, and the next bind re-resolves against the new catalogue.
 fn admit_scheduled_generation(scheduled_generation: u64, current_generation: u64) -> bool {
     scheduled_generation == current_generation
 }
@@ -316,9 +313,9 @@ fn install_cache_probe(
         // Reject a texture resolved from the pre-FullSync catalogue: the
         // schedule-time generation is authoritative for this result, and
         // the live generation moving means the catalogue changed while the
-        // resolution was pending (2026-09-12 review finding). The row
-        // still displays the texture; it is simply not admitted, so the
-        // next bind re-resolves against the new catalogue.
+        // resolution was pending. The row still displays the texture; it is
+        // simply not admitted, so the next bind re-resolves against the new
+        // catalogue.
         if !admit_scheduled_generation(content_generation, cache.content_generation()) {
             return;
         }
@@ -349,7 +346,7 @@ mod tests {
     /// generation at admission (`install_cache_probe`), and this gate is
     /// that comparison. Without it a pre-sync texture would be inserted
     /// under a generation the new catalogue never queries — a silent
-    /// stale admission (2026-09-12 review finding).
+    /// stale admission.
     #[test]
     fn interposed_fullsync_rejects_a_pre_sync_admission() {
         let cache = AlbumArtCache::new();

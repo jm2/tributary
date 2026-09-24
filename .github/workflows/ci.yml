@@ -624,11 +624,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      # Heavier strict-lint passes only on x86_64 — the windows-11-arm
-      # runner is materially slower than the rest, so we skip the extra
-      # clippy passes and the cargo-test step there. ARM64 still gets a
-      # build to confirm cross-compile health and produces a release
-      # artifact.
+      # The debug --all-targets clippy pass runs only on x86_64: no code is
+      # gated on target_arch, so its lints cannot differ on aarch64. Both
+      # legs build natively on their own runner, so both run the tests.
       - name: Clippy (debug, --all-targets)
         if: matrix.arch == 'x86_64'
         run: |
@@ -637,14 +635,6 @@ jobs:
           cargo clippy --all-targets --target ${{ matrix.rust_target }} -- -D warnings
 
       - name: Clippy (release)
-        if: matrix.arch == 'x86_64'
-        run: |
-          export PKG_CONFIG_ALLOW_CROSS="1"
-          export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
-          cargo clippy --release --target ${{ matrix.rust_target }} -- -D warnings
-
-      - name: Clippy (release, ARM64-only fast path)
-        if: matrix.arch == 'aarch64'
         run: |
           export PKG_CONFIG_ALLOW_CROSS="1"
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
@@ -657,7 +647,6 @@ jobs:
           cargo build --release --target ${{ matrix.rust_target }}
 
       - name: Run tests
-        if: matrix.arch == 'x86_64'
         run: |
           export PKG_CONFIG_ALLOW_CROSS="1"
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"

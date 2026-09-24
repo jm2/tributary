@@ -13,8 +13,6 @@
 //! invariant across output changes instead of relying on playbin's incidental
 //! `element-setup` ordering.
 
-#![cfg_attr(test, allow(dead_code))]
-
 #[cfg(any(target_os = "macos", test))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
@@ -26,6 +24,7 @@ use gstreamer as gst;
 #[cfg(target_os = "macos")]
 use gtk::glib;
 
+#[cfg(target_os = "macos")]
 const OSX_AUDIO_FACTORY: &str = "osxaudiosink";
 #[cfg(target_os = "macos")]
 const CHANNEL_FILTER_FACTORY: &str = "capsfilter";
@@ -109,6 +108,7 @@ impl ReopenCoordinator {
         self.generation.load(Ordering::Acquire) != applied_generation
     }
 
+    #[cfg(target_os = "macos")]
     fn abandon(&self) {
         self.pending.store(false, Ordering::Release);
     }
@@ -303,6 +303,7 @@ fn cap_raw_audio_channels(caps: gst::Caps) -> gst::Caps {
     capped
 }
 
+#[cfg(target_os = "macos")]
 fn has_stereo_channel_cap(caps: &gst::CapsRef) -> bool {
     let raw = gst::Caps::builder("audio/x-raw").build();
     let raw_over_stereo = gst::Caps::builder("audio/x-raw")

@@ -2,6 +2,9 @@
 app:
   not_playing: "Niets afspelen"
   scanning: "Bibliotheek scannen…"
+  unsupported_file_names_skipped:
+    one: "%{count} audiobestand overgeslagen: de naam is geen geldige UTF-8"
+    other: "%{count} audiobestanden overgeslagen: de namen zijn geen geldige UTF-8"
   live: "LIVE"
 
 # ── Header bar ─────────────────────────────────────────────────────
@@ -204,6 +207,7 @@ playlist_io:
   import_success_heading: "XSPF-afspeellijst geïmporteerd"
   import_warning_heading: "XSPF-afspeellijst met waarschuwingen geïmporteerd"
   import_success_body: "‘%{name}’ is geïmporteerd.\n\nOvereenkomend: %{matched}\nNiet overeenkomend (behouden): %{unmatched}\nMislukt (niet geïmporteerd): %{failed}"
+  import_skipped_unsupported_names: "Overgeslagen (bestandsnaam geen geldige UTF-8): %{count}"
   import_failed_heading: "XSPF-afspeellijst kon niet worden geïmporteerd"
   import_rollback_body: "%{error}\n\nEr is geen afspeellijst of item vastgelegd; alle databasewijzigingen zijn teruggedraaid."
   import_worker_failed_body: "Het importproces is gestopt voordat het een resultaat kon melden: %{error}\n\nEr is geen vastgelegde afspeellijst gepubliceerd."

@@ -537,12 +537,9 @@ impl Player {
 
     /// Non-blocking query of the current playback state.
     ///
-    /// Reachable only through `LocalOutput::state` (the trait impl),
-    /// which itself currently has no production caller — the UI
-    /// follows state via `PlayerEvent::StateChanged` instead. Keeping
-    /// the method as part of `Player`'s API surface for future
-    /// on-demand queries.
-    #[allow(dead_code)]
+    /// Backs `LocalOutput::state`; the UI follows state through
+    /// `PlayerEvent::StateChanged` instead.
+    #[allow(dead_code, reason = "only tests poll output state directly")]
     pub fn state(&self) -> PlayerState {
         let (_, current, _) = self.playbin.state(gst::ClockTime::ZERO);
         match current {
@@ -1187,7 +1184,7 @@ mod tests {
         }
     }
 
-    // ── Cross-platform user-state isolation (tr-cy381) ──────────────
+    // ── Cross-platform user-state isolation ──────────────
 
     /// Child marker for [`production_state_resolution_ignores_an_external_user_state_file`].
     const USER_STATE_ISOLATION_CHILD: &str = "TRIBUTARY_USER_STATE_ISOLATION_CHILD";
@@ -1228,7 +1225,7 @@ mod tests {
             .expect("run isolated user-state child")
     }
 
-    /// Behavioral regression for tr-cy381: run the *production* user-state
+    /// Behavioral regression: run the *production* user-state
     /// resolution ([`volume_path`] + [`load_saved_volume`]) in a separate
     /// test process and prove it reads the sandbox, not an external
     /// user-state file seeded behind `HOME`/`XDG_*`.

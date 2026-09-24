@@ -129,8 +129,8 @@ registry seam in detail.
 
 - **Intel Macs are not supported.** There is no x86_64 macOS build, so the `.dmg` does not run on
   Intel Macs.
-- **Windows on ARM** builds are compiled and packaged by CI, but CI runs the test suite only on
-  x86_64, so the aarch64 build is less tested.
+- **Windows on ARM** is built, tested, and packaged natively on Windows 11 ARM64, like the x86_64
+  build.
 - **Native Linux packages** need GTK 4.16 or newer and libadwaita 1.6 or newer, which Debian 12,
   Ubuntu 24.04, and Linux Mint 22.x don't provide. Use the Flatpak (GNOME 50 runtime) there.
 - **The `.deb` is built on Debian unstable**, so its binary needs a recent glibc: the 0.6.2 `.deb`
@@ -333,7 +333,8 @@ flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo --i
 `./scripts/build-linux.sh --flatpak` uses the same generator, then builds and validates a
 single-file `tributary.flatpak` bundle instead of installing; no native build is required first.
 
-The sandbox does not expose the whole home directory:
+The sandbox has GPU access (`--device=dri`), so GTK renders with the host's graphics driver
+rather than in software. It does not expose the whole home directory:
 
 - **XDG Music** is available read/write.
 - A custom library folder chosen in **Preferences → Library Folders** goes through the GTK
@@ -605,6 +606,11 @@ from a writable mount so the file can be created; after that, read-only access i
 Renaming or moving a file inside a library folder keeps its play count, rating, and playlist
 entries when Tributary sees the rename while it is running on Linux or Windows. On macOS, and for
 changes made while Tributary is closed, a renamed file is treated as a new track.
+
+On Linux and other Unix systems a file name can contain bytes that aren't valid UTF-8, such as
+Latin-1 names copied from an older system. Tributary can't store those names exactly, so it skips
+those audio files and shows how many it skipped; rename them to UTF-8 names to add them. XSPF
+imports skip, and count, entries that point at such names.
 
 ### Browsing Removable Media
 
