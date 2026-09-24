@@ -2791,7 +2791,7 @@ mod tests {
             std::env::var_os("TMPDIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp"))
-                .join(format!("tr-2xstt-folder-{tag}-{}", std::process::id()))
+                .join(format!("tributary-folder-{tag}-{}", std::process::id()))
         }
 
         fn root_path(&self, name: &str) -> std::path::PathBuf {

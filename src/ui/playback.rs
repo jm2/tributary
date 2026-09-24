@@ -7033,8 +7033,7 @@ mod tests {
                 .pending_history_credit
                 .as_ref()
                 .is_some_and(|(pending, _)| pending.track_id().as_str() == "orphan-a"),
-            "the second overload must not evict the undelivered orphan from \
-             the stash (PR #286 finding A2)"
+            "the second overload must not evict the undelivered orphan from the stash"
         );
 
         // Drain. The orphan's delivery rides the next admission attempt

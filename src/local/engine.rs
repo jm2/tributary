@@ -17417,7 +17417,7 @@ mod tests {
     /// scan-settle wait it used to block on is the R9 delay this engine
     /// removed), and the FIFO barrier acks only after the scan drains —
     /// nothing admitted during the scan is lost or reordered.
-    #[ignore = "explicit Q4 measurement harness; run with --ignored (tr-am6qr)"]
+    #[ignore = "explicit Q4 measurement harness; run with --ignored"]
     // The parse-delay window inside intentionally holds a std::MutexGuard
     // across the engine-run awaits — exclusivity with the sibling
     // large-library harness is the point. This current-thread tokio test
