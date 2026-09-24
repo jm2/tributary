@@ -273,6 +273,12 @@ download:
   progress: "%{total} 曲中 %{done} 曲をダウンロード中…"
   finished: "ダウンロードが完了しました。ダウンロード済み：%{downloaded}、スキップ：%{skipped}、失敗：%{failed}。"
   cancelled: "ダウンロードをキャンセルしました。ダウンロード済み：%{downloaded}、スキップ：%{skipped}、失敗：%{failed}。"
+  refused:
+    one: "サーバーが %{count} 曲のダウンロードを拒否しました。"
+    other: "サーバーが %{count} 曲のダウンロードを拒否しました。"
+  refused_permission:
+    one: "サーバーが %{count} 曲のダウンロードを拒否しました。このアカウントのダウンロードを許可するよう、サーバーの管理者に依頼してください。"
+    other: "サーバーが %{count} 曲のダウンロードを拒否しました。このアカウントのダウンロードを許可するよう、サーバーの管理者に依頼してください。"
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "デバイスにコピー"

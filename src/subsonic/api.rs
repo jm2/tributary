@@ -45,6 +45,19 @@ pub struct SubsonicError {
     pub code: i32,
 }
 
+/// Whether `body` is a Subsonic error envelope refusing the request: wrong
+/// credentials (40), token authentication unsupported (41), or not
+/// authorized for the operation (50).
+pub fn is_refusal_body(body: &[u8]) -> bool {
+    serde_json::from_slice::<SubsonicEnvelope>(body).is_ok_and(|envelope| {
+        envelope.response.status == "failed"
+            && envelope
+                .response
+                .error
+                .is_some_and(|error| matches!(error.code, 40 | 41 | 50))
+    })
+}
+
 // ── getArtists ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

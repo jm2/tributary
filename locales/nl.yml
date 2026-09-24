@@ -273,6 +273,12 @@ download:
   progress: "%{done} van %{total} downloaden…"
   finished: "Downloads voltooid. Gedownload: %{downloaded}, overgeslagen: %{skipped}, mislukt: %{failed}."
   cancelled: "Downloads geannuleerd. Gedownload: %{downloaded}, overgeslagen: %{skipped}, mislukt: %{failed}."
+  refused:
+    one: "De server heeft %{count} download geweigerd."
+    other: "De server heeft %{count} downloads geweigerd."
+  refused_permission:
+    one: "De server heeft %{count} download geweigerd. Vraag de serverbeheerder om downloads voor dit account toe te staan."
+    other: "De server heeft %{count} downloads geweigerd. Vraag de serverbeheerder om downloads voor dit account toe te staan."
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "Kopiëren naar apparaat"

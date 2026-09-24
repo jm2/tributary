@@ -508,7 +508,7 @@ playback occurrence, never from the currently selected GTK row after playback st
 
 | Playback owner | Initial policy |
 |---|---|
-| Built-in local library | Eligible after the user enables Last.fm. |
+| Built-in local library | Not yet eligible: the library database does not record which fields came from tags, so a title taken from the file name cannot be told apart from a tagged one ([#336](https://github.com/jm2/tributary/issues/336)). |
 | Retained removable-media track | Eligible after the user enables Last.fm. |
 | Structured operating-system-opened file | Eligible after the user enables Last.fm. |
 | Authenticated Subsonic, Jellyfin, Plex, or DAAP catalogue | Disabled per source by default; the user must explicitly opt in after the duplicate-scrobble warning. |
