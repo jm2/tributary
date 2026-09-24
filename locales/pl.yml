@@ -492,6 +492,7 @@ errors:
     invalid_response: "%{backend} zwrócił nieprawidłową odpowiedź"
     authentication_method_unsupported: "Metoda uwierzytelniania %{backend} nie jest obsługiwana"
     source_failed: "Wystąpił błąd źródła %{backend}"
+    catalogue_incomplete: "Nie udało się wczytać części muzyki z serwera %{server}. Połącz się ponownie, aby spróbować jeszcze raz."
     removable_backend: "Nośnik wymienny"
     generic_backend: "Serwer zdalny"
   playback:

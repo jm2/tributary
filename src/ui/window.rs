@@ -448,6 +448,7 @@ struct SourceReducerContext {
     browser_widget: gtk::Box,
     browser_state: browser::BrowserState,
     status_label: gtk::Label,
+    toast_overlay: adw::ToastOverlay,
     column_view: gtk::ColumnView,
     app_config: Rc<RefCell<preferences::AppConfig>>,
     invalidate_source_playback: SourcePlaybackInvalidator,
@@ -619,6 +620,7 @@ impl SourceReducerContext {
             browser_widget: state.browser_widget.clone(),
             browser_state: state.browser_state.clone(),
             status_label: state.status_label.clone(),
+            toast_overlay: state.toast_overlay.clone(),
             column_view: state.column_view.clone(),
             app_config: state.app_config.clone(),
             invalidate_source_playback,
@@ -996,6 +998,23 @@ fn reconcile_remote_failure(
     }
 }
 
+/// The notice for a server whose library loaded incompletely when it
+/// connected. A complete load shows none.
+fn incomplete_catalogue_notice(
+    locale: &str,
+    incomplete: bool,
+    server_name: &str,
+) -> Option<String> {
+    incomplete.then(|| {
+        rust_i18n::t!(
+            "errors.remote.catalogue_incomplete",
+            locale = locale,
+            server = server_name
+        )
+        .into_owned()
+    })
+}
+
 fn reconcile_radio_refresh_failure(
     context: &SourceReducerContext,
     view: &crate::architecture::ViewOrigin,
@@ -1323,6 +1342,24 @@ fn reconcile_source_baseline(
                     &context.column_view,
                 );
                 reducer.published_catalogues.insert(source_id, identity);
+                // A server publishes one catalogue per connection, so this
+                // notice appears once for the connection that loaded it.
+                if let Some(notice) = sidebar_source_by_id(&context.sidebar_store, source_id)
+                    .and_then(|(_, source)| {
+                        incomplete_catalogue_notice(
+                            &rust_i18n::locale(),
+                            catalogue.value.incomplete(),
+                            &source.name(),
+                        )
+                    })
+                {
+                    context.toast_overlay.add_toast(
+                        adw::Toast::builder()
+                            .title(notice)
+                            .use_markup(false)
+                            .build(),
+                    );
+                }
             }
         }
 
@@ -5476,6 +5513,31 @@ mod identity_tests {
                 assert!(
                     message.contains(&count.to_string()) && !message.contains("%{"),
                     "{locale} {count}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_catalogue_notice_names_the_server_only_for_incomplete_loads() {
+        const SERVER: &str = "Home <Server> & Co";
+        let english = incomplete_catalogue_notice("en", true, SERVER);
+        assert_eq!(
+            english.as_deref(),
+            Some("Some music from Home <Server> & Co couldn’t be loaded. Reconnect to try again.")
+        );
+        for locale in rust_i18n::available_locales!() {
+            assert_eq!(incomplete_catalogue_notice(&locale, false, SERVER), None);
+            let notice = incomplete_catalogue_notice(&locale, true, SERVER).expect("notice");
+            assert!(
+                notice.contains(SERVER) && !notice.contains("%{"),
+                "{locale}: {notice}"
+            );
+            if locale != "en" {
+                assert_ne!(
+                    Some(&notice),
+                    english.as_ref(),
+                    "{locale}: English fallback"
                 );
             }
         }

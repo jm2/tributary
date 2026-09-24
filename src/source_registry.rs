@@ -955,6 +955,7 @@ impl PublicStreamContribution {
 pub struct AcceptedView {
     tracks: Arc<Vec<Track>>,
     public_streams: HashMap<TrackId, PublicHttpEndpoint>,
+    incomplete: bool,
 }
 
 impl AcceptedView {
@@ -1009,18 +1010,26 @@ impl AcceptedView {
         Ok(Self {
             tracks,
             public_streams,
+            incomplete: false,
         })
     }
 
-    fn published(tracks: Arc<Vec<Track>>) -> Self {
+    fn published(tracks: Arc<Vec<Track>>, incomplete: bool) -> Self {
         Self {
             tracks,
             public_streams: HashMap::new(),
+            incomplete,
         }
     }
 
     pub fn tracks(&self) -> &[Track] {
         self.tracks.as_slice()
+    }
+
+    /// Whether the load that produced these tracks is known to have missed
+    /// music its server has, so the user can be told to reconnect.
+    pub fn incomplete(&self) -> bool {
+        self.incomplete
     }
 
     #[cfg(test)]
@@ -1041,6 +1050,7 @@ struct AcceptedSourcePayload {
     public_streams: HashMap<TrackId, PublicHttpEndpoint>,
     regular_playlist_capability: RegularPlaylistCapability,
     regular_playlist_index: RegularPlaylistTrackIndex,
+    incomplete: bool,
 }
 
 #[derive(Clone)]
@@ -1057,6 +1067,7 @@ impl AcceptedSourcePayload {
             public_streams: view.public_streams,
             regular_playlist_capability: RegularPlaylistCapability::Unsupported,
             regular_playlist_index: RegularPlaylistTrackIndex::Unsupported,
+            incomplete: view.incomplete,
         }
     }
 
@@ -1083,11 +1094,12 @@ impl AcceptedSourcePayload {
             public_streams: HashMap::new(),
             regular_playlist_capability: capability,
             regular_playlist_index,
+            incomplete: false,
         }
     }
 
     fn published(&self) -> AcceptedView {
-        AcceptedView::published(Arc::clone(&self.tracks))
+        AcceptedView::published(Arc::clone(&self.tracks), self.incomplete)
     }
 
     fn regular_playlist_track(&self, track_id: &TrackId) -> Option<&Track> {
@@ -1165,6 +1177,14 @@ pub trait ManagedSourceAdapter: LifecycleAdapter + Send + Sync {
 
     /// Load the first complete catalogue after construction is staged.
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture;
+
+    /// Whether the catalogue [`Self::load_initial_catalogue`] just loaded is
+    /// known to be missing music the server has: paging stopped early, or a
+    /// part of the library failed to load. Items skipped because they could
+    /// never be played do not count. The default reports a complete load.
+    fn initial_catalogue_incomplete(&self) -> bool {
+        false
+    }
 
     /// Load one named view while observing exact generation cancellation.
     fn load_view(
@@ -1308,6 +1328,10 @@ macro_rules! standard_remote_adapter {
                 )
             }
 
+            fn initial_catalogue_incomplete(&self) -> bool {
+                self.catalogue_incomplete()
+            }
+
             fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
                 Box::pin(async move {
                     RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
@@ -1370,6 +1394,10 @@ impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
 
     fn load_initial_catalogue(self: Arc<Self>) -> CatalogueFuture {
         Box::pin(async move { crate::architecture::load_track_catalog(self.as_ref()).await })
+    }
+
+    fn initial_catalogue_incomplete(&self) -> bool {
+        self.catalogue_incomplete()
     }
 
     fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -1442,6 +1470,10 @@ impl ManagedSourceAdapter for crate::jellyfin::JellyfinBackend {
             self.ensure_initialized().await?;
             crate::architecture::load_track_catalog(self.as_ref()).await
         })
+    }
+
+    fn initial_catalogue_incomplete(&self) -> bool {
+        self.catalogue_incomplete()
     }
 
     fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
@@ -2233,11 +2265,13 @@ impl SourceRegistry {
                     return RefreshTaskResult::Cancelled;
                 }
                 let regular_playlist_capability = adapter.regular_playlist_capability();
-                match adapter.load_initial_catalogue().await {
-                    Ok(tracks) => RefreshTaskResult::Refreshed(AcceptedSourcePayload::catalogue(
-                        tracks,
-                        regular_playlist_capability,
-                    )),
+                match Arc::clone(&adapter).load_initial_catalogue().await {
+                    Ok(tracks) => {
+                        let mut payload =
+                            AcceptedSourcePayload::catalogue(tracks, regular_playlist_capability);
+                        payload.incomplete = adapter.initial_catalogue_incomplete();
+                        RefreshTaskResult::Refreshed(payload)
+                    }
                     Err(error) => RefreshTaskResult::Failed(failure_category(&error)),
                 }
             },
@@ -8843,6 +8877,60 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].uri.path(), "/System/Ping");
         service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn remote_catalogue_publication_carries_whether_the_load_was_incomplete() {
+        let registry = registry();
+        let healthy_artist = MockResponse::json(serde_json::json!({
+            "subsonic-response": {
+                "status": "ok",
+                "artist": {"id": "artist", "name": "Artist", "album": []}
+            }
+        }));
+        for (artist_reply, incomplete) in [
+            (healthy_artist, false),
+            (MockResponse::status(StatusCode::SERVICE_UNAVAILABLE), true),
+        ] {
+            let service = MockHttpService::start(vec![
+                MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                    serde_json::json!({"subsonic-response": {"status": "ok"}}),
+                )),
+                MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(
+                    serde_json::json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "artists": {"index": [{"artist": [{"id": "artist", "name": "Artist"}]}]}
+                        }
+                    }),
+                )),
+                MockRoute::get("/rest/getArtist.view").reply(artist_reply),
+            ])
+            .await;
+            let source_id = SourceId::random();
+            registry
+                .claim_provenance(source_id, SourceProvenance::Saved)
+                .expect("saved claim");
+            let server_url = service.base_url();
+            registry
+                .connect_standard(
+                    source_id,
+                    |_| {},
+                    move || async move {
+                        crate::subsonic::SubsonicBackend::connect(&server_url, "user", "pw").await
+                    },
+                )
+                .expect("connection admitted");
+            wait_for_catalogue(&registry, source_id).await;
+
+            let catalogue = registry
+                .snapshot(source_id)
+                .and_then(|snapshot| snapshot.catalogue)
+                .expect("accepted catalogue");
+            assert_eq!(catalogue.value.incomplete(), incomplete);
+            service.finish().await;
+        }
+        registry.shutdown().wait().await;
     }
 
     #[tokio::test]

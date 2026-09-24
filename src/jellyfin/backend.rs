@@ -4,7 +4,7 @@
 //! the full track catalogue into an in-memory cache, and exposes it through
 //! the unified `MediaBackend` trait.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
@@ -60,6 +60,9 @@ struct LibraryCache {
     /// whose container is absent or outside the allowlist map to the explicit
     /// unknown.
     representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
+    /// Paging stopped before the server's list ended, so the server has
+    /// music this cache lacks.
+    incomplete: bool,
 }
 
 impl LibraryCache {
@@ -70,6 +73,7 @@ impl LibraryCache {
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
             representation_by_track_id: HashMap::new(),
+            incomplete: false,
         }
     }
 }
@@ -203,9 +207,10 @@ impl JellyfinBackend {
         let mut attribution_profiles = HashMap::new();
         let mut representation_by_track_id = HashMap::new();
         let mut skipped_invalid_track_ids = 0usize;
+        let mut incomplete = false;
 
         for lib in music_libraries {
-            let tracks = self
+            let (tracks, truncated) = self
                 .fetch_all_items(
                     &items_endpoint,
                     &lib.id,
@@ -213,6 +218,7 @@ impl JellyfinBackend {
                     "MediaSources,Genres,UserData,DateCreated",
                 )
                 .await?;
+            incomplete |= truncated;
 
             for item in &tracks {
                 let Ok(track_id) = TrackId::remote(item.id.clone()) else {
@@ -259,7 +265,7 @@ impl JellyfinBackend {
 
         info!(
             tracks = all_tracks.len(),
-            skipped_invalid_track_ids, "Jellyfin library loaded"
+            skipped_invalid_track_ids, incomplete, "Jellyfin library loaded"
         );
 
         let mut cache = self.cache.write().await;
@@ -269,20 +275,25 @@ impl JellyfinBackend {
             track_artwork_locator_by_track_id,
             attribution_profiles,
             representation_by_track_id,
+            incomplete,
         };
 
         Ok(())
     }
 
     /// Fetch all items of a given type from a library, handling pagination.
+    ///
+    /// The returned flag is `true` when paging stopped before the server
+    /// signalled the end of the list, so the items are known to be partial.
     async fn fetch_all_items(
         &self,
         endpoint: &str,
         parent_id: &str,
         include_item_types: &str,
         fields: &str,
-    ) -> BackendResult<Vec<JellyfinItem>> {
+    ) -> BackendResult<(Vec<JellyfinItem>, bool)> {
         let mut all_items = Vec::new();
+        let mut seen_ids = HashSet::new();
         let mut start_index: u32 = 0;
         let mut pages_fetched: u32 = 0;
 
@@ -306,8 +317,28 @@ impl JellyfinBackend {
                 self.client.get_with_params(endpoint, &params).await?;
 
             let page_count = resp.items.len() as u32;
-            all_items.extend(resp.items);
             pages_fetched += 1;
+            let new_ids = resp
+                .items
+                .iter()
+                .filter(|item| seen_ids.insert(item.id.clone()))
+                .count();
+
+            // A page full enough to continue paging that holds no item the
+            // earlier pages lacked means the server is not advancing through
+            // the list (for example it ignores `StartIndex` and repeats a
+            // page). Asking again would only fetch the same items, so keep
+            // what earlier pages loaded.
+            if page_count >= PAGE_SIZE && new_ids == 0 {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    parent_id = %parent_id,
+                    pages_fetched,
+                    "Jellyfin pagination repeated a page; stopping (library may be incomplete)"
+                );
+                return Ok((all_items, true));
+            }
+            all_items.extend(resp.items);
 
             // Terminate on the actual page contents, NOT the server-supplied
             // `TotalRecordCount`.  Trusting that count is unsafe: a short or
@@ -317,7 +348,7 @@ impl JellyfinBackend {
             // truncate the library.  A page smaller than the requested limit
             // (including an empty page) means we have reached the end.
             if page_count < PAGE_SIZE {
-                break;
+                return Ok((all_items, false));
             }
 
             // Defensive cap against a server that keeps returning full pages
@@ -329,13 +360,18 @@ impl JellyfinBackend {
                     pages_fetched,
                     "Jellyfin pagination hit the page cap; stopping (library may be incomplete)"
                 );
-                break;
+                return Ok((all_items, true));
             }
 
             start_index += page_count;
         }
+    }
 
-        Ok(all_items)
+    /// Whether the loaded library is known to be missing music the server
+    /// has. The registry asks right after the load finished, when no refresh
+    /// holds the cache, so the non-blocking read always sees the result.
+    pub(crate) fn catalogue_incomplete(&self) -> bool {
+        self.cache.try_read().is_ok_and(|cache| cache.incomplete)
     }
 
     pub(crate) async fn logout_owned_session(&self) -> BackendResult<()> {
@@ -861,6 +897,7 @@ mod tests {
         .await
         .expect("prefixed paginated Jellyfin fixture");
 
+        assert!(!backend.catalogue_incomplete());
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), (PAGE_SIZE + 1) as usize);
         let first_id = cache.tracks[0]
@@ -900,6 +937,50 @@ mod tests {
             assert!(authorization.contains(&format!(r#"Token="{token}""#)));
             assert!(request.headers.get(reqwest::header::REFERER).is_none());
         }
+        service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_full_page_stops_paging_and_reports_incomplete() {
+        // A server that ignores `StartIndex` answers every request with its
+        // first full page. Only two item requests are queued, so a third
+        // would fail the connection.
+        let page = serde_json::json!({
+            "Items": (0..PAGE_SIZE)
+                .map(|index| serde_json::json!({"Id": format!("track-{index}"), "Type": "Audio"}))
+                .collect::<Vec<_>>(),
+            "TotalRecordCount": PAGE_SIZE * 3
+        });
+        let service = MockHttpService::start(vec![
+            MockRoute::get("/System/Ping").reply(MockResponse::text("Jellyfin Server")),
+            MockRoute::get("/Users/fixture-user/Views").reply(MockResponse::json(
+                serde_json::json!({
+                    "Items": [
+                        {"Id": "music-library", "Name": "Music", "CollectionType": "music"}
+                    ],
+                    "TotalRecordCount": 1
+                }),
+            )),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("StartIndex", "0")
+                .reply(MockResponse::json(page.clone())),
+            MockRoute::get("/Users/fixture-user/Items")
+                .with_query("ParentId", "music-library")
+                .with_query("StartIndex", PAGE_SIZE.to_string())
+                .reply(MockResponse::json(page)),
+        ])
+        .await;
+        let token = Uuid::new_v4().to_string();
+
+        let backend =
+            JellyfinBackend::connect("fixture", &service.base_url(), &token, "fixture-user")
+                .await
+                .expect("a repeated page keeps the items loaded before it");
+
+        assert!(backend.catalogue_incomplete());
+        assert_eq!(backend.cache.read().await.tracks.len(), PAGE_SIZE as usize);
+        assert_eq!(service.requests().len(), 4);
         service.finish().await;
     }
 }

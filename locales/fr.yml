@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend} a renvoyé une réponse non valide"
     authentication_method_unsupported: "La méthode d’authentification de %{backend} n’est pas prise en charge"
     source_failed: "La source %{backend} a échoué"
+    catalogue_incomplete: "Une partie de la musique de %{server} n’a pas pu être chargée. Reconnectez-vous pour réessayer."
     removable_backend: "Support amovible"
     generic_backend: "Serveur distant"
   playback:

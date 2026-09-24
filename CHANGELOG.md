@@ -208,6 +208,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the download summary now says so instead of counting them only as failed. For Subsonic
   servers such as Navidrome, it suggests asking the server's administrator to allow downloads for
   your account.
+- **Server libraries that load only partly** — When part of a Jellyfin, Plex, or Subsonic library
+  can't be loaded on connecting, Tributary now says so and suggests reconnecting, instead of
+  silently showing fewer songs. A Jellyfin server that keeps sending the same page of songs no
+  longer makes Tributary ask for it thousands of times.
 
 ### Security
 
@@ -234,6 +238,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sidebar with fake Jellyfin servers or stop real ones from being marked as gone, and each
   reply is checked against the address it advertises. Server account names and IDs are no longer
   written to the log.
+- **Casting relay limit** — The built-in server that streams music to Chromecast and MPD devices
+  now serves a limited number of streams at once, so a misbehaving device on the network can't
+  exhaust it or disturb playback on this computer. A device that asks for more is told to try
+  again a second later.
 
 ## [0.6.2] — 2026-09-01
 

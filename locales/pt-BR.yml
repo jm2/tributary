@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend} retornou uma resposta inválida"
     authentication_method_unsupported: "O método de autenticação do %{backend} não é compatível"
     source_failed: "A fonte %{backend} falhou"
+    catalogue_incomplete: "Não foi possível carregar parte das músicas de %{server}. Conecte-se novamente para tentar outra vez."
     removable_backend: "Mídia removível"
     generic_backend: "Servidor remoto"
   playback:
