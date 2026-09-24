@@ -106,6 +106,9 @@ preferences:
   title: "Preferences"
   library_location: "Library Location"
   select_music_folder: "Select Music Folder"
+  downloads: "Downloads"
+  download_folder: "Download Folder"
+  select_download_folder: "Select Download Folder"
   library_restart_hint: "Restart Tributary to apply library folder changes."
   reauthorize_folder: "Reauthorize…"
   select_reauthorization_folder: "Select the Same Library Folder"
@@ -260,6 +263,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Properties…"
+  download: "Download"
   add_to_playlist: "Add to Playlist"
   remove_from_playlist: "Remove from Playlist"
   playlist_add_unsupported_heading: "Tracks Weren’t Added"
@@ -268,6 +272,26 @@ context:
   playlist_add_success:
     one: "%{count} track added to %{playlist}."
     other: "%{count} tracks added to %{playlist}."
+
+# ── Downloads ────────────────────────────────────────
+download:
+  progress: "Downloading %{done} of %{total}…"
+  finished: "Downloads finished. Downloaded: %{downloaded}, skipped: %{skipped}, failed: %{failed}."
+  cancelled: "Downloads cancelled. Downloaded: %{downloaded}, skipped: %{skipped}, failed: %{failed}."
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "Copy to Device"
+  unknown_artist: "Unknown Artist"
+  unknown_album: "Unknown Album"
+  starting: "Copying to %{device}…"
+  progress: "Copying to %{device} (%{done}/%{total})…"
+  finished: "Finished copying to %{device}. Copied: %{copied}, already there: %{skipped}, failed: %{failed}."
+  cancelled: "Copying to %{device} was cancelled. Copied: %{copied}, already there: %{skipped}, failed: %{failed}."
+  not_enough_space: "Not enough space on %{device}: %{required} needed, %{available} free. Nothing was copied."
+  read_only: "%{device} is read-only. Nothing was copied."
+  device_unavailable: "%{device} is no longer available. Nothing was copied."
+  playlist_unreadable: "The playlist couldn’t be read. Nothing was copied."
+  stopped: "Copying to %{device} stopped unexpectedly."
 
 # ── Regular playlists ──────────────────────────────────────────────
 regular_playlist:

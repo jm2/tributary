@@ -169,6 +169,10 @@ pub struct AppConfig {
         deserialize_with = "crate::audio::equalizer::EqualizerSettings::deserialize_lenient"
     )]
     pub equalizer: crate::audio::equalizer::EqualizerSettings,
+    /// Folder that downloaded remote tracks are saved to. `None` uses
+    /// [`crate::download::default_download_dir`].
+    #[serde(default)]
+    pub download_path: Option<String>,
 }
 
 /// Thumbnail side length for the browser Album pane.
@@ -389,6 +393,7 @@ impl Default for AppConfig {
             album_pane_artwork: false,
             album_pane_artwork_size: AlbumArtSize::default(),
             equalizer: crate::audio::equalizer::EqualizerSettings::default(),
+            download_path: None,
         }
     }
 }
@@ -458,6 +463,50 @@ pub fn library_path_is_claimed(config: &AppConfig, path: &str) -> bool {
             library_paths_overlap(&pending.old_path, path)
                 || library_paths_overlap(&pending.new_path, path)
         })
+}
+
+/// Add one library folder unless it is already configured or reserved,
+/// saving the change before publishing it. Returns whether it was added; the
+/// running engine scans it from the next start.
+pub fn add_library_path(config: &std::cell::RefCell<AppConfig>, path: &str) -> bool {
+    let mut cfg = config.borrow_mut();
+    if library_path_is_claimed(&cfg, path) {
+        return false;
+    }
+    let mut candidate = cfg.clone();
+    candidate.library_paths.push(path.to_string());
+    if !save_config(&candidate) {
+        return false;
+    }
+    *cfg = candidate;
+    info!(path, "Library folder added");
+    true
+}
+
+/// The folder downloaded tracks are saved to.
+pub fn download_dir(config: &AppConfig) -> Option<std::path::PathBuf> {
+    config
+        .download_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(crate::download::default_download_dir)
+}
+
+/// Make the download folder part of the library unless a configured folder
+/// already contains it. Returns whether it was added.
+pub fn add_download_library_path(
+    config: &std::cell::RefCell<AppConfig>,
+    folder: &std::path::Path,
+) -> bool {
+    let covered = config
+        .borrow()
+        .library_paths
+        .iter()
+        .any(|root| folder.starts_with(root));
+    !covered
+        && folder
+            .to_str()
+            .is_some_and(|path| add_library_path(config, path))
 }
 
 /// Schedule an identity-preserving root reauthorization.
@@ -955,28 +1004,9 @@ pub fn show_preferences(
                                 warn!("Ignoring a selected library folder with a non-Unicode path");
                                 return;
                             };
-                            // Do not add duplicate/overlapping configured or
-                            // pending scopes. Persist the candidate before
-                            // publishing it to the running UI.
-                            let added = {
-                                let mut cfg = config.borrow_mut();
-                                if library_path_is_claimed(&cfg, &path_str) {
-                                    false
-                                } else {
-                                    let mut candidate = cfg.clone();
-                                    candidate.library_paths.push(path_str.clone());
-                                    if save_config(&candidate) {
-                                        *cfg = candidate;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                }
-                            };
-                            if !added {
+                            if !add_library_path(&config, &path_str) {
                                 return;
                             }
-                            info!(path = %path_str, "Library folder added");
 
                             let row = build_library_path_row(
                                 &path_str,
@@ -1013,6 +1043,7 @@ pub fn show_preferences(
     library_group.add(&library_box);
     library_group.add(&import_rhythmbox_btn);
     page.add(&library_group);
+    page.add(&downloads_group(parent, config, saves));
 
     // ── Browser Views group (dense horizontal checkboxes) ───────────
     let browser_group = adw::PreferencesGroup::builder()
@@ -1316,6 +1347,61 @@ pub fn show_preferences(
 
     prefs_dialog.present(Some(parent));
     page
+}
+
+/// The Downloads group: where downloaded remote tracks are saved.
+fn downloads_group(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.downloads").as_ref())
+        .build();
+    let folder_label = |config: &AppConfig| {
+        download_dir(config).map_or_else(String::new, |folder| folder.display().to_string())
+    };
+    let row = adw::ActionRow::builder()
+        .title(rust_i18n::t!("preferences.download_folder").as_ref())
+        .subtitle(folder_label(&config.borrow()))
+        .subtitle_selectable(true)
+        .build();
+    let choose = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text(rust_i18n::t!("preferences.select_download_folder").as_ref())
+        .build();
+    {
+        let (parent, config, saves, row) =
+            (parent.clone(), config.clone(), saves.clone(), row.clone());
+        choose.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title(rust_i18n::t!("preferences.select_download_folder").as_ref())
+                .modal(true)
+                .build();
+            let (config, saves, row) = (config.clone(), saves.clone(), row.clone());
+            dialog.select_folder(
+                Some(&parent),
+                None::<&gtk::gio::Cancellable>,
+                move |result| {
+                    let Some(path) = result.ok().and_then(|folder| folder.path()) else {
+                        return;
+                    };
+                    let Some(path) = path.to_str() else {
+                        warn!("Ignoring a selected download folder with a non-Unicode path");
+                        return;
+                    };
+                    config.borrow_mut().download_path = Some(path.to_string());
+                    row.set_subtitle(&folder_label(&config.borrow()));
+                    saves.schedule();
+                },
+            );
+        });
+    }
+    row.add_suffix(&choose);
+    group.add(&row);
+    group
 }
 
 /// The Privacy group: consent to the IP geolocation behind Stations Near Me.

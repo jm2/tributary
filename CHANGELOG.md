@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Copy to Device** — Right-click tracks or a playlist and choose a USB drive, SD card, or music
+  player to copy the music onto it, organized by artist and album. Files already on the device
+  are skipped, the copy can be cancelled, and a copied playlist is saved as an `.m3u8` file. In
+  the Flatpak, drives under `/media`, `/run/media`, and `/mnt` are now writable.
+- **Download remote tracks** — Right-click tracks from a Subsonic, Jellyfin, Plex, or DAAP server
+  and choose Download to keep a copy in your library for offline listening. Files are saved to a
+  Tributary Downloads folder in your music folder, which you can change in Preferences.
 - **License notices in Windows and macOS downloads** — Each download now includes a
   `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
   offer of their source code.
-  distinct identities for multiple roots, lazy navigation, and a visible notice when a
-  root is unavailable.
 - **Album artwork in the browser** — The Album pane can show cover art for local and server
   albums. Turn it on under Preferences → Browser Views and choose Small, Medium, or Large.
 - **Folder browsing** — A Folder pane browses the local library by library folder and
@@ -24,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apply to the playing track immediately and are remembered between sessions.
 - **Drag and drop onto playlists** — Drag selected tracks onto a playlist in the sidebar to add
   them in the order shown, and drag playlists to reorder the sidebar.
+- **Drag tracks to a file manager** — Drag tracks from your local library into a file manager to
+  copy their files there. A selection that includes server, radio, or removable-media tracks
+  offers no files but can still be dropped on a playlist.
 - **Chromecast over IPv6** — Chromecast receivers are discovered and can play over IPv6, and
   Tributary picks the network interface that reaches the selected receiver.
 - **Tag editing on removable drives** — Properties can now edit tracks on USB drives and other

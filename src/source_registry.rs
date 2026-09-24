@@ -259,7 +259,7 @@ pub enum RetainedFileStreamCapability {
     Supported,
 }
 
-/// Which consumer is requesting one retained-file stream resolution.
+/// Which consumer is requesting one stream resolution.
 ///
 /// The album pane resolves artwork speculatively for every bound row, while
 /// playback is user-paced and must never wait behind that speculative work.
@@ -273,6 +273,11 @@ pub enum StreamResolutionClass {
     Speculative,
     /// Playback-critical resolution.
     Playback,
+    /// An offline download. A remote adapter whose protocol has a separate
+    /// original-file endpoint (Subsonic `download.view`) resolves that
+    /// instead of its playback stream; every other adapter resolves its
+    /// playback stream.
+    Download,
 }
 
 /// Exact bounded structured metadata which one live adapter authorizes for a
@@ -1404,6 +1409,21 @@ impl ManagedSourceAdapter for crate::subsonic::SubsonicBackend {
     fn resolve_stream(self: Arc<Self>, track_id: TrackId) -> StreamFuture {
         Box::pin(async move {
             RemoteMediaResolver::resolve_stream(self.as_ref(), &track_id)
+                .await
+                .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
+        })
+    }
+
+    fn resolve_stream_classified(
+        self: Arc<Self>,
+        track_id: TrackId,
+        class: StreamResolutionClass,
+    ) -> StreamFuture {
+        if class != StreamResolutionClass::Download {
+            return self.resolve_stream(track_id);
+        }
+        Box::pin(async move {
+            self.resolve_download(&track_id)
                 .await
                 .map(|request| AdapterStream::ProtectedHttp(Box::new(request)))
         })

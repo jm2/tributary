@@ -42,7 +42,9 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules) | ✅ Regular playlists may include remote tracks |
 | Drag and drop tracks onto playlists | ✅ |
+| Drag tracks out to a file manager | ✅ Copies local library files only |
 | Subsonic server playlists (import a copy, or keep a read-only synced mirror) | ✅ |
+| Download remote tracks for offline listening | ✅ Saved as ordinary local files — see [Downloading Remote Tracks](#downloading-remote-tracks) |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
 | Batch metadata editing (multi-select) | ✅ |
@@ -61,7 +63,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
 | USB/removable-media browsing (live sidebar entries + track scan) | ✅ |
-| USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
+| USB file transfer (copy to device with progress) | ✅ Right-click tracks or a playlist → **Copy to Device**; MTP-only phones are not supported — see [Copying Music to a Device](#copying-music-to-a-device) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
 | Rhythmbox profile migration | ✅ Preview-first import of ratings, play counts, and playlists |
@@ -338,9 +340,8 @@ The sandbox does not expose the whole home directory:
   [file-chooser portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.FileChooser.html),
   which grants persistent read/write access. Tag editing still needs the folder to be writable on
   the host.
-- Media mounted under `/media`, `/run/media`, and `/mnt` is exposed read-only for the automatic
-  **Devices** entries and playback. To edit tags on external media, add the folder explicitly in
-  Preferences instead.
+- Media mounted under `/media`, `/run/media`, and `/mnt` is exposed read/write for the automatic
+  **Devices** entries, playback, tag editing, and **Copy to Device**.
 - A custom path saved by an older Flatpak build may become unavailable under this policy. Use that
   root's **Reauthorize…** action in Preferences to reselect the same folder through the portal,
   confirm the move, and restart Tributary so the relocation completes before scanning. Removing and
@@ -464,6 +465,7 @@ src/
 ├── platform_runtime.rs     # Early runtime setup for self-contained Windows/macOS builds
 ├── panic_reporting.rs      # Content-free panic diagnostics
 ├── discovery.rs            # mDNS + UDP zero-config server discovery
+├── download.rs             # Offline downloads of remote tracks into a library folder
 ├── http_security.rs        # Shared hardening for outbound HTTP clients
 ├── http_body.rs            # Bounded response-body collection
 ├── remote_rating_wire.rs   # Tolerant decoding of optional remote ratings
@@ -521,6 +523,7 @@ src/
     ├── folder_browser.rs   # Folder pane over the local library
     ├── tracklist.rs        # GtkColumnView track listing
     ├── context_menu.rs     # Tracklist context menu, playlist add/remove, drag and drop
+    ├── downloads.rs        # Download action progress and summary notifications
     ├── source_connect.rs   # Sidebar selection handler (source switching + auth flows)
     ├── source_navigation.rs# Asynchronous source navigation results
     ├── discovery_handler.rs# mDNS/DNS-SD event handler (sidebar + output list)
@@ -577,6 +580,11 @@ In the folder pane, double-click a root or directory to descend (Enter works on 
 too), and use the `…` row to go back up one level.
 Click any column header to sort; click again to reverse; click a third time to clear the sort.
 
+Drag selected tracks into a file manager window to copy their files there. Only tracks from your
+local library offer files: if the selection includes a server, radio, or removable-media track,
+the drag can still add to a playlist but hands no files to the file manager. Tributary offers a
+copy only, never a move, so the originals stay in your library.
+
 To show cover art in the Album pane, turn on **Album pane artwork** under Preferences → Browser
 Views and choose Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for
 server libraries, from the server.
@@ -607,15 +615,53 @@ optional, so a non-removable or network mount can occasionally appear too. Selec
 shows its scanned tracks; the scan stays on the device's own filesystem and does not follow links.
 
 Tributary does not mount or eject volumes, and MTP-only devices are not supported. In the Flatpak,
-file access for the automatic Devices entries is read-only and limited to `/media`, `/run/media`,
-and `/mnt`; a device mounted elsewhere can still be listed but cannot be scanned or played (see
+file access for the automatic Devices entries is limited to `/media`, `/run/media`, and `/mnt`; a
+device mounted elsewhere can still be listed but cannot be scanned, played, or copied to (see
 [Flatpak (Linux)](#flatpak-linux)).
+
+### Copying Music to a Device
+
+Right-click selected tracks, or a playlist in the sidebar, and choose a device under **Copy to
+Device**. Only writable devices from the **Devices** list are offered, so the entry is hidden
+when none is mounted. Tracks are copied to `Music/<Album Artist or Artist>/<Album>/<NN Title>.<ext>` on the
+device, with names adjusted for FAT and exFAT. A file already there with the same size is
+skipped, so copying the same playlist again only adds what is missing. Copying a playlist also
+writes `Music/Playlists/<Playlist>.m3u8`, listing the copied tracks by relative path.
+
+Tributary checks the free space first and copies nothing if the tracks will not fit. A toast shows
+progress with a **Cancel** button; cancelling keeps the tracks that finished and removes only the
+unfinished file. Streamed tracks from servers and radio stations cannot be copied.
+
+This works with USB drives, SD cards, music players, and phones that mount as USB storage. Phones
+that connect only over MTP, as most Android phones do, are not supported: the Devices list
+includes only mounts with a native filesystem path, which leaves out GVfs `mtp://` mounts.
+Copying does not start automatically when a device is plugged in.
 
 ### Connecting to Remote Servers
 
 Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and UDP broadcast (Jellyfin). Discovered servers appear in the sidebar — click one to connect. Password-protected DAAP shares show a lock icon; passwordless shares connect with a single click.
 
 To manually add a server, click the **+** button in the sidebar toolbar and enter the server type (Subsonic, Jellyfin, or Plex), URL, and credentials. Manually-added servers are persisted across launches (credentials are entered in the UI only — they are not stored on disk).
+
+### Downloading Remote Tracks
+
+Select tracks from a Subsonic, Jellyfin, Plex, or DAAP server (or server tracks in a playlist),
+right-click, and choose **Download**. Each track is saved as
+`<Album Artist>/<Album>/<NN Title>.<ext>` in a **Tributary Downloads** folder inside your music
+folder; choose another folder under **Downloads** in Preferences. Two tracks download at a time,
+a notification shows progress with a **Cancel** button, and a summary reports how many tracks were
+downloaded, skipped because the file already exists, or failed. Subsonic downloads use the
+server's original-file download, so the account needs download permission there; Jellyfin, Plex,
+and DAAP tracks are fetched as the original file.
+
+The download folder is part of your library. When a library folder already contains it (the
+default when your library is your music folder), finished files appear right away. Otherwise
+Tributary adds the download folder as a library folder after the first download, and it is
+scanned from the next start.
+
+A download is an ordinary local copy: it appears in the local library next to the server's track
+rather than replacing it, and playing the server's row still streams from the server. Tributary
+does not delete downloads or limit the folder's size.
 
 ### Internet Radio
 
@@ -772,6 +818,7 @@ Open **Preferences** from the hamburger menu (☰) to:
   links inside a library folder are not followed. Removing a folder forgets its tracks, with their
   play counts and ratings, at the next start; playlists keep those entries as unmatched items.
 - Reauthorize a library folder or import from Rhythmbox
+- Choose the folder that downloaded tracks are saved to (see [Downloading Remote Tracks](#downloading-remote-tracks))
 - Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
 - Show/hide tracklist columns
 - Set up the equalizer for playback on this computer

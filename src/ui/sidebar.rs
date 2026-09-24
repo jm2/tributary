@@ -38,6 +38,8 @@ pub enum PlaylistAction {
     ExportPlaylist(String),
     /// Reorder the playlist sidebar presentation order (full ordered id list).
     Reorder(Vec<String>),
+    /// Copy a playlist's local files and an `.m3u8` to a device (id).
+    CopyToDevice(String, super::device_copy::CopyDestination),
 }
 
 /// Compute the sidebar playlist order after a drag moves `dragged_id`
@@ -547,6 +549,21 @@ pub fn build_sidebar(
                             Some("edit-smart"),
                         );
                     }
+
+                    let tx_c = tx.clone();
+                    let pid_c = pid.clone();
+                    let copy_to_device: Rc<dyn Fn(super::device_copy::CopyDestination)> =
+                        Rc::new(move |destination| {
+                            let _ = tx_c
+                                .try_send(PlaylistAction::CopyToDevice(pid_c.clone(), destination));
+                        });
+                    super::device_copy::append_menu_items(
+                        &menu,
+                        &action_group,
+                        "",
+                        super::device_copy::writable_devices(&store_for_gesture),
+                        &copy_to_device,
+                    );
                 } else {
                     // Pull mirrors deliberately have no ordinary rename,
                     // export, delete, or smart-rule action. Record E adds

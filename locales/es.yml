@@ -103,6 +103,9 @@ preferences:
   title: "Preferencias"
   library_location: "Ubicación de la biblioteca"
   select_music_folder: "Seleccionar carpeta de música"
+  downloads: "Descargas"
+  download_folder: "Carpeta de descargas"
+  select_download_folder: "Seleccionar carpeta de descargas"
   library_restart_hint: "Reinicie Tributary para aplicar los cambios en las carpetas de música."
   reauthorize_folder: "Volver a autorizar…"
   select_reauthorization_folder: "Seleccionar la misma carpeta de la biblioteca"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "Propiedades…"
+  download: "Descargar"
   add_to_playlist: "Añadir a lista de reproducción"
   remove_from_playlist: "Quitar de lista de reproducción"
   playlist_add_unsupported_heading: "No se añadieron pistas"
@@ -259,6 +263,26 @@ context:
   playlist_add_success:
     one: "%{count} pista añadida a %{playlist}."
     other: "%{count} pistas añadidas a %{playlist}."
+
+# ── Descargas ────────────────────────────────────────
+download:
+  progress: "Descargando %{done} de %{total}…"
+  finished: "Descargas finalizadas. Descargadas: %{downloaded}, omitidas: %{skipped}, fallidas: %{failed}."
+  cancelled: "Descargas canceladas. Descargadas: %{downloaded}, omitidas: %{skipped}, fallidas: %{failed}."
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "Copiar al dispositivo"
+  unknown_artist: "Artista desconocido"
+  unknown_album: "Álbum desconocido"
+  starting: "Copiando a %{device}…"
+  progress: "Copiando a %{device} (%{done}/%{total})…"
+  finished: "Copia a %{device} terminada. Copiados: %{copied}, ya existentes: %{skipped}, con error: %{failed}."
+  cancelled: "Se canceló la copia a %{device}. Copiados: %{copied}, ya existentes: %{skipped}, con error: %{failed}."
+  not_enough_space: "No hay espacio suficiente en %{device}: se necesitan %{required} y hay %{available} libres. No se copió nada."
+  read_only: "%{device} es de solo lectura. No se copió nada."
+  device_unavailable: "%{device} ya no está disponible. No se copió nada."
+  playlist_unreadable: "No se pudo leer la lista de reproducción. No se copió nada."
+  stopped: "La copia a %{device} se detuvo de forma inesperada."
 
 # ── Listas de reproducción normales ───────────────────────────────────
 regular_playlist:

@@ -103,6 +103,9 @@ preferences:
   title: "偏好設定"
   library_location: "音樂庫位置"
   select_music_folder: "選擇音樂資料夾"
+  downloads: "下載"
+  download_folder: "下載資料夾"
+  select_download_folder: "選擇下載資料夾"
   library_restart_hint: "重新啟動 Tributary 以套用音樂資料夾變更。"
   reauthorize_folder: "重新授權…"
   select_reauthorization_folder: "選擇相同的音樂庫資料夾"
@@ -251,6 +254,7 @@ library_root_trust:
 # ── Context menu ───────────────────────────────────────────────────
 context:
   properties: "內容…"
+  download: "下載"
   add_to_playlist: "加入播放清單"
   remove_from_playlist: "從播放清單移除"
   playlist_add_unsupported_heading: "曲目未加入"
@@ -259,6 +263,26 @@ context:
   playlist_add_success:
     one: "已將 %{count} 首曲目加入 %{playlist}。"
     other: "已將 %{count} 首曲目加入 %{playlist}。"
+
+# ── 下載 ────────────────────────────────────────
+download:
+  progress: "正在下載（%{done}/%{total}）…"
+  finished: "下載已完成。已下載：%{downloaded}，已略過：%{skipped}，失敗：%{failed}。"
+  cancelled: "下載已取消。已下載：%{downloaded}，已略過：%{skipped}，失敗：%{failed}。"
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "複製到裝置"
+  unknown_artist: "未知演出者"
+  unknown_album: "未知專輯"
+  starting: "正在複製到 %{device}…"
+  progress: "正在複製到 %{device}（%{done}/%{total}）…"
+  finished: "已完成複製到 %{device}。已複製：%{copied}，已存在：%{skipped}，失敗：%{failed}"
+  cancelled: "已取消複製到 %{device}。已複製：%{copied}，已存在：%{skipped}，失敗：%{failed}"
+  not_enough_space: "%{device} 空間不足：需要 %{required}，可用 %{available}。未複製任何內容。"
+  read_only: "%{device} 為唯讀。未複製任何內容。"
+  device_unavailable: "%{device} 已無法使用。未複製任何內容。"
+  playlist_unreadable: "無法讀取播放清單。未複製任何內容。"
+  stopped: "複製到 %{device} 意外停止。"
 
 # ── 一般播放清單 ──────────────────────────────────────────────
 regular_playlist:
