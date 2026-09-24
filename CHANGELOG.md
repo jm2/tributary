@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Download remote tracks** — Right-click tracks from a Subsonic, Jellyfin, Plex, or DAAP server
+  and choose Download to keep a copy in your library for offline listening. Files are saved to a
+  Tributary Downloads folder in your music folder, which you can change in Preferences.
 - **License notices in Windows and macOS downloads** — Each download now includes a
   `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
   offer of their source code.
