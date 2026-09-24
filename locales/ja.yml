@@ -269,6 +269,20 @@ download:
   progress: "%{total} 曲中 %{done} 曲をダウンロード中…"
   finished: "ダウンロードが完了しました。ダウンロード済み：%{downloaded}、スキップ：%{skipped}、失敗：%{failed}。"
   cancelled: "ダウンロードをキャンセルしました。ダウンロード済み：%{downloaded}、スキップ：%{skipped}、失敗：%{failed}。"
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "デバイスにコピー"
+  unknown_artist: "不明なアーティスト"
+  unknown_album: "不明なアルバム"
+  starting: "%{device} にコピーしています…"
+  progress: "%{device} にコピーしています (%{done}/%{total})…"
+  finished: "%{device} へのコピーが完了しました。コピー: %{copied}、既存: %{skipped}、失敗: %{failed}"
+  cancelled: "%{device} へのコピーをキャンセルしました。コピー: %{copied}、既存: %{skipped}、失敗: %{failed}"
+  not_enough_space: "%{device} の空き容量が不足しています（必要: %{required}、空き: %{available}）。何もコピーされませんでした。"
+  read_only: "%{device} は読み取り専用です。何もコピーされませんでした。"
+  device_unavailable: "%{device} は利用できなくなりました。何もコピーされませんでした。"
+  playlist_unreadable: "プレイリストを読み込めませんでした。何もコピーされませんでした。"
+  stopped: "%{device} へのコピーが予期せず停止しました。"
 
 # ── 通常のプレイリスト ─────────────────────────────────────────
 regular_playlist:

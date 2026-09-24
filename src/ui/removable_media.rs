@@ -448,6 +448,7 @@ impl RemovableMediaController {
         };
         let row =
             SourceObject::removable_device(name, &device.source_key, device.mount_point.clone());
+        super::device_copy::probe_writable(&row);
         if let Some(position) = self.find_device_row(&device.source_key) {
             // Replace in one model notification. A remove followed by an
             // insert briefly selects a neighbouring source when this is the

@@ -271,6 +271,20 @@ download:
   progress: "Pobieranie %{done} z %{total}…"
   finished: "Pobieranie zakończone. Pobrane: %{downloaded}, pominięte: %{skipped}, nieudane: %{failed}."
   cancelled: "Pobieranie anulowane. Pobrane: %{downloaded}, pominięte: %{skipped}, nieudane: %{failed}."
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "Kopiuj na urządzenie"
+  unknown_artist: "Nieznany artysta"
+  unknown_album: "Nieznany album"
+  starting: "Kopiowanie na %{device}…"
+  progress: "Kopiowanie na %{device} (%{done}/%{total})…"
+  finished: "Zakończono kopiowanie na %{device}. Skopiowano: %{copied}, już istniało: %{skipped}, błędy: %{failed}."
+  cancelled: "Anulowano kopiowanie na %{device}. Skopiowano: %{copied}, już istniało: %{skipped}, błędy: %{failed}."
+  not_enough_space: "Za mało miejsca na %{device}: potrzeba %{required}, wolne %{available}. Nic nie zostało skopiowane."
+  read_only: "Urządzenie %{device} jest tylko do odczytu. Nic nie zostało skopiowane."
+  device_unavailable: "Urządzenie %{device} nie jest już dostępne. Nic nie zostało skopiowane."
+  playlist_unreadable: "Nie udało się odczytać listy odtwarzania. Nic nie zostało skopiowane."
+  stopped: "Kopiowanie na %{device} zostało nieoczekiwanie przerwane."
 
 # ── Zwykłe listy odtwarzania ───────────────────────────────────────
 regular_playlist:

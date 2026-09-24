@@ -271,6 +271,20 @@ download:
   progress: "Скачивание: %{done} из %{total}…"
   finished: "Скачивание завершено. Скачано: %{downloaded}, пропущено: %{skipped}, с ошибкой: %{failed}."
   cancelled: "Скачивание отменено. Скачано: %{downloaded}, пропущено: %{skipped}, с ошибкой: %{failed}."
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "Копировать на устройство"
+  unknown_artist: "Неизвестный исполнитель"
+  unknown_album: "Неизвестный альбом"
+  starting: "Копирование на %{device}…"
+  progress: "Копирование на %{device} (%{done}/%{total})…"
+  finished: "Копирование на %{device} завершено. Скопировано: %{copied}, уже есть: %{skipped}, ошибок: %{failed}."
+  cancelled: "Копирование на %{device} отменено. Скопировано: %{copied}, уже есть: %{skipped}, ошибок: %{failed}."
+  not_enough_space: "Недостаточно места на %{device}: нужно %{required}, свободно %{available}. Ничего не скопировано."
+  read_only: "Устройство %{device} доступно только для чтения. Ничего не скопировано."
+  device_unavailable: "Устройство %{device} больше недоступно. Ничего не скопировано."
+  playlist_unreadable: "Не удалось прочитать плейлист. Ничего не скопировано."
+  stopped: "Копирование на %{device} неожиданно прервано."
 
 # ── Обычные плейлисты ───────────────────────────────────────────
 regular_playlist:

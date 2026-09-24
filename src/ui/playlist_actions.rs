@@ -111,6 +111,11 @@ pub fn setup_playlist_actions(
     let rt_handle = state.rt_handle.clone();
     let win = state.window.clone();
     let playlist_sidebar_refresh = state.playlist_sidebar_refresh.clone();
+    let copy_feedback = super::device_copy::CopyFeedback {
+        toast_overlay: state.toast_overlay.clone(),
+        rt_handle: state.rt_handle.clone(),
+        sidebar_store: state.sidebar_store.clone(),
+    };
 
     // Serialize sidebar reorder persistence: one worker applies reorder
     // writes in receipt order, so a later reorder is never overtaken by an
@@ -235,6 +240,20 @@ pub fn setup_playlist_actions(
                         }
                     } else {
                         debug!(id = %playlist_id, "ExportPlaylist: playlist_allows_ordinary_actions rejected");
+                    }
+                }
+
+                sidebar::PlaylistAction::CopyToDevice(playlist_id, destination) => {
+                    debug!(id = %playlist_id, "dispatching CopyToDevice");
+                    if playlist_allows_ordinary_actions(&sidebar_store, &playlist_id) {
+                        if let Some((_, source)) = playlist_source(&sidebar_store, &playlist_id) {
+                            super::device_copy::copy_playlist(
+                                &copy_feedback,
+                                destination,
+                                playlist_id,
+                                source.name(),
+                            );
+                        }
                     }
                 }
 

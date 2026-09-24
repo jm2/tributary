@@ -62,7 +62,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Smart playlist compound sort (multi-key ordering) | ✅ |
 | Geo-distance sorting for Stations Near Me | ✅ |
 | USB/removable-media browsing (live sidebar entries + track scan) | ✅ |
-| USB file transfer (copy to device with progress) | ❌ Planned ([#8](https://github.com/jm2/tributary/issues/8)) |
+| USB file transfer (copy to device with progress) | ✅ Right-click tracks or a playlist → **Copy to Device**; MTP-only phones are not supported — see [Copying Music to a Device](#copying-music-to-a-device) |
 | Multiple music library directories | ✅ |
 | Playlist import/export (XSPF) | ✅ |
 | Rhythmbox profile migration | ✅ Preview-first import of ratings, play counts, and playlists |
@@ -339,9 +339,8 @@ The sandbox does not expose the whole home directory:
   [file-chooser portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.FileChooser.html),
   which grants persistent read/write access. Tag editing still needs the folder to be writable on
   the host.
-- Media mounted under `/media`, `/run/media`, and `/mnt` is exposed read-only for the automatic
-  **Devices** entries and playback. To edit tags on external media, add the folder explicitly in
-  Preferences instead.
+- Media mounted under `/media`, `/run/media`, and `/mnt` is exposed read/write for the automatic
+  **Devices** entries, playback, tag editing, and **Copy to Device**.
 - A custom path saved by an older Flatpak build may become unavailable under this policy. Use that
   root's **Reauthorize…** action in Preferences to reselect the same folder through the portal,
   confirm the move, and restart Tributary so the relocation completes before scanning. Removing and
@@ -610,9 +609,27 @@ optional, so a non-removable or network mount can occasionally appear too. Selec
 shows its scanned tracks; the scan stays on the device's own filesystem and does not follow links.
 
 Tributary does not mount or eject volumes, and MTP-only devices are not supported. In the Flatpak,
-file access for the automatic Devices entries is read-only and limited to `/media`, `/run/media`,
-and `/mnt`; a device mounted elsewhere can still be listed but cannot be scanned or played (see
+file access for the automatic Devices entries is limited to `/media`, `/run/media`, and `/mnt`; a
+device mounted elsewhere can still be listed but cannot be scanned, played, or copied to (see
 [Flatpak (Linux)](#flatpak-linux)).
+
+### Copying Music to a Device
+
+Right-click selected tracks, or a playlist in the sidebar, and choose a device under **Copy to
+Device**. Only writable devices from the **Devices** list are offered, so the entry is hidden
+when none is mounted. Tracks are copied to `Music/<Album Artist or Artist>/<Album>/<NN Title>.<ext>` on the
+device, with names adjusted for FAT and exFAT. A file already there with the same size is
+skipped, so copying the same playlist again only adds what is missing. Copying a playlist also
+writes `Music/Playlists/<Playlist>.m3u8`, listing the copied tracks by relative path.
+
+Tributary checks the free space first and copies nothing if the tracks will not fit. A toast shows
+progress with a **Cancel** button; cancelling keeps the tracks that finished and removes only the
+unfinished file. Streamed tracks from servers and radio stations cannot be copied.
+
+This works with USB drives, SD cards, music players, and phones that mount as USB storage. Phones
+that connect only over MTP, as most Android phones do, are not supported: the Devices list
+includes only mounts with a native filesystem path, which leaves out GVfs `mtp://` mounts.
+Copying does not start automatically when a device is plugged in.
 
 ### Connecting to Remote Servers
 

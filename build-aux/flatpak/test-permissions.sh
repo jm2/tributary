@@ -20,7 +20,7 @@ insert_and_reject()
 
     awk -v entry="$entry" '
         { print }
-        $0 == "  - --filesystem=/mnt:ro" {
+        $0 == "  - --filesystem=/mnt:rw" {
             print entry
             inserted = 1
         }
@@ -73,7 +73,8 @@ insert_and_reject quoted-home '  - "--filesystem=home:ro"'
 insert_and_reject commented-host '  - --filesystem=host:rw # hidden from a naive parser'
 insert_and_reject arbitrary-root '  - --filesystem=/etc:rw'
 insert_and_reject arbitrary-xdg-root '  - --filesystem=xdg-documents:rw'
-insert_and_reject writable-media '  - --filesystem=/media:rw'
+insert_and_reject broader-run-root '  - --filesystem=/run:rw'
+insert_and_reject creatable-media '  - --filesystem=/media:create'
 insert_and_reject raw-device '  - --device=all'
 insert_and_reject system-bus '  - --system-talk-name=org.freedesktop.UDisks2'
 insert_and_reject session-bus '  - --talk-name=org.example.Unreviewed'

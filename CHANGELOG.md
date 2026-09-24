@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Copy to Device** — Right-click tracks or a playlist and choose a USB drive, SD card, or music
+  player to copy the music onto it, organized by artist and album. Files already on the device
+  are skipped, the copy can be cancelled, and a copied playlist is saved as an `.m3u8` file. In
+  the Flatpak, drives under `/media`, `/run/media`, and `/mnt` are now writable.
 - **Download remote tracks** — Right-click tracks from a Subsonic, Jellyfin, Plex, or DAAP server
   and choose Download to keep a copy in your library for offline listening. Files are saved to a
   Tributary Downloads folder in your music folder, which you can change in Preferences.

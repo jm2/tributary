@@ -269,6 +269,20 @@ download:
   progress: "%{done} van %{total} downloaden…"
   finished: "Downloads voltooid. Gedownload: %{downloaded}, overgeslagen: %{skipped}, mislukt: %{failed}."
   cancelled: "Downloads geannuleerd. Gedownload: %{downloaded}, overgeslagen: %{skipped}, mislukt: %{failed}."
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "Kopiëren naar apparaat"
+  unknown_artist: "Onbekende artiest"
+  unknown_album: "Onbekend album"
+  starting: "Kopiëren naar %{device}…"
+  progress: "Kopiëren naar %{device} (%{done}/%{total})…"
+  finished: "Kopiëren naar %{device} voltooid. Gekopieerd: %{copied}, al aanwezig: %{skipped}, mislukt: %{failed}."
+  cancelled: "Kopiëren naar %{device} geannuleerd. Gekopieerd: %{copied}, al aanwezig: %{skipped}, mislukt: %{failed}."
+  not_enough_space: "Niet genoeg ruimte op %{device}: %{required} nodig, %{available} vrij. Er is niets gekopieerd."
+  read_only: "%{device} is alleen-lezen. Er is niets gekopieerd."
+  device_unavailable: "%{device} is niet meer beschikbaar. Er is niets gekopieerd."
+  playlist_unreadable: "De afspeellijst kon niet worden gelezen. Er is niets gekopieerd."
+  stopped: "Kopiëren naar %{device} is onverwacht gestopt."
 
 # ── Gewone afspeellijsten ─────────────────────────────────────────
 regular_playlist:
