@@ -19,11 +19,11 @@ finish-args:
   # portals to grant persistent access to any other user-selected folder.
   - --filesystem=xdg-music:rw
   # Flatpak documents these as the conventional external-drive mount roots.
-  # Automatic device browsing needs only native-path reads; a user who wants
-  # tag editing can add a writable folder explicitly through GtkFileDialog.
-  - --filesystem=/media:ro
-  - --filesystem=/run/media:ro
-  - --filesystem=/mnt:ro
+  # Devices are browsed through native paths, and Copy to Device and tag
+  # editing write to them, so the roots are exposed read/write.
+  - --filesystem=/media:rw
+  - --filesystem=/run/media:rw
+  - --filesystem=/mnt:rw
   # GIO VolumeMonitor reaches the host GVfs daemons through this service
   # namespace, whose methods are broader than mount listing alone. Tributary
   # consumes only cached native mount metadata; xdg-run/gvfs{,d} grants are
