@@ -15,8 +15,8 @@ individually, except `sea-orm` and `sea-orm-migration`, which always share a gro
 matching manifest requirements and locked versions. The `dependabot-automerge.yml` workflow may
 enable GitHub's native auto-merge for semver-patch updates only: most core crates are 0.x, where a
 minor bump is breaking, and a group that contains any minor bump is reported as a minor update.
-Routine auto-merge stays off until the `main` ruleset requires the repository's full all-checks
-policy (see "Closing the gap (the machine gate)" in `docs/refinery-config.md`). Compiler
+Auto-merge waits for the `main` ruleset's required checks (see "Merge gate" in
+`docs/refinery-config.md`). Compiler
 proposals and updates to the pinned `dtolnay/rust-toolchain` and `dependabot/fetch-metadata`
 actions never auto-merge.
 
