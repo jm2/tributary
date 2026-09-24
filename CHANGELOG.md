@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asks for confirmation first, with Cancel as the default.
 - **Maintenance** — Dependencies were refreshed, the fuzz tests now cover more file and network
   parsers, and CI runs the interface tests on a real display, checks one shared lockfile, and
-  auto-merges only patch-level dependency updates.
+  auto-merges only patch-level dependency updates. Unused internal code and placeholder data no
+  longer ship in the app.
 
 ### Fixed
 
