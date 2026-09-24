@@ -151,14 +151,15 @@ for prohibited in \
   'libmmbd64.dylib' \
   'libgstresindvd.dylib' \
   'WidevineCDM.framework' \
-  'FairPlayRuntime'; do
+  'FairPlayRuntime' \
+  'libgstfdkaac.dylib' \
+  'libfdk-aac.2.dylib'; do
   assert_prohibited_name "$prohibited"
 done
 
 for ordinary_runtime in \
   'libgstlibav.dylib' \
   'libavcodec.61.dylib' \
-  'libgstfdkaac.dylib' \
   'libgstaudioparsers.dylib' \
   'libgstdvdlpcmdec.dylib' \
   'libgstdvdsub.dylib' \
@@ -388,5 +389,123 @@ make_bundle "$UNINSPECTABLE_BUNDLE"
 touch "$UNINSPECTABLE_BUNDLE/Contents/Frameworks/libordinary.dylib"
 touch "$UNINSPECTABLE_BUNDLE/Contents/Frameworks/libordinary.dylib.otool-fail"
 assert_status 2 macos_validate_bundle_copy_control "$UNINSPECTABLE_BUNDLE"
+
+# The shared plugin allowlist loads for macOS, keeps the Windows-only sinks
+# out, and rejects malformed, duplicate, forbidden, and empty lists.
+ALLOWLIST_FILE="${SCRIPT_DIR}/../build-aux/packaging/bundled-gstreamer-plugins.txt"
+assert_status 0 macos_gstreamer_allowlist_load "$ALLOWLIST_FILE" macos
+for required_plugin in coreelements playback soup osxaudio libav; do
+  macos_gstreamer_plugin_is_allowlisted "libgst${required_plugin}.dylib" \
+    || fail "allowlist is missing the required ${required_plugin} plugin"
+done
+for excluded_plugin in wasapi2 directsound fdkaac x264 x265 openh264 webrtc vulkan; do
+  if macos_gstreamer_plugin_is_allowlisted "libgst${excluded_plugin}.dylib"; then
+    fail "macOS allowlist unexpectedly admits ${excluded_plugin}"
+  fi
+done
+if macos_gstreamer_plugin_is_allowlisted 'libgstsoup.dylib.bak'; then
+  fail "allowlist matched a non-plugin filename"
+fi
+BAD_ALLOWLIST="${TEST_ROOT}/bad-allowlist.txt"
+for bad_entry in 'Soup' 'soup linux' 'libgstsoup.dylib' 'fdkaac' $'soup\nsoup' 'wasapi2 windows'; do
+  printf '%s\n' "$bad_entry" > "$BAD_ALLOWLIST"
+  assert_status 1 macos_gstreamer_allowlist_load "$BAD_ALLOWLIST" macos
+done
+assert_status 0 macos_gstreamer_allowlist_load "$ALLOWLIST_FILE" macos
+
+ALLOWED_PLUGIN_DIR="${TEST_ROOT}/Allowlisted Plugins"
+mkdir -p "$ALLOWED_PLUGIN_DIR"
+touch "$ALLOWED_PLUGIN_DIR/libgstcoreelements.dylib" "$ALLOWED_PLUGIN_DIR/libgstosxaudio.dylib"
+assert_status 0 macos_validate_gstreamer_plugin_allowlist "$ALLOWED_PLUGIN_DIR"
+touch "$ALLOWED_PLUGIN_DIR/libgstx264.dylib"
+assert_status 1 macos_validate_gstreamer_plugin_allowlist "$ALLOWED_PLUGIN_DIR"
+[[ "$MACOS_PACKAGE_POLICY_REASON" == *'libgstx264.dylib'* ]] \
+  || fail "unlisted plugin did not produce a useful diagnostic"
+rm "$ALLOWED_PLUGIN_DIR/libgstx264.dylib"
+mkdir -p "$ALLOWED_PLUGIN_DIR/include/gst"
+assert_status 1 macos_validate_gstreamer_plugin_allowlist "$ALLOWED_PLUGIN_DIR"
+rm -r "$ALLOWED_PLUGIN_DIR/include"
+ln -s libgstcoreelements.dylib "$ALLOWED_PLUGIN_DIR/libgstsoup.dylib"
+assert_status 1 macos_validate_gstreamer_plugin_allowlist "$ALLOWED_PLUGIN_DIR"
+rm "$ALLOWED_PLUGIN_DIR/libgstsoup.dylib"
+assert_status 1 macos_validate_gstreamer_plugin_allowlist "${TEST_ROOT}/missing-plugins"
+
+# Notices attribute copied files to Homebrew kegs through prefix and opt
+# symlinks, copy keg license files, and fail for an unattributable binary.
+BREW_ROOT="${TEST_ROOT}/Brew Prefix"
+CELLAR="${BREW_ROOT}/Cellar"
+mkdir -p "$CELLAR/glib/2.86.0/lib" "$CELLAR/adwaita-icon-theme/49.0/share/icons/Adwaita" \
+  "$CELLAR/nolicense/1.0_1/lib" "$BREW_ROOT/lib" "$BREW_ROOT/opt" "$BREW_ROOT/share/icons/hicolor"
+printf 'glib\n' > "$CELLAR/glib/2.86.0/lib/libglib-2.0.0.dylib"
+printf 'LGPL text\n' > "$CELLAR/glib/2.86.0/COPYING"
+printf 'readme\n' > "$CELLAR/glib/2.86.0/README.md"
+cat > "$CELLAR/glib/2.86.0/sbom.spdx.json" <<'SBOM'
+{
+  "packages": [
+    {
+      "name": "glib",
+      "versionInfo": "2.86.0",
+      "licenseDeclared": "NOASSERTION",
+      "licenseConcluded": "LGPL-2.1-or-later",
+      "downloadLocation": "https://download.gnome.org/sources/glib/2.86/glib-2.86.0.tar.xz",
+      "copyrightText": "NOASSERTION"
+    }
+  ]
+}
+SBOM
+printf 'icon\n' > "$CELLAR/adwaita-icon-theme/49.0/share/icons/Adwaita/index.theme"
+printf 'CC text\n' > "$CELLAR/adwaita-icon-theme/49.0/LICENSE"
+printf 'plain\n' > "$CELLAR/nolicense/1.0_1/lib/libplain.dylib"
+ln -s ../Cellar/glib/2.86.0 "$BREW_ROOT/opt/glib"
+ln -s ../Cellar/nolicense/1.0_1/lib/libplain.dylib "$BREW_ROOT/lib/libplain.dylib"
+ln -s ../../Cellar/adwaita-icon-theme/49.0/share/icons/Adwaita "$BREW_ROOT/share/icons/Adwaita"
+printf 'cache\n' > "$BREW_ROOT/share/icons/hicolor/icon-theme.cache"
+CELLAR="$(cd -P "$CELLAR" && pwd -P)"
+
+NOTICE_RESOURCES="${TEST_ROOT}/Notice.app/Contents/Resources"
+mkdir -p "$NOTICE_RESOURCES/lib/gstreamer-1.0"
+MACOS_BUNDLED_BINARY_SOURCES=(
+  "$BREW_ROOT/opt/glib/lib/libglib-2.0.0.dylib"
+  "$BREW_ROOT/lib/libplain.dylib"
+)
+MACOS_BUNDLED_DATA_SOURCES=("$BREW_ROOT/share/icons/Adwaita" "$BREW_ROOT/share/icons/hicolor")
+assert_status 0 macos_write_third_party_notices "$NOTICE_RESOURCES" "$CELLAR" "${SCRIPT_DIR}/.."
+NOTICES="$NOTICE_RESOURCES/THIRD-PARTY-NOTICES.txt"
+grep -q 'Source code offer' "$NOTICES" || fail "notices lack the source code offer"
+grep -q 'built by Homebrew (https://brew.sh)' "$NOTICES" || fail "notices lack the packager"
+grep -q '^glib 2.86.0$' "$NOTICES" || fail "notices lack the glib keg"
+grep -q '^  License: LGPL-2.1-or-later$' "$NOTICES" || fail "notices lack the SBOM license"
+grep -q '^  Source: https://download.gnome.org/sources/glib/2.86/glib-2.86.0.tar.xz$' "$NOTICES" \
+  || fail "notices lack the SBOM source location"
+grep -q '^  License files: licenses/glib/COPYING$' "$NOTICES" \
+  || fail "notices did not list exactly the glib license file"
+grep -q '^adwaita-icon-theme 49.0$' "$NOTICES" || fail "notices lack a data-tree keg"
+grep -q '^nolicense 1.0_1$' "$NOTICES" || fail "notices lack a keg reached through a lib symlink"
+grep -q '^  License: not recorded in the keg$' "$NOTICES" \
+  || fail "a keg without an SBOM did not get an explicit license placeholder"
+[[ "$(grep -c '^  Build recipe: ' "$NOTICES")" -eq 3 ]] \
+  || fail "notices listed an unexpected component"
+[[ -f "$NOTICE_RESOURCES/licenses/glib/COPYING" ]] || fail "keg license file was not copied"
+[[ ! -e "$NOTICE_RESOURCES/licenses/glib/README.md" ]] || fail "a non-license metafile was copied"
+[[ -f "$NOTICE_RESOURCES/licenses/adwaita-icon-theme/LICENSE" ]] \
+  || fail "data-tree keg license file was not copied"
+for common_license in GPL-3.0 GPL-2.0 LGPL-2.0 LGPL-2.1 LGPL-3.0; do
+  [[ -s "$NOTICE_RESOURCES/licenses/common/${common_license}.txt" ]] \
+    || fail "common license text is missing: ${common_license}"
+done
+
+touch "$NOTICE_RESOURCES/lib/gstreamer-1.0/libgstcoreelements.dylib"
+assert_status 0 macos_validate_release_contents "${TEST_ROOT}/Notice.app"
+touch "$NOTICE_RESOURCES/lib/gstreamer-1.0/libgstfdkaac.dylib"
+assert_status 1 macos_validate_release_contents "${TEST_ROOT}/Notice.app"
+rm "$NOTICE_RESOURCES/lib/gstreamer-1.0/libgstfdkaac.dylib"
+rm "$NOTICES"
+assert_status 1 macos_validate_release_contents "${TEST_ROOT}/Notice.app"
+
+printf 'stray\n' > "${TEST_ROOT}/libstray.dylib"
+MACOS_BUNDLED_BINARY_SOURCES+=("${TEST_ROOT}/libstray.dylib")
+assert_status 1 macos_write_third_party_notices "$NOTICE_RESOURCES" "$CELLAR" "${SCRIPT_DIR}/.."
+[[ "$MACOS_PACKAGE_POLICY_REASON" == *'libstray.dylib'* ]] \
+  || fail "an unattributable binary did not produce a useful diagnostic"
 
 echo "ok - macOS packaging policy rejects decrypt components without hiding ordinary codecs"

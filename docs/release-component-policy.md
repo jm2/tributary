@@ -1,11 +1,16 @@
 # Release component policy
 
-Last reviewed: 2026-07-20
+Last reviewed: 2026-09-23
 
 Tributary is a music-library application. It does not implement DVD, Blu-ray, DRM-protected-media,
 or proprietary content-decryption-module playback, so release artifacts must not contain dedicated
 copy-control circumvention components or the unused optical-disc access plugins that can introduce
 them transitively.
+
+The Windows and macOS bundles also carry only an allowlisted set of GStreamer audio plugins and
+ship third-party license notices for every packaged component; see
+[Bundled GStreamer plugins](#bundled-gstreamer-plugins) and
+[Third-party notices](#third-party-notices).
 
 This is a conservative release-engineering boundary, not a representation that a filename by
 itself determines a component's legal status and not legal advice. Laws, licenses, patents, and
@@ -24,7 +29,11 @@ It covers:
   media;
 - standalone MakeMKV tooling, the dedicated Debian `libdvd-pkg` installer, and conventional AACS
   key-database artifacts; and
-- proprietary browser/video content-decryption modules such as Widevine, PlayReady, or FairPlay.
+- proprietary browser/video content-decryption modules such as Widevine, PlayReady, or FairPlay;
+  and
+- the Fraunhofer FDK AAC library and its GStreamer plugin, whose license the FSF lists as
+  incompatible with the GPL. Tributary is GPL-3.0-or-later; FFmpeg's native AAC decoder (through
+  `libav`) covers AAC playback instead.
 
 The policy intentionally does not deny ordinary audio decoders, container parsers, TLS libraries,
 or general-purpose cryptography. Those components support Tributary's normal authorized playback
@@ -72,6 +81,54 @@ the same validators directly. Windows ZIP, native Linux package, and Flatpak out
 and inspected before upload; the macOS app and Windows installer source tree are inspected
 immediately before their trusted container tools run.
 
+## Bundled GStreamer plugins
+
+[`build-aux/packaging/bundled-gstreamer-plugins.txt`](../build-aux/packaging/bundled-gstreamer-plugins.txt)
+lists the only GStreamer plugins the Windows and macOS bundles may contain. It covers the elements
+Tributary and its packaged runtime probe create (`playbin3`, `souphttpsrc`, the equalizer chain,
+`identity`/`capsfilter`, and the platform sinks `wasapi2sink`/`directsoundsink` or
+`osxaudiosink`), typefinding, internet-radio ICY and HLS handling, and the parsers, demuxers, and
+decoders for the supported library formats: MP3, FLAC, AAC/ALAC in M4A, Ogg Vorbis and Opus,
+WAV, AIFF, and WMA. Encoders, video, WebRTC, RTMP, SRT, Vulkan, NVCodec, and the remaining
+plugins in the packagers' plugin directories are not copied.
+
+Each bundler copies only the listed plugins and then the native dependency closure of those
+plugins and the application, so a library that only an omitted plugin needed is not shipped.
+Static and import libraries (`.a`, `.dll.a`) are never copied. The Windows bundler removes
+unlisted plugins, link-time libraries, and root DLLs left by an older incremental tree before it
+copies anything, and the installer deletes the previous plugin directory and root DLLs on upgrade.
+Both platforms fail the bundle when the finished plugin directory contains any unlisted member,
+before the runtime probe, the ZIP or DMG, and the installer. The Windows bundle also carries GLib's
+`gdbus.exe` beside `libgio`, which GLib runs to autolaunch the session bus that
+single-instance activation needs; the same gate requires it.
+
+`libav` remains necessary: GStreamer has no native ALAC or WMA decoder. MSYS2 and Homebrew build
+FFmpeg as GPL-3.0-or-later with external encoders linked in (x264, x265, SVT-AV1, and libvpx on
+both; AOM and rav1e on MSYS2), so those libraries stay in the dependency closure even though no
+encoder plugin ships. Removing them would require a decoder-only FFmpeg build, which is a separate
+packaging change. FFmpeg's GPL build is compatible with Tributary's license and is covered by the
+notices and source offer below.
+
+Adding a plugin to the allowlist is a review-boundary change: record which element needs it and
+update this document, the packaging tests, and the changelog together.
+
+## Third-party notices
+
+Every Windows and macOS bundle contains `THIRD-PARTY-NOTICES.txt` and a `licenses/` directory
+(inside `Contents/Resources` on macOS). The bundlers attribute each copied file to the package
+that installed it: the MSYS2 pacman database on Windows, and the Homebrew keg a file resolves into
+on macOS. Each entry lists the package, version, declared license (MSYS2 package metadata or the
+keg's SPDX SBOM), and source location, and each package's own license files are copied beside
+it. `licenses/common/` holds the GNU GPL and LGPL texts, including Tributary's GPL-3.0, for
+packages that do not ship their own copy. The notices include a written offer to provide the
+complete corresponding source of every GPL- or LGPL-licensed component for at least three years
+after the release.
+
+A bundled executable or library that no installed package owns fails the bundle, and the
+release-contents gate rejects a bundle without the notices, the GNU texts, or the source offer.
+Some MSYS2 packages ship no license file at all (for example libvorbis, libtheora, and libvpx);
+their entries say so and point to the exact source package, which contains the upstream license.
+
 ## Review boundary
 
 Any change that weakens the denied list, adds a new bundled media framework/plugin source, enables
@@ -105,14 +162,12 @@ archive; Tributary's install manifests intentionally introduce no such container
 review-boundary change. Release inputs must therefore continue to come from the pinned or
 documented package sources used by the build workflows.
 
-A capability-derived audio-plugin allowlist and narrower native distribution relationships would
-be stronger than recognizable-name denial, but they are not safe to guess from one build host:
-GStreamer autoplugging, platform sinks, remote-source handling, supported containers, and any
-future selected AirPlay sender must all remain covered. Some distributions place unused
-disc-access plugins in the same broad plugin packages as supported audio capabilities; that does
-not place them in Tributary's package payload, but it is a valid least-privilege follow-up. Treat
-both changes as a separate cross-platform packaging improvement with a real playback matrix, not
-as an unreviewed tightening of this emergency gate.
+The plugin allowlist is derived from the elements Tributary creates and the formats it supports,
+and the packaging tests pin that mapping to the code. It is not yet backed by a per-format
+playback matrix on each platform; the packaged runtime probe exercises HTTP FLAC playback only.
+Native Linux packages and Flatpak rely on distribution or runtime plugin packages, which may
+still contain unused disc-access plugins outside Tributary's own payload; narrowing those
+relationships remains a least-privilege follow-up.
 
 The first P2.4 AirPlay sender design investigation is recorded in
 [`airplay-sender-design.md`](airplay-sender-design.md). It scopes a maintained RAOP-1

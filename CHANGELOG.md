@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **License notices in Windows and macOS downloads** — Each download now includes a
+  `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
+  offer of their source code.
   distinct identities for multiple roots, lazy navigation, and a visible notice when a
   root is unavailable.
 - **Album artwork in the browser** — The Album pane can show cover art for local and server
@@ -36,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Smaller Windows and macOS downloads** — The downloads now contain only the audio plugins
+  Tributary uses, leaving out video, streaming, and encoder plugins and the FDK AAC library,
+  whose license does not allow it to ship with Tributary.
 - **AirPlay outputs need a sender** — AirPlay receivers appear in the output selector only when
   the installed GStreamer can send to them, so builds without that support no longer list rows that
   fail on play. The README explains how to reach AirPlay speakers through your operating system.
@@ -49,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Single instance on Windows** — Starting Tributary again, or opening a file with it, while
+  it is already running now hands off to the running window instead of starting a second copy.
 - **Fewer freezes** — Album artwork is decoded in the background at the size it is shown, ejecting a
   drive while a tag edit is saving no longer freezes the window (the save is cancelled and the file
   left unchanged), and moving or deleting many library files updates the track list in one step.

@@ -295,7 +295,9 @@ tree only while that receipt still matches, so rerun the full bundle after chang
 
 Tributary does not play DVDs, Blu-ray discs, or DRM-protected media, and its packaging scripts
 refuse to ship optical-disc decryption or content-decryption components. Ordinary audio codecs,
-TLS, and general-purpose cryptography are unaffected. The
+TLS, and general-purpose cryptography are unaffected. Windows and macOS bundles contain only the
+GStreamer plugins Tributary uses for audio playback and include `THIRD-PARTY-NOTICES.txt` with the
+bundled components' licenses. The
 [release component policy](docs/release-component-policy.md) describes exactly what each
 platform's packaging validates.
 
