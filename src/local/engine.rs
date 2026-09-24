@@ -5355,6 +5355,7 @@ async fn initial_scan_with_control(
     // snapshot instead of re-querying. A failed individual delete is logged and
     // skipped rather than aborting the whole scan, so a transient DB hiccup
     // can't discard the FullSync/ScanComplete that follow.
+    let mut removed_paths = Vec::new();
     if content_mutations_allowed {
         for row in &existing_tracks {
             let row_path = Path::new(&row.file_path);
@@ -5502,9 +5503,7 @@ async fn initial_scan_with_control(
             .await
             {
                 Ok(GuardedTrackDeleteOutcome::Deleted) => {
-                    let _ = tx
-                        .send(LibraryEvent::TrackRemoved(row.file_path.clone()))
-                        .await;
+                    removed_paths.push(row.file_path.clone());
                 }
                 Ok(GuardedTrackDeleteOutcome::Missing) => {}
                 Ok(GuardedTrackDeleteOutcome::GuardRejected) => {
@@ -5531,7 +5530,16 @@ async fn initial_scan_with_control(
     // Send full sync. A transient failure here is logged but still lets the
     // scan finish (reconcile + ScanComplete) so the UI settles into a synced
     // state instead of hanging on the spinner with no completion signal.
-    send_library_snapshot(db, tx).await;
+    //
+    // The snapshot already omits every stale row deleted above, so those rows
+    // are not also announced one by one: each per-row removal costs the UI a
+    // pass over the whole library. They go out individually only when no
+    // snapshot could be read.
+    if send_library_snapshot(db, tx).await == LibrarySnapshotPublication::StorageUnavailable {
+        for path in removed_paths {
+            let _ = tx.send(LibraryEvent::TrackRemoved(path)).await;
+        }
+    }
 
     // Reconcile orphaned playlist entries with newly-discovered tracks.
     let playlist_mgr = super::playlist_manager::PlaylistManager::new(db.clone());
@@ -12099,6 +12107,65 @@ mod tests {
             events.is_empty(),
             "a cancelled scan emits no completion events: {events:?}"
         );
+    }
+
+    /// The stale pass announces its deletions through the FullSync that
+    /// follows it, not as one `TrackRemoved` per row: each per-row event
+    /// costs the UI a pass over the whole library.
+    #[tokio::test]
+    async fn stale_deletions_are_published_by_the_full_sync_not_per_row() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("stale-full-sync");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+        let missing = directory.path().join("missing.wav");
+        write_minimal_wav(&missing);
+        let music_dirs = [directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+
+        // The first scan enrolls the root and indexes both files; the second
+        // is authoritative and finds one of them gone.
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("enrolling scan");
+        std::fs::remove_file(&missing).expect("remove indexed file");
+        while event_rx.try_recv().is_ok() {}
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("reconciling scan");
+
+        let missing = missing.to_string_lossy();
+        let remaining = track::Entity::find().all(&db).await.expect("query tracks");
+        assert_eq!(remaining.len(), 1, "the scan deletes the stale row");
+        assert_ne!(remaining[0].file_path, missing.as_ref());
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LibraryEvent::TrackRemoved(_))),
+            "stale deletions must not be announced row by row: {events:?}"
+        );
+        let full_sync = events
+            .iter()
+            .find_map(|event| match event {
+                LibraryEvent::FullSync(tracks) => Some(tracks),
+                _ => None,
+            })
+            .expect("the scan publishes a FullSync");
+        assert_eq!(full_sync.len(), 1);
+        assert!(full_sync
+            .iter()
+            .all(|track| track.file_path.as_deref() != Some(missing.as_ref())));
     }
 
     /// A parser that settles inside its shutdown grace is *kept* by the

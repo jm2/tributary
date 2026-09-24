@@ -444,25 +444,69 @@ impl AirPlayOutput {
         uri: &str,
         volume: f64,
     ) -> Result<gst::Pipeline, String> {
-        let pipeline_str = format!(
-            "uridecodebin name=decoder uri=\"{}\" ! audioconvert ! avenc_alac ! raopsink name=raop host={} port={}",
-            uri.replace('"', "\\\""),
-            host,
-            port,
-        );
-
-        let element = gst::parse::launch(&pipeline_str)
-            .map_err(|_| "Failed to build RAOP pipeline".to_string())?;
-        let pipeline = element
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| "RAOP launch did not yield a Pipeline".to_string())?;
-
+        let pipeline = Self::build_sender_pipeline("raopsink", host, port, uri)?;
         if let Some(sink) = pipeline.by_name("raop") {
             sink.set_property("volume", Self::volume_to_db(volume));
         }
-        let decoder = pipeline
-            .by_name("decoder")
-            .ok_or_else(|| "RAOP pipeline has no URI decoder".to_string())?;
+        Ok(pipeline)
+    }
+
+    /// Assemble `uridecodebin ! audioconvert ! avenc_alac ! <sink>` element
+    /// by element. The receiver host comes from an mDNS advertisement, so the
+    /// host, port, and URI are set as property values and never pass through
+    /// the pipeline-description parser.
+    fn build_sender_pipeline(
+        sink_factory: &str,
+        host: &str,
+        port: u16,
+        uri: &str,
+    ) -> Result<gst::Pipeline, String> {
+        let make = |factory: &str, name: &str| {
+            gst::ElementFactory::make(factory)
+                .name(name)
+                .build()
+                .map_err(|_| format!("Failed to create {factory} for the RAOP pipeline"))
+        };
+        let decoder = make("uridecodebin", "decoder")?;
+        let convert = make("audioconvert", "convert")?;
+        let encoder = make("avenc_alac", "encoder")?;
+        let sink = make(sink_factory, "raop")?;
+
+        let string_host = sink
+            .find_property("host")
+            .is_some_and(|property| property.value_type() == glib::Type::STRING);
+        if !string_host || sink.find_property("port").is_none() {
+            return Err("The RAOP sink has no host or port property".to_string());
+        }
+        decoder.set_property("uri", uri);
+        sink.set_property("host", host);
+        // The port's integer type belongs to the third-party sink; a decimal
+        // string deserializes into whichever one it declares.
+        sink.set_property_from_str("port", &port.to_string());
+
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add_many([&decoder, &convert, &encoder, &sink])
+            .map_err(|_| "Failed to assemble the RAOP pipeline".to_string())?;
+        gst::Element::link_many([&convert, &encoder, &sink])
+            .map_err(|_| "Failed to link the RAOP pipeline".to_string())?;
+
+        // uridecodebin adds its decoded pads once the stream is typed; the
+        // first audio pad feeds the encoder chain.
+        let convert_sink = convert
+            .static_pad("sink")
+            .ok_or_else(|| "audioconvert has no sink pad".to_string())?;
+        decoder.connect_pad_added(move |_, pad| {
+            let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+            let is_audio = caps
+                .structure(0)
+                .is_some_and(|structure| structure.name().starts_with("audio/"));
+            if is_audio && !convert_sink.is_linked() {
+                if let Err(error) = pad.link(&convert_sink) {
+                    warn!(?error, "AirPlay: failed to link the decoded audio pad");
+                }
+            }
+        });
         super::Player::install_loopback_http_source_policy(&decoder);
 
         Ok(pipeline)
@@ -620,6 +664,41 @@ impl AudioOutput for AirPlayOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The receiver host and the media URI reach their elements verbatim as
+    /// property values: text that would be pipeline syntax in a launch
+    /// string adds no element and sets no other property. `tcpclientsink`
+    /// stands in for the third-party `raopsink` because it declares the same
+    /// string `host` and integer `port` properties.
+    #[test]
+    fn sender_pipeline_sets_advertised_fields_as_values_not_syntax() {
+        let factories = [
+            "uridecodebin",
+            "audioconvert",
+            "avenc_alac",
+            "tcpclientsink",
+        ];
+        if gst::init().is_err()
+            || factories
+                .iter()
+                .any(|factory| gst::ElementFactory::find(factory).is_none())
+        {
+            eprintln!("skipping: RAOP stand-in pipeline elements are not installed");
+            return;
+        }
+        let host = "evil.local port=1 ! filesink location=/nonexistent/pwned";
+        let uri = "http://127.0.0.1:9/a\"b\\c.flac";
+
+        let pipeline = AirPlayOutput::build_sender_pipeline("tcpclientsink", host, 7000, uri)
+            .expect("build the stand-in sender pipeline");
+
+        assert_eq!(pipeline.children().len(), 4);
+        let sink = pipeline.by_name("raop").expect("named sink");
+        assert_eq!(sink.property::<String>("host"), host);
+        assert_eq!(sink.property::<i32>("port"), 7000);
+        let decoder = pipeline.by_name("decoder").expect("named decoder");
+        assert_eq!(decoder.property::<String>("uri"), uri);
+    }
 
     #[test]
     fn test_airplay_output_name() {

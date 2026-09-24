@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fewer freezes** — Album artwork is decoded in the background at the size it is shown, ejecting a
+  drive while a tag edit is saving no longer freezes the window (the save is cancelled and the file
+  left unchanged), and moving or deleting many library files updates the track list in one step.
+- **Pausing while a track starts** — Play/Pause now works while a track is still buffering instead
+  of being ignored.
 - **Safer library upgrades** — Tributary now copies the library database to a `backups` folder
   before upgrading it, keeping the three newest copies, and an upgrade interrupted partway can
   be retried. An older version opened on a newer library now says so and points to the copies,
@@ -171,6 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **AirPlay receiver names** — A receiver's advertised host name can no longer change the AirPlay
+  playback pipeline Tributary builds for it.
 - **Release builds** — Release packages are built from exact, reviewed versions of the build
   actions, Rust compiler, and packaging tools, and each published file has a GitHub
   build-provenance attestation that `gh attestation verify` can check.

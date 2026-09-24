@@ -332,6 +332,10 @@ impl TrackObject {
     pub fn uri(&self) -> String {
         self.imp().uri.borrow().clone()
     }
+    /// Run `f` on the URI without cloning it.
+    pub(crate) fn with_uri<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        f(&self.imp().uri.borrow())
+    }
     pub fn cover_art_url(&self) -> String {
         self.imp().cover_art_url.borrow().clone()
     }

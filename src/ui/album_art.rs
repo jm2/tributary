@@ -4,6 +4,8 @@
 //! - Extracting embedded album art from local audio files (FLAC, MP3, M4A, OGG)
 //! - Fetching remote album art URLs (Subsonic, Jellyfin, Plex cover art)
 //! - A persistent background worker thread with generation-based staleness detection
+//! - Decoding artwork at its display size on those workers, so the GTK main
+//!   thread only installs a finished thumbnail texture
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,7 +46,7 @@ const MAX_PENDING_LOCAL_ART_JOBS: usize = 64;
 /// Side length (device pixels) the now-playing header thumbnail renders
 /// at. Mirrors the header bar's `set_pixel_size(36)` so a decoded header
 /// texture is bounded to the same on-screen size as its placeholder icon
-/// (see [`bound_texture_side`]).
+/// (see [`decode_art_thumbnail`]).
 const HEADER_ART_SIDE: i32 = 36;
 
 /// Global generation counter for album art requests.  Incremented on
@@ -168,11 +170,13 @@ impl ScopedArtFetch {
     }
 }
 
-/// Request sent to the album art worker thread.
+/// Request sent to the album art worker thread. The worker fetches, then
+/// decodes the artwork bounded to `max_side` before replying.
 struct ArtRequest {
     source: ArtSource,
     liveness: RequestLiveness,
-    reply_tx: async_channel::Sender<Vec<u8>>,
+    max_side: i32,
+    reply_tx: async_channel::Sender<gtk::gdk::Texture>,
 }
 
 /// Remote artwork input. Deliberately not `Debug`: the resolved variant owns
@@ -354,11 +358,13 @@ fn resolved_art_client(
     Some(client)
 }
 
-/// Perform one remote-artwork HTTP fetch and deliver the body to the
-/// request's reply channel on success. The post-response liveness and
-/// activity re-checks keep a cancelled row (or superseded track) from
-/// receiving bytes fetched after its revocation.
+/// Perform one remote-artwork HTTP fetch, decode the body on this worker,
+/// and deliver the thumbnail to the request's reply channel on success. The
+/// post-response and post-decode liveness and activity re-checks keep a
+/// cancelled row (or superseded track) from receiving artwork fetched after
+/// its revocation.
 fn send_and_deliver_art(request: reqwest::blocking::RequestBuilder, req: ArtRequest) {
+    let still_wanted = |req: &ArtRequest| req.source.is_active() && req.liveness.is_valid();
     match request.timeout(REMOTE_ART_TIMEOUT).send() {
         Ok(resp) if resp.status().is_success() => {
             match crate::http_body::read_limited_blocking(
@@ -366,10 +372,12 @@ fn send_and_deliver_art(request: reqwest::blocking::RequestBuilder, req: ArtRequ
                 MAX_REMOTE_ART_BYTES,
                 REMOTE_ART_TIMEOUT,
             ) {
-                Ok(bytes)
-                    if !bytes.is_empty() && req.source.is_active() && req.liveness.is_valid() =>
-                {
-                    let _ = req.reply_tx.send_blocking(bytes);
+                Ok(bytes) if !bytes.is_empty() && still_wanted(&req) => {
+                    if let Some(texture) = decode_art_thumbnail(&bytes, req.max_side) {
+                        if still_wanted(&req) {
+                            let _ = req.reply_tx.send_blocking(texture);
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -404,13 +412,15 @@ pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
     image.set_icon_name(Some("audio-x-generic-symbolic"));
     let reply_rx =
         enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
-            extract_direct_file_album_art_bytes(&path)
+            decode_art_thumbnail(
+                &extract_direct_file_album_art_bytes(&path)?,
+                HEADER_ART_SIDE,
+            )
         });
     display_local_album_art_reply(
         image,
         reply_rx,
         RequestLiveness::GlobalGeneration(generation),
-        HEADER_ART_SIDE,
     );
 }
 
@@ -464,8 +474,8 @@ pub fn update_resolved_file_album_art_scoped(
 /// The placeholder is installed synchronously so the row is never blank while
 /// admission is pending. The extraction job is then handed to
 /// [`admit_local_art_job`], which retains it across a saturated bounded lane
-/// instead of dropping it, and the eventual bytes are bounded to `max_side`
-/// before painting.
+/// instead of dropping it, and the worker decodes the extracted bytes bounded
+/// to `max_side` before replying.
 fn spawn_scoped_local_art<F>(
     image: &gtk::Image,
     liveness: &ScopedArtFetch,
@@ -478,8 +488,9 @@ fn spawn_scoped_local_art<F>(
     let image = image.clone();
     let token = liveness.clone();
     glib::MainContext::default().spawn_local(async move {
-        let reply_rx = admit_local_art_job(extract, token.clone()).await;
-        display_local_album_art_reply(&image, reply_rx, RequestLiveness::Scoped(token), max_side);
+        let decode = move || decode_art_thumbnail(&extract()?, max_side);
+        let reply_rx = admit_local_art_job(decode, token.clone()).await;
+        display_local_album_art_reply(&image, reply_rx, RequestLiveness::Scoped(token));
     });
 }
 
@@ -507,21 +518,24 @@ pub fn update_resolved_file_album_art(
     image.set_icon_name(Some("audio-x-generic-symbolic"));
     let reply_rx =
         enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
-            extract_resolved_file_album_art_bytes(&media)
+            decode_art_thumbnail(
+                &extract_resolved_file_album_art_bytes(&media)?,
+                HEADER_ART_SIDE,
+            )
         });
     display_local_album_art_reply(
         image,
         reply_rx,
         RequestLiveness::GlobalGeneration(generation),
-        HEADER_ART_SIDE,
     );
 }
 
-/// One queued local embedded-art extraction.
+/// One queued local embedded-art extraction. `extract` both reads and
+/// decodes the artwork, so the worker replies with a finished thumbnail.
 struct LocalArtJob {
     liveness: RequestLiveness,
-    extract: Box<dyn FnOnce() -> Option<Vec<u8>> + Send>,
-    reply_tx: async_channel::Sender<Vec<u8>>,
+    extract: Box<dyn FnOnce() -> Option<gtk::gdk::Texture> + Send>,
+    reply_tx: async_channel::Sender<gtk::gdk::Texture>,
 }
 
 /// Get (or lazily create) the isolated local-art extraction lanes.
@@ -612,9 +626,9 @@ fn run_local_art_job(job: LocalArtJob) {
     let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(extract))
         .ok()
         .flatten();
-    if let Some(bytes) = extracted {
+    if let Some(texture) = extracted {
         if liveness.is_valid() {
-            let _ = reply_tx.send_blocking(bytes);
+            let _ = reply_tx.send_blocking(texture);
         }
     }
 }
@@ -622,11 +636,11 @@ fn run_local_art_job(job: LocalArtJob) {
 fn enqueue_local_art_job<F>(
     liveness: RequestLiveness,
     extract: F,
-) -> async_channel::Receiver<Vec<u8>>
+) -> async_channel::Receiver<gtk::gdk::Texture>
 where
-    F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
+    F: FnOnce() -> Option<gtk::gdk::Texture> + Send + 'static,
 {
-    let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
+    let (tx, rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
     // Never schedule extraction for an already-revoked request: the row was
     // re-bound (or the track superseded) between scheduling and the first
     // poll, and the worker would exit at its first liveness check anyway.
@@ -677,11 +691,11 @@ where
 async fn admit_local_art_job<F>(
     extract: F,
     liveness: ScopedArtFetch,
-) -> async_channel::Receiver<Vec<u8>>
+) -> async_channel::Receiver<gtk::gdk::Texture>
 where
-    F: FnOnce() -> Option<Vec<u8>> + Send + 'static,
+    F: FnOnce() -> Option<gtk::gdk::Texture> + Send + 'static,
 {
-    let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+    let (reply_tx, reply_rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
     // Never schedule extraction for an already-revoked request (mirrors
     // `enqueue_local_art_job`): dropping `reply_tx` closes the channel.
     if !liveness.is_live() {
@@ -717,34 +731,52 @@ where
 
 fn display_local_album_art_reply(
     image: &gtk::Image,
-    reply_rx: async_channel::Receiver<Vec<u8>>,
+    reply_rx: async_channel::Receiver<gtk::gdk::Texture>,
     liveness: RequestLiveness,
-    max_side: i32,
 ) {
     let image = image.clone();
     glib::MainContext::default().spawn_local(async move {
-        if let Ok(data) = reply_rx.recv().await {
+        if let Ok(texture) = reply_rx.recv().await {
             if liveness.is_valid() {
-                let bytes = glib::Bytes::from_owned(data);
-                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                    let texture = bound_texture_side(&texture, max_side);
-                    image.set_paintable(Some(&texture));
-                }
+                image.set_paintable(Some(&texture));
             }
         }
     });
 }
 
-/// Aspect-preserving longest-side bound for a decoded artwork texture.
+/// Decode encoded artwork into a texture whose longest side is at most
+/// `max_side`. Blocking — call from an art worker, never the GTK thread.
 ///
 /// `GtkImage::set_pixel_size` only sizes an icon-name placeholder: a texture
 /// installed with `set_paintable` renders at its natural decoded size and
-/// retains that full surface. A 2000×2000 embedded cover therefore stayed a
-/// 2000×2000 texture in the row AND in the display cache no matter how small
-/// the live 32/48/72 preference was (2026-09-13 review finding). Every decode
-/// path funnels through this bound first, so the displayed and retained
-/// surface is the preference-sized thumbnail on local, direct, resolved
-/// remote, and cache-hit paints alike.
+/// retains that full surface, so every artwork path decodes through this
+/// bound and the displayed and retained surface is the preference-sized
+/// thumbnail. GDK-Pixbuf produces the bounded size directly (a JPEG decodes
+/// at a reduced scale); formats without a GDK-Pixbuf loader fall back to
+/// GTK's own decoders at full size, then the same bound. Both paths are
+/// thread-safe, and the returned texture is immutable and `Send`.
+fn decode_art_thumbnail(data: &[u8], max_side: i32) -> Option<gtk::gdk::Texture> {
+    use gtk::gdk::gdk_pixbuf::prelude::*;
+
+    let loader = gtk::gdk::gdk_pixbuf::PixbufLoader::new();
+    loader.connect_size_prepared(move |loader, width, height| {
+        let bounded = bounded_dimensions(width, height, max_side);
+        if bounded != (width, height) {
+            loader.set_size(bounded.0, bounded.1);
+        }
+    });
+    let written = loader.write(data);
+    // Close even after a failed write so the loader releases its decoder.
+    let closed = loader.close();
+    if let (Ok(()), Ok(()), Some(pixbuf)) = (written, closed, loader.pixbuf()) {
+        return Some(gtk::gdk::Texture::for_pixbuf(&pixbuf));
+    }
+    let texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from(data)).ok()?;
+    Some(bound_texture_side(&texture, max_side))
+}
+
+/// Aspect-preserving longest-side bound for an already-decoded texture: the
+/// fallback half of [`decode_art_thumbnail`].
 fn bound_texture_side(texture: &gtk::gdk::Texture, max_side: i32) -> gtk::gdk::Texture {
     let (dest_width, dest_height) = bounded_dimensions(texture.width(), texture.height(), max_side);
     if dest_width == texture.width() && dest_height == texture.height() {
@@ -769,10 +801,11 @@ fn bound_texture_side(texture: &gtk::gdk::Texture, max_side: i32) -> gtk::gdk::T
     gtk::gdk::Texture::for_pixbuf(&scaled)
 }
 
-/// Pure longest-side bound shared by [`bound_texture_side`] and its unit
-/// tests. Never upscales: dimensions already within `max_side` are returned
-/// unchanged, otherwise the longest side becomes `max_side` and the shorter
-/// side keeps its ratio (rounded down, never below one pixel).
+/// Pure longest-side bound shared by [`decode_art_thumbnail`],
+/// [`bound_texture_side`], and their unit tests. Never upscales: dimensions
+/// already within `max_side` are returned unchanged, otherwise the longest
+/// side becomes `max_side` and the shorter side keeps its ratio (rounded
+/// down, never below one pixel).
 fn bounded_dimensions(width: i32, height: i32, max_side: i32) -> (i32, i32) {
     if max_side <= 0 || width <= 0 || height <= 0 {
         // Defensive: an unwired preference must not collapse artwork to
@@ -1208,20 +1241,21 @@ fn enqueue_remote_album_art(
         // finding).
         let token = token.clone();
         glib::MainContext::default().spawn_local(async move {
-            let reply_rx = admit_pane_art_request(source, token.clone()).await;
-            paint_remote_album_art_reply(image, reply_rx, RequestLiveness::Scoped(token), max_side);
+            let reply_rx = admit_pane_art_request(source, token.clone(), max_side).await;
+            paint_remote_album_art_reply(image, reply_rx, RequestLiveness::Scoped(token));
         });
         return;
     }
 
     // Header lane: dedicated and unbounded, so no retry is needed.
-    let reply_rx = enqueue_art_request(source, liveness.clone());
-    paint_remote_album_art_reply(image, reply_rx, liveness, max_side);
+    let reply_rx = enqueue_art_request(source, liveness.clone(), max_side);
+    paint_remote_album_art_reply(image, reply_rx, liveness);
 }
 
-/// Receive one remote-artwork reply on the GTK main thread and paint it,
-/// re-checking liveness so a superseded request (newer header generation or
-/// a revoked/rebound pane row) cannot publish bytes the user will never see.
+/// Receive one decoded remote-artwork reply on the GTK main thread and paint
+/// it, re-checking liveness so a superseded request (newer header generation
+/// or a revoked/rebound pane row) cannot publish artwork the user will never
+/// see.
 ///
 /// Deliberately a plain `fn` that spawns on the GTK main context rather than
 /// an `async fn` awaited by its callers: the future owns a `gtk::Image`,
@@ -1231,18 +1265,13 @@ fn enqueue_remote_album_art(
 /// otherwise fire on the helper.
 fn paint_remote_album_art_reply(
     image: gtk::Image,
-    reply_rx: async_channel::Receiver<Vec<u8>>,
+    reply_rx: async_channel::Receiver<gtk::gdk::Texture>,
     liveness: RequestLiveness,
-    max_side: i32,
 ) {
     glib::MainContext::default().spawn_local(async move {
-        if let Ok(data) = reply_rx.recv().await {
+        if let Ok(texture) = reply_rx.recv().await {
             if liveness.is_valid() {
-                let bytes = glib::Bytes::from_owned(data);
-                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-                    let texture = bound_texture_side(&texture, max_side);
-                    image.set_paintable(Some(&texture));
-                }
+                image.set_paintable(Some(&texture));
             }
         }
     });
@@ -1262,14 +1291,15 @@ fn paint_remote_album_art_reply(
 fn enqueue_art_request(
     source: ArtSource,
     liveness: RequestLiveness,
-) -> async_channel::Receiver<Vec<u8>> {
+    max_side: i32,
+) -> async_channel::Receiver<gtk::gdk::Texture> {
     if let RequestLiveness::Scoped(token) = &liveness {
-        return submit_pane_art_request(source, token.clone()).into_receiver();
+        return submit_pane_art_request(source, token.clone(), max_side).into_receiver();
     }
 
     // Header lane: dedicated and unbounded, so the header's request is
     // never refused by pane backlog and never queued behind pane work.
-    let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+    let (reply_tx, reply_rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
     let Some(workers) = art_workers() else {
         // No worker is available (thread spawn failed at startup):
         // silently skip — there's nothing to fetch with and the
@@ -1280,6 +1310,7 @@ fn enqueue_art_request(
     let request = ArtRequest {
         source,
         liveness,
+        max_side,
         reply_tx,
     };
     let _ = workers.header_tx.send(request);
@@ -1293,15 +1324,15 @@ fn enqueue_art_request(
 /// lane (retrying cannot help).
 enum PaneSubmit {
     /// The request is queued; its receiver will observe the result.
-    Queued(async_channel::Receiver<Vec<u8>>),
+    Queued(async_channel::Receiver<gtk::gdk::Texture>),
     /// The bounded lane is full: the request was refused and may be retried.
-    Saturated(async_channel::Receiver<Vec<u8>>),
+    Saturated(async_channel::Receiver<gtk::gdk::Texture>),
     /// No worker exists or the lane is disconnected.
-    Unavailable(async_channel::Receiver<Vec<u8>>),
+    Unavailable(async_channel::Receiver<gtk::gdk::Texture>),
 }
 
 impl PaneSubmit {
-    fn into_receiver(self) -> async_channel::Receiver<Vec<u8>> {
+    fn into_receiver(self) -> async_channel::Receiver<gtk::gdk::Texture> {
         match self {
             Self::Queued(reply_rx) | Self::Saturated(reply_rx) | Self::Unavailable(reply_rx) => {
                 reply_rx
@@ -1312,14 +1343,19 @@ impl PaneSubmit {
 
 /// Perform one non-blocking pane-lane submission, categorising the refusal
 /// so the retry path can react to it.
-fn submit_pane_art_request(source: ArtSource, liveness: ScopedArtFetch) -> PaneSubmit {
-    let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+fn submit_pane_art_request(
+    source: ArtSource,
+    liveness: ScopedArtFetch,
+    max_side: i32,
+) -> PaneSubmit {
+    let (reply_tx, reply_rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
     let Some(workers) = art_workers() else {
         return PaneSubmit::Unavailable(reply_rx);
     };
     let request = ArtRequest {
         source,
         liveness: RequestLiveness::Scoped(liveness),
+        max_side,
         reply_tx,
     };
     match workers.pane_tx.try_send(request) {
@@ -1345,15 +1381,16 @@ fn submit_pane_art_request(source: ArtSource, liveness: ScopedArtFetch) -> PaneS
 async fn admit_pane_art_request(
     source: ArtSource,
     liveness: ScopedArtFetch,
-) -> async_channel::Receiver<Vec<u8>> {
+    max_side: i32,
+) -> async_channel::Receiver<gtk::gdk::Texture> {
     loop {
         if !liveness.is_live() {
             // Revoked before admission: return an already-closed channel so
             // the caller observes completion without waiting.
-            let (_reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+            let (_reply_tx, reply_rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
             return reply_rx;
         }
-        match submit_pane_art_request(source.clone(), liveness.clone()) {
+        match submit_pane_art_request(source.clone(), liveness.clone(), max_side) {
             PaneSubmit::Queued(reply_rx) => return reply_rx,
             PaneSubmit::Unavailable(reply_rx) => return reply_rx,
             PaneSubmit::Saturated(_) => {
@@ -1425,8 +1462,22 @@ mod tests {
         .expect("authorize media fixture")
     }
 
+    /// Longest side every test request decodes at; each fixture image is
+    /// smaller, so replies keep the fixture's own width as its identity.
+    const TEST_ART_SIDE: i32 = 72;
+
+    /// A `width`×1 thumbnail; the width identifies which job produced it.
+    fn art(width: i32) -> gtk::gdk::Texture {
+        solid_texture(width, 1)
+    }
+
+    /// PNG bytes of a `width`×`height` image, as a server or tag would carry.
+    fn png_bytes(width: i32, height: i32) -> Vec<u8> {
+        solid_texture(width, height).save_to_png_bytes().to_vec()
+    }
+
     fn spawn_art_fixture(
-        body: &'static [u8],
+        body: Vec<u8>,
         before_response: impl FnOnce() + Send + 'static,
     ) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind artwork fixture");
@@ -1457,7 +1508,9 @@ mod tests {
             stream
                 .write_all(headers.as_bytes())
                 .expect("write artwork response headers");
-            stream.write_all(body).expect("write artwork response body");
+            stream
+                .write_all(&body)
+                .expect("write artwork response body");
         });
         (format!("http://{address}/art"), thread)
     }
@@ -1490,7 +1543,7 @@ mod tests {
                 release_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("release delayed local read");
-                Some(b"stale-local-art".to_vec())
+                Some(art(1))
             },
         );
         request_seen_rx
@@ -1500,14 +1553,17 @@ mod tests {
         let current_generation = next_generation();
         let current_reply = enqueue_local_art_job(
             RequestLiveness::GlobalGeneration(current_generation),
-            || Some(b"current-local-art".to_vec()),
+            || Some(art(2)),
         );
         release_tx.send(()).expect("release stale local read");
 
         assert!(stale_reply.recv_blocking().is_err());
         assert_eq!(
-            current_reply.recv_blocking().expect("current local art"),
-            b"current-local-art"
+            current_reply
+                .recv_blocking()
+                .expect("current local art")
+                .width(),
+            2
         );
     }
 
@@ -1656,18 +1712,19 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let (stale_url, stale_server) = spawn_art_fixture(b"stale-art", move || {
+        let (stale_url, stale_server) = spawn_art_fixture(png_bytes(3, 1), move || {
             request_seen_tx.send(()).expect("report delayed request");
             release_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("release delayed response");
         });
-        let (current_url, current_server) = spawn_art_fixture(b"current-art", || {});
+        let (current_url, current_server) = spawn_art_fixture(png_bytes(4, 1), || {});
 
         let stale_generation = next_generation();
         let stale_reply = enqueue_art_request(
             ArtSource::Url(stale_url),
             RequestLiveness::GlobalGeneration(stale_generation),
+            TEST_ART_SIDE,
         );
         request_seen_rx
             .recv_timeout(Duration::from_secs(5))
@@ -1677,18 +1734,20 @@ mod tests {
         let current_reply = enqueue_art_request(
             ArtSource::Url(current_url),
             RequestLiveness::GlobalGeneration(current_generation),
+            TEST_ART_SIDE,
         );
         release_tx.send(()).expect("release stale response");
 
         assert!(
             stale_reply.recv_blocking().is_err(),
-            "the worker must close a stale request without publishing its bytes"
+            "the worker must close a stale request without publishing its artwork"
         );
         assert_eq!(
             current_reply
                 .recv_blocking()
-                .expect("current artwork bytes"),
-            b"current-art"
+                .expect("current artwork")
+                .width(),
+            4
         );
         assert!(generation_is_current(current_generation));
 
@@ -1697,16 +1756,16 @@ mod tests {
     }
 
     /// Wait for a one-shot artwork reply with a deadline, without
-    /// blocking forever: `Ok(bytes)` when published, `None` when the
+    /// blocking forever: the reply's width when published, `None` when the
     /// channel closed (dropped request) or the deadline passed.
     fn wait_for_reply(
-        reply: &async_channel::Receiver<Vec<u8>>,
+        reply: &async_channel::Receiver<gtk::gdk::Texture>,
         deadline: Duration,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<i32> {
         let start = std::time::Instant::now();
         loop {
             match reply.try_recv() {
-                Ok(bytes) => return Some(bytes),
+                Ok(texture) => return Some(texture.width()),
                 Err(TryRecvError::Closed) => return None,
                 Err(TryRecvError::Empty) => {}
             }
@@ -1743,7 +1802,7 @@ mod tests {
     fn saturate_pane_lane() -> PaneLaneSaturation {
         let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let (blocked_url, server) = spawn_art_fixture(b"blocked-pane-art", move || {
+        let (blocked_url, server) = spawn_art_fixture(png_bytes(1, 1), move || {
             request_seen_tx
                 .send(())
                 .expect("report blocked pane request");
@@ -1779,12 +1838,13 @@ mod tests {
         for _ in 0..MAX_PENDING_PANE_ART_REQUESTS {
             let filler_token = ScopedArtFetch::new();
             filler_token.revoke();
-            let (reply_tx, _reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+            let (reply_tx, _reply_rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
             if workers
                 .pane_tx
                 .try_send(ArtRequest {
                     source: ArtSource::Url("http://127.0.0.1:1/art".to_string()),
                     liveness: RequestLiveness::Scoped(filler_token),
+                    max_side: TEST_ART_SIDE,
                     reply_tx,
                 })
                 .is_err()
@@ -1792,7 +1852,7 @@ mod tests {
                 break;
             }
         }
-        let _ = occupying; // the blocked request's bytes go nowhere
+        let _ = occupying; // the blocked request's artwork goes nowhere
         PaneLaneSaturation {
             release_tx: Some(release_tx),
             server: Some(server),
@@ -1811,14 +1871,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _saturation = saturate_pane_lane();
 
-        let (url, server) = spawn_art_fixture(b"header-art", || {});
+        let (url, server) = spawn_art_fixture(png_bytes(5, 1), || {});
         let header_reply = enqueue_art_request(
             ArtSource::Url(url),
             RequestLiveness::GlobalGeneration(next_generation()),
+            TEST_ART_SIDE,
         );
         assert_eq!(
-            wait_for_reply(&header_reply, Duration::from_secs(5)).as_deref(),
-            Some(b"header-art".as_slice()),
+            wait_for_reply(&header_reply, Duration::from_secs(5)),
+            Some(5),
             "the header lane must be served while the pane lane is fully saturated"
         );
         server.join().expect("join header fixture");
@@ -1838,10 +1899,11 @@ mod tests {
         // The probe targets a working fixture: if it were accepted (bug),
         // it would eventually deliver; refused (correct), the receiver is
         // closed at once and the fixture is never contacted.
-        let (url, _never_contacted) = spawn_art_fixture(b"overflow-art", || {});
+        let (url, _never_contacted) = spawn_art_fixture(png_bytes(1, 1), || {});
         let overflow = enqueue_art_request(
             ArtSource::Url(url),
             RequestLiveness::Scoped(ScopedArtFetch::new()),
+            TEST_ART_SIDE,
         );
         assert!(
             matches!(overflow.try_recv(), Err(TryRecvError::Closed)),
@@ -1856,7 +1918,7 @@ mod tests {
     /// and re-attempts admission until capacity returns, then receives its
     /// artwork. A regression back to a single non-retrying submission would
     /// observe the saturated lane, close the reply immediately, and fail the
-    /// bytes assertion below — covering the 2026-09-13 review finding's
+    /// reply assertion below — covering the 2026-09-13 review finding's
     /// "prove the still-visible row eventually loads" end to end.
     #[test]
     fn saturated_pane_lane_retries_until_the_still_visible_row_loads() {
@@ -1864,8 +1926,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // The eventually-admitted request must yield real bytes.
-        let (url, server) = spawn_art_fixture(b"retried-pane-art", || {});
+        // The eventually-admitted request must yield real artwork.
+        let (url, server) = spawn_art_fixture(png_bytes(6, 1), || {});
 
         // Occupy the pane worker and fill the bounded lane.
         let saturation = saturate_pane_lane();
@@ -1884,12 +1946,16 @@ mod tests {
         // services because it pushes this context as the thread default.
         let token = ScopedArtFetch::new();
         let context = glib::MainContext::new();
-        let reply = context.block_on(admit_pane_art_request(ArtSource::Url(url), token));
+        let reply = context.block_on(admit_pane_art_request(
+            ArtSource::Url(url),
+            token,
+            TEST_ART_SIDE,
+        ));
 
         releaser.join().expect("join saturation releaser");
         assert_eq!(
-            wait_for_reply(&reply, Duration::from_secs(10)).as_deref(),
-            Some(b"retried-pane-art".as_slice()),
+            wait_for_reply(&reply, Duration::from_secs(10)),
+            Some(6),
             "a still-visible row must load once pane capacity returns"
         );
         server.join().expect("join retried pane fixture");
@@ -1904,19 +1970,19 @@ mod tests {
     /// Enqueue one blocking extraction job that reports on `seen_tx` and
     /// then parks until `release_rx` receives, modelling a slow worker.
     /// Returns the job's reply receiver so the caller can assert the
-    /// admitted bytes arrive.
+    /// admitted `width`-identified thumbnail arrives.
     fn enqueue_blocking_pool_job(
         liveness: RequestLiveness,
         seen_tx: mpsc::SyncSender<()>,
         release_rx: mpsc::Receiver<()>,
-        payload: &'static [u8],
-    ) -> async_channel::Receiver<Vec<u8>> {
+        width: i32,
+    ) -> async_channel::Receiver<gtk::gdk::Texture> {
         enqueue_local_art_job(liveness, move || {
             seen_tx.send(()).expect("report pool worker");
             release_rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("release pool worker");
-            Some(payload.to_vec())
+            Some(art(width))
         })
     }
 
@@ -1925,11 +1991,14 @@ mod tests {
     /// that releases the worker.
     fn occupy_pool_worker(
         liveness: RequestLiveness,
-        payload: &'static [u8],
-    ) -> (async_channel::Receiver<Vec<u8>>, mpsc::SyncSender<()>) {
+        width: i32,
+    ) -> (
+        async_channel::Receiver<gtk::gdk::Texture>,
+        mpsc::SyncSender<()>,
+    ) {
         let (seen_tx, seen_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let reply = enqueue_blocking_pool_job(liveness, seen_tx, release_rx, payload);
+        let reply = enqueue_blocking_pool_job(liveness, seen_tx, release_rx, width);
         expect_worker_occupied(seen_rx);
         (reply, release_tx)
     }
@@ -1947,13 +2016,13 @@ mod tests {
     /// is admitted.
     fn fill_pending_backlog(queue: &async_channel::Sender<LocalArtJob>, reserved: usize) {
         for pending in reserved..MAX_PENDING_LOCAL_ART_JOBS {
-            let (reply_tx, _reply_rx) = async_channel::bounded::<Vec<u8>>(1);
+            let (reply_tx, _reply_rx) = async_channel::bounded::<gtk::gdk::Texture>(1);
             queue
                 .try_send(LocalArtJob {
                     liveness: RequestLiveness::Scoped(ScopedArtFetch::new()),
                     extract: Box::new(move || {
                         let _ = pending;
-                        Some(b"filler".to_vec())
+                        Some(art(1))
                     }),
                     reply_tx,
                 })
@@ -1988,12 +2057,12 @@ mod tests {
         // so queued jobs are not invalidated by unrelated liveness churn.
         let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
 
-        let (reply1, release1_tx) = occupy_pool_worker(scoped(), b"one");
-        let (reply2, release2_tx) = occupy_pool_worker(scoped(), b"two");
+        let (reply1, release1_tx) = occupy_pool_worker(scoped(), 1);
+        let (reply2, release2_tx) = occupy_pool_worker(scoped(), 2);
 
         let (seen3_tx, seen3_rx) = mpsc::sync_channel(0);
         let (release3_tx, release3_rx) = mpsc::sync_channel(0);
-        let reply3 = enqueue_blocking_pool_job(scoped(), seen3_tx, release3_rx, b"three");
+        let reply3 = enqueue_blocking_pool_job(scoped(), seen3_tx, release3_rx, 3);
         assert!(
             seen3_rx.recv_timeout(Duration::from_millis(400)).is_err(),
             "the pool must not grow a third worker for a third blocking job"
@@ -2014,18 +2083,18 @@ mod tests {
         );
 
         // Free both workers: the queued job must then run on the freed
-        // worker, and every admitted job's bytes must arrive.
+        // worker, and every admitted job's artwork must arrive.
         release1_tx.send(()).expect("release worker one");
         release2_tx.send(()).expect("release worker two");
         seen3_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("queued job ran after a worker freed");
         release3_tx.send(()).expect("release worker three");
-        assert_eq!(reply1.recv_blocking().expect("worker one reply"), b"one");
-        assert_eq!(reply2.recv_blocking().expect("worker two reply"), b"two");
+        assert_eq!(reply1.recv_blocking().expect("worker one reply").width(), 1);
+        assert_eq!(reply2.recv_blocking().expect("worker two reply").width(), 2);
         assert_eq!(
-            reply3.recv_blocking().expect("worker three reply"),
-            b"three"
+            reply3.recv_blocking().expect("worker three reply").width(),
+            3
         );
 
         // Leave the pool clean for the next test under the same lock: freeing
@@ -2052,8 +2121,8 @@ mod tests {
         let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
 
         // Occupy BOTH pane workers with blocking extractions.
-        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), b"pane-one");
-        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), b"pane-two");
+        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), 1);
+        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), 2);
 
         // Saturate the pane backlog exactly to capacity. The two blocked
         // jobs are held by the workers, not queued, so fill every slot.
@@ -2067,14 +2136,14 @@ mod tests {
         let header_reply =
             enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
                 header_seen_tx.send(()).expect("report header worker");
-                Some(b"header-art".to_vec())
+                Some(art(7))
             });
         header_seen_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("header extraction must run despite a saturated pane lane");
         assert_eq!(
-            header_reply.recv_blocking().expect("header reply"),
-            b"header-art"
+            header_reply.recv_blocking().expect("header reply").width(),
+            7
         );
 
         // Release the pane workers and wait for the queued fillers to
@@ -2093,7 +2162,7 @@ mod tests {
     }
 
     /// The pane's scoped retained-authority entry point must publish the
-    /// ORIGINAL authorized file's bytes through the extraction pool: the
+    /// ORIGINAL authorized file's artwork through the extraction pool: the
     /// media carries the retained capability, so a pathname replacement
     /// cannot swap the artwork (2026-09-10 review finding — the raw
     /// file:// path freshly opened whatever the pathname then pointed to).
@@ -2111,8 +2180,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = tempfile::tempdir().expect("temporary authority root");
-        let original = mp4_with_cover_art(b"original-retained-art");
-        let replacement = mp4_with_cover_art(b"replacement-path-art");
+        let original = mp4_with_cover_art(&png_bytes(8, 1));
+        let replacement = mp4_with_cover_art(&png_bytes(9, 1));
         let media = authorized_media(root.path(), "track.m4a", &original);
         let path = root.path().join("track.m4a");
         std::fs::rename(&path, root.path().join("displaced.m4a")).expect("move admitted file");
@@ -2120,11 +2189,14 @@ mod tests {
 
         let liveness = ScopedArtFetch::new();
         let reply = enqueue_local_art_job(RequestLiveness::Scoped(liveness.clone()), move || {
-            extract_resolved_file_album_art_bytes(&media)
+            decode_art_thumbnail(
+                &extract_resolved_file_album_art_bytes(&media)?,
+                TEST_ART_SIDE,
+            )
         });
         assert_eq!(
-            reply.recv_blocking().expect("retained-handle art bytes"),
-            b"original-retained-art",
+            reply.recv_blocking().expect("retained-handle art").width(),
+            8,
             "extraction must read the retained capability, not the replaced path"
         );
     }
@@ -2155,6 +2227,7 @@ mod tests {
         let remote_reply = enqueue_art_request(
             ArtSource::Url("http://127.0.0.1:1/art".to_string()),
             RequestLiveness::Scoped(liveness),
+            TEST_ART_SIDE,
         );
 
         assert!(
@@ -2179,10 +2252,11 @@ mod tests {
     fn enqueue_admitted_pane_request(
         url: String,
         liveness: RequestLiveness,
-    ) -> Option<async_channel::Receiver<Vec<u8>>> {
+    ) -> Option<async_channel::Receiver<gtk::gdk::Texture>> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let reply = enqueue_art_request(ArtSource::Url(url.clone()), liveness.clone());
+            let reply =
+                enqueue_art_request(ArtSource::Url(url.clone()), liveness.clone(), TEST_ART_SIDE);
             if matches!(reply.try_recv(), Err(TryRecvError::Empty)) {
                 return Some(reply);
             }
@@ -2214,7 +2288,7 @@ mod tests {
         let (request_seen_tx, request_seen_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         let liveness = ScopedArtFetch::new();
-        let (stale_url, server) = spawn_art_fixture(b"late-scoped-art", move || {
+        let (stale_url, server) = spawn_art_fixture(png_bytes(1, 1), move || {
             request_seen_tx.send(()).expect("report scoped request");
             release_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -2234,7 +2308,7 @@ mod tests {
 
         assert!(
             reply.recv_blocking().is_err(),
-            "a revoked scoped request must not publish its bytes"
+            "a revoked scoped request must not publish its artwork"
         );
         server.join().expect("join scoped artwork fixture");
     }
@@ -2258,24 +2332,24 @@ mod tests {
         let revoker = liveness.clone();
         let reply = enqueue_local_art_job(RequestLiveness::Scoped(liveness), move || {
             revoker.revoke();
-            Some(b"mid-flight-local-art".to_vec())
+            Some(art(1))
         });
         assert!(
             reply.recv_blocking().is_err(),
-            "bytes extracted under a revoked token must be dropped"
+            "artwork extracted under a revoked token must be dropped"
         );
     }
 
     /// Poll a local-pool reply until it closes, which happens when its
     /// job is dequeued (a refusal would have closed it at enqueue).
     /// Bounded so a regression fails instead of hanging.
-    fn assert_reply_closes_from_dequeue(reply: &async_channel::Receiver<Vec<u8>>) {
+    fn assert_reply_closes_from_dequeue(reply: &async_channel::Receiver<gtk::gdk::Texture>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             match reply.try_recv() {
                 Err(TryRecvError::Closed) => return,
                 Err(TryRecvError::Empty) => {}
-                Ok(bytes) => panic!("a dropped-in job published {bytes:?}"),
+                Ok(texture) => panic!("a dropped-in job published {texture:?}"),
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2298,35 +2372,41 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
 
-        let (reply1, release1_tx) = occupy_pool_worker(scoped(), b"one");
-        let (reply2, release2_tx) = occupy_pool_worker(scoped(), b"two");
+        let (reply1, release1_tx) = occupy_pool_worker(scoped(), 1);
+        let (reply2, release2_tx) = occupy_pool_worker(scoped(), 2);
         let panic_reply = enqueue_local_art_job(scoped(), || panic!("extractor blew up"));
-        let survivor = enqueue_local_art_job(scoped(), || Some(b"survivor".to_vec()));
+        let survivor = enqueue_local_art_job(scoped(), || Some(art(5)));
 
         release1_tx.send(()).expect("release worker one");
         release2_tx.send(()).expect("release worker two");
-        assert_eq!(reply1.recv_blocking().expect("worker one reply"), b"one");
-        assert_eq!(reply2.recv_blocking().expect("worker two reply"), b"two");
+        assert_eq!(reply1.recv_blocking().expect("worker one reply").width(), 1);
+        assert_eq!(reply2.recv_blocking().expect("worker two reply").width(), 2);
 
         // FIFO: the panicking job is dequeued first (its reply closes),
         // then the survivor behind it publishes through the same worker.
         assert_reply_closes_from_dequeue(&panic_reply);
         assert_eq!(
-            survivor.recv_blocking().expect("survivor job reply"),
-            b"survivor"
+            survivor
+                .recv_blocking()
+                .expect("survivor job reply")
+                .width(),
+            5
         );
 
         // One surviving thread could mask a dead sibling, but two
         // simultaneous blocking jobs require the full fixed pool.
-        let (reply3, release3_tx) = occupy_pool_worker(scoped(), b"three");
-        let (reply4, release4_tx) = occupy_pool_worker(scoped(), b"four");
+        let (reply3, release3_tx) = occupy_pool_worker(scoped(), 3);
+        let (reply4, release4_tx) = occupy_pool_worker(scoped(), 4);
         release3_tx.send(()).expect("release worker three");
         release4_tx.send(()).expect("release worker four");
         assert_eq!(
-            reply3.recv_blocking().expect("worker three reply"),
-            b"three"
+            reply3.recv_blocking().expect("worker three reply").width(),
+            3
         );
-        assert_eq!(reply4.recv_blocking().expect("worker four reply"), b"four");
+        assert_eq!(
+            reply4.recv_blocking().expect("worker four reply").width(),
+            4
+        );
     }
 
     #[test]
@@ -2469,12 +2549,45 @@ mod tests {
         );
     }
 
+    /// Encoded artwork decodes straight to the bounded thumbnail — aspect
+    /// ratio kept, never upscaled — and undecodable bytes yield nothing.
+    #[test]
+    fn decode_art_thumbnail_bounds_encoded_artwork() {
+        let large = png_bytes(300, 200);
+        let decoded = decode_art_thumbnail(&large, 48).expect("decode a large PNG");
+        assert_eq!((decoded.width(), decoded.height()), (48, 32));
+
+        let small = png_bytes(20, 10);
+        let decoded = decode_art_thumbnail(&small, 72).expect("decode a small PNG");
+        assert_eq!((decoded.width(), decoded.height()), (20, 10));
+
+        assert!(decode_art_thumbnail(b"not an image", 72).is_none());
+    }
+
+    /// The remote worker replies with the decoded thumbnail bounded to the
+    /// request's side, so the GTK thread only installs it.
+    #[test]
+    fn remote_worker_replies_with_a_bounded_thumbnail() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (url, server) = spawn_art_fixture(png_bytes(400, 100), || {});
+        let reply = enqueue_art_request(
+            ArtSource::Url(url),
+            RequestLiveness::GlobalGeneration(next_generation()),
+            36,
+        );
+        let texture = reply.recv_blocking().expect("decoded remote artwork");
+        assert_eq!((texture.width(), texture.height()), (36, 9));
+        server.join().expect("join artwork fixture");
+    }
+
     /// Saturate the local pane lane (both workers blocked, every pending slot
     /// filled), then drive the production [`admit_local_art_job`] retry on a
     /// private glib main context: a still-visible row's job must be retained
     /// through saturation and run once capacity returns. A regression back
     /// to the drop-on-`Full` `try_send` would close the reply immediately and
-    /// fail the bytes assertion below (2026-09-13 review finding).
+    /// fail the reply assertion below (2026-09-13 review finding).
     #[test]
     fn saturated_local_lane_retries_until_the_still_visible_row_runs() {
         let _guard = GENERATION_TEST_LOCK
@@ -2485,8 +2598,8 @@ mod tests {
 
         // Occupy both pane workers with blocking extractions and fill every
         // pending slot, so the lane is provably saturated.
-        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), b"local-one");
-        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), b"local-two");
+        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), 1);
+        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), 2);
         let queue = local_art_pane_queue().expect("local art pane pool initialized");
         fill_pending_backlog(queue, 0);
 
@@ -2500,15 +2613,12 @@ mod tests {
 
         let token = ScopedArtFetch::new();
         let context = glib::MainContext::new();
-        let reply = context.block_on(admit_local_art_job(
-            move || Some(b"retried-local-art".to_vec()),
-            token,
-        ));
+        let reply = context.block_on(admit_local_art_job(move || Some(art(9)), token));
 
         releaser.join().expect("join local releaser");
         assert_eq!(
-            wait_for_reply(&reply, Duration::from_secs(10)).as_deref(),
-            Some(b"retried-local-art".as_slice()),
+            wait_for_reply(&reply, Duration::from_secs(10)),
+            Some(9),
             "a still-visible row's local job must run once pane capacity returns"
         );
         drain_local_pane_lane(queue);
@@ -2526,8 +2636,8 @@ mod tests {
 
         let scoped = || RequestLiveness::Scoped(ScopedArtFetch::new());
 
-        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), b"revoke-one");
-        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), b"revoke-two");
+        let (_reply1, release1_tx) = occupy_pool_worker(scoped(), 1);
+        let (_reply2, release2_tx) = occupy_pool_worker(scoped(), 2);
         let queue = local_art_pane_queue().expect("local art pane pool initialized");
         fill_pending_backlog(queue, 0);
 

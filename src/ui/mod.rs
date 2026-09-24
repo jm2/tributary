@@ -14,6 +14,7 @@ pub mod folder_browser;
 pub mod header_bar;
 pub mod lastfm_settings;
 mod library_commands;
+mod local_row_batch;
 pub mod objects;
 pub mod open_files;
 pub mod output_dialogs;
