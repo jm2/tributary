@@ -83,7 +83,7 @@ impl CastPlayback {
 
 /// Chromecast audio output — streams to a Cast V2 device.
 pub struct ChromecastOutput {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read only through AudioOutput::name")]
     display_name: String,
     /// Receiver's control endpoint address. Recorded here (not only inside
     /// the connector captured by the worker) so `ensure_cast_server` can

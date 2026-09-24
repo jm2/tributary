@@ -3,7 +3,7 @@
 //! Split verbatim from `album_art_cache.rs` so each module stays under
 //! the file-size budget; no assertion, key-identity, or budget check
 //! was altered. The suite exercises the cache through its public
-//! surface plus the `#[allow(dead_code)]` seams, exactly as before.
+//! surface plus its test-only accessors.
 use super::*;
 use gtk::glib;
 

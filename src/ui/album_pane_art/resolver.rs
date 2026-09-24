@@ -109,8 +109,8 @@ pub enum LocalLibrary {
     /// Open the process-wide shared library database. Production only.
     Shared,
     /// Resolve against this private connection; `init_db` is never
-    /// consulted on this path. Constructed by tests only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// consulted on this path.
+    #[cfg(test)]
     Injected(sea_orm::DatabaseConnection),
 }
 
@@ -284,6 +284,7 @@ async fn resolve_builtin_local_art(
         // unreachable on this path, so an injected resolution can never
         // create, migrate, or change any library outside the fixture
         // (R1, 2026-09-17 refinery audit).
+        #[cfg(test)]
         LocalLibrary::Injected(db) => db.clone(),
     };
     // Stop before the retained-authority probe if the row was revoked

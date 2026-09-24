@@ -1521,7 +1521,6 @@ impl PlaybackSession {
     /// eligibility or metadata validation, so an ineligible or invalid load
     /// cannot be retrieved again. This method never consults mutable GTK rows,
     /// output duration, a filename, URI, or backend lookup.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_accepted_lastfm_output_load(
         &mut self,
         generation: PlayerEventGeneration,

@@ -398,15 +398,6 @@ impl Default for AppConfig {
     }
 }
 
-impl AppConfig {
-    /// Convenience getter: primary library path (first in the list).
-    /// Used by callers that only need the main directory.
-    #[allow(dead_code)] // Will be used by Chromecast and other features.
-    pub fn primary_library_path(&self) -> &str {
-        self.library_paths.first().map(|s| s.as_str()).unwrap_or("")
-    }
-}
-
 /// Validate a proposed identity-preserving library-root reauthorization.
 ///
 /// Path comparisons are deliberately exact: these are the persisted paths

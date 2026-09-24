@@ -18,7 +18,6 @@ pub enum RepeatMode {
 }
 
 /// Interactive widgets exposed for the integration bridge to drive.
-#[allow(dead_code)]
 pub struct HeaderBarWidgets {
     pub header: adw::HeaderBar,
     pub play_button: gtk::Button,

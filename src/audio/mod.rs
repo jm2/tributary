@@ -537,12 +537,9 @@ impl Player {
 
     /// Non-blocking query of the current playback state.
     ///
-    /// Reachable only through `LocalOutput::state` (the trait impl),
-    /// which itself currently has no production caller — the UI
-    /// follows state via `PlayerEvent::StateChanged` instead. Keeping
-    /// the method as part of `Player`'s API surface for future
-    /// on-demand queries.
-    #[allow(dead_code)]
+    /// Backs `LocalOutput::state`; the UI follows state through
+    /// `PlayerEvent::StateChanged` instead.
+    #[allow(dead_code, reason = "only tests poll output state directly")]
     pub fn state(&self) -> PlayerState {
         let (_, current, _) = self.playbin.state(gst::ClockTime::ZERO);
         match current {

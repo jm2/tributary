@@ -107,9 +107,7 @@ impl AlbumArtCache {
         self.inner.borrow_mut().content_generation += 1;
     }
 
-    /// Current library content generation. Test seam for the rebuild
-    /// path's invalidation contract.
-    #[allow(dead_code)] // exercised by the widget-test build and cache tests
+    /// Current library content generation.
     pub fn content_generation(&self) -> u64 {
         self.inner.borrow().content_generation
     }
@@ -212,13 +210,13 @@ impl AlbumArtCache {
     }
 
     /// Total number of entries currently cached.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.borrow().entries.len()
     }
 
     /// True if the cache holds zero entries.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.borrow().entries.is_empty()
     }
@@ -226,7 +224,7 @@ impl AlbumArtCache {
     /// Approximate decoded byte cost across every cached entry. Used by
     /// tests to assert that the byte budget is enforced independently of
     /// the count cap.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn approximate_byte_total(&self) -> u64 {
         self.inner.borrow().total_bytes
     }

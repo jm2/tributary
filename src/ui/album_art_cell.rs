@@ -21,7 +21,6 @@ use crate::architecture::SourceId;
 /// across rows avoids creating a fresh widget per row in a virtualized
 /// list (a real cost — each `Image` is a GObject and a CSS node).
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct AlbumArtCell {
     pub row: gtk::Box,
     pub image: gtk::Image,
@@ -179,11 +178,6 @@ impl AlbumArtCellState {
             fetch_liveness: Rc::new(RefCell::new(None)),
             paintable_notify_id: Rc::new(RefCell::new(None)),
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn row(&self) -> &gtk::Box {
-        &self.cell.row
     }
 
     pub(crate) fn current_generation(&self) -> BindGeneration {

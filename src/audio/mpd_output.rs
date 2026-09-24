@@ -262,7 +262,7 @@ fn supervision_authorizes(plan: MpdControlPlan, supervision: &Mutex<SupervisionS
 }
 
 pub struct MpdOutput {
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read only through AudioOutput::name")]
     display_name: String,
     event_tx: async_channel::Sender<PlayerEvent>,
     event_generation: AtomicU64,
@@ -275,7 +275,6 @@ pub struct MpdOutput {
     /// Revoke-only supervision state shared with the worker. The field
     /// itself is retained so callers (and the test harness) can inspect or
     /// seed the supervisor; the worker is the only writer.
-    #[allow(dead_code)]
     supervision: Arc<Mutex<SupervisionState>>,
 }
 
@@ -4742,7 +4741,6 @@ mod tests {
         events: async_channel::Receiver<PlayerEvent>,
         proxy: ProxyServices,
         worker: Option<std::thread::JoinHandle<()>>,
-        #[allow(dead_code)]
         supervision: Arc<Mutex<SupervisionState>>,
     }
 
