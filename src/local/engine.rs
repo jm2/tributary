@@ -632,6 +632,7 @@ impl LibraryEngine {
             &command_rx,
             &mut completed_commands,
             &playlist_sidebar_refresh,
+            None,
         )
         .await;
         if let Err(e) = scan_result {
@@ -4225,7 +4226,28 @@ async fn process_library_commands_without_watcher(
     }
 }
 
-/// Service admitted library commands while the initial scan runs.
+/// Commands a watcher reconciliation hands back to the watcher loop instead of
+/// servicing them while it scans.
+#[derive(Default)]
+struct HandedBackCommands {
+    /// A root-trust command, unprocessed. The loop runs it after the
+    /// reconciliation, with its backlog discard and authority scan, exactly as
+    /// if it had arrived at a loop boundary.
+    root_trust: Option<LibraryCommand>,
+    /// A rescan request. The loop reprobes the roots before rescanning.
+    rescan: bool,
+}
+
+/// The watcher loop's library-command service, lent to its reconciliation
+/// scans so ratings and history settle while one runs.
+struct WatcherCommands<'a> {
+    rx: &'a async_channel::Receiver<LibraryCommand>,
+    completed: &'a mut HashMap<Uuid, CompletedRootTrustCommand>,
+    handed_back: HandedBackCommands,
+}
+
+/// Service admitted library commands while a library scan runs: the startup
+/// scan, or a watcher reconciliation when `hand_back` is `Some`.
 ///
 /// The scan's read-only traversal and parsing run on blocking workers that
 /// cannot be cancelled while the window is open. Driving command service from
@@ -4258,6 +4280,12 @@ async fn process_library_commands_without_watcher(
 /// every earlier admitted command has settled in FIFO order, so the loop waits
 /// for the (cancelled) scan to reach settlement before acknowledging. That
 /// keeps the close drain behind every already admitted durable mutation.
+///
+/// During the startup scan a root-trust command runs here to completion,
+/// authority scan included, and a rescan request is dropped because the
+/// running scan covers it. A watcher reconciliation instead hands both back
+/// through `hand_back`. After taking a root-trust command it stops taking
+/// commands, so every later command keeps its FIFO place behind that one.
 #[allow(clippy::too_many_arguments)]
 async fn service_commands_while_scanning<F>(
     scan: F,
@@ -4268,6 +4296,7 @@ async fn service_commands_while_scanning<F>(
     command_rx: &async_channel::Receiver<LibraryCommand>,
     completed_commands: &mut HashMap<Uuid, CompletedRootTrustCommand>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
+    mut hand_back: Option<&mut HandedBackCommands>,
 ) -> F::Output
 where
     F: std::future::Future<Output = anyhow::Result<()>>,
@@ -4286,8 +4315,8 @@ where
             result = scan.as_mut() => return result,
             command = GatedCommandRecv::new(command_rx, scan_write_txn) => command,
         };
-        match next {
-            Ok(LibraryCommand::Flush { completion }) => {
+        match (next, hand_back.as_deref_mut()) {
+            (Ok(LibraryCommand::Flush { completion }), _) => {
                 // Reserved drain: let the cancelled scan settle (admitted
                 // durable work completes; held read-only work is abandoned
                 // under budget) before acknowledging the writer.
@@ -4295,12 +4324,17 @@ where
                 let _ = completion.send(()).await;
                 return result;
             }
-            Ok(LibraryCommand::Rescan) => {
+            (Ok(LibraryCommand::Rescan), None) => {
                 info!(
                     "Library rescan requested during the startup scan; the running scan covers it"
                 );
             }
-            Ok(command) => {
+            (Ok(LibraryCommand::Rescan), Some(hand_back)) => hand_back.rescan = true,
+            (Ok(command @ LibraryCommand::ConfirmRootTrust(_)), Some(hand_back)) => {
+                hand_back.root_trust = Some(command);
+                commands_open = false;
+            }
+            (Ok(command), _) => {
                 // Service the command while KEEPING THE SCAN POLLED. The
                 // command's own DB work pends on the connection pool, and the
                 // pool may have granted its only connection to the parked
@@ -4358,7 +4392,7 @@ where
                     }
                 }
             }
-            Err(_) => commands_open = false,
+            (Err(_), _) => commands_open = false,
         }
     }
 }
@@ -6917,22 +6951,36 @@ fn discard_watcher_backlog(rx: &mut mpsc::Receiver<notify::Result<notify::Event>
 
 /// The watcher's authoritative fallback: an ordinary library scan, bounded by
 /// the window-close cancellation like the startup scan so closing the window
-/// never waits for a whole-library rescan.
+/// never waits for a whole-library rescan. Library commands are serviced
+/// while it runs, as during the startup scan, except those it hands back.
 async fn reconcile_watched_library(
     db: &DatabaseConnection,
     music_dirs: &[PathBuf],
     tx: &async_channel::Sender<LibraryEvent>,
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
+    discovery: &ScanDiscoveryHold,
+    commands: &mut WatcherCommands<'_>,
 ) -> anyhow::Result<()> {
-    initial_scan_shutdown_aware(
+    let scan_write_txn = ScanWriteTxnGate::default();
+    service_commands_while_scanning(
+        initial_scan_shutdown_aware(
+            db,
+            music_dirs,
+            tx,
+            playlist_sidebar_refresh,
+            cancellation,
+            discovery,
+            &scan_write_txn,
+        ),
+        &scan_write_txn,
         db,
         music_dirs,
         tx,
+        commands.rx,
+        commands.completed,
         playlist_sidebar_refresh,
-        cancellation,
-        &ScanDiscoveryHold::none(),
-        &ScanWriteTxnGate::default(),
+        Some(&mut commands.handed_back),
     )
     .await
 }
@@ -6944,6 +6992,7 @@ async fn reconcile_unreliable_watcher_stream(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
     rx: &mut mpsc::Receiver<notify::Result<notify::Event>>,
+    commands: &mut WatcherCommands<'_>,
 ) -> bool {
     // The queued backlog belongs to the same stream gap and cannot be applied
     // incrementally. Events racing with this drain may be discarded too; the
@@ -6952,8 +7001,16 @@ async fn reconcile_unreliable_watcher_stream(
     // loop iteration.
     discard_watcher_backlog(rx);
     info!("Reconciling library after filesystem watcher stream loss");
-    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
-        .await
+    match reconcile_watched_library(
+        db,
+        music_dirs,
+        tx,
+        playlist_sidebar_refresh,
+        cancellation,
+        &ScanDiscoveryHold::none(),
+        commands,
+    )
+    .await
     {
         Ok(()) => true,
         Err(error) => {
@@ -6970,6 +7027,7 @@ async fn reconcile_root_marker_mutations(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     cancellation: &CancellationToken,
     roots: &HashSet<PathBuf>,
+    commands: &mut WatcherCommands<'_>,
 ) -> bool {
     // Invalidate persisted authorization before any asynchronous traversal.
     // A marker created by the bootstrap scan is restored to available by this
@@ -6978,8 +7036,16 @@ async fn reconcile_root_marker_mutations(
         mark_root_path_unavailable(db, root).await;
     }
     info!("Reconciling library after library root marker mutation");
-    match reconcile_watched_library(db, music_dirs, tx, playlist_sidebar_refresh, cancellation)
-        .await
+    match reconcile_watched_library(
+        db,
+        music_dirs,
+        tx,
+        playlist_sidebar_refresh,
+        cancellation,
+        &ScanDiscoveryHold::none(),
+        commands,
+    )
+    .await
     {
         Ok(()) => true,
         Err(error) => {
@@ -7062,6 +7128,12 @@ async fn process_directory_events(
     playlist_sidebar_refresh: &PlaylistSidebarRefresh,
     scan_cancellation: &CancellationToken,
 ) -> anyhow::Result<()> {
+    let mut commands = WatcherCommands {
+        rx: command_rx,
+        completed: completed_commands,
+        handed_back: HandedBackCommands::default(),
+    };
+
     // ── Debounced event processing ──────────────────────────────
     // Collect filesystem events for a short window, deduplicate by
     // path, then process the batch. This collapses the 3-5 duplicate
@@ -7088,17 +7160,33 @@ async fn process_directory_events(
                 music_dirs,
                 tx,
                 playlist_sidebar_refresh,
-                completed_commands,
+                commands.completed,
                 pending,
             )
             .await;
             continue;
         }
 
+        // A root-trust command a reconciliation handed back was admitted
+        // before anything still queued, so it runs first.
+        if let Some(command) = commands.handed_back.root_trust.take() {
+            pending_trust_scan = process_library_command(
+                db.as_ref(),
+                music_dirs,
+                tx,
+                playlist_sidebar_refresh,
+                commands.completed,
+                command,
+            )
+            .await;
+            continue;
+        }
+        rescan_requested |= std::mem::take(&mut commands.handed_back.rescan);
+
         // Each UI mutation is one serialized engine command. Drain at most one
         // per batch boundary so it cannot interleave with a watcher mutation.
         if commands_open {
-            match command_rx.try_recv() {
+            match commands.rx.try_recv() {
                 Ok(LibraryCommand::Rescan) => {
                     rescan_requested = true;
                     continue;
@@ -7109,7 +7197,7 @@ async fn process_directory_events(
                         music_dirs,
                         tx,
                         playlist_sidebar_refresh,
-                        completed_commands,
+                        commands.completed,
                         command,
                     )
                     .await;
@@ -7141,6 +7229,7 @@ async fn process_directory_events(
                 playlist_sidebar_refresh,
                 scan_cancellation,
                 &mut watcher.rx,
+                &mut commands,
             )
             .await;
             if reconciliation_pending {
@@ -7153,7 +7242,7 @@ async fn process_directory_events(
         // batch. A closed command channel must not stop filesystem watching.
         let wake = tokio::select! {
             biased;
-            command = command_rx.recv(), if commands_open => WatcherWake::Command(command),
+            command = commands.rx.recv(), if commands_open => WatcherWake::Command(command),
             _ = root_probe.tick() => WatcherWake::RootProbe,
             first = watcher.rx.recv() => WatcherWake::Event(first),
         };
@@ -7168,7 +7257,7 @@ async fn process_directory_events(
                     music_dirs,
                     tx,
                     playlist_sidebar_refresh,
-                    completed_commands,
+                    commands.completed,
                     command,
                 )
                 .await;
@@ -7239,6 +7328,7 @@ async fn process_directory_events(
                 playlist_sidebar_refresh,
                 scan_cancellation,
                 &batch.identity_changed_roots,
+                &mut commands,
             )
             .await;
             if reconciliation_pending {
@@ -7916,6 +8006,8 @@ async fn process_directory_events(
                 tx,
                 playlist_sidebar_refresh,
                 scan_cancellation,
+                &ScanDiscoveryHold::none(),
+                &mut commands,
             )
             .await
             {
@@ -12471,6 +12563,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             control
@@ -12518,6 +12611,176 @@ mod tests {
         assert_eq!(rated.rating, Some(80));
     }
 
+    /// A watcher-triggered reconciliation services commands like the startup
+    /// scan: a rating admitted while its traversal is held settles before the
+    /// reconciliation can finish.
+    #[tokio::test]
+    async fn watcher_reconciliation_services_a_rating_while_discovery_is_held() {
+        let db = rename_test_database().await;
+        // Outside the scan root, so the reconciliation never touches the row.
+        let rating_path = std::env::temp_dir().join("tributary-reconcile-rating.flac");
+        insert_rename_test_track(
+            &db,
+            "reconcile-rating-track",
+            rating_path.to_string_lossy().as_ref(),
+            "Reconciled",
+            0,
+        )
+        .await;
+        let directory = TestDirectory::new("reconcile-held-discovery");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let mut completed = HashMap::new();
+        let mut commands = WatcherCommands {
+            rx: &command_rx,
+            completed: &mut completed,
+            handed_back: HandedBackCommands::default(),
+        };
+
+        let reconciliation = reconcile_watched_library(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &refresh,
+            &cancellation,
+            &hold,
+            &mut commands,
+        );
+        let driver = async {
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            command_tx
+                .send(LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("reconcile-rating-track").expect("valid track ID"),
+                    rating: Some(Rating::new(60).expect("valid rating")),
+                })
+                .await
+                .expect("admit the rating command");
+            // Deadlocks (and times out) unless the rating settles while the
+            // traversal is still held.
+            loop {
+                let event = event_rx.recv().await.expect("event channel stays open");
+                if matches!(event, LibraryEvent::TrackRatingUpdated(_)) {
+                    break;
+                }
+            }
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::PostParse);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::CommitGuard);
+        };
+
+        let (result, ()) = tokio::join!(reconciliation, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the held reconciliation must service the rating");
+        });
+        result.expect("reconciliation completes after the hold is released");
+
+        let rated = track::Entity::find_by_id("reconcile-rating-track")
+            .one(&db)
+            .await
+            .expect("query rated track")
+            .expect("rated track exists");
+        assert_eq!(rated.rating, Some(60));
+        assert!(commands.handed_back.root_trust.is_none());
+        assert!(!commands.handed_back.rescan);
+    }
+
+    /// A reconciliation hands root-trust and rescan commands back to the
+    /// watcher loop unprocessed, and takes nothing after the root-trust
+    /// command, so a later rating keeps its FIFO place behind it.
+    #[tokio::test]
+    async fn watcher_reconciliation_hands_back_root_trust_and_rescan() {
+        let db = rename_test_database().await;
+        let trust_directory = TestDirectory::new("reconcile-handback-trust");
+        create_root_marker(trust_directory.path()).expect("create adoptable marker");
+        let trust_scan = scan_root(trust_directory.path().to_path_buf());
+        let stored = persist_root_scan_status(&db, &trust_scan, None, false, true, false)
+            .await
+            .expect("persist unconfirmed marker");
+        let request = build_root_trust_request(&trust_scan, &stored, RootTrustReason::EmptyRoot, 0)
+            .expect("build adoption request");
+        let request_id = request.request_id();
+
+        let directory = TestDirectory::new("reconcile-handback");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join("present.wav"));
+        let music_dirs = vec![directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let refresh = test_playlist_sidebar_refresh();
+        let cancellation = CancellationToken::new();
+        let (hold, control) = ScanDiscoveryHold::controlling();
+        let mut completed = HashMap::new();
+        let mut commands = WatcherCommands {
+            rx: &command_rx,
+            completed: &mut completed,
+            handed_back: HandedBackCommands::default(),
+        };
+
+        let reconciliation = reconcile_watched_library(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &refresh,
+            &cancellation,
+            &hold,
+            &mut commands,
+        );
+        let driver = async {
+            control
+                .wait_until_reached(ScanDiscoveryStage::Traversal)
+                .await;
+            for command in [
+                LibraryCommand::Rescan,
+                LibraryCommand::ConfirmRootTrust(request),
+                LibraryCommand::SetTrackRating {
+                    track_id: TrackId::new("absent-track").expect("valid track ID"),
+                    rating: Some(Rating::new(20).expect("valid rating")),
+                },
+            ] {
+                command_tx.send(command).await.expect("admit the command");
+            }
+            while command_rx.len() > 1 {
+                tokio::task::yield_now().await;
+            }
+            control.release(ScanDiscoveryStage::Traversal);
+            control.release(ScanDiscoveryStage::PostParse);
+            control.release(ScanDiscoveryStage::RootStatus);
+            control.release(ScanDiscoveryStage::CommitGuard);
+        };
+
+        let (result, ()) = tokio::join!(reconciliation, async {
+            tokio::time::timeout(Duration::from_secs(60), driver)
+                .await
+                .expect("the held reconciliation must take the queued commands");
+        });
+        result.expect("reconciliation completes after the hold is released");
+
+        assert!(commands.handed_back.rescan);
+        assert!(matches!(
+            commands.handed_back.root_trust,
+            Some(LibraryCommand::ConfirmRootTrust(ref handed)) if handed.request_id() == request_id
+        ));
+        assert!(commands.completed.is_empty(), "root trust ran early");
+        assert!(
+            matches!(
+                command_rx.try_recv(),
+                Ok(LibraryCommand::SetTrackRating { .. })
+            ),
+            "the rating stays queued behind the handed-back command"
+        );
+    }
+
     /// Deterministic reserved-drain regression: a `Flush` admitted after an
     /// earlier rating is acknowledged only once the held scan settles, so no
     /// already-admitted command can be reported drained while discovery still
@@ -12556,6 +12819,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             control
@@ -12649,6 +12913,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             // Let the read-only phases through uncaptured (traversal, the
@@ -12761,6 +13026,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             control.release(ScanDiscoveryStage::Traversal);
@@ -12875,6 +13141,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             // Read-only phases pass uncaptured; the seam this test cares
@@ -12988,6 +13255,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let driver = async {
             // Hold the scan at the per-file post-parse rendezvous — still
@@ -13199,6 +13467,7 @@ mod tests {
             &command_rx,
             &mut completed,
             &refresh,
+            None,
         );
         let (flush_tx, flush_rx) = async_channel::bounded(1);
         let driver = async {

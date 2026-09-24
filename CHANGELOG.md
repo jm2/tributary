@@ -138,6 +138,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rescan to finish.
 - **Playlist edits during a scan** — Creating, renaming, deleting, importing, or editing playlists
   while a scan is running now waits briefly instead of failing with "database is locked".
+- **Edits during library refreshes** — Ratings and play counts no longer wait for a library refresh
+  that file changes started, such as after syncing music into a library folder.
 - **Upgrading libraries from 0.5.x** — A deleted song with a blank artist tag in an old playlist no
   longer stops the upgrade and leaves the library empty. If the library database can't be opened
   or upgraded, Tributary now shows an error instead of an empty library.
