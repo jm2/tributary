@@ -1558,8 +1558,7 @@ pub(crate) fn build_window(
     load_css();
 
     // ── Sidebar sources ────────────────────────────────────────────────
-    let sources = super::dummy_data::build_sources();
-    let mut sources = sources;
+    let mut sources = super::sidebar::build_sources();
 
     // Load manually-added servers from servers.json.
     let saved_servers = load_saved_servers();
