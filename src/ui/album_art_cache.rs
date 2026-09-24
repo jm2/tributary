@@ -66,9 +66,7 @@ pub struct AlbumArtCacheInner {
     /// set is rebuilt (FullSync, source switch): entries keyed under an
     /// older generation become unqueryable, so a changed cover is
     /// re-resolved within the same source session instead of serving the
-    /// pre-sync pixels (2026-09-10 review finding — the key previously
-    /// carried the source epoch but no artwork/content generation, and a
-    /// same-session FullSync left changed covers stale).
+    /// pre-sync pixels.
     pub(crate) content_generation: u64,
 }
 
@@ -107,9 +105,7 @@ impl AlbumArtCache {
         self.inner.borrow_mut().content_generation += 1;
     }
 
-    /// Current library content generation. Test seam for the rebuild
-    /// path's invalidation contract.
-    #[allow(dead_code)] // exercised by the widget-test build and cache tests
+    /// Current library content generation.
     pub fn content_generation(&self) -> u64 {
         self.inner.borrow().content_generation
     }
@@ -150,11 +146,8 @@ impl AlbumArtCache {
     /// every insert. A single texture whose decoded surface exceeds the
     /// ENTIRE budget is refused outright: no eviction order can make
     /// room for it, so admitting it would leave the cache permanently
-    /// over budget (2026-09-10 review finding — the former loop stopped
-    /// at one entry precisely to avoid that state, which let one oversized
-    /// decoded texture pin the cache over its cap). The row keeps
-    /// displaying the refused texture; only its cache retention is
-    /// declined, and the next bind simply re-resolves it.
+    /// over budget. The row keeps displaying the refused texture; only its
+    /// cache retention is declined, and the next bind simply re-resolves it.
     pub fn insert(
         &self,
         source: Option<&SourceId>,
@@ -212,13 +205,13 @@ impl AlbumArtCache {
     }
 
     /// Total number of entries currently cached.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.borrow().entries.len()
     }
 
     /// True if the cache holds zero entries.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.borrow().entries.is_empty()
     }
@@ -226,7 +219,7 @@ impl AlbumArtCache {
     /// Approximate decoded byte cost across every cached entry. Used by
     /// tests to assert that the byte budget is enforced independently of
     /// the count cap.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn approximate_byte_total(&self) -> u64 {
         self.inner.borrow().total_bytes
     }
@@ -246,10 +239,9 @@ fn cache_key(
     // exposing the Uuid type at the call site. The source session epoch
     // sits between the source identity and the content generation: a
     // source that is reactivated under a new epoch gets fresh keys, so
-    // stale artwork from the previous session can never be served
-    // (2026-09-07 review finding), and a library content change inside
-    // one session gets fresh keys through the generation field
-    // (2026-09-10 review finding). Local rows have no epoch; their keys
+    // stale artwork from the previous session can never be served, and a
+    // library content change inside one session gets fresh keys through
+    // the generation field. Local rows have no epoch; their keys
     // omit that field but still carry the generation.
     let epoch = match source_epoch {
         Some(epoch) => epoch.to_string(),
@@ -274,7 +266,7 @@ fn cache_key(
 /// Charging the requested pixel size instead let a full-resolution cover
 /// (~16 MiB retained for a 2000×2000 RGBA image) count as a few KiB, so
 /// the advertised 32 MiB budget could hold hundreds of large decoded
-/// textures (2026-09-08 review finding).
+/// textures.
 fn approximate_texture_bytes(texture: &gdk::Texture) -> u64 {
     (texture.width() as u64)
         .saturating_mul(texture.height() as u64)

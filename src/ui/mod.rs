@@ -216,7 +216,7 @@ pub mod widget_test_session {
     /// context would dispatch a foreign source on its own worker thread,
     /// tripping glib's `ThreadGuard` ("Value accessed from different
     /// thread than where it was created") inside a non-unwinding C
-    /// trampoline and aborting the entire test binary (tr-8wtab). Pump the
+    /// trampoline and aborting the entire test binary. Pump the
     /// session's context instead — helpers can fetch it with
     /// `MainContext::thread_default()`, which returns `Some` exactly
     /// because the session pushed it — so only sources this same thread

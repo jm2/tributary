@@ -98,8 +98,7 @@ fn candidate(
 /// that still carries a source id but whose session epoch was
 /// revoked/stripped (or whose registry handle is absent) must leave
 /// the placeholder. It must never fall through to the stale snapshot
-/// `cover_art_url`, and never reopen the raw `file://` pathname
-/// (2026-09-12 review finding).
+/// `cover_art_url`, and never reopen the raw `file://` pathname.
 #[tokio::test]
 async fn incomplete_retained_identity_leaves_the_placeholder() {
     let liveness = album_art::ScopedArtFetch::new();
@@ -153,7 +152,7 @@ async fn incomplete_retained_identity_leaves_the_placeholder() {
 /// The genuinely external compatibility path survives: a row with NO
 /// source identity at all keeps its transitional direct locator, and
 /// a row with neither locator leaves the placeholder rather than
-/// fabricating one (2026-09-12 review finding).
+/// fabricating one.
 #[tokio::test]
 async fn external_rows_keep_the_transitional_direct_path() {
     let liveness = album_art::ScopedArtFetch::new();
@@ -200,19 +199,15 @@ async fn external_rows_keep_the_transitional_direct_path() {
     assert!(matches!(resolved, ResolvedArtKind::NoArtwork));
 }
 
-// The built-in local resolution tests live in `super::local_library_tests`:
-// the former `builtin_local_artwork_resolves_on_the_application_runtime`
-// test reached the production `init_db()` seam, so a normal `cargo test`
-// run created, migrated, and opened the real user library, and its single
-// NoArtwork assertion also accepted a database error (R1, 2026-09-17
-// refinery audit). The replacement tests resolve against an injected
-// in-memory library with an authorized temporary root and assert a
-// successful retained-file resolution with real embedded-art extraction.
+// The built-in local resolution tests live in `super::local_library_tests`.
+// They resolve against an injected in-memory library with an authorized
+// temporary root, never the production `init_db()` seam (which would
+// create, migrate, and open the real user library), and assert a successful
+// retained-file resolution with real embedded-art extraction.
 
-/// N3 regression (2026-09-14 review finding): a built-in-local row
-/// whose token is revoked mid-resolution must not continue its
-/// resolution. This drives the runtime-handoff cancellation seam with
-/// a controllable future, so cancellation — not merely the final
+/// Regression: a built-in-local row whose token is revoked mid-resolution must
+/// not continue its resolution. This drives the runtime-handoff cancellation
+/// seam with a controllable future, so cancellation — not merely the final
 /// placeholder — is observable: the parked work is dropped before it
 /// can complete, mirroring a rebind that revokes a row whose
 /// `resolve_track` authority probe is still pending.
@@ -271,7 +266,7 @@ fn revoked_builtin_local_resolution_is_cancelled() {
 /// runtime must be cancelled the moment the row's token is revoked, so
 /// a rebind that lands while a retained authority probe is still
 /// waiting does not run the probe to completion for a row that can no
-/// longer paint (2026-09-17 review finding).
+/// longer paint.
 #[test]
 fn revoked_registry_resolution_on_runtime_is_cancelled() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -337,7 +332,7 @@ fn pre_revoked_builtin_local_row_is_refused_at_admission() {
     // An injected (empty, in-memory) library keeps even a regressed
     // admission order from touching the real user library: the revoked
     // check fires before any database access, and the injected path can
-    // never reach `init_db` at all (R1, 2026-09-17 refinery audit).
+    // never reach `init_db` at all.
     let library = LocalLibrary::Injected(
         tokio::runtime::Runtime::new()
             .expect("fixture setup runtime")

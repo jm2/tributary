@@ -6,6 +6,7 @@ fuzz_target!(|data: &[u8]| {
     // Production import reads the file as UTF-8 first, so invalid UTF-8
     // never reaches the parser. The parser must only accept or reject.
     if let Ok(text) = std::str::from_utf8(data) {
-        let _ = tributary::local::playlist_io::parse_xspf(text);
+        let playlist = std::path::Path::new("/fuzz/playlist.xspf");
+        let _ = tributary::local::playlist_io::parse_xspf(text, Some(playlist));
     }
 });

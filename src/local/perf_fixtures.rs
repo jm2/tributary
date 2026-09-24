@@ -534,8 +534,7 @@ mod tests {
     #[test]
     fn expected_catalogue_cardinalities_match_the_documented_layout() {
         // 12 tracks per album, 4 albums per artist, final partial groups.
-        // These are the numbers the refinery acceptance requires the
-        // measurement to assert through the real backend.
+        // The measurement asserts these numbers through the real backend.
         assert_eq!(expected_album_count(10_000), 834);
         assert_eq!(expected_artist_count(10_000), 209);
         assert_eq!(expected_album_count(100_000), 8_334);
@@ -600,7 +599,7 @@ mod tests {
         assert_eq!(empty - half, 50);
         // The backend-native id is a heap `String` per row (the scan stores
         // the SQLite id verbatim), so omitting it underreported the metric
-        // by its length × track count (refinery F1, PR #285).
+        // by its length × track count.
         track.native_track_id = Some(TrackId::new("native-track-id").expect("valid track id"));
         let with_id = catalogue_bytes(std::slice::from_ref(&track));
         assert_eq!(with_id - half, "native-track-id".len());

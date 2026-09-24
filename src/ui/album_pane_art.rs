@@ -146,7 +146,7 @@ impl AlbumArtController {
     /// for any row that scrolls into view afterwards. The cell is shared
     /// with the `BrowserState` so a write through the public setter is
     /// observed here without any further wiring.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn attach_pixel_size(&self, pixel_size: Rc<Cell<i32>>) {
         *self.pixel_size.borrow_mut() = Some(pixel_size);
     }
@@ -155,7 +155,7 @@ impl AlbumArtController {
         &self.cache
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn placeholder_icon(&self) -> &'static str {
         self.placeholder_icon
     }
@@ -423,8 +423,7 @@ impl AlbumArtController {
             .unwrap_or_default();
 
         // Snapshot the application runtime alongside the roots: the
-        // built-in local arm must run off the runtime-less GTK main context
-        // (2026-09-13 review finding).
+        // built-in local arm must run off the runtime-less GTK main context.
         let rt_handle = self.rt_handle.borrow().clone();
 
         let fetch = PaneFetch {

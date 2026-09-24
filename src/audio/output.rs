@@ -55,10 +55,9 @@ pub enum OutputType {
 pub trait AudioOutput {
     /// Human-readable display name for the output selector UI.
     ///
-    /// Examples: "My Computer", "Living Room MPD". Currently consumed
-    /// only by tests; the active-output label in the header bar is
-    /// driven from the source list rather than the output instance.
-    #[allow(dead_code)]
+    /// Examples: "My Computer", "Living Room MPD". The active-output label
+    /// in the header bar comes from the source list, not from this.
+    #[allow(dead_code, reason = "only tests identify outputs by name")]
     fn name(&self) -> &str;
 
     /// The output type, used for icon selection in the popover.
@@ -165,10 +164,9 @@ pub trait AudioOutput {
 
     /// Non-blocking query of the current playback state.
     ///
-    /// Currently every output reports state asynchronously through the
-    /// `PlayerEvent` channel; this method exists for future on-demand
-    /// queries and is not yet polled by the UI.
-    #[allow(dead_code)]
+    /// Every output also reports state asynchronously through the
+    /// `PlayerEvent` channel, which is what the UI follows.
+    #[allow(dead_code, reason = "only tests poll output state directly")]
     fn state(&self) -> PlayerState;
 
     /// Current playback position in milliseconds, or `None` if unknown.

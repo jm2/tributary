@@ -12,16 +12,13 @@
 //! redirecting only those variables does not isolate the child there.
 
 /// Environment variable used only by process-isolated tests to redirect
-/// [`data_dir`] into a private sandbox. Production never sets it.
-///
-/// Referenced only from test-gated code, so non-test builds would otherwise
-/// report it dead.
-#[allow(dead_code)]
+/// [`data_dir`] into a private sandbox.
+#[cfg(test)]
 pub const TEST_USER_STATE_DIR_ENV: &str = "TRIBUTARY_TEST_USER_STATE_DIR";
 
 /// Resolve the Tributary application data root (`<data_dir>`).
 ///
-/// In test builds a non-empty [`TEST_USER_STATE_DIR_ENV`] takes precedence
+/// In test builds a non-empty `TEST_USER_STATE_DIR_ENV` takes precedence
 /// over the platform directory, so every production persistence path
 /// (volume, database, settings, server/output/config files) lands inside the
 /// isolated child's sandbox. The override is compiled out of non-test builds,
@@ -36,7 +33,7 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
 
 /// Resolve the user cache root (`<cache_dir>`).
 ///
-/// In test builds a non-empty [`TEST_USER_STATE_DIR_ENV`] redirects it to a
+/// In test builds a non-empty `TEST_USER_STATE_DIR_ENV` redirects it to a
 /// `cache` folder inside that sandbox, as it does for [`data_dir`].
 pub fn cache_dir() -> Option<std::path::PathBuf> {
     #[cfg(test)]

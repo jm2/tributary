@@ -3,7 +3,7 @@
 //! Split verbatim from `album_art_cache.rs` so each module stays under
 //! the file-size budget; no assertion, key-identity, or budget check
 //! was altered. The suite exercises the cache through its public
-//! surface plus the `#[allow(dead_code)]` seams, exactly as before.
+//! surface plus its test-only accessors.
 use super::*;
 use gtk::glib;
 
@@ -224,7 +224,7 @@ fn solid_texture(width: i32, height: i32) -> gdk::Texture {
 /// `width × height × 4` bytes; under the previous requested-size
 /// approximation a 2000×2000 cover counted as ~9 KiB, so the
 /// nominal 32 MiB budget could retain hundreds of large decoded
-/// textures (2026-09-08 review finding).
+/// textures.
 #[test]
 fn cache_budget_charges_decoded_texture_dimensions_not_requested_pixel_size() {
     let cache = AlbumArtCache::new();
@@ -357,9 +357,8 @@ fn cache_field_separator_is_unit_separator_control_byte() {
 /// that is reactivated (reconnect, credential refresh, backend
 /// restart) mints a NEW epoch, and the same album key under the new
 /// epoch must never serve the texture decoded under the previous
-/// epoch's identity (2026-09-07 review finding). Old-epoch entries
-/// simply age out through the bounded eviction; they can never be
-/// *queried* by a newer epoch.
+/// epoch's identity. Old-epoch entries simply age out through the bounded
+/// eviction; they can never be *queried* by a newer epoch.
 #[test]
 fn cache_keys_distinguish_source_session_epochs() {
     use crate::architecture::SourceId;
@@ -411,7 +410,7 @@ fn cache_keys_distinguish_source_session_epochs() {
 /// A single decoded texture larger than the ENTIRE byte budget must
 /// be refused outright. The former eviction loop stopped at one
 /// entry, so exactly such a texture was admitted with the cache
-/// pinned permanently over its cap (2026-09-10 review finding).
+/// pinned permanently over its cap.
 /// No eviction order can make room for it, so `insert` declines
 /// retention while the row keeps displaying the texture it painted.
 #[test]

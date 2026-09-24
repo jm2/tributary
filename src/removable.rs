@@ -249,9 +249,9 @@ impl ManagedSourceAdapter for RemovableMediaAdapter {
     /// speculative pane probes must not saturate the shared blocking pool or
     /// delay playback. The class permit is acquired BEFORE the probe is
     /// submitted and moved INTO the blocking closure, so an aborted
-    /// speculative caller cannot release capacity while the probe still runs
-    /// (2026-09-14 review finding). The exact-membership gate and both mount
-    /// validations stay inside the per-object operation.
+    /// speculative caller cannot release capacity while the probe still runs.
+    /// The exact-membership gate and both mount validations stay inside the
+    /// per-object operation.
     fn resolve_stream_classified(
         self: Arc<Self>,
         track_id: TrackId,
@@ -557,7 +557,7 @@ fn resolution_failed() -> BackendError {
 ///
 /// Speculative pane work and playback-critical resolution must not share one
 /// gate: a saturated album pane must never delay a playback resolution that
-/// is waiting on a blocking mounted probe (2026-09-14 review finding).
+/// is waiting on a blocking mounted probe.
 fn probe_class_for(class: StreamResolutionClass) -> crate::local::resolver::ProbeClass {
     match class {
         StreamResolutionClass::Speculative | StreamResolutionClass::Download => {

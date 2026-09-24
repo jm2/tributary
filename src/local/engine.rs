@@ -12515,7 +12515,7 @@ mod tests {
         );
     }
 
-    /// Deterministic R1 regression: hold a real initial scan inside read-only
+    /// Deterministic regression: hold a real initial scan inside read-only
     /// traversal, then admit a rating edit. The edit must settle while the
     /// discovery step is still held, because command service is driven
     /// independently of the scan's read-only work.
@@ -12978,7 +12978,7 @@ mod tests {
         );
     }
 
-    /// Round-3 regression: a command deferred behind an open scan write
+    /// Regression: a command deferred behind an open scan write
     /// transaction must settle PROMPTLY once that transaction commits — its
     /// write runs against an idle database, far below the production
     /// five-second busy timeout. Fail-closed: if the reciprocal gate ever
@@ -13091,16 +13091,15 @@ mod tests {
         );
     }
 
-    /// Round-4 regression (PR #286 finding j9j81): cancellation that arrives
-    /// WHILE the scan is parked at a write boundary's command-settlement wait
-    /// must still refuse to open a write transaction. The pre-wait admission
-    /// check cannot observe a shutdown that lands mid-park, so the boundary
-    /// must re-check admission after the wait resolves — refusing exactly as
-    /// the pre-wait check does, keeping the write-transaction gate closed,
-    /// admitting no durable mutation, and letting the close drain settle
-    /// promptly. Fail-closed: a regression to the pre-round-4 behavior opens
-    /// the transaction here and the engine future never settles inside the
-    /// join timeout.
+    /// Regression: cancellation that arrives WHILE the scan is parked at a
+    /// write boundary's command-settlement wait must still refuse to open a
+    /// write transaction. The pre-wait admission check cannot observe a
+    /// shutdown that lands mid-park, so the boundary must re-check admission
+    /// after the wait resolves — refusing exactly as the pre-wait check does,
+    /// keeping the write-transaction gate closed, admitting no durable
+    /// mutation, and letting the close drain settle promptly. Fail-closed:
+    /// without the re-check the boundary opens the transaction here and the
+    /// engine future never settles inside the join timeout.
     #[tokio::test]
     async fn scan_cancelled_during_command_settlement_wait_never_opens_write_txn() {
         let db = rename_test_database().await;
@@ -13205,14 +13204,14 @@ mod tests {
         let _ = event_rx.try_recv();
     }
 
-    /// Round-3 reciprocal regression (cid 4051684281): dispatched command work
-    /// that is still in flight must hold the scan AT its write boundaries —
-    /// the scan may not open a write transaction the work's own writes would
-    /// queue behind. Ordering proof: the rating is dispatched while the scan
-    /// is parked at the post-parse rendezvous, and by the time the scan
-    /// reaches the in-transaction CommitGuard rendezvous the rating has
-    /// already settled, because every boundary crossing requires the in-flight
-    /// flag to be clear.
+    /// Reciprocal regression: dispatched command work that is still in flight
+    /// must hold the scan AT its write boundaries — the scan may not open a
+    /// write transaction the work's own writes would queue behind. Ordering
+    /// proof: the rating is dispatched while the scan is parked at the
+    /// post-parse rendezvous, and by the time the scan reaches the
+    /// in-transaction CommitGuard rendezvous the rating has already settled,
+    /// because every boundary crossing requires the in-flight flag to be
+    /// clear.
     #[tokio::test]
     async fn scan_write_boundary_defers_while_dispatched_command_work_is_in_flight() {
         let db = rename_test_database().await;
@@ -17387,16 +17386,15 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Q4 engine-loop/GTK responsiveness lane (tr-am6qr).
+    // Q4 engine-loop/GTK responsiveness lane.
     //
     // Measurement harness for the engine-side startup endpoints this lane
     // owns: time to publish the startup snapshot (FullSync / ScanComplete)
     // and cancellation settlement of the FIFO barrier when commands and the
     // shutdown Flush are admitted while the initial scan is still in
     // flight. The GTK-side publication/stall endpoints are measured by the
-    // env-gated helper in `ui::browser::tests` (see that module). Sibling
-    // lane tr-7nguk owns the shared fixture/parse-delay seam; until it
-    // lands this harness stands alone on committed fixture bytes.
+    // env-gated helper in `ui::browser::tests` (see that module). This
+    // harness stands alone on committed fixture bytes.
     //
     // The harness is `#[ignore]`d because it is an explicit measurement
     // run (budgets are recorded per runner in
@@ -17495,11 +17493,11 @@ mod tests {
                     // before it acks the Flush barrier, so when the collector
                     // is polled with both channels ready the queued events
                     // must be stamped ahead of the ack. Polling the flush arm
-                    // first let the ack win that race: the loop broke, the
-                    // post-loop drain stamped ScanComplete AFTER flush_ack_us,
-                    // and the bench's `scan_complete_us <= flush_ack_us`
-                    // settlement assert panicked (tr-kcfmsh, reproduced on
-                    // main fc5d0d6a).
+                    // first would let the ack win that race: the loop would
+                    // break, the post-loop drain would stamp ScanComplete
+                    // AFTER flush_ack_us, and the bench's
+                    // `scan_complete_us <= flush_ack_us` settlement assert
+                    // would panic.
                     event = event_rx.recv() => {
                         match event {
                             Ok(event) => {
@@ -17539,12 +17537,11 @@ mod tests {
         timeline
     }
 
-    /// Regression (PR #291 review Correction 1): the startup-timeline
-    /// sampler must stamp each event when it ARRIVES, not when the
-    /// `select!` wait began. Feed two events at known post-entry delays
-    /// and require the recorded `*_us` values to reflect those delays —
-    /// the defective sampler stamped the first event with ~0 µs (loop
-    /// entry) because it sampled before blocking on the empty channel.
+    /// Regression: the startup-timeline sampler must stamp each event when
+    /// it ARRIVES, not when the `select!` wait began. Feed two events at
+    /// known post-entry delays and require the recorded `*_us` values to
+    /// reflect those delays — sampling before blocking on the empty channel
+    /// would stamp the first event with ~0 µs (loop entry).
     /// Cheap by construction: no fixture tree, no engine, no `#[ignore]`.
     #[tokio::test]
     async fn q4_startup_timeline_stamps_arrival_not_wait_start() {
@@ -17603,7 +17600,7 @@ mod tests {
         // stamp is floored at the second delay. The event arm is polled
         // first under `biased;`, so a queued FullSync is stamped before
         // the ack even when both channels are ready at the same poll —
-        // the ack never preempts already-published events (tr-kcfmsh).
+        // the ack never preempts already-published events.
         let flush_ack_us = timeline.flush_ack_us.expect("flush ack recorded");
         assert!(
             flush_ack_us >= SECOND_DELAY_MS * 1_000,
@@ -17615,19 +17612,18 @@ mod tests {
         );
     }
 
-    /// Regression (tr-kcfmsh): the settlement sampler must drain
-    /// already-published events BEFORE selecting the Flush ack. Pre-load
-    /// the event channel with a large queue whose LAST entry is
-    /// ScanComplete, and ack the Flush barrier before the sampler is ever
-    /// polled, so both channels are ready at its first `select!`. Under
-    /// the old flush-first bias the ack won that race immediately and the
-    /// post-loop drain stamped ScanComplete milliseconds AFTER the ack,
-    /// panicking the Q4 bench (`scan_complete_us <= flush_ack_us`). With
-    /// event-first bias every queued event is consumed in-loop and the
-    /// ack is stamped last. The queue is sized so the defective ordering
-    /// fails the assert by a wide, deterministic margin rather than a
-    /// clock-granularity flake. Cheap by construction: no fixture tree,
-    /// no engine, no `#[ignore]`.
+    /// Regression: the settlement sampler must drain already-published events
+    /// BEFORE selecting the Flush ack. Pre-load the event channel with a large
+    /// queue whose LAST entry is ScanComplete, and ack the Flush barrier
+    /// before the sampler is ever polled, so both channels are ready at its
+    /// first `select!`. Under the old flush-first bias the ack won that race
+    /// immediately and the post-loop drain stamped ScanComplete milliseconds
+    /// AFTER the ack, panicking the Q4 bench (`scan_complete_us <=
+    /// flush_ack_us`). With event-first bias every queued event is consumed
+    /// in-loop and the ack is stamped last. The queue is sized so the
+    /// defective ordering fails the assert by a wide, deterministic margin
+    /// rather than a clock-granularity flake. Cheap by construction: no
+    /// fixture tree, no engine, no `#[ignore]`.
     #[tokio::test]
     async fn q4_startup_timeline_acks_only_after_queued_events_drain() {
         let (event_tx, event_rx) = async_channel::unbounded();
@@ -17690,12 +17686,12 @@ mod tests {
     /// scan-settle wait it used to block on is the R9 delay this engine
     /// removed), and the FIFO barrier acks only after the scan drains —
     /// nothing admitted during the scan is lost or reordered.
-    #[ignore = "explicit Q4 measurement harness; run with --ignored (tr-am6qr)"]
+    #[ignore = "explicit Q4 measurement harness; run with --ignored"]
     // The parse-delay window inside intentionally holds a std::MutexGuard
     // across the engine-run awaits — exclusivity with the sibling
-    // large-library harness is the point (refinery F2, PR #285). This
-    // current-thread tokio test cannot deadlock on it; only sibling
-    // test-harness threads block, which is the required serialization.
+    // large-library harness is the point. This current-thread tokio test
+    // cannot deadlock on it; only sibling test-harness threads block, which is
+    // the required serialization.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn q4_engine_startup_and_during_scan_admission_benchmark() {
@@ -17768,10 +17764,9 @@ mod tests {
         // Serialize the engine run against any concurrent parse-delay
         // window: both opt-in Q4 tests share the process-wide seam, and an
         // overlapping armed delay would distort this timeline and pollute
-        // the invocation counter (refinery F2, PR #285). Released after the
-        // abort below, mirroring the production teardown shape. (The
-        // function-level `allow` covers the intentional hold across the
-        // timeline awaits.)
+        // the invocation counter. Released after the abort below, mirroring
+        // the production teardown shape. (The function-level `allow` covers
+        // the intentional hold across the timeline awaits.)
         let parse_delay_window = super::TEST_ONLY_PARSE_DELAY_WINDOW
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17886,9 +17881,8 @@ mod tests {
 
         struct ParseDelayGuard {
             /// Held for the guard's whole window so a concurrent harness
-            /// cannot arm, poll, or reset the shared seam under us
-            /// (refinery F2, PR #285). Released after the delay static is
-            /// disarmed in `Drop`.
+            /// cannot arm, poll, or reset the shared seam under us.
+            /// Released after the delay static is disarmed in `Drop`.
             _window: std::sync::MutexGuard<'static, ()>,
         }
 

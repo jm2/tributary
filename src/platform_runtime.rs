@@ -4,16 +4,18 @@
 //! initialization, so bundled paths and writable caches must be selected before
 //! either toolkit is touched.  Writable registries live below the user's cache
 //! directory and are separated by platform, architecture, and install path.
-#![cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 use std::env;
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 use std::ffi::OsStr;
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
 #[cfg(any(test, target_os = "windows", target_os = "macos"))]
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 const CACHE_NAMESPACE: &str = "tributary/runtime";
 #[cfg(any(test, target_os = "windows", target_os = "macos"))]
 const PLATFORM_RUNTIME_PROBE_FLAG: &str = "--tributary-platform-runtime-probe";
@@ -27,6 +29,7 @@ const PIXBUF_CACHE_LIMIT: usize = 1024 * 1024;
 #[cfg(target_os = "macos")]
 const HELPER_ERROR_LIMIT: usize = 64 * 1024;
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeCachePaths {
     root: PathBuf,
@@ -62,6 +65,7 @@ pub fn configure_before_toolkit() -> anyhow::Result<bool> {
     }
 }
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn runtime_cache_paths(
     cache_base: &Path,
     platform: &str,
@@ -96,6 +100,7 @@ fn runtime_cache_paths(
     })
 }
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn stable_path_fingerprint(path: &Path) -> u64 {
     // FNV-1a is deliberately simple and deterministic across Rust versions.
     // This is a cache namespace, not a security boundary.
@@ -107,10 +112,12 @@ fn stable_path_fingerprint(path: &Path) -> u64 {
     hash
 }
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn should_set_env(existing: Option<&OsStr>) -> bool {
     existing.is_none()
 }
 
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn should_set_gstreamer_env(unversioned: Option<&OsStr>, versioned: Option<&OsStr>) -> bool {
     should_set_env(unversioned) && should_set_env(versioned)
 }
@@ -132,6 +139,7 @@ fn set_if_unset(key: &str, value: impl AsRef<OsStr>) {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn set_gstreamer_if_unset(unversioned: &str, versioned: &str, value: impl AsRef<OsStr>) {
     if should_set_gstreamer_env(
         env::var_os(unversioned).as_deref(),
@@ -204,7 +212,7 @@ fn prepare_windows_registry(layout: &WindowsBundleLayout) -> Option<PathBuf> {
     Some(caches.gst_registry)
 }
 
-#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+#[cfg(any(test, target_os = "windows"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowsBundleLayout {
     install_root: PathBuf,
@@ -212,7 +220,7 @@ struct WindowsBundleLayout {
     scanner: PathBuf,
 }
 
-#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+#[cfg(any(test, target_os = "windows"))]
 fn detect_windows_bundle(exe: &Path) -> Option<WindowsBundleLayout> {
     let install_root = exe.parent()?.to_path_buf();
     let plugin_dir = install_root.join("lib").join("gstreamer-1.0");

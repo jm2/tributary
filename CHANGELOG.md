@@ -180,6 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **XSPF import and export** — Exports keep an existing file's permissions, new exports are readable
   by other programs, and exporting over a symbolic link updates the file it points to. A playlist
   with one bad duration still imports, and files over 64 MiB are refused with a clear message.
+- **Relative XSPF locations** — Importing an XSPF playlist now uses track locations written
+  relative to the playlist file instead of ignoring them.
 - **Playlist housekeeping** — Deleted default smart playlists no longer come back, Rhythmbox imports
   keep their playlist order, and file changes no longer re-read the whole library when some playlist
   entries are unmatched.

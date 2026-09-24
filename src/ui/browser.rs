@@ -481,7 +481,7 @@ pub fn build_browser(
     // ── Layout ───────────────────────────────────────────────────────
     // Spacing must stay 0: the separators appended below are the gutter,
     // and Box spacing adds pixels on both sides of each separator,
-    // widening every 1px gutter to 3px (2026-09-07 review rejection).
+    // widening every 1px gutter to 3px.
     let panes_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(0)
@@ -575,9 +575,8 @@ pub fn set_album_pane_artwork_size(browser_box: &gtk::Box, state: &BrowserState,
 /// the store with the filters cleared and reset the selection to "All",
 /// which expanded the pane to unrelated albums and — through the
 /// selection-changed callback — silently cleared the user's active
-/// album filter (2026-09-08 PR #171 review). Fresh artwork candidates
-/// are not a layout concern: every library change repopulates the store
-/// through [`reset_browser_data`].
+/// album filter. Fresh artwork candidates are not a layout concern: every
+/// library change repopulates the store through [`reset_browser_data`].
 ///
 /// The cache is cleared because every entry was decoded at the previous
 /// size and would never match a new `(album_key, pixel_size)` lookup
@@ -679,8 +678,7 @@ pub fn attach_app_config(
 /// Must be called once after `build_browser`. The built-in local
 /// library's retained artwork authority polls Tokio time/blocking APIs,
 /// which panic on the runtime-less GTK main context the pane fetch is
-/// driven on, so the controller runs that arm on this handle
-/// (2026-09-13 review finding).
+/// driven on, so the controller runs that arm on this handle.
 pub fn attach_runtime(state: &BrowserState, rt_handle: tokio::runtime::Handle) {
     state.album_art_controller.attach_runtime(rt_handle);
 }
@@ -688,8 +686,6 @@ pub fn attach_runtime(state: &BrowserState, rt_handle: tokio::runtime::Handle) {
 /// Lightweight snapshot of track fields for filtering (avoids borrowing GObjects).
 #[derive(Clone)]
 pub struct TrackSnapshot {
-    #[allow(dead_code)] // Used by window.rs search filter via TrackObject, not directly here
-    title: String,
     genre: String,
     artist: String,
     /// Album artist (used for browser grouping when the preference is on).
@@ -715,7 +711,6 @@ pub struct TrackSnapshot {
 impl TrackSnapshot {
     pub fn from_object(t: &TrackObject) -> Self {
         Self {
-            title: t.title(),
             genre: t.genre(),
             artist: t.artist(),
             album_artist: t.album_artist(),
@@ -964,10 +959,9 @@ fn build_album_factory(
         // and artist panes use, so the album pane keeps the established
         // list-row accessibility contract — presentational label/count
         // children plus the combined album/count accessible name on the
-        // GtkListItem — instead of an ad-hoc `gtk::Label` that lost both
-        // (2026-09-13 review finding). The visible text now matches the
-        // sibling panes (primary label + dimmed count), not a bespoke
-        // "label (count)" string.
+        // GtkListItem — instead of an ad-hoc `gtk::Label` that lost both.
+        // The visible text now matches the sibling panes (primary label +
+        // dimmed count), not a bespoke "label (count)" string.
         return browser_row_factory();
     }
 
@@ -1742,13 +1736,11 @@ fn get_store_from_pane(pane: &gtk::Box) -> Option<gio::ListStore> {
 // tests but does not give them thread affinity, so a second GTK-touching
 // `#[test]` would still run on a different libtest worker thread than the
 // one that ran `gtk::init` and construct widgets off the initializing
-// thread (2026-09-09 review rejection, PR #179). Every GTK-touching
-// contract in the crate — including the context-menu ones — therefore runs
-// inside that one test's body, via small helpers here and in
-// `context_menu::tests`, which also keeps each function under Codacy's
-// 50-lines-of-code method limit. The test funnels its display gate, the
-// single `gtk::init`, and the whole widget-exercising body through the
-// crate-wide `ui::widget_test_session` lock.
+// thread. Every GTK-touching contract in the crate — including the
+// context-menu ones — therefore runs inside that one test's body, via small
+// helpers here and in `context_menu::tests`. The test funnels its display
+// gate, the single `gtk::init`, and the whole widget-exercising body through
+// the crate-wide `ui::widget_test_session` lock.
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
@@ -1833,7 +1825,7 @@ mod tests {
         assert_eq!(row.count().text(), "");
     }
 
-    // ── Q4 engine-loop/GTK responsiveness lane (tr-am6qr) ──────────────
+    // ── Q4 engine-loop/GTK responsiveness lane ──────────────
 
     /// Deterministic synthetic snapshot spread over 4 genres, 5 artists,
     /// and 4 album-per-artist groups, so browser pane cardinality is a
@@ -2222,14 +2214,13 @@ mod tests {
         assert_eq!(get_selection(&panes[0]).selected(), 1);
     }
 
-    /// Codex P2 (PR #171 discussion r3962112844): toggling album-pane
-    /// artwork or changing its thumbnail size is a presentation-only
-    /// factory swap. The rebuild must keep the album store filtered to
-    /// the active genre selection and keep the selected album row; the
-    /// previous implementation repopulated the store with the filters
-    /// cleared and reset the selection to "All", which expanded the pane
-    /// to unrelated albums and — through the selection-changed callback
-    /// — silently cleared the user's active album filter.
+    /// Toggling album-pane artwork or changing its thumbnail size is a
+    /// presentation-only factory swap. The rebuild must keep the album
+    /// store filtered to the active genre selection and keep the selected
+    /// album row; repopulating the store with the filters cleared and the
+    /// selection reset to "All" would expand the pane to unrelated albums
+    /// and — through the selection-changed callback — silently clear the
+    /// user's active album filter.
     fn factory_swap_preserves_album_filters_and_selection() {
         let tracks = vec![
             art_fixture_track(1, "AR", "A1", "G1", "file:///t1.flac"),
@@ -2264,8 +2255,7 @@ mod tests {
     /// FullSync and any other full data rebuild must invalidate cached
     /// covers: the rebuild bumps the album-art cache's content
     /// generation, so artwork decoded before the rebuild can never be
-    /// queried afterwards (2026-09-10 review finding — same-session
-    /// FullSync used to leave changed covers stale).
+    /// queried afterwards, even within the same source session.
     fn rebuild_bumps_album_art_content_generation() {
         let tracks = vec![art_fixture_track(1, "AR", "A1", "G1", "file:///t1.flac")];
         let (browser_box, state) =
@@ -2282,7 +2272,7 @@ mod tests {
     /// browser-row accessibility contract: its factory setup must attach
     /// the shared [`BrowserRow`] (presentational label/count children)
     /// that bind publishes the combined accessible name on, not an ad-hoc
-    /// `gtk::Label` that regressed both (2026-09-13 review finding).
+    /// `gtk::Label` that regressed both.
     fn album_artwork_disabled_keeps_browser_row_contract() {
         let controller = Rc::new(AlbumArtController::new(FALLBACK_PLACEHOLDER_ICON));
         let factory = build_album_factory(
@@ -2801,7 +2791,7 @@ mod tests {
             std::env::var_os("TMPDIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp"))
-                .join(format!("tr-2xstt-folder-{tag}-{}", std::process::id()))
+                .join(format!("tributary-folder-{tag}-{}", std::process::id()))
         }
 
         fn root_path(&self, name: &str) -> std::path::PathBuf {
@@ -3866,7 +3856,7 @@ mod tests {
     ///   master rows, the browser snapshot, and repopulate the genre panes;
     ///   when `TRIBUTARY_Q4_UI_BENCH_TRACKS` is set it additionally times
     ///   the publication/rebuild endpoints at that scale
-    ///   ([`Self::q4_publication_contract_and_bench`], tr-am6qr);
+    ///   ([`Self::q4_publication_contract_and_bench`]);
     /// - the per-row playlist drop target must resolve the row under the
     ///   pointer, drive the production `connect_accept`/`connect_drop`
     ///   handlers, and forward the exact displayed candidate order
@@ -3880,20 +3870,17 @@ mod tests {
     /// crate: the `ui::widget_test_session` mutex serializes but does not
     /// give thread affinity, so a second GTK-touching `#[test]` would
     /// construct widgets off the initializing thread and trip gtk-rs
-    /// main-thread checks (2026-09-09 review rejection, PR #179).
+    /// main-thread checks.
     ///
     /// Asserts on the `GtkListItem:accessible-label` property (GTK 4.12),
     /// which GTK uses as the row's accessible name — the widget-level
     /// equivalent of an Orca row-announcement smoke test.
     ///
-    /// Q1 gate (`tr-sptyt`, issue #274): the CI `gtk-display-gate` job runs
-    /// this test under Xvfb with `TRIBUTARY_GTK_GATE=require`, so a display
-    /// that never comes up — or a future refactor that lets this body skip —
-    /// fails the job instead of passing vacuously. The corrected R3/R4
-    /// selection-restoration, per-row drag/drop destination, settings and
-    /// close contracts join THIS body as their implementations land
-    /// (`tr-2xstt`, `tr-y72e3`, `tr-hdgwh`); they must not become competing
-    /// GTK `#[test]`s.
+    /// The CI `gtk-display-gate` job runs this test under Xvfb with
+    /// `TRIBUTARY_GTK_GATE=require`, so a display that never comes up — or
+    /// a future refactor that lets this body skip — fails the job instead
+    /// of passing vacuously. New GTK widget contracts join THIS body; they
+    /// must not become competing GTK `#[test]`s.
     #[test]
     fn gtk_widget_contracts_hold_on_one_session() {
         // Run every widget construction and assertion below — including
@@ -3969,11 +3956,9 @@ mod tests {
                 pending_search_debounce_never_fires_after_source_replacement();
                 source_replacement_resets_folder_navigation();
 
-                // Folder activation contracts (issue #251). The
-                // R4 activation contract is split into focused
-                // tests (Codacy method-size rework round); every
-                // split form still runs in this consolidated
-                // session block.
+                // Folder activation contracts (issue #251), split into
+                // focused tests that all run in this consolidated session
+                // block.
                 sole_root_activation_navigates_when_already_selected();
                 ellipsis_labelled_rows_keep_typed_identities();
                 empty_leaf_up_row_is_only_row_and_still_navigates();

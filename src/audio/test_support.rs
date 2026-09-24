@@ -166,10 +166,9 @@ impl Drop for RemoveFileOnDrop {
 /// *real* invoking user's state (`<data_dir>/tributary/...`), so a file
 /// another run left behind changes the child's pipeline. Concretely, a stray
 /// `enabled = true` `equalizer.cfg` arms the equalizer install seam inside
-/// this child's playback-to-EOS pipeline and can error the stream before EOS
-/// (tr-cy381). The child contract is playback with in-memory defaults;
-/// on-disk persistence is the config modules' tested concern, not this
-/// harness's.
+/// this child's playback-to-EOS pipeline and can error the stream before EOS.
+/// The child contract is playback with in-memory defaults; on-disk persistence
+/// is the config modules' tested concern, not this harness's.
 ///
 /// [`crate::paths::TEST_USER_STATE_DIR_ENV`] is the cross-platform mechanism:
 /// production resolves it ahead of the platform lookup, so it isolates the
