@@ -42,6 +42,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Column drag-and-drop reordering with persistence | ✅ |
 | Regular & smart playlists (iTunes-style rules) | ✅ Regular playlists may include remote tracks |
 | Drag and drop tracks onto playlists | ✅ |
+| Drag tracks out to a file manager | ✅ Copies local library files only |
 | Subsonic server playlists (import a copy, or keep a read-only synced mirror) | ✅ |
 | Realtime text search filter (title, artist, album, genre) | ✅ |
 | Song metadata editing (Properties dialog with Save/Cancel) | ✅ |
@@ -576,6 +577,11 @@ panes** above the tracklist to filter by Genre → Artist → Album, or browse t
 In the folder pane, double-click a root or directory to descend (Enter works on the focused row
 too), and use the `…` row to go back up one level.
 Click any column header to sort; click again to reverse; click a third time to clear the sort.
+
+Drag selected tracks into a file manager window to copy their files there. Only tracks from your
+local library offer files: if the selection includes a server, radio, or removable-media track,
+the drag can still add to a playlist but hands no files to the file manager. Tributary offers a
+copy only, never a move, so the originals stay in your library.
 
 To show cover art in the Album pane, turn on **Album pane artwork** under Preferences → Browser
 Views and choose Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for
