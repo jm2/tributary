@@ -492,6 +492,7 @@ errors:
     invalid_response: "%{backend} вернул недопустимый ответ"
     authentication_method_unsupported: "Метод аутентификации %{backend} не поддерживается"
     source_failed: "Сбой источника %{backend}"
+    catalogue_incomplete: "Не удалось загрузить часть музыки с сервера %{server}. Подключитесь заново, чтобы повторить попытку."
     removable_backend: "Съёмный носитель"
     generic_backend: "Удалённый сервер"
   playback:
