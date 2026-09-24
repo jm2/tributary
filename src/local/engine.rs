@@ -17998,6 +17998,8 @@ mod tests {
         }
     }
 
+    // Its only caller removes a watched root, which Windows forbids.
+    #[cfg(not(windows))]
     async fn wait_for_root_status(events: &async_channel::Receiver<LibraryEvent>, available: bool) {
         loop {
             if let LibraryEvent::RootStatusChanged(statuses) =
