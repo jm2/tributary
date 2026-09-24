@@ -3335,7 +3335,7 @@ pub(crate) fn build_window(
                         // the occurrence: a play qualified at EOS and refused
                         // during overload has no later sample to re-earn
                         // through once this branch replays, advances, or
-                        // clears (PR #286 round-4 finding j9j83).
+                        // clears.
                         retry_pending_history_credit_before_transition(
                             &playback_history_commands,
                             &playback_session,
@@ -3901,11 +3901,10 @@ pub(super) fn refresh_displayed_tracks(
 /// refresh the library on screen, keeping the user's browser filters,
 /// search, folder location and scroll position.
 ///
-/// Extracted verbatim from the event loop so the Q4 responsiveness
-/// benchmark times the same unit production runs — conversion through
-/// folder-model rebuild, everything the main loop blocks on during a
-/// FullSync — instead of a display-only slice of it
-/// (tr-am6qr corrective round 2, thread PRRT_kwDOR1IXks6j8AJ5).
+/// Extracted verbatim from the event loop so the responsiveness benchmark
+/// times the same unit production runs — conversion through folder-model
+/// rebuild, everything the main loop blocks on during a FullSync — instead
+/// of a display-only slice of it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_full_sync_publication(
     tracks: &[crate::architecture::models::Track],

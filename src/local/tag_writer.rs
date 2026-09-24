@@ -564,8 +564,7 @@ fn unlink_bound_private_name(
 /// the sole link at the private name, plant a foreign entry, and make the
 /// count fall to zero for the plant — can still counterfeit the
 /// post-condition. The window is not fully closed; POSIX offers no
-/// unlink-by-fd. A strictly atomic identity-conditional unlink remains
-/// the recorded operator/coordinator decision (PR #237 precedent).
+/// unlink-by-fd, so this residual is deliberately accepted.
 ///
 /// [`unlinkat`]: rustix::fs::unlinkat
 // The `u64::from` is load-bearing on macOS (`st_nlink` is `u16` there) and
