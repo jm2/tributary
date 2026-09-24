@@ -207,6 +207,7 @@ playlist_io:
   import_success_heading: "XSPF 재생목록을 가져옴"
   import_warning_heading: "경고와 함께 XSPF 재생목록을 가져옴"
   import_success_body: "“%{name}”을(를) 가져왔습니다.\n\n일치: %{matched}\n불일치(보존됨): %{unmatched}\n실패(가져오지 않음): %{failed}"
+  import_skipped_unsupported_names: "건너뜀(파일 이름이 올바른 UTF-8이 아님): %{count}"
   import_failed_heading: "XSPF 재생목록을 가져올 수 없음"
   import_rollback_body: "%{error}\n\n재생목록이나 항목을 확정하지 않았으며 모든 데이터베이스 변경 사항을 되돌렸습니다."
   import_worker_failed_body: "가져오기 작업이 결과를 보고하기 전에 중지되었습니다: %{error}\n\n확정된 재생목록을 표시하지 않았습니다."

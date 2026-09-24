@@ -207,6 +207,7 @@ playlist_io:
   import_success_heading: "XSPFプレイリストをインポートしました"
   import_warning_heading: "警告付きでXSPFプレイリストをインポートしました"
   import_success_body: "「%{name}」をインポートしました。\n\n一致: %{matched}\n不一致（保持）: %{unmatched}\n失敗（未インポート）: %{failed}"
+  import_skipped_unsupported_names: "スキップ（ファイル名が有効な UTF-8 ではない）: %{count}"
   import_failed_heading: "XSPFプレイリストをインポートできませんでした"
   import_rollback_body: "%{error}\n\nプレイリストと項目は確定されず、データベースへの変更はすべて取り消されました。"
   import_worker_failed_body: "インポート処理が結果を返す前に停止しました: %{error}\n\n確定済みのプレイリストは表示されていません。"

@@ -209,6 +209,7 @@ playlist_io:
   import_success_heading: "Плейлист XSPF импортирован"
   import_warning_heading: "Плейлист XSPF импортирован с предупреждениями"
   import_success_body: "Импортирован «%{name}».\n\nСопоставлено: %{matched}\nНе сопоставлено (сохранено): %{unmatched}\nОшибок (не импортировано): %{failed}"
+  import_skipped_unsupported_names: "Пропущено (имя файла не является допустимым UTF-8): %{count}"
   import_failed_heading: "Не удалось импортировать плейлист XSPF"
   import_rollback_body: "%{error}\n\nПлейлист и его записи не были зафиксированы; все изменения базы данных отменены."
   import_worker_failed_body: "Процесс импорта остановился до получения результата: %{error}\n\nЗафиксированный плейлист не был показан."

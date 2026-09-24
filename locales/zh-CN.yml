@@ -207,6 +207,7 @@ playlist_io:
   import_success_heading: "已导入 XSPF 播放列表"
   import_warning_heading: "已导入 XSPF 播放列表，但有警告"
   import_success_body: "已导入“%{name}”。\n\n已匹配：%{matched}\n未匹配（已保留）：%{unmatched}\n失败（未导入）：%{failed}"
+  import_skipped_unsupported_names: "已跳过（文件名不是有效的 UTF-8）：%{count}"
   import_failed_heading: "无法导入 XSPF 播放列表"
   import_rollback_body: "%{error}\n\n未提交播放列表或任何条目；所有数据库更改均已回滚。"
   import_worker_failed_body: "导入进程在报告结果前已停止：%{error}\n\n未显示任何已提交的播放列表。"

@@ -207,6 +207,7 @@ playlist_io:
   import_success_heading: "Liste XSPF importée"
   import_warning_heading: "Liste XSPF importée avec des avertissements"
   import_success_body: "« %{name} » a été importée.\n\nCorrespondances : %{matched}\nSans correspondance (conservées) : %{unmatched}\nÉchecs (non importées) : %{failed}"
+  import_skipped_unsupported_names: "Ignorées (nom de fichier non valide en UTF-8) : %{count}"
   import_failed_heading: "Impossible d’importer la liste XSPF"
   import_rollback_body: "%{error}\n\nAucune liste ni entrée n’a été validée ; toutes les modifications de la base de données ont été annulées."
   import_worker_failed_body: "Le processus d’importation s’est arrêté avant de fournir un résultat : %{error}\n\nAucune liste validée n’a été publiée."

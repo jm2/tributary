@@ -168,10 +168,15 @@ fn serialize_xspf(tracks: &[track::Model]) -> anyhow::Result<Vec<u8>> {
 /// `trackList` / `track` children. Comments, CDATA, extensions, and unrelated
 /// nesting therefore cannot manufacture phantom playlist entries.
 ///
-/// Returns a list of `ImportedTrack` with whatever metadata the file provides.
+/// Returns the entries with whatever metadata the file provides.
 /// Rating-like `<meta>` or extension content is intentionally inert and can
 /// never overwrite Tributary's app-owned library rating.
-pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
+///
+/// An entry whose only local location names a file that is not valid UTF-8
+/// is skipped and counted: the library refuses such names, so that location
+/// can never identify a library track, and a lossy rendering of it could
+/// match the wrong one.
+pub fn import_xspf(path: &Path) -> anyhow::Result<XspfImport> {
     let mut bytes = Vec::new();
     fs::File::open(path)?
         .take(MAX_XSPF_IMPORT_BYTES + 1)
@@ -183,14 +188,42 @@ pub fn import_xspf(path: &Path) -> anyhow::Result<Vec<ImportedTrack>> {
         );
     }
     let content = String::from_utf8(bytes).map_err(|_| anyhow!("XSPF file is not UTF-8"))?;
-    let tracks = parse_xspf(&content)?;
+    let imported = parse_xspf(&content)?;
 
     info!(
         path = %path.display(),
-        tracks = tracks.len(),
+        tracks = imported.tracks.len(),
+        unsupported_names = imported.unsupported_names,
         "XSPF playlist imported"
     );
-    Ok(tracks)
+    Ok(imported)
+}
+
+/// The entries of one parsed XSPF playlist.
+#[derive(Debug, Default)]
+pub struct XspfImport {
+    pub tracks: Vec<ImportedTrack>,
+    /// Entries skipped because their only local location names a file that
+    /// is not valid UTF-8.
+    pub unsupported_names: usize,
+}
+
+impl XspfImport {
+    fn finish_track(&mut self, state: XspfTrackState) {
+        if state.unsupported_location && state.track.file_path.is_empty() {
+            self.unsupported_names += 1;
+        } else {
+            self.tracks.push(state.track);
+        }
+    }
+}
+
+/// One `<track>` while it is being parsed.
+#[derive(Debug)]
+struct XspfTrackState {
+    track: ImportedTrack,
+    /// A `<location>` named a local file whose name is not valid UTF-8.
+    unsupported_location: bool,
 }
 
 const XSPF_NAMESPACE: &[u8] = b"http://xspf.org/ns/0/";
@@ -228,14 +261,14 @@ fn empty_imported_track() -> ImportedTrack {
 }
 
 /// Parse XSPF document text: the file-independent core of [`import_xspf`].
-pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
+pub fn parse_xspf(content: &str) -> anyhow::Result<XspfImport> {
     validate_xml_10_text(content)?;
 
     let mut reader = NsReader::from_str(content.trim_start_matches('\u{feff}'));
     reader.config_mut().check_comments = true;
 
     let mut stack = Vec::<XspfNode>::new();
-    let mut tracks = Vec::new();
+    let mut imported = XspfImport::default();
     let mut current_track = None;
     let mut saw_root = false;
     let mut root_closed = false;
@@ -305,7 +338,7 @@ pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                     &mut current_track,
                 )? {
                     XspfNode::Track => {
-                        tracks.push(current_track.take().ok_or_else(|| {
+                        imported.finish_track(current_track.take().ok_or_else(|| {
                             anyhow!("malformed XSPF: missing track working state")
                         })?);
                     }
@@ -337,7 +370,7 @@ pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
                         );
                     }
                     XspfNode::Track => {
-                        tracks.push(current_track.take().ok_or_else(|| {
+                        imported.finish_track(current_track.take().ok_or_else(|| {
                             anyhow!("malformed XSPF: missing track working state")
                         })?);
                     }
@@ -395,7 +428,7 @@ pub fn parse_xspf(content: &str) -> anyhow::Result<Vec<ImportedTrack>> {
         bail!("malformed XSPF: missing direct <trackList> child");
     }
 
-    Ok(tracks)
+    Ok(imported)
 }
 
 fn is_xspf_namespace(namespace: &ResolveResult<'_>) -> anyhow::Result<bool> {
@@ -506,7 +539,7 @@ fn classify_xspf_node(
     is_xspf: bool,
     local_name: &str,
     saw_track_list: &mut bool,
-    current_track: &mut Option<ImportedTrack>,
+    current_track: &mut Option<XspfTrackState>,
 ) -> anyhow::Result<XspfNode> {
     if !is_xspf {
         return Ok(XspfNode::Other);
@@ -524,7 +557,10 @@ fn classify_xspf_node(
             if current_track.is_some() {
                 bail!("malformed XSPF: nested playlist track state");
             }
-            *current_track = Some(empty_imported_track());
+            *current_track = Some(XspfTrackState {
+                track: empty_imported_track(),
+                unsupported_location: false,
+            });
             Ok(XspfNode::Track)
         }
         Some(XspfNode::Track) => Ok(xspf_field(local_name).map_or(XspfNode::Other, |field| {
@@ -589,14 +625,14 @@ fn resolve_xml_reference(reference: &quick_xml::events::BytesRef<'_>) -> anyhow:
         .ok_or_else(|| anyhow!("unsupported XSPF entity reference: &{name};"))
 }
 
-fn apply_xspf_field(track: &mut ImportedTrack, field: XspfField, value: &str) {
+fn apply_xspf_field(state: &mut XspfTrackState, field: XspfField, value: &str) {
+    let track = &mut state.track;
     match field {
-        XspfField::Location if track.file_path.is_empty() => {
-            let file_path = uri_to_file_path(value.trim());
-            if !file_path.is_empty() {
-                track.file_path = file_path;
-            }
-        }
+        XspfField::Location if track.file_path.is_empty() => match uri_to_file_path(value.trim()) {
+            XspfLocation::Local(file_path) => track.file_path = file_path,
+            XspfLocation::UnsupportedName => state.unsupported_location = true,
+            XspfLocation::NotLocal => {}
+        },
         XspfField::Location => {}
         XspfField::Title => track.title = value.to_string(),
         XspfField::Creator => track.artist = value.to_string(),
@@ -823,25 +859,43 @@ fn file_path_to_uri(path: &str) -> String {
     )
 }
 
+/// What an XSPF `<location>` names.
+#[derive(Debug)]
+enum XspfLocation {
+    /// A local file path, exactly as text.
+    Local(String),
+    /// A local file whose name is not valid UTF-8, which the library never
+    /// indexes.
+    UnsupportedName,
+    /// Anything that is not a local file.
+    NotLocal,
+}
+
 /// Convert a `file://` URI back to a filesystem path.
 ///
 /// Uses `Url::to_file_path`, which percent-decodes the path and keeps the
 /// leading slash on Unix absolute paths (the old `strip_prefix("file:///")`
 /// dropped it). Non-`file`, malformed, and non-local inputs deliberately yield
-/// no path so a web URL can never be retained as a local-library identity.
-fn uri_to_file_path(uri: &str) -> String {
+/// no path so a web URL can never be retained as a local-library identity. A
+/// path that decodes to a name that is not valid UTF-8 is reported as such,
+/// never rendered lossily into a path another file could own.
+fn uri_to_file_path(uri: &str) -> XspfLocation {
     let Ok(url) = Url::parse(uri) else {
-        return String::new();
+        return XspfLocation::NotLocal;
     };
     if url.scheme() != "file" {
-        return String::new();
+        return XspfLocation::NotLocal;
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return String::new();
+        return XspfLocation::NotLocal;
     }
-    url.to_file_path()
-        .ok()
-        .map_or_else(String::new, |path| path.to_string_lossy().into_owned())
+    match url.to_file_path() {
+        Ok(path) => path
+            .into_os_string()
+            .into_string()
+            .map_or(XspfLocation::UnsupportedName, XspfLocation::Local),
+        Err(()) => XspfLocation::NotLocal,
+    }
 }
 
 fn validate_xml_10_text(value: &str) -> anyhow::Result<()> {
@@ -945,7 +999,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let path = directory.path().join("playlist.xspf");
         fs::write(&path, document).expect("write XSPF fixture");
-        import_xspf(&path)
+        import_xspf(&path).map(|imported| imported.tracks)
     }
 
     #[test]
@@ -985,6 +1039,35 @@ mod tests {
         // A carriage return delivered through a character reference is
         // content, not an end-of-line, so it survives normalization.
         assert_eq!(tracks[0].title, "one\rtwo");
+    }
+
+    /// A location that decodes to a name that is not valid UTF-8 is never
+    /// rendered lossily: its entry is skipped and counted, while a literal
+    /// U+FFFD name, a metadata-only entry, and an entry with a later usable
+    /// location all import normally.
+    #[cfg(unix)]
+    #[test]
+    fn a_location_that_is_not_utf8_skips_its_entry_with_a_count() {
+        let imported = super::parse_xspf(concat!(
+            "<playlist version='1' xmlns='http://xspf.org/ns/0/'>",
+            "<trackList>",
+            "<track><location>file:///music/a%FF.flac</location><title>Bytes</title></track>",
+            "<track><location>file:///music/a%EF%BF%BD.flac</location></track>",
+            "<track><title>Metadata only</title></track>",
+            "<track><location>file:///music/b%FE.flac</location>",
+            "<location>file:///music/b.flac</location></track>",
+            "</trackList></playlist>"
+        ))
+        .expect("parse XSPF");
+
+        assert_eq!(imported.unsupported_names, 1);
+        let paths: Vec<&str> = imported
+            .tracks
+            .iter()
+            .map(|track| track.file_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/music/a\u{FFFD}.flac", "", "/music/b.flac"]);
+        assert_eq!(imported.tracks[1].title, "Metadata only");
     }
 
     #[test]
@@ -1395,7 +1478,9 @@ mod tests {
         )];
 
         export_xspf(&tracks, &destination).expect("replace XSPF export");
-        let imported = import_xspf(&destination).expect("read replaced XSPF export");
+        let imported = import_xspf(&destination)
+            .expect("read replaced XSPF export")
+            .tracks;
 
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].file_path, source_path);
@@ -1427,7 +1512,9 @@ mod tests {
 
         export_xspf(&negative, &destination)
             .expect("an invalid optional duration must not block export");
-        let imported = import_xspf(&destination).expect("read replaced XSPF export");
+        let imported = import_xspf(&destination)
+            .expect("read replaced XSPF export")
+            .tracks;
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].file_path, track_path);
         assert_eq!(imported[0].title, "Song");
@@ -1550,7 +1637,10 @@ mod tests {
         export_xspf(&tracks, &existing).expect("replace existing file");
         assert_eq!(file_mode(&existing), 0o640);
         assert_eq!(
-            import_xspf(&existing).expect("read replaced export").len(),
+            import_xspf(&existing)
+                .expect("read replaced export")
+                .tracks
+                .len(),
             1
         );
     }
@@ -1578,7 +1668,10 @@ mod tests {
             .expect("inspect destination")
             .file_type()
             .is_symlink());
-        assert_eq!(import_xspf(&target).expect("read link target").len(), 1);
+        assert_eq!(
+            import_xspf(&target).expect("read link target").tracks.len(),
+            1
+        );
         assert!(temporary_artifacts(directory.path(), &target).is_empty());
     }
 

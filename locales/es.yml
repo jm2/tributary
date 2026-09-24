@@ -207,6 +207,7 @@ playlist_io:
   import_success_heading: "Lista XSPF importada"
   import_warning_heading: "Lista XSPF importada con advertencias"
   import_success_body: "Se importó «%{name}».\n\nCoincidencias: %{matched}\nSin coincidencia (conservadas): %{unmatched}\nFallidas (no importadas): %{failed}"
+  import_skipped_unsupported_names: "Omitidas (nombre de archivo no es UTF-8 válido): %{count}"
   import_failed_heading: "No se pudo importar la lista XSPF"
   import_rollback_body: "%{error}\n\nNo se confirmó ninguna lista ni entrada; se revirtieron todos los cambios en la base de datos."
   import_worker_failed_body: "El proceso de importación se detuvo antes de informar un resultado: %{error}\n\nNo se publicó ninguna lista confirmada."

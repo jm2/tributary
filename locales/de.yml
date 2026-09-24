@@ -207,6 +207,7 @@ playlist_io:
   import_success_heading: "XSPF-Wiedergabeliste importiert"
   import_warning_heading: "XSPF-Wiedergabeliste mit Warnungen importiert"
   import_success_body: "„%{name}“ wurde importiert.\n\nZugeordnet: %{matched}\nNicht zugeordnet (beibehalten): %{unmatched}\nFehlgeschlagen (nicht importiert): %{failed}"
+  import_skipped_unsupported_names: "Übersprungen (Dateiname kein gültiges UTF-8): %{count}"
   import_failed_heading: "XSPF-Wiedergabeliste konnte nicht importiert werden"
   import_rollback_body: "%{error}\n\nEs wurden weder die Wiedergabeliste noch Einträge gespeichert; alle Datenbankänderungen wurden rückgängig gemacht."
   import_worker_failed_body: "Der Importprozess wurde beendet, bevor er ein Ergebnis melden konnte: %{error}\n\nEs wurde keine gespeicherte Wiedergabeliste angezeigt."

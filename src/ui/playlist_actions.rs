@@ -877,7 +877,14 @@ fn handle_import_playlist(
             // Carry an explicit committed result or a user-visible error back
             // to GTK. A dropped sender is handled as a failure too.
             let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
-                Result<(String, crate::local::playlist_manager::PlaylistImportCounts), String>,
+                Result<
+                    (
+                        String,
+                        crate::local::playlist_manager::PlaylistImportCounts,
+                        usize,
+                    ),
+                    String,
+                >,
             >();
 
             let path_clone = path.clone();
@@ -902,14 +909,18 @@ fn handle_import_playlist(
                     })?;
                     let mgr = crate::local::playlist_manager::PlaylistManager::new(db);
                     let result = mgr
-                        .import_regular_playlist(&name_clone, &imported)
+                        .import_regular_playlist(&name_clone, &imported.tracks)
                         .await
                         .map_err(|error| {
                             rust_i18n::t!("playlist_io.import_commit_failed", error = error)
                                 .into_owned()
                         })?;
 
-                    Ok((result.playlist.name, result.counts))
+                    Ok((
+                        result.playlist.name,
+                        result.counts,
+                        imported.unsupported_names,
+                    ))
                 }
                 .await;
 
@@ -925,31 +936,26 @@ fn handle_import_playlist(
             let playlist_sidebar_refresh = playlist_sidebar_refresh.clone();
             glib::MainContext::default().spawn_local(async move {
                 match result_rx.await {
-                    Ok(Ok((pname, counts))) => {
+                    Ok(Ok((pname, counts, unsupported_names))) => {
                         info!(
                             name = %pname,
                             matched = counts.matched,
                             unmatched = counts.unmatched,
                             failed = counts.failed,
+                            unsupported_names,
                             "XSPF playlist import complete"
                         );
-                        let body = rust_i18n::t!(
-                            "playlist_io.import_success_body",
-                            name = pname,
-                            matched = counts.matched,
-                            unmatched = counts.unmatched,
-                            failed = counts.failed
+                        let (heading, body) = import_summary_copy(
+                            &rust_i18n::locale(),
+                            &pname,
+                            counts,
+                            unsupported_names,
                         );
-                        let heading = if counts.failed == 0 {
-                            rust_i18n::t!("playlist_io.import_success_heading")
-                        } else {
-                            rust_i18n::t!("playlist_io.import_warning_heading")
-                        };
                         // The manager returned only after the playlist and
                         // all retained entries committed together. The new row
                         // still comes only from the engine-owned publication.
                         request_playlist_sidebar_refresh(&playlist_sidebar_refresh);
-                        show_playlist_alert(&win, heading.as_ref(), body.as_ref());
+                        show_playlist_alert(&win, &heading, &body);
                     }
                     Ok(Err(error)) => show_playlist_alert(
                         &win,
@@ -966,6 +972,41 @@ fn handle_import_playlist(
             });
         },
     );
+}
+
+/// The heading and body reporting one committed XSPF import.
+///
+/// Entries skipped for unsupported file names get their own line and make
+/// the import a warning, like entries that failed to import.
+fn import_summary_copy(
+    locale: &str,
+    name: &str,
+    counts: crate::local::playlist_manager::PlaylistImportCounts,
+    unsupported_names: usize,
+) -> (String, String) {
+    let mut body = rust_i18n::t!(
+        "playlist_io.import_success_body",
+        locale = locale,
+        name = name,
+        matched = counts.matched,
+        unmatched = counts.unmatched,
+        failed = counts.failed
+    )
+    .into_owned();
+    if unsupported_names > 0 {
+        body.push('\n');
+        body.push_str(&rust_i18n::t!(
+            "playlist_io.import_skipped_unsupported_names",
+            locale = locale,
+            count = unsupported_names
+        ));
+    }
+    let heading = if counts.failed == 0 && unsupported_names == 0 {
+        rust_i18n::t!("playlist_io.import_success_heading", locale = locale)
+    } else {
+        rust_i18n::t!("playlist_io.import_warning_heading", locale = locale)
+    };
+    (heading.into_owned(), body)
 }
 
 /// Export a playlist to an XSPF file.
@@ -1200,6 +1241,35 @@ mod tests {
             let localized = playlist_mutation_failed_copy(&locale);
             assert!(!localized.heading.is_empty(), "{locale}: empty heading");
             assert!(!localized.body.is_empty(), "{locale}: empty body");
+            if locale != "en" {
+                assert_ne!(localized, english, "{locale} must not fall back to English");
+            }
+        }
+    }
+
+    #[test]
+    fn import_summary_reports_skipped_unsupported_names_as_a_warning() {
+        let counts = crate::local::playlist_manager::PlaylistImportCounts {
+            matched: 3,
+            unmatched: 1,
+            failed: 0,
+        };
+
+        let (heading, body) = import_summary_copy("en", "Mix", counts, 0);
+        assert_eq!(heading, "XSPF Playlist Imported");
+        assert!(!body.contains("UTF-8"));
+
+        let (heading, body) = import_summary_copy("en", "Mix", counts, 2);
+        assert_eq!(heading, "XSPF Playlist Imported with Warnings");
+        assert!(
+            body.ends_with("\nSkipped (file name not valid UTF-8): 2"),
+            "{body}"
+        );
+
+        for locale in rust_i18n::available_locales!() {
+            let (_, localized) = import_summary_copy(&locale, "Mix", counts, 2);
+            let (_, english) = import_summary_copy("en", "Mix", counts, 2);
+            assert!(localized.contains('2'), "{locale}: {localized}");
             if locale != "en" {
                 assert_ne!(localized, english, "{locale} must not fall back to English");
             }
