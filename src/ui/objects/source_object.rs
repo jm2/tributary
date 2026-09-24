@@ -102,6 +102,9 @@ mod imp {
         /// Native mount path for a removable device. Kept as a `PathBuf` so
         /// non-UTF-8 paths are never corrupted by a lossy string conversion.
         pub device_mount_point: RefCell<Option<PathBuf>>,
+        /// Whether a removable device's filesystem was last reported
+        /// writable. False until the asynchronous probe answers.
+        pub device_writable: Cell<bool>,
         /// Whether this remote source has been authenticated and connected.
         pub connected: Cell<bool>,
         /// Whether an authentication attempt is in progress.
@@ -245,6 +248,12 @@ impl SourceObject {
     }
     pub fn device_mount_point(&self) -> Option<PathBuf> {
         self.imp().device_mount_point.borrow().clone()
+    }
+    pub fn device_writable(&self) -> bool {
+        self.imp().device_writable.get()
+    }
+    pub fn set_device_writable(&self, writable: bool) {
+        self.imp().device_writable.set(writable);
     }
     pub fn connected(&self) -> bool {
         self.imp().connected.get()

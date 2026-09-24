@@ -260,6 +260,21 @@ context:
     one: "已将 %{count} 首曲目添加到 %{playlist}。"
     other: "已将 %{count} 首曲目添加到 %{playlist}。"
 
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "复制到设备"
+  unknown_artist: "未知艺术家"
+  unknown_album: "未知专辑"
+  starting: "正在复制到 %{device}…"
+  progress: "正在复制到 %{device}（%{done}/%{total}）…"
+  finished: "已完成复制到 %{device}。已复制：%{copied}，已存在：%{skipped}，失败：%{failed}"
+  cancelled: "已取消复制到 %{device}。已复制：%{copied}，已存在：%{skipped}，失败：%{failed}"
+  not_enough_space: "%{device} 空间不足：需要 %{required}，可用 %{available}。未复制任何内容。"
+  read_only: "%{device} 为只读。未复制任何内容。"
+  device_unavailable: "%{device} 已不可用。未复制任何内容。"
+  playlist_unreadable: "无法读取播放列表。未复制任何内容。"
+  stopped: "复制到 %{device} 意外停止。"
+
 # ── 常规播放列表 ────────────────────────────────────────────
 regular_playlist:
   unavailable_track: "不可用的曲目"

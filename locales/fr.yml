@@ -260,6 +260,21 @@ context:
     one: "%{count} piste ajoutée à %{playlist}."
     other: "%{count} pistes ajoutées à %{playlist}."
 
+# ── Copy to device ─────────────────────────────────────────────────
+device_copy:
+  menu_heading: "Copier sur l’appareil"
+  unknown_artist: "Artiste inconnu"
+  unknown_album: "Album inconnu"
+  starting: "Copie vers %{device}…"
+  progress: "Copie vers %{device} (%{done}/%{total})…"
+  finished: "Copie vers %{device} terminée. Copiés : %{copied}, déjà présents : %{skipped}, échecs : %{failed}."
+  cancelled: "Copie vers %{device} annulée. Copiés : %{copied}, déjà présents : %{skipped}, échecs : %{failed}."
+  not_enough_space: "Espace insuffisant sur %{device} : %{required} nécessaires, %{available} libres. Rien n’a été copié."
+  read_only: "%{device} est en lecture seule. Rien n’a été copié."
+  device_unavailable: "%{device} n’est plus disponible. Rien n’a été copié."
+  playlist_unreadable: "Impossible de lire la liste de lecture. Rien n’a été copié."
+  stopped: "La copie vers %{device} s’est arrêtée de façon inattendue."
+
 # ── Listes de lecture normales ───────────────────────────────────────
 regular_playlist:
   unavailable_track: "Piste indisponible"

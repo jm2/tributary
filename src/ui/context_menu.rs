@@ -574,6 +574,14 @@ fn append_context_menu_actions(
         show_unsupported,
     );
 
+    build_copy_to_device_actions(
+        menu,
+        action_group,
+        session.sm,
+        &popup_plan.selection,
+        session.mutation_context,
+    );
+
     // ── Properties… ──────────────────────────────────────────
     let automatic_device = active_source_is_automatic_device(session.sidebar_store, active_key);
     build_properties_action(
@@ -1299,6 +1307,42 @@ fn exact_playlist_entry_ids(
     (!entry_ids.is_empty()).then_some(entry_ids)
 }
 
+/// Offer "Copy to Device" when a writable device is mounted and at least
+/// one selected row has a file to copy. The rows' files are resolved now,
+/// so the copy uses the selection the menu was opened over.
+fn build_copy_to_device_actions(
+    menu: &gtk::gio::Menu,
+    action_group: &gtk::gio::SimpleActionGroup,
+    sm: &gtk::SortListModel,
+    selection: &SelectionSnapshot,
+    context: &PlaylistMutationContext,
+) {
+    let destinations = super::device_copy::writable_devices(&context.sidebar_store);
+    if destinations.is_empty() {
+        return;
+    }
+    let (sources, unavailable) =
+        super::device_copy::selection_sources(sm, &selection.positions, &context.sidebar_store);
+    if sources.is_empty() {
+        return;
+    }
+    let feedback = super::device_copy::CopyFeedback {
+        toast_overlay: context.toast_overlay.clone(),
+        rt_handle: context.rt_handle.clone(),
+        sidebar_store: context.sidebar_store.clone(),
+    };
+    let copy: Rc<dyn Fn(super::device_copy::CopyDestination)> = Rc::new(move |destination| {
+        super::device_copy::copy_tracks(&feedback, destination, sources.clone(), unavailable);
+    });
+    super::device_copy::append_menu_items(
+        menu,
+        action_group,
+        "tracklist-ctx.",
+        destinations,
+        &copy,
+    );
+}
+
 /// Build the "Properties…" action for selected tracks.
 ///
 /// Opening the menu only checks that every selected row can be edited and
@@ -1650,7 +1694,7 @@ fn playlist_is_editable_regular(sidebar_store: &gtk::gio::ListStore, playlist_id
     })
 }
 
-fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
+pub(super) fn local_file_path(uri: &str) -> Option<std::path::PathBuf> {
     let url = url::Url::parse(uri).ok()?;
     (url.scheme() == "file")
         .then(|| url.to_file_path().ok())

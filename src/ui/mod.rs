@@ -7,6 +7,7 @@ pub mod album_pane_art;
 pub mod browser;
 mod confirm_dialog;
 pub mod context_menu;
+pub mod device_copy;
 pub mod discovery_handler;
 pub mod equalizer_panel;
 pub mod folder_browser;
