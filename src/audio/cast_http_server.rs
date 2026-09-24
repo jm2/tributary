@@ -49,7 +49,7 @@
 //!   but every later lookup receives the same 404 as an unknown or revoked
 //!   ticket. Legacy explicit-file routes keep their server-lifetime contract;
 //!   playback-time local-authority routes are revoked with their owning load.
-//! - **Bounded concurrent work**: the process serves at most
+//! - **Bounded concurrent work**: each server serves at most
 //!   [`MAX_CONCURRENT_RELAY_RESPONSES`] media responses at once. A request
 //!   beyond that gets `503 Service Unavailable` with `Retry-After: 1` before
 //!   any file, blocking worker, or upstream fetch is started, so a
@@ -60,7 +60,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -105,19 +105,15 @@ const UPSTREAM_RESPONSE_HEADER_DEADLINE: Duration = Duration::from_secs(10);
 const UPSTREAM_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ROUTED_UPSTREAM_CLIENTS: usize = 64;
 
-/// Most media responses the relay serves at once, across every relay server in
-/// the process: Chromecast, MPD, and the loopback tickets that local and
-/// AirPlay playback use.
+/// Most media responses one relay server serves at once.
 ///
 /// A receiver normally has only a few requests open per track: the current
 /// stream plus a seek or a preload. Sixteen leaves wide headroom for that while
 /// bounding the blocking workers, open files, and upstream fetches that
-/// receivers can hold at once.
+/// receivers can hold at once. Each server has its own budget, so a device on
+/// the network holding the Chromecast or MPD relay's permits can never starve
+/// the loopback relay that local and AirPlay playback use.
 const MAX_CONCURRENT_RELAY_RESPONSES: usize = 16;
-
-/// Process-wide admission permits behind [`MAX_CONCURRENT_RELAY_RESPONSES`].
-static RELAY_RESPONSE_PERMITS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_RESPONSES)));
 
 const STAGE_INBOUND_TICKET: &str = "inbound_ticket";
 const STAGE_TICKET_REGISTRATION: &str = "ticket_registration";
@@ -424,9 +420,9 @@ struct ServerState {
     /// redirect policy, so a hostile redirect cannot walk the credential to
     /// another host or downgrade it to plaintext.
     upstream: UpstreamMediaClient,
-    /// Media-response admission permits. Every server shares
-    /// [`RELAY_RESPONSE_PERMITS`]; one permit is held for the whole life of
-    /// one response's work.
+    /// This server's media-response admission permits, sized by
+    /// [`MAX_CONCURRENT_RELAY_RESPONSES`]; one permit is held for the whole
+    /// life of one response's work.
     permits: Arc<Semaphore>,
 }
 
@@ -570,7 +566,7 @@ impl CastHttpServer {
         let state = ServerState {
             media: media.clone(),
             upstream,
-            permits: Arc::clone(&RELAY_RESPONSE_PERMITS),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RELAY_RESPONSES)),
         };
 
         let app = Router::new()
