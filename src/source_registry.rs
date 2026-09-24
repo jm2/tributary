@@ -1299,12 +1299,10 @@ where
     RegularPlaylistCapability::SourceScopedEntries
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 mod server_playlist_sealed {
     pub trait Adapter {}
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn server_playlist_capability<A>() -> ServerPlaylistCapability
 where
     A: server_playlist_sealed::Adapter,
