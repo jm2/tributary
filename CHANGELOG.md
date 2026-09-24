@@ -64,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Files with non-UTF-8 names** — On Linux and other Unix systems, audio files whose names
+  aren't valid UTF-8 are now skipped with a notice saying how many, instead of being stored under
+  a garbled name that could merge distinct files into one track or never play. XSPF imports skip
+  and count entries that point at such names, and tracks stored that way by earlier versions are
+  removed by the next complete library scan.
 - **Single instance on Windows** — Starting Tributary again, or opening a file with it, while
   it is already running now hands off to the running window instead of starting a second copy.
 - **Fewer freezes** — Album artwork is decoded in the background at the size it is shown, ejecting a

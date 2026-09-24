@@ -6,6 +6,22 @@ representation plus an explicit unsupported-input boundary, for review before
 any behavior changes. It authorizes follow-up implementation beads; it does not
 ship them.
 
+Implemented: safe refusal (PR #PENDING); lossless representation remains future
+work. The local library now admits only paths that are valid UTF-8, so a stored
+`file_path` is always the exact native path. The scanner and the watcher refuse
+an audio file whose name is not valid UTF-8 instead of storing a lossy
+rendering, log it once per session in escaped form, and tell the user how many
+files were skipped; XSPF import skips and counts entries whose location decodes
+to such a name. This is a narrower boundary than §7's replacement-character
+refusal: a file literally named with U+FFFD is valid UTF-8 and indexes
+normally, and a legacy row stored by an earlier lossy conversion is no longer
+kept alive by the refused file, so the next complete authoritative scan removes
+it like any other missing track (it is removed, not quarantined, and its rating
+and history go with it). The one ambiguity left without native keys is a legacy
+lossy row whose text exactly names a literal U+FFFD file: that row is reused
+for the literal file. The versioned key, migration, quarantine, and lossless
+import/export described below are not implemented.
+
 Revision 6 (this head) continues the corrective chain over the independently
 rejected heads `16140be0d03d17c1f299cf7690adea6648722160` (Revision 2),
 `bc49dbe514334e94c081e3156ab97a12df11f066` (Revision 3),

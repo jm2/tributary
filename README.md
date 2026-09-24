@@ -606,6 +606,11 @@ Renaming or moving a file inside a library folder keeps its play count, rating, 
 entries when Tributary sees the rename while it is running on Linux or Windows. On macOS, and for
 changes made while Tributary is closed, a renamed file is treated as a new track.
 
+On Linux and other Unix systems a file name can contain bytes that aren't valid UTF-8, such as
+Latin-1 names copied from an older system. Tributary can't store those names exactly, so it skips
+those audio files and shows how many it skipped; rename them to UTF-8 names to add them. XSPF
+imports skip, and count, entries that point at such names.
+
 ### Browsing Removable Media
 
 Mounted USB drives and other removable media appear under a **Devices** heading in the sidebar
