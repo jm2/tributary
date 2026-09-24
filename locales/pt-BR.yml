@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "Nada tocando"
   scanning: "Escaneando biblioteca…"
   live: "AO VIVO"
@@ -21,6 +20,10 @@ header:
   playback_position: "Posição da reprodução"
   volume: "Volume"
   rescan_library: "Reexaminar a biblioteca"
+  my_computer: "Meu computador"
+  preferences_menu: "_Preferências"
+  about_menu: "_Sobre o Tributary"
+  quit_menu: "_Sair"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "Dispositivos"
   usb_device: "Dispositivo USB"
   add_server: "Adicionar servidor"
-  new_playlist: "Nova lista de reprodução"
   remove_server: "Remover servidor"
   disconnect: "Desconectar"
   new_playlist_menu: "Nova lista de reprodução"
@@ -53,6 +55,9 @@ browser:
   all: "Todos"
   folder_root_unavailable: "%{name} (indisponível)"
   folder_unavailable_notice: "Esta pasta está indisponível no momento"
+  unknown_genre: "Desconhecido"
+  folder_no_sources: "A navegação por pastas abrange apenas as fontes da biblioteca local"
+  folder_no_roots: "Nenhuma pasta de biblioteca configurada"
   album_artwork: "Capas no painel de álbuns"
   album_artwork_size_small: "Pequeno"
   album_artwork_size_medium: "Médio"
@@ -97,8 +102,6 @@ ratings:
 preferences:
   title: "Preferências"
   library_location: "Localização da biblioteca"
-  music_folder: "Pasta de música"
-  browse: "Procurar…"
   select_music_folder: "Selecionar pasta de música"
   library_restart_hint: "Reinicie o Tributary para aplicar as alterações nas pastas de música."
   reauthorize_folder: "Reautorizar…"
@@ -125,6 +128,9 @@ preferences:
   privacy: "Privacidade"
   location_title: "Localização para Estações próximas"
   location_subtitle: "Descobrir sua localização aproximada pelo seu endereço IP usando ipapi.co, ipwho.is ou freeipapi.com."
+  add_folder: "Adicionar pasta"
+  remove_folder: "Remover pasta"
+  group_by_album_artist: "Agrupar por artista do álbum"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -272,6 +278,7 @@ properties:
   field_artist: "Artista"
   field_album: "Álbum"
   field_genre: "Gênero"
+  field_composer: "Compositor"
   field_year: "Ano"
   field_track_number: "Faixa nº"
   field_disc_number: "Disco nº"
@@ -303,14 +310,16 @@ properties:
   mixed_cleared: "Será apagado em todas as faixas"
   musicbrainz_applied: "Preenchido a partir do lançamento do MusicBrainz “%{release}”. Confira os campos antes de salvar."
   musicbrainz_title_only: "Nenhum lançamento do MusicBrainz correspondeu ao álbum, então apenas o título e o artista foram preenchidos."
+  invalid_number_heading: "Verifique o campo destacado"
+  invalid_number_body: "%{field} deve ser um número inteiro."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "Nova lista inteligente"
   edit_title: "Editar lista inteligente: %{name}"
-  match_label: "Correspondência"
-  match_all: "Todas"
-  match_any: "Qualquer uma"
+  match_label: "Corresponder a"
+  match_all: "todas"
+  match_any: "qualquer uma"
   add_rule: "Adicionar regra"
   remove_rule: "Remover regra"
   limit_to: "Limitar a"
@@ -318,6 +327,76 @@ smart_playlist:
   rule_reversed_range: "O primeiro valor não pode ser maior que o segundo."
   rule_not_positive: "Insira um número inteiro igual ou maior que 1."
   rule_invalid_date: "Insira uma data no formato YYYY-MM-DD, por exemplo 2024-01-15."
+  match_suffix: "das seguintes regras:"
+  selected_by: "selecionados por"
+  sort_by: "Ordenar por:"
+  add_sort_level: "Adicionar nível de ordenação"
+  remove_sort_level: "Remover nível de ordenação"
+  value_placeholder: "valor"
+  range_end_placeholder: "até"
+  field:
+    title: "Título"
+    artist: "Artista"
+    album_artist: "Artista do álbum"
+    album: "Álbum"
+    genre: "Gênero"
+    composer: "Compositor"
+    year: "Ano"
+    track_number: "Número da faixa"
+    disc_number: "Número do disco"
+    duration: "Duração"
+    duration_seconds: "Duração (s)"
+    bitrate: "Taxa de bits"
+    bitrate_kbps: "Taxa de bits (kbps)"
+    sample_rate_hz: "Taxa de amostragem (Hz)"
+    format: "Formato"
+    play_count: "Reproduções"
+    last_played: "Última reprodução"
+    date_added: "Data de adição"
+    date_modified: "Data de modificação"
+    file_size_bytes: "Tamanho do arquivo (bytes)"
+    rating: "Avaliação"
+    rating_range: "Avaliação (1–100)"
+    track_id: "ID da faixa"
+  operator:
+    is: "é"
+    is_not: "não é"
+    contains: "contém"
+    does_not_contain: "não contém"
+    starts_with: "começa com"
+    ends_with: "termina com"
+    greater_than: "maior que"
+    less_than: "menor que"
+    in_range: "no intervalo"
+    is_rated: "tem avaliação"
+    is_unrated: "não tem avaliação"
+    is_before: "é antes de"
+    is_after: "é depois de"
+    is_in_the_last: "está nos últimos"
+    is_not_in_the_last: "não está nos últimos"
+  date_unit:
+    days: "dias"
+    weeks: "semanas"
+    months: "meses"
+  limit_unit:
+    items: "itens"
+    minutes: "minutos"
+    hours: "horas"
+    megabytes: "MB"
+    gigabytes: "GB"
+  limit_sort:
+    random: "Aleatório"
+    most_played: "Mais reproduzidas"
+    least_played: "Menos reproduzidas"
+    most_recently_added: "Adicionadas mais recentemente"
+    least_recently_added: "Adicionadas há mais tempo"
+    most_recently_played: "Reproduzidas mais recentemente"
+    least_recently_played: "Reproduzidas há mais tempo"
+    highest_rated: "Mais bem avaliadas"
+    lowest_rated: "Menos bem avaliadas"
+  sort_direction:
+    ascending: "Crescente"
+    descending: "Decrescente"
 
 # ── Playlists do servidor ──────────────────────────────────────────
 server_playlists:
@@ -371,6 +450,8 @@ errors:
     invalid_response: "%{backend} retornou uma resposta inválida"
     authentication_method_unsupported: "O método de autenticação do %{backend} não é compatível"
     source_failed: "A fonte %{backend} falhou"
+    removable_backend: "Mídia removível"
+    generic_backend: "Servidor remoto"
   playback:
     network_request_failed: "Falha na solicitação de áudio pela rede"
     decoder_failed: "Falha no decodificador de áudio"
@@ -390,15 +471,18 @@ errors:
     unsupported_location: "Não é possível abrir este local. O Tributary só pode abrir arquivos deste computador."
     closing: "O Tributary está fechando. Abra-o novamente depois que ele for fechado."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} músicas, %{hours} horas"
-  songs_minutes: "%{count} músicas, %{minutes} minutos"
+  songs:
+    one: "%{count} música"
+    other: "%{count} músicas"
+  hours:
+    one: "%{hours} hora"
+    other: "%{hours} horas"
+  minutes:
+    one: "%{minutes} minuto"
+    other: "%{minutes} minutos"
+  summary: "%{songs}, %{duration}"
 
 # ── Migração do Rhythmbox ─────────────────────────────────────────
 rhythmbox_migration:

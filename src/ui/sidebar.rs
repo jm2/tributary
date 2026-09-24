@@ -121,12 +121,12 @@ fn configure_action_button(button: &gtk::Button, action: Option<&SidebarButtonAc
         }
         Some(SidebarButtonAction::Disconnect(_)) => {
             button.set_icon_name("media-eject-symbolic");
-            button.set_tooltip_text(Some("Disconnect"));
+            button.set_tooltip_text(Some(rust_i18n::t!("sidebar.disconnect").as_ref()));
             button.set_visible(true);
         }
         Some(SidebarButtonAction::Delete(_)) => {
             button.set_icon_name("user-trash-symbolic");
-            button.set_tooltip_text(Some("Remove server"));
+            button.set_tooltip_text(Some(rust_i18n::t!("sidebar.remove_server").as_ref()));
             button.set_visible(true);
         }
         None => {

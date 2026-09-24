@@ -2183,7 +2183,7 @@ impl ProgressDisplay {
         } else {
             adjustment.set_upper(1.0);
             adjustment.set_value(0.0);
-            self.duration_label.set_label("LIVE");
+            self.duration_label.set_label(&rust_i18n::t!("app.live"));
         }
         self.seeking.set(false);
         self.scale.set_sensitive(duration_ms.is_some());

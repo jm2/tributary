@@ -160,6 +160,19 @@ impl TagEdits {
         parse_tag_number("Disc #", self.disc_number.as_deref())?;
         Ok(())
     }
+
+    /// The first numeric field [`Self::validate`] rejects, named like the
+    /// struct field (`year`, `track_number`, or `disc_number`).
+    pub fn invalid_number_field(&self) -> Option<&'static str> {
+        [
+            ("year", &self.year),
+            ("track_number", &self.track_number),
+            ("disc_number", &self.disc_number),
+        ]
+        .into_iter()
+        .find(|(_, raw)| parse_tag_number("", raw.as_deref()).is_err())
+        .map(|(name, _)| name)
+    }
 }
 
 /// What the user asked us to do with one numeric tag field.
@@ -2596,13 +2609,15 @@ mod tests {
         assert!(year("2026").validate().is_ok());
         assert!(year("").validate().is_ok());
         assert!(TagEdits::default().validate().is_ok());
+        assert_eq!(year("2026").invalid_number_field(), None);
     }
 
     #[test]
     fn a_malformed_number_is_rejected_and_names_the_field() {
-        for (label, edits) in [
+        for (label, field, edits) in [
             (
                 "Year",
+                "year",
                 TagEdits {
                     year: Some("2026a".to_string()),
                     ..Default::default()
@@ -2610,6 +2625,7 @@ mod tests {
             ),
             (
                 "Track #",
+                "track_number",
                 TagEdits {
                     track_number: Some("one".to_string()),
                     ..Default::default()
@@ -2617,6 +2633,7 @@ mod tests {
             ),
             (
                 "Disc #",
+                "disc_number",
                 TagEdits {
                     disc_number: Some("-1".to_string()),
                     ..Default::default()
@@ -2628,6 +2645,7 @@ mod tests {
                 .expect_err("a malformed number must be rejected")
                 .to_string();
             assert!(error.contains(label), "error should name {label}: {error}");
+            assert_eq!(edits.invalid_number_field(), Some(field));
         }
     }
 

@@ -463,13 +463,17 @@ fn remote_playlist_row(
     track: crate::source_registry::RegularPlaylistTrack,
 ) -> TrackObject {
     let metadata = track.metadata();
+    let genre = metadata.genre().map_or_else(
+        || rust_i18n::t!("browser.unknown_genre"),
+        std::borrow::Cow::Borrowed,
+    );
     let row = TrackObject::new(
         metadata.track_number().unwrap_or(0),
         metadata.title(),
         metadata.duration_secs().unwrap_or(0),
         metadata.artist_name(),
         metadata.album_title(),
-        metadata.genre().unwrap_or("Unknown"),
+        &genre,
         metadata.composer().unwrap_or(""),
         metadata.year().unwrap_or(0),
         &metadata
@@ -924,7 +928,9 @@ pub fn setup_source_connect(state: &WindowState) {
                 &column_view,
             );
             if let Some(category) = retained_failure {
-                status_label.set_text(&category.user_message("Removable media"));
+                status_label.set_text(
+                    &category.user_message(&rust_i18n::t!("errors.remote.removable_backend")),
+                );
             }
             return;
         }

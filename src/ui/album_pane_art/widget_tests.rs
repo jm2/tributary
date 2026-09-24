@@ -48,7 +48,7 @@ pub fn album_art_row_publishes_combined_accessible_name() {
 /// "(0)"; mirrors the zero-count browser-row contract.
 pub fn album_art_row_zero_count_announces_bare_label() {
     let list_item: gtk::ListItem = glib::Object::new();
-    let item = BrowserItem::new("All", 0);
+    let item = BrowserItem::all_row(0);
     bind_album_row_accessibility(&list_item, &item);
     assert_eq!(list_item.accessible_label(), "All");
 }

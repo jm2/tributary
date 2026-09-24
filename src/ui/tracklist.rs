@@ -668,15 +668,35 @@ pub(super) fn build_tracklist(
 
 /// Recompute and set the status label text from the current tracks.
 pub fn update_status(label: &gtk::Label, tracks: &[TrackObject]) {
-    let count = tracks.len();
     let total_secs: u64 = tracks.iter().map(|t| t.duration_secs()).sum();
-    let hours = total_secs as f64 / 3600.0;
-    if hours >= 1.0 {
-        label.set_text(&format!("{count} songs, {hours:.1} hours"));
+    label.set_text(&status_text(tracks.len(), total_secs, &rust_i18n::locale()));
+}
+
+/// The status summary: the song count and the total duration, in hours
+/// with one decimal from one hour up and in whole minutes below that.
+fn status_text(count: usize, total_secs: u64, locale: &str) -> String {
+    use super::l10n::{localize_decimal, plural_key};
+
+    let count = count.to_string();
+    let songs_key = plural_key("status.songs", locale, &count);
+    let songs = rust_i18n::t!(songs_key.as_str(), locale = locale, count = count);
+    let duration = if total_secs >= 3600 {
+        let hours = format!("{:.1}", total_secs as f64 / 3600.0);
+        let key = plural_key("status.hours", locale, &hours);
+        let hours = localize_decimal(locale, &hours);
+        rust_i18n::t!(key.as_str(), locale = locale, hours = hours)
     } else {
-        let mins = total_secs as f64 / 60.0;
-        label.set_text(&format!("{count} songs, {mins:.0} minutes"));
-    }
+        let minutes = ((total_secs + 30) / 60).to_string();
+        let key = plural_key("status.minutes", locale, &minutes);
+        rust_i18n::t!(key.as_str(), locale = locale, minutes = minutes)
+    };
+    rust_i18n::t!(
+        "status.summary",
+        locale = locale,
+        songs = songs,
+        duration = duration
+    )
+    .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1133,20 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
+
+    #[test]
+    fn status_text_selects_plural_forms_and_decimal_separators() {
+        for (locale, count, total_secs, expected) in [
+            ("en", 1, 60, "1 song, 1 minute"),
+            ("en", 2, 12_240, "2 songs, 3.4 hours"),
+            ("de", 12, 5_400, "12 Titel, 1,5 Stunden"),
+            ("pl", 3, 7_200, "3 utwory, 2,0 godziny"),
+            ("pl", 5, 300, "5 utworów, 5 minut"),
+            ("ru", 21, 120, "21 трек, 2 минуты"),
+        ] {
+            assert_eq!(status_text(count, total_secs, locale), expected, "{locale}");
+        }
+    }
 
     #[derive(Debug, Deserialize)]
     struct RatingCatalog {

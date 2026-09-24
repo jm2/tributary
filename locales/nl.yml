@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "Niets afspelen"
   scanning: "Bibliotheek scannen…"
   live: "LIVE"
@@ -21,6 +20,10 @@ header:
   playback_position: "Afspeelpositie"
   volume: "Volume"
   rescan_library: "Bibliotheek opnieuw scannen"
+  my_computer: "Mijn computer"
+  preferences_menu: "_Voorkeuren"
+  about_menu: "_Over Tributary"
+  quit_menu: "_Afsluiten"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "Apparaten"
   usb_device: "USB-apparaat"
   add_server: "Server toevoegen"
-  new_playlist: "Nieuwe afspeellijst"
   remove_server: "Server verwijderen"
   disconnect: "Verbinding verbreken"
   new_playlist_menu: "Nieuwe afspeellijst"
@@ -53,6 +55,9 @@ browser:
   all: "Alles"
   folder_root_unavailable: "%{name} (niet beschikbaar)"
   folder_unavailable_notice: "Deze map is momenteel niet beschikbaar"
+  unknown_genre: "Onbekend"
+  folder_no_sources: "Bladeren door mappen werkt alleen voor lokale bibliotheekbronnen"
+  folder_no_roots: "Geen bibliotheekmappen ingesteld"
   album_artwork: "Albumhoezen in de albumweergave"
   album_artwork_size_small: "Klein"
   album_artwork_size_medium: "Middelgroot"
@@ -97,8 +102,6 @@ ratings:
 preferences:
   title: "Voorkeuren"
   library_location: "Bibliotheeklocatie"
-  music_folder: "Muziekmap"
-  browse: "Bladeren…"
   select_music_folder: "Muziekmap selecteren"
   library_restart_hint: "Herstart Tributary om wijzigingen aan muziekmappen toe te passen."
   reauthorize_folder: "Opnieuw autoriseren…"
@@ -125,6 +128,9 @@ preferences:
   privacy: "Privacy"
   location_title: "Locatie voor Stations in de buurt"
   location_subtitle: "Bepaal uw geschatte locatie op basis van uw IP-adres via ipapi.co, ipwho.is of freeipapi.com."
+  add_folder: "Map toevoegen"
+  remove_folder: "Map verwijderen"
+  group_by_album_artist: "Groeperen op albumartiest"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -272,6 +278,7 @@ properties:
   field_artist: "Artiest"
   field_album: "Album"
   field_genre: "Genre"
+  field_composer: "Componist"
   field_year: "Jaar"
   field_track_number: "Nummer #"
   field_disc_number: "Schijf #"
@@ -303,14 +310,16 @@ properties:
   mixed_cleared: "Wordt bij alle nummers gewist"
   musicbrainz_applied: "Ingevuld vanuit de MusicBrainz-uitgave ‘%{release}’. Controleer de velden voordat je opslaat."
   musicbrainz_title_only: "Geen MusicBrainz-uitgave kwam overeen met het album, dus alleen de titel en artiest zijn ingevuld."
+  invalid_number_heading: "Controleer het gemarkeerde veld"
+  invalid_number_body: "%{field} moet een geheel getal zijn."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "Nieuwe slimme afspeellijst"
   edit_title: "Slimme afspeellijst bewerken: %{name}"
-  match_label: "Overeenkomen"
-  match_all: "Alle"
-  match_any: "Minstens één"
+  match_label: "Voldoet aan"
+  match_all: "alle"
+  match_any: "minstens één"
   add_rule: "Regel toevoegen"
   remove_rule: "Regel verwijderen"
   limit_to: "Beperken tot"
@@ -318,6 +327,76 @@ smart_playlist:
   rule_reversed_range: "De eerste waarde mag niet groter zijn dan de tweede."
   rule_not_positive: "Voer een geheel getal van 1 of meer in."
   rule_invalid_date: "Voer een datum in als YYYY-MM-DD, bijvoorbeeld 2024-01-15."
+  match_suffix: "van de volgende regels:"
+  selected_by: "geselecteerd op"
+  sort_by: "Sorteren op:"
+  add_sort_level: "Sorteerniveau toevoegen"
+  remove_sort_level: "Sorteerniveau verwijderen"
+  value_placeholder: "waarde"
+  range_end_placeholder: "tot"
+  field:
+    title: "Titel"
+    artist: "Artiest"
+    album_artist: "Albumartiest"
+    album: "Album"
+    genre: "Genre"
+    composer: "Componist"
+    year: "Jaar"
+    track_number: "Tracknummer"
+    disc_number: "Schijfnummer"
+    duration: "Duur"
+    duration_seconds: "Duur (sec)"
+    bitrate: "Bitrate"
+    bitrate_kbps: "Bitrate (kbps)"
+    sample_rate_hz: "Samplefrequentie (Hz)"
+    format: "Formaat"
+    play_count: "Aantal keer afgespeeld"
+    last_played: "Laatst afgespeeld"
+    date_added: "Datum toegevoegd"
+    date_modified: "Datum gewijzigd"
+    file_size_bytes: "Bestandsgrootte (bytes)"
+    rating: "Beoordeling"
+    rating_range: "Beoordeling (1–100)"
+    track_id: "Track-ID"
+  operator:
+    is: "is"
+    is_not: "is niet"
+    contains: "bevat"
+    does_not_contain: "bevat niet"
+    starts_with: "begint met"
+    ends_with: "eindigt op"
+    greater_than: "groter dan"
+    less_than: "kleiner dan"
+    in_range: "in bereik"
+    is_rated: "is beoordeeld"
+    is_unrated: "is niet beoordeeld"
+    is_before: "is vóór"
+    is_after: "is na"
+    is_in_the_last: "valt in de laatste"
+    is_not_in_the_last: "valt niet in de laatste"
+  date_unit:
+    days: "dagen"
+    weeks: "weken"
+    months: "maanden"
+  limit_unit:
+    items: "items"
+    minutes: "minuten"
+    hours: "uur"
+    megabytes: "MB"
+    gigabytes: "GB"
+  limit_sort:
+    random: "Willekeurig"
+    most_played: "Meest afgespeeld"
+    least_played: "Minst afgespeeld"
+    most_recently_added: "Laatst toegevoegd"
+    least_recently_added: "Eerst toegevoegd"
+    most_recently_played: "Laatst afgespeeld"
+    least_recently_played: "Langst niet afgespeeld"
+    highest_rated: "Hoogst beoordeeld"
+    lowest_rated: "Laagst beoordeeld"
+  sort_direction:
+    ascending: "Oplopend"
+    descending: "Aflopend"
 
 # ── Serverafspeellijsten ───────────────────────────────────────────
 server_playlists:
@@ -371,6 +450,8 @@ errors:
     invalid_response: "%{backend} heeft een ongeldig antwoord geretourneerd"
     authentication_method_unsupported: "De authenticatiemethode van %{backend} wordt niet ondersteund"
     source_failed: "De %{backend}-bron is mislukt"
+    removable_backend: "Verwisselbaar medium"
+    generic_backend: "Externe server"
   playback:
     network_request_failed: "De audionetwerkaanvraag is mislukt"
     decoder_failed: "De audiodecoder is mislukt"
@@ -390,15 +471,18 @@ errors:
     unsupported_location: "Deze locatie kan niet worden geopend. Tributary kan alleen bestanden op deze computer openen."
     closing: "Tributary wordt afgesloten. Open het opnieuw zodra het is afgesloten."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} nummers, %{hours} uur"
-  songs_minutes: "%{count} nummers, %{minutes} minuten"
+  songs:
+    one: "%{count} nummer"
+    other: "%{count} nummers"
+  hours:
+    one: "%{hours} uur"
+    other: "%{hours} uur"
+  minutes:
+    one: "%{minutes} minuut"
+    other: "%{minutes} minuten"
+  summary: "%{songs}, %{duration}"
 
 # ── Rhythmbox-migratie ────────────────────────────────────────────
 rhythmbox_migration:

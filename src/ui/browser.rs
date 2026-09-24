@@ -242,8 +242,8 @@ pub fn build_browser(
         .build();
 
     // ── Build the 3 panes ────────────────────────────────────────────
-    let genre_pane = build_pane("Genre", &genre_store);
-    let artist_pane = build_pane("Artist", &artist_store);
+    let genre_pane = build_pane(&rust_i18n::t!("browser.genre"), &genre_store);
+    let artist_pane = build_pane(&rust_i18n::t!("browser.artist"), &artist_store);
     let album_pane = build_album_pane(
         &album_store,
         album_art_controller.clone(),
@@ -251,7 +251,7 @@ pub fn build_browser(
         album_pane_artwork_size.clone(),
         None,
     );
-    let folder_pane = build_pane("Folder", &folder_store);
+    let folder_pane = build_pane(&rust_i18n::t!("browser.folder"), &folder_store);
 
     // Initial population — unfiltered, handlers are not connected yet,
     // so autoselect lands every pane on "All".
@@ -1084,7 +1084,8 @@ fn restore_selection(pane: &gtk::Box, label: &Option<String>) {
     let sel = get_selection(pane);
     if let Some(target) = label {
         let model = sel.model().unwrap();
-        for i in 0..model.n_items() {
+        // Row 0 is the "All" row, whose label can equal a data value.
+        for i in 1..model.n_items() {
             if let Some(item) = model.item(i) {
                 if let Some(bi) = item.downcast_ref::<BrowserItem>() {
                     if bi.label() == *target {
@@ -1126,7 +1127,7 @@ fn populate_genres(
         *map.entry(t.genre.clone()).or_insert(0) += 1;
     }
     let total: u32 = map.values().sum();
-    store.append(&BrowserItem::new("All", total));
+    store.append(&BrowserItem::all_row(total));
     for (genre, count) in &map {
         store.append(&BrowserItem::new(genre, *count));
     }
@@ -1156,7 +1157,7 @@ fn populate_artists(
             .or_insert(0) += 1;
     }
     let total: u32 = map.values().sum();
-    store.append(&BrowserItem::new("All", total));
+    store.append(&BrowserItem::all_row(total));
     for (artist, count) in &map {
         store.append(&BrowserItem::new(artist, *count));
     }
@@ -1199,7 +1200,7 @@ pub fn populate_albums(
             });
     }
     let total: u32 = map.values().sum();
-    store.append(&BrowserItem::new("All", total));
+    store.append(&BrowserItem::all_row(total));
     for (album, count) in &map {
         if let Some(candidate) = candidates.get(album) {
             store.append(&BrowserItem::new_with_artwork(
@@ -1532,7 +1533,7 @@ fn populate_folder_pane(
     match (model, location) {
         (None, _) => {
             rows.push((
-                "Folder browsing follows the local library sources".to_string(),
+                rust_i18n::t!("browser.folder_no_sources").into_owned(),
                 0,
                 FolderRowKind::Status,
             ));
@@ -1553,7 +1554,7 @@ fn populate_folder_pane(
             }
             if rows.is_empty() {
                 rows.push((
-                    "No library folders configured".to_string(),
+                    rust_i18n::t!("browser.folder_no_roots").into_owned(),
                     0,
                     FolderRowKind::Status,
                 ));
@@ -3948,6 +3949,7 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 crate::ui::playlist_editor::widget_tests::number_and_date_rows_gate_ok();
+                crate::ui::playlist_editor::widget_tests::rows_are_labelled_for_the_locale_they_are_built_for();
                 crate::ui::server_dialogs::widget_tests::connect_waits_for_required_credentials();
                 crate::ui::server_dialogs::widget_tests::add_server_keeps_incomplete_input_with_a_reason();
                 crate::ui::properties_dialog::widget_tests::editing_a_mixed_field_marks_it_for_clearing();

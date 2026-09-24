@@ -139,6 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rating column in other languages** — The Rating column no longer stays hidden when Tributary
   runs in a language other than English. Column titles are now translated, and saved column
   settings carry over.
+- **More of the app in your language** — Properties, the smart playlist editor, the status bar,
+  the main menu, the browser panes, Preferences, and the library folder trust prompts no longer
+  show English in other languages. Song counts and durations use the right plural forms and
+  decimal separator, and a rejected number in Properties is now highlighted.
 - **Column reordering** — A reordered column is saved once the drag finishes, so an interrupted
   save can't lose it.
 - **Very large playlist selections** — Adding or removing more than about 32,000 tracks at once no

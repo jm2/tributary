@@ -1,6 +1,5 @@
 # ── Application ────────────────────────────────────────────────────
 app:
-  name: "Tributary"
   not_playing: "Rien en lecture"
   scanning: "Analyse de la bibliothèque…"
   live: "EN DIRECT"
@@ -21,6 +20,10 @@ header:
   playback_position: "Position de lecture"
   volume: "Volume"
   rescan_library: "Réanalyser la bibliothèque"
+  my_computer: "Mon ordinateur"
+  preferences_menu: "_Préférences"
+  about_menu: "À _propos de Tributary"
+  quit_menu: "_Quitter"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -34,7 +37,6 @@ sidebar:
   devices: "Appareils"
   usb_device: "Périphérique USB"
   add_server: "Ajouter un serveur"
-  new_playlist: "Nouvelle liste de lecture"
   remove_server: "Supprimer le serveur"
   disconnect: "Déconnecter"
   new_playlist_menu: "Nouvelle liste de lecture"
@@ -53,6 +55,9 @@ browser:
   all: "Tous"
   folder_root_unavailable: "%{name} (indisponible)"
   folder_unavailable_notice: "Ce dossier est actuellement indisponible"
+  unknown_genre: "Inconnu"
+  folder_no_sources: "La navigation par dossiers ne couvre que les sources de la bibliothèque locale"
+  folder_no_roots: "Aucun dossier de bibliothèque configuré"
   album_artwork: "Pochettes dans le volet des albums"
   album_artwork_size_small: "Petite"
   album_artwork_size_medium: "Moyenne"
@@ -97,8 +102,6 @@ ratings:
 preferences:
   title: "Préférences"
   library_location: "Emplacement de la bibliothèque"
-  music_folder: "Dossier de musique"
-  browse: "Parcourir…"
   select_music_folder: "Sélectionner le dossier de musique"
   library_restart_hint: "Redémarrez Tributary pour appliquer les modifications apportées aux dossiers de musique."
   reauthorize_folder: "Réautoriser…"
@@ -125,6 +128,9 @@ preferences:
   privacy: "Confidentialité"
   location_title: "Localisation pour Stations à proximité"
   location_subtitle: "Déterminer votre position approximative à partir de votre adresse IP via ipapi.co, ipwho.is ou freeipapi.com."
+  add_folder: "Ajouter un dossier"
+  remove_folder: "Retirer le dossier"
+  group_by_album_artist: "Regrouper par artiste de l'album"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -272,6 +278,7 @@ properties:
   field_artist: "Artiste"
   field_album: "Album"
   field_genre: "Genre"
+  field_composer: "Compositeur"
   field_year: "Année"
   field_track_number: "Piste n°"
   field_disc_number: "Disque n°"
@@ -303,14 +310,16 @@ properties:
   mixed_cleared: "Sera effacé sur toutes les pistes"
   musicbrainz_applied: "Rempli à partir de la parution MusicBrainz « %{release} ». Vérifiez les champs avant d’enregistrer."
   musicbrainz_title_only: "Aucune parution MusicBrainz ne correspond à l’album : seuls le titre et l’artiste ont été remplis."
+  invalid_number_heading: "Vérifiez le champ en surbrillance"
+  invalid_number_body: "%{field} doit être un nombre entier."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
   new_title: "Nouvelle liste intelligente"
   edit_title: "Modifier la liste intelligente : %{name}"
-  match_label: "Correspondance"
-  match_all: "Toutes"
-  match_any: "Au moins une"
+  match_label: "Correspondre à"
+  match_all: "toutes"
+  match_any: "au moins une"
   add_rule: "Ajouter une règle"
   remove_rule: "Supprimer la règle"
   limit_to: "Limiter à"
@@ -318,6 +327,76 @@ smart_playlist:
   rule_reversed_range: "La première valeur ne doit pas dépasser la seconde."
   rule_not_positive: "Saisissez un nombre entier supérieur ou égal à 1."
   rule_invalid_date: "Saisissez une date au format YYYY-MM-DD, par exemple 2024-01-15."
+  match_suffix: "des règles suivantes :"
+  selected_by: "sélectionnés par"
+  sort_by: "Trier par :"
+  add_sort_level: "Ajouter un niveau de tri"
+  remove_sort_level: "Supprimer le niveau de tri"
+  value_placeholder: "valeur"
+  range_end_placeholder: "à"
+  field:
+    title: "Titre"
+    artist: "Artiste"
+    album_artist: "Artiste de l'album"
+    album: "Album"
+    genre: "Genre"
+    composer: "Compositeur"
+    year: "Année"
+    track_number: "Numéro de piste"
+    disc_number: "Numéro de disque"
+    duration: "Durée"
+    duration_seconds: "Durée (s)"
+    bitrate: "Débit"
+    bitrate_kbps: "Débit (kbit/s)"
+    sample_rate_hz: "Fréquence d'échantillonnage (Hz)"
+    format: "Format"
+    play_count: "Nombre de lectures"
+    last_played: "Dernière lecture"
+    date_added: "Date d'ajout"
+    date_modified: "Date de modification"
+    file_size_bytes: "Taille du fichier (octets)"
+    rating: "Note"
+    rating_range: "Note (1–100)"
+    track_id: "ID de piste"
+  operator:
+    is: "est"
+    is_not: "n'est pas"
+    contains: "contient"
+    does_not_contain: "ne contient pas"
+    starts_with: "commence par"
+    ends_with: "se termine par"
+    greater_than: "supérieur à"
+    less_than: "inférieur à"
+    in_range: "compris entre"
+    is_rated: "est noté"
+    is_unrated: "n'est pas noté"
+    is_before: "est avant le"
+    is_after: "est après le"
+    is_in_the_last: "est dans les derniers"
+    is_not_in_the_last: "n'est pas dans les derniers"
+  date_unit:
+    days: "jours"
+    weeks: "semaines"
+    months: "mois"
+  limit_unit:
+    items: "éléments"
+    minutes: "minutes"
+    hours: "heures"
+    megabytes: "Mo"
+    gigabytes: "Go"
+  limit_sort:
+    random: "Aléatoire"
+    most_played: "Les plus écoutés"
+    least_played: "Les moins écoutés"
+    most_recently_added: "Ajoutés le plus récemment"
+    least_recently_added: "Ajoutés le moins récemment"
+    most_recently_played: "Écoutés le plus récemment"
+    least_recently_played: "Écoutés le moins récemment"
+    highest_rated: "Les mieux notés"
+    lowest_rated: "Les moins bien notés"
+  sort_direction:
+    ascending: "Croissant"
+    descending: "Décroissant"
 
 # ── Listes du serveur ──────────────────────────────────────────────
 server_playlists:
@@ -371,6 +450,8 @@ errors:
     invalid_response: "%{backend} a renvoyé une réponse non valide"
     authentication_method_unsupported: "La méthode d’authentification de %{backend} n’est pas prise en charge"
     source_failed: "La source %{backend} a échoué"
+    removable_backend: "Support amovible"
+    generic_backend: "Serveur distant"
   playback:
     network_request_failed: "La requête audio réseau a échoué"
     decoder_failed: "Le décodeur audio a échoué"
@@ -390,15 +471,18 @@ errors:
     unsupported_location: "Impossible d’ouvrir cet emplacement. Tributary ne peut ouvrir que des fichiers présents sur cet ordinateur."
     closing: "Tributary est en cours de fermeture. Rouvrez-le une fois qu’il sera fermé."
 
-# ── About dialog ───────────────────────────────────────────────────
-about:
-  application_name: "Tributary"
-  developer_name: "John-Michael Mulesa"
-
 # ── Status bar ─────────────────────────────────────────────────────
 status:
-  songs_hours: "%{count} morceaux, %{hours} heures"
-  songs_minutes: "%{count} morceaux, %{minutes} minutes"
+  songs:
+    one: "%{count} morceau"
+    other: "%{count} morceaux"
+  hours:
+    one: "%{hours} heure"
+    other: "%{hours} heures"
+  minutes:
+    one: "%{minutes} minute"
+    other: "%{minutes} minutes"
+  summary: "%{songs}, %{duration}"
 
 # ── Migration depuis Rhythmbox ────────────────────────────────────
 rhythmbox_migration:

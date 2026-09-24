@@ -35,6 +35,17 @@ pub enum MediaAction {
 
 // ── Controller ──────────────────────────────────────────────────────────
 
+/// What the OS overlay shows while nothing plays: the application name
+/// and a localized idle status.
+fn idle_metadata(status: &str) -> MediaMetadata<'_> {
+    MediaMetadata {
+        title: Some("Tributary"),
+        artist: Some(status),
+        album: Some(""),
+        ..Default::default()
+    }
+}
+
 /// Wraps `souvlaki::MediaControls` and routes OS media-key events to
 /// the GTK main thread.
 pub struct MediaController {
@@ -111,13 +122,9 @@ impl MediaController {
             .map_err(|e| anyhow::anyhow!("Failed to attach media controls handler: {e:?}"))?;
 
         // Publish initial (idle) state so the OS overlay is registered.
+        let idle_status = rust_i18n::t!("app.not_playing");
         controls
-            .set_metadata(MediaMetadata {
-                title: Some("Tributary"),
-                artist: Some("No track loaded"),
-                album: Some(""),
-                ..Default::default()
-            })
+            .set_metadata(idle_metadata(&idle_status))
             .map_err(|e| anyhow::anyhow!("Failed to set initial metadata: {e:?}"))?;
 
         controls
@@ -162,12 +169,8 @@ impl MediaController {
         // Also clear the now-playing text so the OS overlay doesn't keep
         // showing the last track after playback stops. Mirror the idle
         // metadata published at construction.
-        if let Err(e) = self.controls.set_metadata(MediaMetadata {
-            title: Some("Tributary"),
-            artist: Some("No track loaded"),
-            album: Some(""),
-            ..Default::default()
-        }) {
+        let idle_status = rust_i18n::t!("app.not_playing");
+        if let Err(e) = self.controls.set_metadata(idle_metadata(&idle_status)) {
             warn!("Failed to clear media metadata on stop: {e:?}");
         }
         if let Err(e) = self.controls.set_playback(MediaPlayback::Stopped) {
