@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -279,6 +279,13 @@ const JELLYFIN_DISCOVERY_MSG: &[u8] = b"Who is JellyfinServer?";
 const JELLYFIN_BROADCAST_INTERVAL: Duration = Duration::from_mins(1);
 /// Number of consecutive missed cycles before declaring a Jellyfin server lost.
 const JELLYFIN_MISS_THRESHOLD: u32 = 3;
+/// Wall-clock length of the reply-collection window after each broadcast.
+const JELLYFIN_RESPONSE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Capacity of the discovery event channel. Producers are dedicated threads
+/// that block while it is full, so a slow consumer applies backpressure
+/// instead of losing `Found`/`Lost` events or buffering without bound.
+const DISCOVERY_EVENT_CAPACITY: usize = 256;
 
 /// Start all background discovery mechanisms. Discovered servers are
 /// sent through the returned receiver. The sender stays alive as long
@@ -287,7 +294,7 @@ const JELLYFIN_MISS_THRESHOLD: u32 = 3;
 /// Call this once from the GTK startup path and consume the receiver
 /// in a `glib::MainContext::default().spawn_local()` loop.
 pub fn start_discovery() -> async_channel::Receiver<DiscoveryEvent> {
-    let (tx, rx) = async_channel::unbounded();
+    let (tx, rx) = async_channel::bounded(DISCOVERY_EVENT_CAPACITY);
 
     // ── mDNS discovery (Subsonic + Plex + DAAP) ─────────────────────
     {
@@ -635,7 +642,8 @@ fn publish_mdns_events(events: Vec<DiscoveryEvent>, tx: &async_channel::Sender<D
                 "mDNS: server removed"
             ),
         }
-        let _ = tx.try_send(event);
+        // An error means the consumer is gone; nothing is left to notify.
+        let _ = tx.send_blocking(event);
     }
 }
 
@@ -643,15 +651,182 @@ fn publish_mdns_events(events: Vec<DiscoveryEvent>, tx: &async_channel::Sender<D
 /// discovery state, logs, a sidebar row, or source-connection ownership.
 ///
 /// The shared parser returns a fixed error that never includes `address`.
-fn validate_jellyfin_discovery_address(address: &str) -> Result<(), &'static str> {
-    crate::http_security::parse_base_url(address).map(|_| ())
+fn validate_jellyfin_discovery_address(address: &str) -> Result<url::Url, &'static str> {
+    crate::http_security::parse_base_url(address)
+}
+
+/// Whether a reply received from `source` may advertise `address`.
+///
+/// An IP-literal host must be the replying host itself. A DNS-name host (a
+/// server's configured published URL) cannot be tied to the sender without a
+/// blocking lookup, so it is accepted only from a LAN-scoped source.
+fn jellyfin_reply_source_is_plausible(address: &url::Url, source: IpAddr) -> bool {
+    let source = source.to_canonical();
+    match address.host() {
+        Some(url::Host::Ipv4(host)) => IpAddr::V4(host) == source,
+        Some(url::Host::Ipv6(host)) => IpAddr::V6(host).to_canonical() == source,
+        Some(url::Host::Domain(_)) => is_lan_scoped(source),
+        None => false,
+    }
+}
+
+fn is_lan_scoped(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
+/// Jellyfin servers found by UDP discovery, keyed by advertised base URL.
+///
+/// At most [`MAX_MDNS_PUBLICATIONS`] servers are retained. Once full, replies
+/// for new addresses are ignored while known servers keep refreshing, and
+/// `responded` only ever holds known addresses, so a reply flood cannot grow
+/// either map.
+#[derive(Default)]
+struct JellyfinServers {
+    /// Advertised address → (display name, consecutive missed cycles).
+    known: HashMap<String, (String, u32)>,
+    /// Known addresses that replied during the current cycle.
+    responded: HashSet<String>,
+}
+
+impl JellyfinServers {
+    /// Admit one reply datagram from `source`, returning `Found` when it
+    /// introduces a new server.
+    fn observe(&mut self, reply: &[u8], source: IpAddr) -> Option<DiscoveryEvent> {
+        // Discovery responses are unauthenticated network input. Never
+        // format the body into logs: its advertised address may contain
+        // user-info or a bearer-like query value that must be rejected
+        // before publication.
+        debug!(bytes = reply.len(), "Jellyfin UDP response received");
+
+        let response = String::from_utf8_lossy(reply);
+        let discovery = match serde_json::from_str::<crate::jellyfin::api::JellyfinDiscoveryResponse>(
+            &response,
+        ) {
+            Ok(discovery) => discovery,
+            Err(e) => {
+                debug!(error = %e, "Failed to parse Jellyfin discovery response");
+                return None;
+            }
+        };
+
+        let address = match validate_jellyfin_discovery_address(&discovery.address) {
+            Ok(address) => address,
+            Err(error) => {
+                // `error` is fixed text and deliberately contains no parser
+                // diagnostic or rejected address.
+                warn!(
+                    error,
+                    "Ignoring Jellyfin discovery response with invalid server URL"
+                );
+                return None;
+            }
+        };
+        if !jellyfin_reply_source_is_plausible(&address, source) {
+            debug!("Ignoring Jellyfin discovery response whose address does not match its sender");
+            return None;
+        }
+
+        if let Some((name, _misses)) = self.known.get_mut(&discovery.address) {
+            *name = discovery.name;
+            self.responded.insert(discovery.address);
+            return None;
+        }
+        if self.known.len() >= MAX_MDNS_PUBLICATIONS {
+            debug!("Jellyfin discovery is at capacity; ignoring a new server");
+            return None;
+        }
+
+        info!(
+            name = %discovery.name,
+            "Jellyfin server discovered via UDP"
+        );
+        self.responded.insert(discovery.address.clone());
+        self.known
+            .insert(discovery.address.clone(), (discovery.name.clone(), 0));
+        Some(DiscoveryEvent::Found(DiscoveredServer {
+            name: discovery.name,
+            url: discovery.address,
+            service_type: "jellyfin".to_string(),
+            requires_password: None,
+            advertised_route: None,
+            device_id: None,
+        }))
+    }
+
+    /// Close one broadcast cycle, returning `Lost` for every server that has
+    /// now missed [`JELLYFIN_MISS_THRESHOLD`] consecutive cycles.
+    fn end_cycle(&mut self) -> Vec<DiscoveryEvent> {
+        let responded = std::mem::take(&mut self.responded);
+        let mut lost = Vec::new();
+        self.known.retain(|address, (name, misses)| {
+            if responded.contains(address) {
+                *misses = 0;
+                return true;
+            }
+            *misses += 1;
+            debug!(
+                name = %name,
+                misses = *misses,
+                "Jellyfin server missed a broadcast cycle"
+            );
+            if *misses < JELLYFIN_MISS_THRESHOLD {
+                return true;
+            }
+            info!(
+                name = %name,
+                "Jellyfin server lost after {JELLYFIN_MISS_THRESHOLD} missed cycles"
+            );
+            lost.push(DiscoveryEvent::Lost {
+                url: address.clone(),
+                service_type: "jellyfin".to_string(),
+            });
+            false
+        });
+        lost
+    }
+}
+
+/// Collect Jellyfin replies until `window` of wall-clock time has elapsed.
+///
+/// `receive` reads one datagram and must return an error once its timeout
+/// expires. The timeout passed to it is always the nonzero time left in the
+/// window, so a sender that replies continuously cannot extend collection.
+fn collect_jellyfin_replies<Receive, Publish>(
+    servers: &mut JellyfinServers,
+    window: Duration,
+    mut receive: Receive,
+    mut publish: Publish,
+) where
+    Receive: FnMut(&mut [u8], Duration) -> std::io::Result<(usize, SocketAddr)>,
+    Publish: FnMut(DiscoveryEvent),
+{
+    let deadline = Instant::now() + window;
+    let mut buf = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Ok((len, sender)) = receive(&mut buf, remaining) else {
+            // A timeout ends the window; any other receive failure also ends
+            // this cycle and is retried on the next broadcast.
+            return;
+        };
+        if let Some(event) = servers.observe(&buf[..len], sender.ip()) {
+            publish(event);
+        }
+    }
 }
 
 /// Run Jellyfin UDP broadcast discovery with periodic re-broadcasts.
 ///
 /// Sends `"Who is JellyfinServer?"` to `255.255.255.255:7359` every
-/// 60 seconds. Tracks which servers respond each cycle. After 3
-/// consecutive missed cycles, sends `DiscoveryEvent::Lost`.
+/// 60 seconds and collects replies for [`JELLYFIN_RESPONSE_WINDOW`]. After
+/// [`JELLYFIN_MISS_THRESHOLD`] consecutive missed cycles a server is
+/// reported as `DiscoveryEvent::Lost`.
 fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -666,15 +841,11 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         return;
     }
 
-    // Set a receive timeout for each read cycle.
-    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
-
     info!(
         "Jellyfin UDP discovery: periodic broadcast to 255.255.255.255:{JELLYFIN_DISCOVERY_PORT}"
     );
 
-    // Track known servers: address → (name, consecutive_misses).
-    let mut known: HashMap<String, (String, u32)> = HashMap::new();
+    let mut servers = JellyfinServers::default();
 
     loop {
         // ── Send broadcast ──────────────────────────────────────────
@@ -689,88 +860,21 @@ fn run_jellyfin_udp_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
         }
 
         // ── Collect responses for this cycle ────────────────────────
-        let mut responded_this_cycle: HashSet<String> = HashSet::new();
-        let mut buf = [0u8; 4096];
+        collect_jellyfin_replies(
+            &mut servers,
+            JELLYFIN_RESPONSE_WINDOW,
+            |buf, timeout| {
+                socket.set_read_timeout(Some(timeout))?;
+                socket.recv_from(buf)
+            },
+            |event| {
+                let _ = tx.send_blocking(event);
+            },
+        );
 
-        // Read responses until the 5-second timeout fires.
-        while let Ok((len, _addr)) = socket.recv_from(&mut buf) {
-            let response = String::from_utf8_lossy(&buf[..len]);
-            // Discovery responses are unauthenticated network input. Never
-            // format the body into logs: its advertised address may contain
-            // user-info or a bearer-like query value that must be rejected
-            // before publication.
-            debug!(bytes = len, "Jellyfin UDP response received");
-
-            match serde_json::from_str::<crate::jellyfin::api::JellyfinDiscoveryResponse>(&response)
-            {
-                Ok(discovery) => {
-                    if let Err(error) = validate_jellyfin_discovery_address(&discovery.address) {
-                        // `error` is fixed text and deliberately contains no
-                        // parser diagnostic or rejected address.
-                        warn!(
-                            error,
-                            "Ignoring Jellyfin discovery response with invalid server URL"
-                        );
-                        continue;
-                    }
-
-                    responded_this_cycle.insert(discovery.address.clone());
-
-                    if !known.contains_key(&discovery.address) {
-                        // New server discovered.
-                        info!(
-                            name = %discovery.name,
-                            "Jellyfin server discovered via UDP"
-                        );
-
-                        let _ = tx.try_send(DiscoveryEvent::Found(DiscoveredServer {
-                            name: discovery.name.clone(),
-                            url: discovery.address.clone(),
-                            service_type: "jellyfin".to_string(),
-                            requires_password: None,
-                            advertised_route: None,
-                            device_id: None,
-                        }));
-                    }
-
-                    // Reset miss counter (or insert new entry).
-                    known.insert(discovery.address, (discovery.name, 0));
-                }
-                Err(e) => {
-                    debug!(error = %e, "Failed to parse Jellyfin discovery response");
-                }
-            }
-        }
-
-        // ── Update miss counters and remove stale servers ───────────
-        let mut to_remove = Vec::new();
-        for (address, (name, misses)) in &mut known {
-            if responded_this_cycle.contains(address) {
-                *misses = 0;
-            } else {
-                *misses += 1;
-                debug!(
-                    name = %name,
-                    misses = *misses,
-                    "Jellyfin server missed a broadcast cycle"
-                );
-
-                if *misses >= JELLYFIN_MISS_THRESHOLD {
-                    info!(
-                        name = %name,
-                        "Jellyfin server lost after {JELLYFIN_MISS_THRESHOLD} missed cycles"
-                    );
-                    to_remove.push(address.clone());
-                }
-            }
-        }
-
-        for address in to_remove {
-            known.remove(&address);
-            let _ = tx.try_send(DiscoveryEvent::Lost {
-                url: address,
-                service_type: "jellyfin".to_string(),
-            });
+        // ── Retire servers that stopped replying ────────────────────
+        for event in servers.end_cycle() {
+            let _ = tx.send_blocking(event);
         }
 
         // ── Wait before next broadcast cycle ────────────────────────
@@ -1047,13 +1151,17 @@ fn strip_avahi_name_suffix(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::{Duration, Instant};
+
     use super::{
-        normalize_airplay_device_id, process_chromecast_event, process_mdns_event,
-        strip_airplay_mac_prefix, strip_avahi_display_suffix, strip_avahi_name_suffix,
-        usable_chromecast_control_address, validate_jellyfin_discovery_address, DiscoveredServer,
-        DiscoveryEvent, MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey,
-        CHROMECAST_SERVICE, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS, RAOP_SERVICE,
-        SUBSONIC_SERVICE,
+        collect_jellyfin_replies, normalize_airplay_device_id, process_chromecast_event,
+        process_mdns_event, strip_airplay_mac_prefix, strip_avahi_display_suffix,
+        strip_avahi_name_suffix, usable_chromecast_control_address,
+        validate_jellyfin_discovery_address, DiscoveredServer, DiscoveryEvent, JellyfinServers,
+        MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey, CHROMECAST_SERVICE,
+        JELLYFIN_MISS_THRESHOLD, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS,
+        RAOP_SERVICE, SUBSONIC_SERVICE,
     };
 
     fn resolved_event(
@@ -1633,6 +1741,130 @@ mod tests {
 
         assert!(!error.contains(secret));
         assert!(!error.contains(&address));
+    }
+
+    fn jellyfin_reply(address: &str, name: &str) -> Vec<u8> {
+        serde_json::json!({ "Id": name, "Address": address, "Name": name })
+            .to_string()
+            .into_bytes()
+    }
+
+    /// A distinct LAN host for each index, advertising its own IP literal.
+    fn flooding_host(index: u32) -> (IpAddr, Vec<u8>) {
+        let ip = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + index));
+        (ip, jellyfin_reply(&format!("http://{ip}:8096"), "flood"))
+    }
+
+    #[test]
+    fn jellyfin_collection_window_is_bounded_by_wall_clock_under_a_reply_flood() {
+        const WINDOW: Duration = Duration::from_millis(100);
+        let mut servers = JellyfinServers::default();
+        let mut next = 0_u32;
+        let mut found = 0_usize;
+        let started = Instant::now();
+
+        collect_jellyfin_replies(
+            &mut servers,
+            WINDOW,
+            |buf, timeout| {
+                assert!(!timeout.is_zero() && timeout <= WINDOW);
+                let (ip, reply) = flooding_host(next);
+                next += 1;
+                buf[..reply.len()].copy_from_slice(&reply);
+                Ok((reply.len(), SocketAddr::new(ip, 7359)))
+            },
+            |event| {
+                assert!(matches!(event, DiscoveryEvent::Found(_)));
+                found += 1;
+            },
+        );
+
+        let elapsed = started.elapsed();
+        assert!(elapsed >= WINDOW);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "a continuous flood must not extend the window: {elapsed:?}"
+        );
+        assert!(servers.known.len() <= MAX_MDNS_PUBLICATIONS);
+        assert!(servers.responded.len() <= servers.known.len());
+        assert_eq!(found, servers.known.len());
+    }
+
+    #[test]
+    fn jellyfin_known_servers_are_capped_but_known_servers_keep_refreshing() {
+        let mut servers = JellyfinServers::default();
+        let mut found = 0_usize;
+        for index in 0..(MAX_MDNS_PUBLICATIONS as u32 + 100) {
+            let (ip, reply) = flooding_host(index);
+            found += usize::from(servers.observe(&reply, ip).is_some());
+        }
+        assert_eq!(found, MAX_MDNS_PUBLICATIONS);
+        assert_eq!(servers.known.len(), MAX_MDNS_PUBLICATIONS);
+        assert_eq!(servers.responded.len(), MAX_MDNS_PUBLICATIONS);
+
+        // A known server keeps refreshing at the cap; every other server
+        // is retired after missing the threshold, which frees capacity for
+        // a server that was ignored while the map was full.
+        assert!(servers.end_cycle().is_empty());
+        let (known_ip, known_reply) = flooding_host(0);
+        let mut lost = 0_usize;
+        for _ in 0..JELLYFIN_MISS_THRESHOLD {
+            assert!(servers.observe(&known_reply, known_ip).is_none());
+            lost += servers.end_cycle().len();
+        }
+        assert_eq!(lost, MAX_MDNS_PUBLICATIONS - 1);
+        assert_eq!(servers.known.len(), 1);
+        let (late_ip, late_reply) = flooding_host(MAX_MDNS_PUBLICATIONS as u32 + 1);
+        assert!(servers.observe(&late_reply, late_ip).is_some());
+    }
+
+    #[test]
+    fn jellyfin_reply_must_come_from_the_advertised_host_or_the_lan() {
+        let lan: IpAddr = "192.168.1.10".parse().unwrap();
+        let mut servers = JellyfinServers::default();
+
+        // An IP literal must be the sender itself.
+        let other_host = jellyfin_reply("http://192.168.1.11:8096", "spoof");
+        assert!(servers.observe(&other_host, lan).is_none());
+        let own_host = jellyfin_reply("http://192.168.1.10:8096", "own");
+        let mapped: IpAddr = "::ffff:192.168.1.10".parse().unwrap();
+        assert!(servers.observe(&own_host, mapped).is_some());
+
+        // A DNS name is accepted only from a LAN-scoped sender.
+        let named = jellyfin_reply("https://media.example.test", "named");
+        let public: IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(servers.observe(&named, public).is_none());
+        assert!(servers.observe(&named, lan).is_some());
+
+        assert_eq!(servers.known.len(), 2);
+    }
+
+    #[test]
+    fn jellyfin_server_is_lost_only_after_consecutive_missed_cycles() {
+        let ip: IpAddr = "192.168.1.20".parse().unwrap();
+        let reply = jellyfin_reply("http://192.168.1.20:8096", "den");
+        let mut servers = JellyfinServers::default();
+        assert!(servers.observe(&reply, ip).is_some());
+        assert!(servers.end_cycle().is_empty());
+
+        for _ in 1..JELLYFIN_MISS_THRESHOLD {
+            assert!(servers.end_cycle().is_empty());
+        }
+        // A reply before the threshold resets the miss count.
+        assert!(servers.observe(&reply, ip).is_none());
+        assert!(servers.end_cycle().is_empty());
+        for _ in 1..JELLYFIN_MISS_THRESHOLD {
+            assert!(servers.end_cycle().is_empty());
+        }
+
+        assert_eq!(
+            servers.end_cycle(),
+            vec![DiscoveryEvent::Lost {
+                url: "http://192.168.1.20:8096".to_string(),
+                service_type: "jellyfin".to_string(),
+            }]
+        );
+        assert!(servers.known.is_empty());
     }
 
     #[test]

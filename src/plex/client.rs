@@ -210,11 +210,6 @@ impl PlexClient {
         Self::new_with_route(server.url.as_str(), &server.access_token, server.route)
     }
 
-    /// The raw auth token.
-    pub fn auth_token(&self) -> &str {
-        &self.auth_token
-    }
-
     /// The base URL of the Plex server.
     pub fn base_url(&self) -> &Url {
         &self.base_url
@@ -505,7 +500,7 @@ async fn sign_in(username: &str, password: &str, sign_in_url: &str) -> BackendRe
 
     let sign_in: PlexSignInResponse =
         parse_remote_json("Failed to parse Plex sign-in response", &body)?;
-    info!(user = ?sign_in.user.username, "Plex sign-in successful");
+    info!("Plex sign-in successful");
     Ok(sign_in.user.auth_token)
 }
 

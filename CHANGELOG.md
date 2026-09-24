@@ -163,6 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receivers or Chromecasts that share a name no longer hide each other.
 - **macOS playback of protected streams** — The macOS app now bundles the HTTP support that server
   streams need, so they play on Macs without Homebrew.
+- **Server libraries load more reliably** — A Jellyfin server no longer fails to connect, and a
+  Plex library section is no longer skipped, when the server can't list its albums or artists;
+  Tributary now loads only the tracks. Large iTunes (DAAP) shares use less memory while loading.
+- **Internet radio when a directory server is down** — Radio views now try another Radio-Browser
+  server when one is unavailable, instead of always using the same one.
 
 ### Security
 
@@ -181,6 +186,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named by `SSLKEYLOGFILE`.
 - **TLS library update** — The TLS library was updated to fix a TLS 1.3 handshake-validation
   advisory (RUSTSEC-2026-0285).
+- **Jellyfin discovery and account names in logs** — A device on the network can no longer flood
+  the sidebar with fake Jellyfin servers or stop real ones from being marked as gone, and each
+  reply is checked against the address it advertises. Server account names and IDs are no longer
+  written to the log.
 
 ## [0.6.2] — 2026-09-01
 

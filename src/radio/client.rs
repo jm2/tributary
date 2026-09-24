@@ -1,14 +1,23 @@
 //! Bounded Radio-Browser and IP-geolocation HTTP clients.
 //!
-//! Construction is deliberately local and nonblocking. Radio-Browser's old
-//! mirror-discovery recommendation resolves a DNS name to IP addresses, but
-//! those addresses cannot be used as HTTPS authorities and the result did not
-//! identify a usable certificate-covered hostname. Tributary instead starts
-//! with one known HTTPS mirror and performs all network work inside lifecycle-
-//! owned, cancellable refresh tasks.
+//! Construction is local and nonblocking. The first station request fetches
+//! Radio-Browser's published mirror list (`/json/servers`), keeps only plain
+//! hostnames inside the `api.radio-browser.info` zone, shuffles them as the
+//! API documentation recommends, and appends a small fixed fallback list. If
+//! the mirror list cannot be fetched, the fallback list is used alone. The
+//! candidate list is fixed for the client's lifetime.
+//!
+//! Each station request tries at most [`MAX_MIRROR_ATTEMPTS`] mirrors, starting
+//! from the one that last succeeded, and fails over only on transport, timeout,
+//! HTTP-status, or parse failures. Every attempt keeps the per-request deadline
+//! and body bounds. All network work runs inside lifecycle-owned, cancellable
+//! refresh tasks.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use serde::Deserialize;
+use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -20,8 +29,20 @@ use super::api::{FreeIpApiResponse, GeoLocation, IpApiCoResponse, IpWhoIsRespons
 const DEFAULT_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 500;
 
-/// A certificate-covered Radio-Browser mirror known to support the JSON API.
-const RADIO_BROWSER_API_BASE: &str = "https://de1.api.radio-browser.info";
+/// Radio-Browser's documented mirror-list endpoint. Each entry's `name` is a
+/// certificate-covered HTTPS authority serving the full JSON API.
+const RADIO_BROWSER_SERVERS_URL: &str = "https://all.api.radio-browser.info/json/servers";
+/// Mirrors tried after the discovered ones, or alone when discovery fails.
+const FALLBACK_MIRROR_HOSTS: [&str; 2] =
+    ["de1.api.radio-browser.info", "de2.api.radio-browser.info"];
+/// DNS zone every accepted mirror hostname must belong to, so a mirror list
+/// can never direct requests to an unrelated host.
+const MIRROR_HOST_SUFFIX: &str = ".api.radio-browser.info";
+/// Bounds on the retained mirror list, its response body, and the mirrors
+/// tried for one station request.
+const MAX_MIRRORS: usize = 16;
+const MAX_MIRROR_LIST_BODY_BYTES: u64 = 64 * 1024;
+const MAX_MIRROR_ATTEMPTS: usize = 3;
 const USER_AGENT: &str = concat!("Tributary/", env!("CARGO_PKG_VERSION"));
 
 /// End-to-end deadline for headers and each finite response body.
@@ -81,6 +102,15 @@ impl RadioClientError {
             self
         }
     }
+
+    /// Whether another mirror could plausibly serve the same request.
+    /// Size-policy and local validation failures would repeat on every mirror.
+    const fn allows_mirror_failover(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::Transport | Self::HttpStatus | Self::Parse
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -98,9 +128,23 @@ impl RequestPolicy {
     };
 }
 
-/// Stateless client for finite Radio-Browser API requests.
+/// One entry of the `/json/servers` mirror list. The `ip` field is ignored:
+/// an address cannot serve as the HTTPS authority.
+#[derive(Deserialize)]
+struct MirrorEntry {
+    #[serde(default)]
+    name: String,
+}
+
+/// Client for finite Radio-Browser API requests with mirror failover.
 pub(super) struct RadioBrowserClient {
-    base_url: Url,
+    /// Mirror-list endpoint consulted once to populate `mirrors`; `None` when
+    /// the list was supplied at construction.
+    servers_url: Option<Url>,
+    /// Ordered, non-empty candidate API bases.
+    mirrors: OnceCell<Vec<Url>>,
+    /// Index into `mirrors` of the mirror that last served a request.
+    preferred_mirror: AtomicUsize,
     client: reqwest::Client,
     policy: RequestPolicy,
 }
@@ -108,15 +152,14 @@ pub(super) struct RadioBrowserClient {
 impl RadioBrowserClient {
     /// Construct a client without DNS or any other network operation.
     pub(super) fn new() -> Result<Self, RadioClientError> {
-        let base_url =
-            Url::parse(RADIO_BROWSER_API_BASE).map_err(|_| RadioClientError::ClientConstruction)?;
+        let servers_url = Url::parse(RADIO_BROWSER_SERVERS_URL)
+            .map_err(|_| RadioClientError::ClientConstruction)?;
         let client = public_http_client()?;
-        info!(
-            host = base_url.host_str(),
-            "Radio-Browser API client initialized"
-        );
+        info!("Radio-Browser API client initialized");
         Ok(Self {
-            base_url,
+            servers_url: Some(servers_url),
+            mirrors: OnceCell::new(),
+            preferred_mirror: AtomicUsize::new(0),
             client,
             policy: RequestPolicy::PRODUCTION,
         })
@@ -129,10 +172,34 @@ impl RadioBrowserClient {
 
     #[cfg(test)]
     fn with_test_policy(base_url: String, client: reqwest::Client, policy: RequestPolicy) -> Self {
+        Self::with_mirrors(&[base_url], client, policy)
+    }
+
+    /// Use exactly `base_urls`, in order, without mirror discovery.
+    #[cfg(test)]
+    fn with_mirrors(base_urls: &[String], client: reqwest::Client, policy: RequestPolicy) -> Self {
+        let mirrors: Vec<Url> = base_urls
+            .iter()
+            .map(|base_url| Url::parse(base_url).expect("fixture base URL"))
+            .collect();
         Self {
-            base_url: Url::parse(&base_url).expect("fixture base URL"),
+            servers_url: None,
+            mirrors: OnceCell::from(mirrors),
+            preferred_mirror: AtomicUsize::new(0),
             client,
             policy,
+        }
+    }
+
+    /// Discover mirrors through `servers_url` instead of the production list.
+    #[cfg(test)]
+    fn with_mirror_discovery(servers_url: &str, client: reqwest::Client) -> Self {
+        Self {
+            servers_url: Some(Url::parse(servers_url).expect("fixture servers URL")),
+            mirrors: OnceCell::new(),
+            preferred_mirror: AtomicUsize::new(0),
+            client,
+            policy: RequestPolicy::PRODUCTION,
         }
     }
 
@@ -140,16 +207,16 @@ impl RadioBrowserClient {
         &self,
         limit: Option<u32>,
     ) -> Result<Vec<RadioStation>, RadioClientError> {
-        let url = self.station_url("json/stations/topclick", limit, &[])?;
-        self.fetch_stations(url).await
+        self.fetch_stations("json/stations/topclick", limit, &[])
+            .await
     }
 
     pub(super) async fn fetch_top_vote(
         &self,
         limit: Option<u32>,
     ) -> Result<Vec<RadioStation>, RadioClientError> {
-        let url = self.station_url("json/stations/topvote", limit, &[])?;
-        self.fetch_stations(url).await
+        self.fetch_stations("json/stations/topvote", limit, &[])
+            .await
     }
 
     /// Fetch the coordinate tier used by Near Me.
@@ -168,8 +235,8 @@ impl RadioBrowserClient {
             ("order", "geo_distance"),
             ("has_geo_info", "true"),
         ];
-        let url = self.station_url("json/stations/search", limit, &filters)?;
-        self.fetch_stations(url).await
+        self.fetch_stations("json/stations/search", limit, &filters)
+            .await
     }
 
     /// Fetch the coordinate tier constrained to a country.
@@ -191,8 +258,8 @@ impl RadioBrowserClient {
             ("has_geo_info", "true"),
             ("countrycode", country_code),
         ];
-        let url = self.station_url("json/stations/search", limit, &filters)?;
-        self.fetch_stations(url).await
+        self.fetch_stations("json/stations/search", limit, &filters)
+            .await
     }
 
     /// Fetch the state/province tier, including stations without coordinates.
@@ -210,8 +277,8 @@ impl RadioBrowserClient {
             ("order", "votes"),
             ("reverse", "true"),
         ];
-        let url = self.station_url("json/stations/search", limit, &filters)?;
-        self.fetch_stations(url).await
+        self.fetch_stations("json/stations/search", limit, &filters)
+            .await
     }
 
     /// Fetch the country fallback tier, including stations without location
@@ -227,34 +294,78 @@ impl RadioBrowserClient {
             ("order", "votes"),
             ("reverse", "true"),
         ];
-        let url = self.station_url("json/stations/search", limit, &filters)?;
-        self.fetch_stations(url).await
+        self.fetch_stations("json/stations/search", limit, &filters)
+            .await
     }
 
-    fn station_url(
+    /// The candidate mirrors, fetching the published list on first use.
+    async fn mirrors(&self) -> &[Url] {
+        self.mirrors
+            .get_or_init(|| async {
+                let discovered = match &self.servers_url {
+                    Some(servers_url) => {
+                        // Boxed so every station-view future stays small.
+                        match Box::pin(fetch_mirror_hosts(
+                            &self.client,
+                            servers_url.clone(),
+                            self.policy,
+                        ))
+                        .await
+                        {
+                            Ok(hosts) => hosts,
+                            Err(error) => {
+                                warn!(
+                                    category = ?error,
+                                    "Radio-Browser mirror list unavailable; using fallback mirrors"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => Vec::new(),
+                };
+                let mirrors = mirror_candidates(discovered);
+                info!(mirrors = mirrors.len(), "Radio-Browser mirror list ready");
+                mirrors
+            })
+            .await
+    }
+
+    /// Fetch one station view, failing over across a bounded number of
+    /// mirrors and remembering the mirror that served it.
+    async fn fetch_stations(
         &self,
         path: &str,
         limit: Option<u32>,
         filters: &[(&str, &str)],
-    ) -> Result<Url, RadioClientError> {
-        let mut url = self
-            .base_url
-            .join(path)
-            .map_err(|_| RadioClientError::ClientConstruction)?;
-        let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        {
-            let mut query = url.query_pairs_mut();
-            for (key, value) in filters {
-                query.append_pair(key, value);
-            }
-            query
-                .append_pair("limit", &limit.to_string())
-                .append_pair("hidebroken", "true");
+    ) -> Result<Vec<RadioStation>, RadioClientError> {
+        let mirrors = self.mirrors().await;
+        if mirrors.is_empty() {
+            return Err(RadioClientError::ClientConstruction);
         }
-        Ok(url)
+        let start = self.preferred_mirror.load(Ordering::Relaxed) % mirrors.len();
+        let mut failure: Option<RadioClientError> = None;
+        for offset in 0..mirrors.len().min(MAX_MIRROR_ATTEMPTS) {
+            let index = (start + offset) % mirrors.len();
+            let url = station_url(&mirrors[index], path, limit, filters)?;
+            // Boxed so the retry loop does not inline one request future per
+            // caller into every station-view future.
+            match Box::pin(self.fetch_stations_from(url)).await {
+                Ok(stations) => {
+                    self.preferred_mirror.store(index, Ordering::Relaxed);
+                    return Ok(stations);
+                }
+                Err(error) if error.allows_mirror_failover() => {
+                    debug!(category = ?error, "Radio-Browser mirror failed");
+                    failure = Some(failure.map_or(error, |previous| previous.prefer(error)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(failure.unwrap_or(RadioClientError::Transport))
     }
 
-    async fn fetch_stations(&self, url: Url) -> Result<Vec<RadioStation>, RadioClientError> {
+    async fn fetch_stations_from(&self, url: Url) -> Result<Vec<RadioStation>, RadioClientError> {
         debug!("Fetching a Radio-Browser station view");
         let response = send_bounded(&self.client, url, self.policy.timeout).await?;
         let body = read_bounded(
@@ -276,6 +387,87 @@ impl RadioBrowserClient {
         info!(count = stations.len(), "Radio-Browser station view fetched");
         Ok(stations)
     }
+}
+
+fn station_url(
+    base_url: &Url,
+    path: &str,
+    limit: Option<u32>,
+    filters: &[(&str, &str)],
+) -> Result<Url, RadioClientError> {
+    let mut url = base_url
+        .join(path)
+        .map_err(|_| RadioClientError::ClientConstruction)?;
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in filters {
+            query.append_pair(key, value);
+        }
+        query
+            .append_pair("limit", &limit.to_string())
+            .append_pair("hidebroken", "true");
+    }
+    Ok(url)
+}
+
+/// Fetch and validate the published mirror hostnames, in response order.
+async fn fetch_mirror_hosts(
+    client: &reqwest::Client,
+    servers_url: Url,
+    policy: RequestPolicy,
+) -> Result<Vec<String>, RadioClientError> {
+    let response = send_bounded(client, servers_url, policy.timeout).await?;
+    let body = read_bounded(response, MAX_MIRROR_LIST_BODY_BYTES, policy.timeout).await?;
+    parse_mirror_hosts(&body)
+}
+
+/// Keep at most [`MAX_MIRRORS`] distinct, valid mirror hostnames. The list
+/// carries one entry per address, so the same name normally repeats.
+fn parse_mirror_hosts(body: &[u8]) -> Result<Vec<String>, RadioClientError> {
+    let entries: Vec<MirrorEntry> =
+        serde_json::from_slice(body).map_err(|_| RadioClientError::Parse)?;
+    let mut hosts = Vec::new();
+    for entry in entries {
+        let host = entry.name.to_ascii_lowercase();
+        if is_mirror_host(&host) && !hosts.contains(&host) {
+            hosts.push(host);
+            if hosts.len() == MAX_MIRRORS {
+                break;
+            }
+        }
+    }
+    Ok(hosts)
+}
+
+/// Accept exactly one lowercase DNS label directly under
+/// [`MIRROR_HOST_SUFFIX`]. This rejects addresses, user-info, ports, paths,
+/// and every host outside the Radio-Browser API zone.
+fn is_mirror_host(host: &str) -> bool {
+    host.strip_suffix(MIRROR_HOST_SUFFIX).is_some_and(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
+}
+
+/// Shuffle the discovered mirrors, then append the fallback mirrors not
+/// already present. The result is never empty.
+fn mirror_candidates(mut discovered: Vec<String>) -> Vec<Url> {
+    fastrand::shuffle(&mut discovered);
+    for fallback in FALLBACK_MIRROR_HOSTS {
+        if !discovered.iter().any(|host| host == fallback) {
+            discovered.push(fallback.to_string());
+        }
+    }
+    discovered
+        .iter()
+        .filter_map(|host| Url::parse(&format!("https://{host}/")).ok())
+        .collect()
 }
 
 fn public_http_client() -> Result<reqwest::Client, RadioClientError> {
@@ -546,12 +738,219 @@ mod tests {
     }
 
     #[test]
-    fn construction_is_local_and_selects_a_known_https_authority() {
+    fn construction_is_local_and_defers_mirror_discovery() {
         let client = RadioBrowserClient::new().expect("construct client without network");
+        assert!(client.mirrors.get().is_none());
         assert_eq!(
-            client.base_url.as_str(),
-            "https://de1.api.radio-browser.info/"
+            client.servers_url.as_ref().map(Url::as_str),
+            Some("https://all.api.radio-browser.info/json/servers")
         );
+    }
+
+    #[test]
+    fn mirror_list_keeps_only_distinct_hosts_in_the_api_zone() {
+        let body = serde_json::json!([
+            {"ip": "192.0.2.1", "name": "de1.api.radio-browser.info"},
+            {"ip": "2001:db8::1", "name": "de1.api.radio-browser.info"},
+            {"ip": "192.0.2.2", "name": "NL1.API.Radio-Browser.Info"},
+            {"ip": "192.0.2.3", "name": "192.0.2.3"},
+            {"ip": "192.0.2.4", "name": "mirror.example.test"},
+            {"ip": "192.0.2.5", "name": "de1.api.radio-browser.info.example.test"},
+            {"ip": "192.0.2.6", "name": "user@de2.api.radio-browser.info"},
+            {"ip": "192.0.2.7", "name": "de2.api.radio-browser.info:8443"},
+            {"ip": "192.0.2.8", "name": "a.b.api.radio-browser.info"},
+            {"ip": "192.0.2.9", "name": "-x.api.radio-browser.info"},
+            {"ip": "192.0.2.10", "name": ".api.radio-browser.info"},
+            {"ip": "192.0.2.11"}
+        ]);
+        let hosts = parse_mirror_hosts(body.to_string().as_bytes()).expect("mirror list");
+        assert_eq!(
+            hosts,
+            ["de1.api.radio-browser.info", "nl1.api.radio-browser.info"]
+        );
+
+        let many: Vec<_> = (0..MAX_MIRRORS + 4)
+            .map(|index| serde_json::json!({"name": format!("m{index}.api.radio-browser.info")}))
+            .collect();
+        let hosts = parse_mirror_hosts(serde_json::Value::from(many).to_string().as_bytes())
+            .expect("long mirror list");
+        assert_eq!(hosts.len(), MAX_MIRRORS);
+
+        assert_eq!(
+            parse_mirror_hosts(b"not JSON"),
+            Err(RadioClientError::Parse)
+        );
+    }
+
+    #[test]
+    fn mirror_candidates_append_missing_fallbacks_after_discovered_hosts() {
+        let candidates = mirror_candidates(vec![
+            "nl1.api.radio-browser.info".to_string(),
+            "de1.api.radio-browser.info".to_string(),
+        ]);
+        let hosts: Vec<_> = candidates.iter().filter_map(Url::host_str).collect();
+        assert_eq!(hosts.len(), 3);
+        assert!(hosts[..2].contains(&"nl1.api.radio-browser.info"));
+        assert!(hosts[..2].contains(&"de1.api.radio-browser.info"));
+        assert_eq!(hosts[2], "de2.api.radio-browser.info");
+        assert!(candidates.iter().all(|url| url.scheme() == "https"));
+
+        let fallback: Vec<_> = mirror_candidates(Vec::new())
+            .iter()
+            .map(Url::to_string)
+            .collect();
+        assert_eq!(
+            fallback,
+            [
+                "https://de1.api.radio-browser.info/",
+                "https://de2.api.radio-browser.info/"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_discovery_runs_once_and_falls_back_when_unavailable() {
+        let listed = MockHttpService::start(vec![MockRoute::get("/json/servers").reply(
+            MockResponse::json(serde_json::json!([
+                {"ip": "192.0.2.1", "name": "fi1.api.radio-browser.info"},
+                {"ip": "192.0.2.2", "name": "mirror.example.test"}
+            ])),
+        )])
+        .await;
+        let client = RadioBrowserClient::with_mirror_discovery(
+            &format!("{}/json/servers", listed.base_url()),
+            fixture_client(),
+        );
+        let hosts: Vec<_> = client
+            .mirrors()
+            .await
+            .iter()
+            .filter_map(Url::host_str)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            hosts,
+            [
+                "fi1.api.radio-browser.info",
+                "de1.api.radio-browser.info",
+                "de2.api.radio-browser.info"
+            ]
+        );
+        // The candidate list is cached: a second lookup makes no request.
+        assert_eq!(client.mirrors().await.len(), 3);
+        listed.finish().await;
+
+        let unavailable = MockHttpService::start(vec![MockRoute::get("/json/servers")
+            .reply(MockResponse::status(StatusCode::SERVICE_UNAVAILABLE))])
+        .await;
+        let client = RadioBrowserClient::with_mirror_discovery(
+            &format!("{}/json/servers", unavailable.base_url()),
+            fixture_client(),
+        );
+        let hosts: Vec<_> = client
+            .mirrors()
+            .await
+            .iter()
+            .filter_map(Url::host_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            ["de1.api.radio-browser.info", "de2.api.radio-browser.info"]
+        );
+        unavailable.finish().await;
+    }
+
+    #[tokio::test]
+    async fn station_requests_fail_over_and_remember_the_working_mirror() {
+        let failing = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+            .with_query("limit", "1")
+            .reply(MockResponse::status(StatusCode::SERVICE_UNAVAILABLE))])
+        .await;
+        let working = MockHttpService::start(vec![
+            MockRoute::get("/json/stations/topclick")
+                .with_query("limit", "1")
+                .reply(MockResponse::json(serde_json::json!([station(
+                    "second-mirror",
+                    "https://stream.example.test/live"
+                )]))),
+            MockRoute::get("/json/stations/topvote")
+                .with_query("limit", "1")
+                .reply(MockResponse::json(serde_json::json!([]))),
+        ])
+        .await;
+        let client = RadioBrowserClient::with_mirrors(
+            &[failing.base_url(), working.base_url()],
+            fixture_client(),
+            RequestPolicy::PRODUCTION,
+        );
+
+        let stations = client
+            .fetch_top_click(Some(1))
+            .await
+            .expect("second mirror serves the view");
+        assert_eq!(stations[0].stationuuid, "second-mirror");
+        // The next request starts at the mirror that last succeeded, so the
+        // failing mirror sees exactly one request.
+        assert!(client
+            .fetch_top_vote(Some(1))
+            .await
+            .expect("remembered mirror serves the next view")
+            .is_empty());
+        failing.finish().await;
+        working.finish().await;
+    }
+
+    #[tokio::test]
+    async fn failover_is_bounded_and_skips_non_transient_failures() {
+        let oversized = MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+            .with_query("limit", "1")
+            .reply(MockResponse::text("x".repeat(256)))])
+        .await;
+        let unused = MockHttpService::start(Vec::new()).await;
+        let policy = RequestPolicy {
+            max_station_body_bytes: 128,
+            ..RequestPolicy::PRODUCTION
+        };
+        let client = RadioBrowserClient::with_mirrors(
+            &[oversized.base_url(), unused.base_url()],
+            fixture_client(),
+            policy,
+        );
+        assert_eq!(
+            client.fetch_top_click(Some(1)).await.map(|_| ()),
+            Err(RadioClientError::BodyLimit)
+        );
+        assert!(unused.requests().is_empty());
+        oversized.finish().await;
+        unused.finish().await;
+
+        let mut mirrors = Vec::new();
+        for _ in 0..MAX_MIRROR_ATTEMPTS {
+            mirrors.push(
+                MockHttpService::start(vec![MockRoute::get("/json/stations/topclick")
+                    .with_query("limit", "1")
+                    .reply(MockResponse::status(StatusCode::BAD_GATEWAY))])
+                .await,
+            );
+        }
+        // One mirror beyond the attempt bound must never be contacted.
+        mirrors.push(MockHttpService::start(Vec::new()).await);
+        let client = RadioBrowserClient::with_mirrors(
+            &mirrors
+                .iter()
+                .map(MockHttpService::base_url)
+                .collect::<Vec<_>>(),
+            fixture_client(),
+            RequestPolicy::PRODUCTION,
+        );
+        assert_eq!(
+            client.fetch_top_click(Some(1)).await.map(|_| ()),
+            Err(RadioClientError::HttpStatus)
+        );
+        assert!(mirrors[MAX_MIRROR_ATTEMPTS].requests().is_empty());
+        for mirror in mirrors {
+            mirror.finish().await;
+        }
     }
 
     #[tokio::test]

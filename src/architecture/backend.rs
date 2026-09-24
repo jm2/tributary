@@ -7,14 +7,10 @@
 //! integration.
 
 use async_trait::async_trait;
-use uuid::Uuid;
 
 use super::error::BackendError;
 use super::identity::TrackId;
-use super::models::{
-    Album, Artist, LibraryStats, Rating, RatingCapability, SearchResults, SortField, SortOrder,
-    Track,
-};
+use super::models::{Rating, RatingCapability, Track};
 
 /// The result type used throughout backend operations.
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -67,35 +63,6 @@ pub async fn load_track_catalog(backend: &dyn MediaBackend) -> BackendResult<Vec
 ///   unreachable").
 #[async_trait]
 pub trait MediaBackend: Send + Sync {
-    // -------------------------------------------------------------------
-    // Identity & Lifecycle
-    // -------------------------------------------------------------------
-
-    /// Human-readable display name for this backend.
-    ///
-    /// Examples: `"Local Library"`, `"Navidrome (home)"`, `"Living Room DAAP"`.
-    fn name(&self) -> &str;
-
-    /// A short, machine-readable identifier for the backend type.
-    ///
-    /// Examples: `"local"`, `"subsonic"`, `"daap"`, `"jellyfin"`.
-    fn backend_type(&self) -> &str;
-
-    /// Test connectivity and/or availability of the backend.
-    ///
-    /// For a local backend this might verify the database is accessible;
-    /// for a remote backend it issues a lightweight health-check request.
-    async fn ping(&self) -> BackendResult<()>;
-
-    // -------------------------------------------------------------------
-    // Search
-    // -------------------------------------------------------------------
-
-    /// Full-text search across tracks, albums, and artists.
-    ///
-    /// The `limit` parameter caps the number of results per entity type.
-    async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults>;
-
     /// Retrieve the complete track catalogue for publication to the UI.
     ///
     /// Implementations backed by a remote in-memory cache return its current
@@ -128,35 +95,14 @@ pub trait MediaBackend: Send + Sync {
             operation: "write track ratings".to_string(),
         })
     }
-
-    // -------------------------------------------------------------------
-    // Browsing
-    // -------------------------------------------------------------------
-
-    /// Retrieve all albums, optionally sorted.
-    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>>;
-
-    /// Retrieve all artists.
-    async fn list_artists(&self) -> BackendResult<Vec<Artist>>;
-
-    /// Retrieve every track belonging to a specific album.
-    async fn get_album_tracks(&self, album_id: &Uuid) -> BackendResult<Vec<Track>>;
-
-    /// Retrieve every track belonging to a specific artist.
-    async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>>;
-
-    // -------------------------------------------------------------------
-    // Statistics
-    // -------------------------------------------------------------------
-
-    /// Aggregate library statistics for this backend.
-    async fn get_stats(&self) -> BackendResult<LibraryStats>;
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    use uuid::Uuid;
 
     use super::*;
 
@@ -168,22 +114,6 @@ mod tests {
 
     #[async_trait]
     impl MediaBackend for CatalogSpy {
-        fn name(&self) -> &str {
-            "catalog-spy"
-        }
-
-        fn backend_type(&self) -> &str {
-            "test"
-        }
-
-        async fn ping(&self) -> BackendResult<()> {
-            unreachable!("catalog publication must not ping the backend")
-        }
-
-        async fn search(&self, _query: &str, _limit: usize) -> BackendResult<SearchResults> {
-            unreachable!("catalog publication must not search the backend")
-        }
-
         async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.tracks.clone())
@@ -191,30 +121,6 @@ mod tests {
 
         fn rating_capability(&self) -> RatingCapability {
             self.rating_capability
-        }
-
-        async fn list_albums(
-            &self,
-            _sort: SortField,
-            _order: SortOrder,
-        ) -> BackendResult<Vec<Album>> {
-            unreachable!("catalog publication must not list albums")
-        }
-
-        async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-            unreachable!("catalog publication must not list artists")
-        }
-
-        async fn get_album_tracks(&self, _album_id: &Uuid) -> BackendResult<Vec<Track>> {
-            unreachable!("catalog publication must not resolve an album")
-        }
-
-        async fn get_artist_tracks(&self, _artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-            unreachable!("catalog publication must not resolve an artist")
-        }
-
-        async fn get_stats(&self) -> BackendResult<LibraryStats> {
-            unreachable!("catalog publication must not query statistics")
         }
     }
 

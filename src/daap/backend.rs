@@ -34,12 +34,6 @@ use crate::source_registry::PlaybackAttributionProfile;
 struct LibraryCache {
     scope: Option<DaapCatalogueScope>,
     tracks: Vec<Track>,
-    albums: Vec<Album>,
-    artists: Vec<Artist>,
-    /// Tributary UUID → index in `tracks`.
-    track_by_uuid: HashMap<Uuid, usize>,
-    /// Tributary UUID → DAAP item ID.
-    track_to_daap_id: HashMap<Uuid, u32>,
     /// DAAP item ID → server-declared stream format. The raw `Option` is
     /// preserved: `None` means the server never declared `asfm`, and the
     /// resolved representation must stay explicitly unknown instead of
@@ -55,10 +49,6 @@ impl LibraryCache {
         Self {
             scope: None,
             tracks: Vec::new(),
-            albums: Vec::new(),
-            artists: Vec::new(),
-            track_by_uuid: HashMap::new(),
-            track_to_daap_id: HashMap::new(),
             format_by_daap_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
         }
@@ -75,7 +65,6 @@ impl LibraryCache {
 /// session enters the central lifecycle registry immediately after `mlid` is
 /// parsed and before update/database/items work begins.
 pub struct DaapBackend {
-    display_name: String,
     client: DaapClient,
     cache: RwLock<LibraryCache>,
 }
@@ -84,28 +73,21 @@ impl DaapBackend {
     /// Login to a DAAP server and return the first close-capable adapter.
     ///
     /// # Arguments
-    /// * `name` — display name for the sidebar (e.g. "Living Room DAAP")
     /// * `server_url` — base URL including scheme (e.g. `http://192.168.1.50:3689`)
     /// * `password` — optional share password
-    pub async fn login(
-        name: &str,
-        server_url: &str,
-        password: Option<&str>,
-    ) -> BackendResult<Self> {
-        Self::login_with_route(name, server_url, password, None).await
+    pub async fn login(server_url: &str, password: Option<&str>) -> BackendResult<Self> {
+        Self::login_with_route(server_url, password, None).await
     }
 
     /// Connect through a retained mDNS route without replacing the advertised
     /// hostname in the DAAP origin.
     pub(crate) async fn login_with_route(
-        name: &str,
         server_url: &str,
         password: Option<&str>,
         advertised_route: Option<AdvertisedHttpRoute>,
     ) -> BackendResult<Self> {
         let client = DaapClient::login_with_route(server_url, password, advertised_route).await?;
         Ok(Self {
-            display_name: name.to_string(),
             client,
             cache: RwLock::new(LibraryCache::empty()),
         })
@@ -119,17 +101,11 @@ impl DaapBackend {
         let mlit_items = self.client.fetch_tracks(scope).await?;
 
         let mut all_tracks = Vec::new();
-        let mut track_by_uuid = HashMap::new();
-        let mut track_to_daap_id = HashMap::new();
         let mut format_by_daap_id = HashMap::new();
         let mut attribution_profiles = HashMap::new();
 
-        // Aggregation maps for artists and albums.
-        // Key: name (lowercased for dedup), Value: (display_name, metadata).
-        let mut artist_map: HashMap<String, ArtistAgg> = HashMap::new();
-        let mut album_map: HashMap<(String, String), AlbumAgg> = HashMap::new();
-
-        for nodes in &mlit_items {
+        for nodes in mlit_items {
+            let nodes = nodes.as_slice();
             let Some(daap_id) = dmap::find_u32(nodes, b"miid") else {
                 continue; // Skip items without an ID.
             };
@@ -170,16 +146,16 @@ impl DaapBackend {
                 id: track_uuid,
                 native_track_id: native_track_id.clone(),
                 title,
-                artist_name: artist_name.clone(),
+                artist_name,
                 album_artist_name: None,
                 artist_id: Some(artist_uuid),
-                album_title: album_title.clone(),
+                album_title,
                 album_id: Some(album_uuid),
                 track_number: track_number.map(u32::from),
                 disc_number: disc_number.map(u32::from),
                 duration_secs,
                 composer: None,
-                genre: genre.clone(),
+                genre,
                 year: year.map(i32::from),
                 file_path: None,
                 stream_url: None,
@@ -194,18 +170,15 @@ impl DaapBackend {
                 last_played: None,
             };
 
-            let idx = all_tracks.len();
-            track_by_uuid.insert(track_uuid, idx);
-            track_to_daap_id.insert(track_uuid, daap_id);
             // Attribution provenance is frozen from the raw accepted row
             // before the display fallbacks above substitute any "Unknown",
             // so a synthesized fallback can never become attribution
             // authority.
             if let Some(track_id) = &native_track_id {
                 if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
-                    raw_title.clone(),
-                    raw_artist_name.clone(),
-                    raw_album_title.clone(),
+                    raw_title,
+                    raw_artist_name,
+                    raw_album_title,
                     None,
                     track_number.map(u32::from),
                     duration_secs,
@@ -214,79 +187,14 @@ impl DaapBackend {
                 }
             }
             all_tracks.push(track);
-
-            // ── Aggregate artist ────────────────────────────────────
-            let artist_key = artist_name.to_lowercase();
-            let agg = artist_map.entry(artist_key).or_insert_with(|| ArtistAgg {
-                display_name: artist_name.clone(),
-                uuid: artist_uuid,
-                album_names: std::collections::HashSet::new(),
-                track_count: 0,
-            });
-            agg.track_count += 1;
-            if !album_title.is_empty() {
-                agg.album_names.insert(album_title.to_lowercase());
-            }
-
-            // ── Aggregate album ─────────────────────────────────────
-            let album_key = (album_title.to_lowercase(), artist_name.to_lowercase());
-            let album_agg = album_map.entry(album_key).or_insert_with(|| AlbumAgg {
-                display_title: album_title,
-                display_artist: artist_name,
-                uuid: album_uuid,
-                artist_uuid,
-                year: year.map(i32::from),
-                genre,
-                track_count: 0,
-                total_duration_secs: 0,
-            });
-            album_agg.track_count += 1;
-            album_agg.total_duration_secs += duration_secs.unwrap_or(0);
         }
 
-        // ── Build Artist models ─────────────────────────────────────
-        let all_artists: Vec<Artist> = artist_map
-            .into_values()
-            .map(|agg| Artist {
-                id: agg.uuid,
-                name: agg.display_name,
-                album_count: agg.album_names.len() as u32,
-                track_count: agg.track_count,
-                cover_art_url: None,
-            })
-            .collect();
-
-        // ── Build Album models ──────────────────────────────────────
-        let all_albums: Vec<Album> = album_map
-            .into_values()
-            .map(|agg| Album {
-                id: agg.uuid,
-                title: agg.display_title,
-                artist_name: agg.display_artist,
-                artist_id: Some(agg.artist_uuid),
-                year: agg.year,
-                genre: agg.genre,
-                cover_art_url: None,
-                track_count: agg.track_count,
-                total_duration_secs: Some(agg.total_duration_secs),
-            })
-            .collect();
-
-        info!(
-            tracks = all_tracks.len(),
-            albums = all_albums.len(),
-            artists = all_artists.len(),
-            "DAAP library loaded"
-        );
+        info!(tracks = all_tracks.len(), "DAAP library loaded");
 
         let mut cache = self.cache.write().await;
         *cache = LibraryCache {
             scope: Some(scope),
             tracks: all_tracks,
-            albums: all_albums,
-            artists: all_artists,
-            track_by_uuid,
-            track_to_daap_id,
             format_by_daap_id,
             attribution_profiles,
         };
@@ -320,29 +228,6 @@ impl DaapBackend {
             return Err(unavailable_catalogue());
         }
         self.client.cover_art_request(scope, song_id)
-    }
-
-    /// Resolve a cached application track ID for DAAP lifecycle tests.
-    /// Production playback instead carries pathless `(SourceId, TrackId,
-    /// session epoch)` identity through the central lifecycle registry.
-    #[cfg(test)]
-    pub(super) async fn stream_request_for_track(
-        &self,
-        track_id: &Uuid,
-    ) -> BackendResult<ResolvedHttpRequest> {
-        let cache = self.cache.read().await;
-        let song_id =
-            cache
-                .track_to_daap_id
-                .get(track_id)
-                .ok_or_else(|| BackendError::NotFound {
-                    entity_type: "track".into(),
-                    id: *track_id,
-                })?;
-        let idx = cache.track_by_uuid[track_id];
-        let format = cache.tracks[idx].format.as_deref();
-        let scope = cache.scope.ok_or_else(unavailable_catalogue)?;
-        self.client.stream_request(scope, *song_id, format)
     }
 
     /// Return the exact Last.fm attribution profile retained for one accepted
@@ -447,59 +332,6 @@ impl LifecycleAdapter for DaapBackend {
 
 #[async_trait]
 impl crate::architecture::MediaBackend for DaapBackend {
-    fn name(&self) -> &str {
-        &self.display_name
-    }
-
-    fn backend_type(&self) -> &str {
-        "daap"
-    }
-
-    async fn ping(&self) -> BackendResult<()> {
-        self.client.ping().await
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults> {
-        let cache = self.cache.read().await;
-        let q = query.to_lowercase();
-
-        let tracks: Vec<Track> = cache
-            .tracks
-            .iter()
-            .filter(|t| {
-                t.title.to_lowercase().contains(&q)
-                    || t.artist_name.to_lowercase().contains(&q)
-                    || t.album_title.to_lowercase().contains(&q)
-            })
-            .take(limit)
-            .cloned()
-            .collect();
-
-        let albums: Vec<Album> = cache
-            .albums
-            .iter()
-            .filter(|a| {
-                a.title.to_lowercase().contains(&q) || a.artist_name.to_lowercase().contains(&q)
-            })
-            .take(limit)
-            .cloned()
-            .collect();
-
-        let artists: Vec<Artist> = cache
-            .artists
-            .iter()
-            .filter(|a| a.name.to_lowercase().contains(&q))
-            .take(limit)
-            .cloned()
-            .collect();
-
-        Ok(SearchResults {
-            tracks,
-            albums,
-            artists,
-        })
-    }
-
     async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
         Ok(self.cache.read().await.tracks.clone())
     }
@@ -507,87 +339,6 @@ impl crate::architecture::MediaBackend for DaapBackend {
     fn rating_capability(&self) -> RatingCapability {
         RatingCapability::Unsupported
     }
-
-    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
-        let cache = self.cache.read().await;
-        let mut albums = cache.albums.clone();
-
-        albums.sort_by(|a, b| {
-            let cmp = match sort {
-                SortField::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                SortField::Artist => a
-                    .artist_name
-                    .to_lowercase()
-                    .cmp(&b.artist_name.to_lowercase()),
-                SortField::Year => a.year.cmp(&b.year),
-                _ => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-            };
-            match order {
-                SortOrder::Ascending => cmp,
-                SortOrder::Descending => cmp.reverse(),
-            }
-        });
-
-        Ok(albums)
-    }
-
-    async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-        Ok(self.cache.read().await.artists.clone())
-    }
-
-    async fn get_album_tracks(&self, album_id: &Uuid) -> BackendResult<Vec<Track>> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .tracks
-            .iter()
-            .filter(|t| t.album_id.as_ref() == Some(album_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .tracks
-            .iter()
-            .filter(|t| t.artist_id.as_ref() == Some(artist_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_stats(&self) -> BackendResult<LibraryStats> {
-        let cache = self.cache.read().await;
-        let total_duration: u64 = cache.tracks.iter().filter_map(|t| t.duration_secs).sum();
-
-        Ok(LibraryStats {
-            total_tracks: cache.tracks.len() as u64,
-            total_albums: cache.albums.len() as u64,
-            total_artists: cache.artists.len() as u64,
-            total_duration_secs: total_duration,
-        })
-    }
-}
-
-// ── Aggregation helpers ─────────────────────────────────────────────────
-
-/// Temporary aggregation state for building `Artist` models.
-struct ArtistAgg {
-    display_name: String,
-    uuid: Uuid,
-    album_names: std::collections::HashSet<String>,
-    track_count: u32,
-}
-
-/// Temporary aggregation state for building `Album` models.
-struct AlbumAgg {
-    display_title: String,
-    display_artist: String,
-    uuid: Uuid,
-    artist_uuid: Uuid,
-    year: Option<i32>,
-    genre: Option<String>,
-    track_count: u32,
-    total_duration_secs: u64,
 }
 
 // ── UUID helpers ────────────────────────────────────────────────────────
@@ -621,7 +372,6 @@ mod tests {
             .format_by_daap_id
             .insert(song_id, format.map(str::to_string));
         DaapBackend {
-            display_name: "descriptor fixture".to_string(),
             client: DaapClient::for_adapter_tests("http://198.51.100.10:3689/"),
             cache: RwLock::new(cache),
         }

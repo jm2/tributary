@@ -1,8 +1,8 @@
 //! `MediaBackend` implementation for Plex servers.
 //!
 //! Connects to a Plex instance, discovers music libraries, fetches
-//! the full track/album/artist catalogue into an in-memory cache, and
-//! exposes it through the unified `MediaBackend` trait.
+//! the full track catalogue into an in-memory cache, and exposes it through
+//! the unified `MediaBackend` trait.
 
 use std::collections::HashMap;
 
@@ -19,8 +19,7 @@ use crate::architecture::{
 };
 
 use super::api::{
-    PlexAlbum, PlexAlbumsResponse, PlexArtist, PlexArtistsResponse, PlexIdentityResponse,
-    PlexMedia, PlexPart, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
+    PlexIdentityResponse, PlexMedia, PlexPart, PlexSectionsResponse, PlexTrack, PlexTracksResponse,
 };
 use super::client::PlexClient;
 use crate::source_registry::PlaybackAttributionProfile;
@@ -45,8 +44,6 @@ pub struct MusicLibrary {
     pub key: String,
     /// Human-readable library name (e.g. "Music", "Vinyl Rips").
     pub name: String,
-    /// Server-assigned UUID for this section, if available.
-    pub uuid: Option<String>,
 }
 
 // ── In-memory cache ─────────────────────────────────────────────────────
@@ -63,8 +60,6 @@ struct PlexStreamSource {
 
 struct LibraryCache {
     tracks: Vec<Track>,
-    albums: Vec<Album>,
-    artists: Vec<Artist>,
     /// Exact Plex rating key → selected stream source.
     stream_source_by_track_id: HashMap<TrackId, PlexStreamSource>,
     /// Exact Plex rating key → thumbnail path.
@@ -78,8 +73,6 @@ impl LibraryCache {
     fn empty() -> Self {
         Self {
             tracks: Vec::new(),
-            albums: Vec::new(),
-            artists: Vec::new(),
             stream_source_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
@@ -161,7 +154,6 @@ impl PlexBackend {
             .map(|dir| MusicLibrary {
                 key: dir.key,
                 name: dir.title,
-                uuid: dir.uuid,
             })
             .collect();
 
@@ -188,8 +180,6 @@ impl PlexBackend {
         info!("Fetching Plex library...");
 
         let mut all_tracks = Vec::new();
-        let mut all_albums = Vec::new();
-        let mut all_artists = Vec::new();
         let mut skipped_unplayable_tracks = 0usize;
         let mut stream_source_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
@@ -198,16 +188,11 @@ impl PlexBackend {
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
 
-            // Fetch tracks, albums and artists for this section, paging
-            // through each listing with `X-Plex-Container-Start` /
-            // `X-Plex-Container-Size` (Plex caps the items returned per
-            // request).  A failure in any single call is logged and skips
-            // ONLY this section, so other music libraries still load — one
-            // flaky/transient section must not discard the entire
-            // multi-library catalogue (the Subsonic backend already
-            // tolerates per-item failures this way).  Fetch all three before
-            // accumulating so a mid-section failure never leaves the section
-            // half-populated.
+            // Fetch this section's tracks, paging through the listing with
+            // `X-Plex-Container-Start` / `X-Plex-Container-Size` (Plex caps
+            // the items returned per request). A failure is logged and skips
+            // ONLY this section, so other music libraries still load, and a
+            // section is accumulated only after its whole listing arrived.
             let tracks: Vec<PlexTrack> = match self
                 .fetch_all_pages::<PlexTracksResponse, _>(&section_endpoint, "10", &lib.name, |r| {
                     let c = r.media_container;
@@ -226,43 +211,6 @@ impl PlexBackend {
                 }
             };
 
-            let albums: Vec<PlexAlbum> = match self
-                .fetch_all_pages::<PlexAlbumsResponse, _>(&section_endpoint, "9", &lib.name, |r| {
-                    let c = r.media_container;
-                    (c.metadata, c.total_size)
-                })
-                .await
-            {
-                Ok(items) => items,
-                Err(e) => {
-                    tracing::warn!(
-                        section = %lib.name,
-                        error = %e,
-                        "Failed to fetch Plex albums, skipping section"
-                    );
-                    continue;
-                }
-            };
-
-            let artists: Vec<PlexArtist> = match self
-                .fetch_all_pages::<PlexArtistsResponse, _>(&section_endpoint, "8", &lib.name, |r| {
-                    let c = r.media_container;
-                    (c.metadata, c.total_size)
-                })
-                .await
-            {
-                Ok(items) => items,
-                Err(e) => {
-                    tracing::warn!(
-                        section = %lib.name,
-                        error = %e,
-                        "Failed to fetch Plex artists, skipping section"
-                    );
-                    continue;
-                }
-            };
-
-            // ── Accumulate tracks (type=10) ─────────────────────────
             for plex_track in &tracks {
                 let Some((track_id, track, source, attribution_profile)) =
                     cacheable_plex_track(plex_track)
@@ -280,67 +228,16 @@ impl PlexBackend {
                 }
                 all_tracks.push(track);
             }
-
-            // ── Accumulate albums (type=9) ──────────────────────────
-            for plex_album in &albums {
-                let album_uuid = deterministic_uuid(&plex_album.rating_key);
-                let artist_id = plex_album
-                    .parent_rating_key
-                    .as_deref()
-                    .map(deterministic_uuid);
-
-                let genre = plex_album.genre.first().and_then(|g| g.tag.clone());
-
-                all_albums.push(Album {
-                    id: album_uuid,
-                    title: plex_album.title.clone().unwrap_or_default(),
-                    artist_name: plex_album.parent_title.clone().unwrap_or_default(),
-                    artist_id,
-                    year: plex_album.year,
-                    genre,
-                    cover_art_url: None,
-                    track_count: plex_album.leaf_count.unwrap_or(0),
-                    total_duration_secs: plex_album.duration.map(|d| d / 1000),
-                });
-            }
-
-            // ── Accumulate artists (type=8) ─────────────────────────
-            for plex_artist in &artists {
-                let artist_uuid = deterministic_uuid(&plex_artist.rating_key);
-
-                // Count tracks and albums for this artist.
-                let track_count = all_tracks
-                    .iter()
-                    .filter(|t| t.artist_id.as_ref() == Some(&artist_uuid))
-                    .count() as u32;
-                let album_count = all_albums
-                    .iter()
-                    .filter(|a| a.artist_id.as_ref() == Some(&artist_uuid))
-                    .count() as u32;
-
-                all_artists.push(Artist {
-                    id: artist_uuid,
-                    name: plex_artist.title.clone().unwrap_or_default(),
-                    album_count,
-                    track_count,
-                    cover_art_url: None,
-                });
-            }
         }
 
         info!(
-            artists = all_artists.len(),
-            albums = all_albums.len(),
             tracks = all_tracks.len(),
-            skipped_unplayable_tracks,
-            "Plex library loaded"
+            skipped_unplayable_tracks, "Plex library loaded"
         );
 
         let mut cache = self.cache.write().await;
         *cache = LibraryCache {
             tracks: all_tracks,
-            albums: all_albums,
-            artists: all_artists,
             stream_source_by_track_id,
             track_artwork_locator_by_track_id,
             attribution_profiles,
@@ -421,11 +318,6 @@ impl PlexBackend {
         Ok(items)
     }
 
-    /// Return the music libraries discovered during init.
-    pub fn music_libraries(&self) -> &[MusicLibrary] {
-        &self.music_libraries
-    }
-
     /// Return the exact Last.fm attribution profile retained for one accepted
     /// catalogue row by its native identity.
     ///
@@ -448,128 +340,12 @@ impl PlexBackend {
 
 #[async_trait]
 impl crate::architecture::MediaBackend for PlexBackend {
-    fn name(&self) -> &str {
-        &self.display_name
-    }
-
-    fn backend_type(&self) -> &str {
-        "plex"
-    }
-
-    async fn ping(&self) -> BackendResult<()> {
-        let _: PlexIdentityResponse = self.client.get("identity").await?;
-        Ok(())
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults> {
-        // Plex search: filter the in-memory cache (the /hubs/search
-        // endpoint is complex and not all Plex servers support it well).
-        let cache = self.cache.read().await;
-        let query_lower = query.to_lowercase();
-
-        let tracks: Vec<Track> = cache
-            .tracks
-            .iter()
-            .filter(|t| {
-                t.title.to_lowercase().contains(&query_lower)
-                    || t.artist_name.to_lowercase().contains(&query_lower)
-                    || t.album_title.to_lowercase().contains(&query_lower)
-            })
-            .take(limit)
-            .cloned()
-            .collect();
-
-        let albums: Vec<Album> = cache
-            .albums
-            .iter()
-            .filter(|a| {
-                a.title.to_lowercase().contains(&query_lower)
-                    || a.artist_name.to_lowercase().contains(&query_lower)
-            })
-            .take(limit)
-            .cloned()
-            .collect();
-
-        let artists: Vec<Artist> = cache
-            .artists
-            .iter()
-            .filter(|a| a.name.to_lowercase().contains(&query_lower))
-            .take(limit)
-            .cloned()
-            .collect();
-
-        Ok(SearchResults {
-            tracks,
-            albums,
-            artists,
-        })
-    }
-
     async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
         Ok(self.cache.read().await.tracks.clone())
     }
 
     fn rating_capability(&self) -> RatingCapability {
         RatingCapability::ReadOnly
-    }
-
-    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
-        let cache = self.cache.read().await;
-        let mut albums = cache.albums.clone();
-
-        albums.sort_by(|a, b| {
-            let cmp = match sort {
-                SortField::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                SortField::Artist => a
-                    .artist_name
-                    .to_lowercase()
-                    .cmp(&b.artist_name.to_lowercase()),
-                SortField::Year => a.year.cmp(&b.year),
-                _ => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-            };
-            match order {
-                SortOrder::Ascending => cmp,
-                SortOrder::Descending => cmp.reverse(),
-            }
-        });
-
-        Ok(albums)
-    }
-
-    async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-        Ok(self.cache.read().await.artists.clone())
-    }
-
-    async fn get_album_tracks(&self, album_id: &Uuid) -> BackendResult<Vec<Track>> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .tracks
-            .iter()
-            .filter(|t| t.album_id.as_ref() == Some(album_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .tracks
-            .iter()
-            .filter(|t| t.artist_id.as_ref() == Some(artist_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_stats(&self) -> BackendResult<LibraryStats> {
-        let cache = self.cache.read().await;
-        let total_duration: u64 = cache.tracks.iter().filter_map(|t| t.duration_secs).sum();
-
-        Ok(LibraryStats {
-            total_tracks: cache.tracks.len() as u64,
-            total_albums: cache.albums.len() as u64,
-            total_artists: cache.artists.len() as u64,
-            total_duration_secs: total_duration,
-        })
     }
 }
 
@@ -618,6 +394,7 @@ fn deterministic_uuid(plex_id: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, plex_id.as_bytes())
 }
 
+#[cfg(test)]
 fn plex_stream_locator(plex: &PlexTrack) -> Option<&str> {
     plex_stream_source(plex).map(|(_, _, locator)| locator)
 }
@@ -946,38 +723,6 @@ mod tests {
                         }]
                     }
                 }))),
-            MockRoute::get("/library/sections/7/all")
-                .with_query("type", "9")
-                .reply(MockResponse::json(serde_json::json!({
-                    "MediaContainer": {
-                        "size": 1,
-                        "totalSize": 1,
-                        "offset": 0,
-                        "Metadata": [{
-                            "ratingKey": "album-1",
-                            "title": "Fixture Album",
-                            "parentTitle": "Fixture Artist",
-                            "parentRatingKey": "artist-1",
-                            "year": 2026,
-                            "leafCount": 1,
-                            "duration": 123_000,
-                            "Genre": [{"tag": "Test"}]
-                        }]
-                    }
-                }))),
-            MockRoute::get("/library/sections/7/all")
-                .with_query("type", "8")
-                .reply(MockResponse::json(serde_json::json!({
-                    "MediaContainer": {
-                        "size": 1,
-                        "totalSize": 1,
-                        "offset": 0,
-                        "Metadata": [{
-                            "ratingKey": "artist-1",
-                            "title": "Fixture Artist"
-                        }]
-                    }
-                }))),
         ])
         .await;
         let token = Uuid::new_v4().to_string();
@@ -986,7 +731,6 @@ mod tests {
             .await
             .expect("connect Plex fixture");
 
-        assert_eq!(backend.music_libraries().len(), 1);
         assert_eq!(backend.rating_capability(), RatingCapability::ReadOnly);
         let published = crate::architecture::load_track_catalog(&backend)
             .await
@@ -998,22 +742,11 @@ mod tests {
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), 1);
         assert_eq!(cache.tracks[0].title, "Fixture Song");
-        assert_eq!(cache.albums.len(), 1);
-        assert_eq!(cache.artists.len(), 1);
         drop(cache);
 
-        let search = backend
-            .search("Fixture Song", 10)
-            .await
-            .expect("search cache");
-        assert_eq!(search.tracks.len(), 1);
-        assert_eq!(
-            search.tracks[0].rating,
-            TrackRating::read_only(Some(Rating::new(85).unwrap()))
-        );
-
+        // Connecting fetches only the identity, the sections, and the tracks.
         let requests = service.requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 3);
         for request in requests {
             assert_eq!(
                 request
@@ -1097,16 +830,6 @@ mod tests {
                         "offset": 0,
                         "Metadata": raw_row_metadata_items()
                     }
-                }))),
-            MockRoute::get("/library/sections/7/all")
-                .with_query("type", "9")
-                .reply(MockResponse::json(serde_json::json!({
-                    "MediaContainer": {"size": 0, "totalSize": 0, "offset": 0}
-                }))),
-            MockRoute::get("/library/sections/7/all")
-                .with_query("type", "8")
-                .reply(MockResponse::json(serde_json::json!({
-                    "MediaContainer": {"size": 0, "totalSize": 0, "offset": 0}
                 }))),
         ]
     }
@@ -1299,31 +1022,6 @@ mod tests {
                         "Metadata": [track(PLEX_PAGE_SIZE)]
                     }
                 }))),
-            MockRoute::get("/gateway/library/sections/7/all")
-                .with_query("type", "9")
-                .with_query("X-Plex-Container-Start", "0")
-                .reply(MockResponse::json(serde_json::json!({
-                    "MediaContainer": {
-                        "size": 1,
-                        "totalSize": 1,
-                        "Metadata": [{
-                            "ratingKey": "album-1",
-                            "title": "Fixture Album",
-                            "parentTitle": "Fixture Artist",
-                            "parentRatingKey": "artist-1"
-                        }]
-                    }
-                }))),
-            MockRoute::get("/gateway/library/sections/7/all")
-                .with_query("type", "8")
-                .with_query("X-Plex-Container-Start", "0")
-                .reply(MockResponse::json(serde_json::json!({
-                    "MediaContainer": {
-                        "size": 1,
-                        "totalSize": 1,
-                        "Metadata": [{"ratingKey": "artist-1", "title": "Fixture Artist"}]
-                    }
-                }))),
             MockRoute::get("/gateway/library/sections/8/all")
                 .with_query("type", "10")
                 .with_query("X-Plex-Container-Start", "0")
@@ -1341,8 +1039,6 @@ mod tests {
 
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), (PLEX_PAGE_SIZE + 1) as usize);
-        assert_eq!(cache.albums.len(), 1);
-        assert_eq!(cache.artists.len(), 1);
         let first_id = cache.tracks[0]
             .native_track_id
             .clone()
@@ -1374,7 +1070,7 @@ mod tests {
         );
 
         let requests = service.requests();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 5);
         for request in requests {
             assert_eq!(
                 request

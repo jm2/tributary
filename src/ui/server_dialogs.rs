@@ -37,12 +37,11 @@ async fn authenticate_manual_plex(
 }
 
 async fn connect_manual_subsonic(
-    server_name: &str,
     server_url: &str,
     username: &str,
     password: &str,
 ) -> crate::architecture::backend::BackendResult<crate::subsonic::SubsonicBackend> {
-    crate::subsonic::SubsonicBackend::connect(server_name, server_url, username, password).await
+    crate::subsonic::SubsonicBackend::connect(server_url, username, password).await
 }
 
 /// Validate a standard remote backend URL before it reaches persistence,
@@ -959,7 +958,7 @@ pub fn show_add_server_dialog(
             }
             _ => source_registry.connect_standard(source_id, on_generation, move || async move {
                 info!("Authenticating with Subsonic (manual)...");
-                connect_manual_subsonic(&server_name, &server_url, &user, &pass).await
+                connect_manual_subsonic(&server_url, &user, &pass).await
             }),
         };
 

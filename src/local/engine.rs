@@ -17556,11 +17556,11 @@ mod tests {
         use std::collections::HashMap;
         use std::time::Instant;
 
-        use crate::architecture::models::{Rating, SortField, SortOrder};
+        use crate::architecture::models::Rating;
 
         use super::super::perf_fixtures::{
-            catalogue_bytes, expected_album_count, expected_artist_count, track_count_from_env,
-            DelayedBackend, ResponsivenessReport, SyntheticLibrary,
+            catalogue_bytes, catalogue_fan_out, expected_album_count, expected_artist_count,
+            track_count_from_env, DelayedBackend, ResponsivenessReport, SyntheticLibrary,
         };
 
         struct ParseDelayGuard {
@@ -17626,22 +17626,19 @@ mod tests {
         // Unknown-Artist/Unknown-Album row pair. Assert BEFORE any metric is
         // recorded so a collapsed catalogue cannot pass as measurement
         // output.
-        let catalogue_backend = LocalBackend::new(db.clone());
-        let scanned_albums = catalogue_backend
-            .list_albums(SortField::Title, SortOrder::Ascending)
-            .await
-            .expect("list albums for cardinality proof");
-        let scanned_artists = catalogue_backend
-            .list_artists()
-            .await
-            .expect("list artists for cardinality proof");
+        let (scanned_albums, scanned_artists) = catalogue_fan_out(
+            &LocalBackend::new(db.clone())
+                .list_tracks()
+                .await
+                .expect("list tracks for cardinality proof"),
+        );
         assert_eq!(
-            scanned_albums.len(),
+            scanned_albums,
             expected_album_count(track_count),
             "persisted catalogue must fan out to one album group per 12 fixture tracks"
         );
         assert_eq!(
-            scanned_artists.len(),
+            scanned_artists,
             expected_artist_count(track_count),
             "persisted catalogue must fan out to one artist group per 4 fixture albums"
         );
@@ -17662,16 +17659,11 @@ mod tests {
             baseline_parses as f64,
             "parses",
         );
-        report.record(
-            "scan_albums",
-            track_count,
-            scanned_albums.len() as f64,
-            "albums",
-        );
+        report.record("scan_albums", track_count, scanned_albums as f64, "albums");
         report.record(
             "scan_artists",
             track_count,
-            scanned_artists.len() as f64,
+            scanned_artists as f64,
             "artists",
         );
         report.record_ms("scan_elapsed", track_count, scan_elapsed);
@@ -17697,32 +17689,6 @@ mod tests {
             catalogue_bytes(&catalogue) as f64,
             "bytes",
         );
-
-        let albums_started = Instant::now();
-        backend
-            .list_albums(SortField::Title, SortOrder::Ascending)
-            .await
-            .expect("list albums");
-        report.record_ms("backend_list_albums", track_count, albums_started.elapsed());
-
-        let artists_started = Instant::now();
-        backend.list_artists().await.expect("list artists");
-        report.record_ms(
-            "backend_list_artists",
-            track_count,
-            artists_started.elapsed(),
-        );
-
-        let search_started = Instant::now();
-        backend
-            .search("Track0001", 50)
-            .await
-            .expect("search catalogue");
-        report.record_ms("backend_search", track_count, search_started.elapsed());
-
-        let stats_started = Instant::now();
-        backend.get_stats().await.expect("read library stats");
-        report.record_ms("backend_get_stats", track_count, stats_started.elapsed());
 
         // Rating mutations over the same catalogue: first directly through the
         // backend seam, then through the production engine command FIFO with a
@@ -17866,22 +17832,19 @@ mod tests {
                     // The delayed pass must reproduce the same real catalogue
                     // fan-out, not a collapsed Unknown-Artist/Unknown-Album
                     // row pair.
-                    let delayed_backend = LocalBackend::new(delayed_db.clone());
-                    let delayed_albums = delayed_backend
-                        .list_albums(SortField::Title, SortOrder::Ascending)
-                        .await
-                        .expect("list albums in delayed pass for cardinality proof");
-                    let delayed_artists = delayed_backend
-                        .list_artists()
-                        .await
-                        .expect("list artists in delayed pass for cardinality proof");
+                    let (delayed_albums, delayed_artists) = catalogue_fan_out(
+                        &LocalBackend::new(delayed_db.clone())
+                            .list_tracks()
+                            .await
+                            .expect("list tracks in delayed pass for cardinality proof"),
+                    );
                     assert_eq!(
-                        delayed_albums.len(),
+                        delayed_albums,
                         expected_album_count(track_count),
                         "delayed scan must persist the full album fan-out"
                     );
                     assert_eq!(
-                        delayed_artists.len(),
+                        delayed_artists,
                         expected_artist_count(track_count),
                         "delayed scan must persist the full artist fan-out"
                     );
@@ -17927,10 +17890,9 @@ mod tests {
     /// any metric.
     #[tokio::test]
     async fn q4_fixture_scan_produces_real_catalogue_fan_out() {
-        use crate::architecture::models::{SortField, SortOrder};
-
         use super::super::perf_fixtures::{
-            expected_album_count, expected_artist_count, SyntheticLibrary,
+            album_title_for, artist_name_for, catalogue_fan_out, expected_album_count,
+            expected_artist_count, SyntheticLibrary,
         };
 
         const TRACKS: usize = 100;
@@ -17950,41 +17912,41 @@ mod tests {
             .len();
         assert_eq!(persisted, TRACKS, "one row per fixture file");
 
-        let backend = LocalBackend::new(db);
-        let albums = backend
-            .list_albums(SortField::Title, SortOrder::Ascending)
+        let tracks = LocalBackend::new(db)
+            .list_tracks()
             .await
-            .expect("list fixture albums");
-        let artists = backend.list_artists().await.expect("list fixture artists");
+            .expect("list fixture tracks");
+        let (albums, artists) = catalogue_fan_out(&tracks);
         assert_eq!(
-            albums.len(),
+            albums,
             expected_album_count(TRACKS),
-            "fixture tags must become distinct album rows (100 tracks -> 9 albums)"
+            "fixture tags must become distinct albums (100 tracks -> 9 albums)"
         );
         assert_eq!(
-            artists.len(),
+            artists,
             expected_artist_count(TRACKS),
-            "fixture tags must become distinct artist rows (9 albums -> 3 artists)"
+            "fixture tags must become distinct artists (9 albums -> 3 artists)"
         );
 
         // Spot-check attribution: tracks 96..100 form the final partial
         // album group (4 tracks); the 9 albums split 4/4/1 across artists,
         // so the final artist owns exactly that one album.
-        let last_album = albums
+        let last_album: Vec<_> = tracks
             .iter()
-            .find(|album| album.title == super::super::perf_fixtures::album_title_for(8))
-            .expect("final album group present");
-        assert_eq!(last_album.track_count, 4);
-        assert_eq!(
-            last_album.artist_name,
-            super::super::perf_fixtures::artist_name_for(2)
-        );
-        let last_artist = artists
+            .filter(|track| track.album_title == album_title_for(8))
+            .collect();
+        assert_eq!(last_album.len(), 4);
+        assert!(last_album
             .iter()
-            .find(|artist| artist.name == super::super::perf_fixtures::artist_name_for(2))
-            .expect("final artist group present");
-        assert_eq!(last_artist.album_count, 1);
-        assert_eq!(last_artist.track_count, 4);
+            .all(|track| track.artist_name == artist_name_for(2)));
+        let last_artist: Vec<_> = tracks
+            .iter()
+            .filter(|track| track.artist_name == artist_name_for(2))
+            .collect();
+        assert_eq!(last_artist.len(), 4);
+        assert!(last_artist
+            .iter()
+            .all(|track| track.album_title == album_title_for(8)));
     }
 
     // ── Root availability, rescans and engine edge cases ──────────────

@@ -10,5 +10,4 @@ pub mod backend;
 pub mod client;
 
 // Public backend type used by the source lifecycle and connection flows.
-#[allow(unused_imports)]
 pub use backend::PlexBackend;

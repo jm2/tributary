@@ -24,7 +24,7 @@ use crate::architecture::{
 
 use super::api::{AlbumEntry, ArtistEntry, SongEntry};
 use super::client::SubsonicClient;
-use crate::source_registry::{BoundedSearchAttributionProfiles, PlaybackAttributionProfile};
+use crate::source_registry::PlaybackAttributionProfile;
 
 /// Maximum number of per-artist / per-album metadata fetches kept in
 /// flight at once while loading the full library.  Bounds concurrency so a
@@ -43,11 +43,8 @@ const MAX_PLAYLIST_LIST_BODY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PLAYLIST_DETAIL_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// In-memory library cache populated from the Subsonic API.
-#[allow(dead_code)]
 struct LibraryCache {
     tracks: Vec<Track>,
-    albums: Vec<Album>,
-    artists: Vec<Artist>,
     /// Exact Subsonic song ID → stream locator.
     stream_locator_by_track_id: HashMap<TrackId, String>,
     /// Exact Subsonic song ID → cover-art ID.
@@ -55,11 +52,6 @@ struct LibraryCache {
     /// Exact Subsonic song ID → Last.fm attribution profile derived from the
     /// raw accepted protocol row before display fallbacks were substituted.
     attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
-    /// Bounded retention for profiles minted from search rows outside the
-    /// refreshed catalogue. Search traffic is unbounded over a session
-    /// lifetime, so these entries are capped separately and can never evict
-    /// a refreshed catalogue profile.
-    search_attribution_profiles: BoundedSearchAttributionProfiles,
     /// Exact Subsonic song ID → validated stream representation. Tracks whose
     /// suffix is absent or outside the allowlist map to the explicit unknown.
     representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
@@ -69,12 +61,9 @@ impl LibraryCache {
     fn empty() -> Self {
         Self {
             tracks: Vec::new(),
-            albums: Vec::new(),
-            artists: Vec::new(),
             stream_locator_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
-            search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
             representation_by_track_id: HashMap::new(),
         }
     }
@@ -84,9 +73,7 @@ impl LibraryCache {
 ///
 /// Create one with [`SubsonicBackend::connect`], which authenticates and
 /// fetches the full library into memory.
-#[allow(dead_code)]
 pub struct SubsonicBackend {
-    display_name: String,
     client: SubsonicClient,
     cache: RwLock<LibraryCache>,
 }
@@ -104,21 +91,14 @@ impl SubsonicBackend {
     ///    HTTPS connections are permitted for this mode.
     ///
     /// # Arguments
-    /// * `name` — display name for the sidebar (e.g. "Navidrome (home)")
     /// * `server_url` — base URL including scheme (e.g. `https://music.example.com`)
     /// * `username` / `password` — Subsonic credentials
-    pub async fn connect(
-        name: &str,
-        server_url: &str,
-        username: &str,
-        password: &str,
-    ) -> BackendResult<Self> {
-        Self::connect_with_route(name, server_url, username, password, None).await
+    pub async fn connect(server_url: &str, username: &str, password: &str) -> BackendResult<Self> {
+        Self::connect_with_route(server_url, username, password, None).await
     }
 
     /// Connect through an immutable address route supplied by discovery.
     pub async fn connect_with_route(
-        name: &str,
         server_url: &str,
         username: &str,
         password: &str,
@@ -152,7 +132,6 @@ impl SubsonicBackend {
         }
 
         let backend = Self {
-            display_name: name.to_string(),
             client,
             cache: RwLock::new(LibraryCache::empty()),
         };
@@ -307,7 +286,7 @@ impl SubsonicBackend {
         // so the resulting cache is identical to the old sequential walk.
         // Per-item failures keep the original log-and-skip semantics: a
         // failed `getArtist` drops that artist entirely, a failed `getAlbum`
-        // drops just that album (the artist's `album_count` still counts it).
+        // drops just that album.
         //
         // An album with several album artists is listed by `getArtist` under
         // each of them. It is fetched once and assembled under the first
@@ -403,8 +382,6 @@ impl SubsonicBackend {
         // Phase 3 — assemble the cache deterministically in artist/album
         // order, mirroring the original sequential walk exactly.
         let mut all_tracks = Vec::new();
-        let mut all_albums = Vec::new();
-        let mut all_artists = Vec::new();
         let mut stream_locator_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
         let mut attribution_profiles = HashMap::new();
@@ -418,10 +395,7 @@ impl SubsonicBackend {
             let Some(api_albums) = albums.as_ref() else {
                 continue;
             };
-            let api_artist = &api_artists[ai];
-            let artist_uuid = deterministic_uuid(&api_artist.id);
-
-            let mut artist_track_count = 0u32;
+            let artist_uuid = deterministic_uuid(&api_artists[ai].id);
 
             for api_album in api_albums {
                 // A failed `getAlbum` drops just this album; taking the songs
@@ -475,45 +449,21 @@ impl SubsonicBackend {
                         attribution_profiles.insert(track_id, profile);
                     }
                     all_tracks.push(track);
-                    artist_track_count += 1;
                 }
-
-                all_albums.push(album_entry_to_album(
-                    api_album,
-                    album_uuid,
-                    Some(artist_uuid),
-                ));
             }
-
-            all_artists.push(Artist {
-                id: artist_uuid,
-                name: api_artist.name.clone(),
-                album_count: api_albums.len() as u32,
-                track_count: artist_track_count,
-                cover_art_url: None,
-            });
         }
 
         info!(
-            artists = all_artists.len(),
-            albums = all_albums.len(),
             tracks = all_tracks.len(),
-            skipped_invalid_track_ids,
-            skipped_duplicate_track_ids,
-            "Subsonic library loaded"
+            skipped_invalid_track_ids, skipped_duplicate_track_ids, "Subsonic library loaded"
         );
 
         let mut cache = self.cache.write().await;
         *cache = LibraryCache {
             tracks: all_tracks,
-            albums: all_albums,
-            artists: all_artists,
             stream_locator_by_track_id,
             track_artwork_locator_by_track_id,
             attribution_profiles,
-            // A full refresh supersedes every search-only retention from the
-            // previous catalogue generation.
-            search_attribution_profiles: BoundedSearchAttributionProfiles::bounded(),
             representation_by_track_id,
         };
 
@@ -521,26 +471,20 @@ impl SubsonicBackend {
     }
 
     /// Return the exact Last.fm attribution profile retained for one accepted
-    /// catalogue or search row by its native identity.
+    /// catalogue row by its native identity.
     ///
-    /// Profiles are derived from the raw protocol row, before display
-    /// fallbacks are substituted, so a synthesized `"Unknown"` can never
-    /// become attribution authority. Refreshed catalogue profiles take
-    /// precedence; search-only profiles are retained separately under a
-    /// bounded eviction policy and never evict catalogue authority. The
-    /// lookup is deliberately non-blocking: a contended refresh returns
-    /// `None`, so Last.fm attribution fails closed instead of waiting on the
-    /// lifecycle state lock that the registry holds while minting.
+    /// Profiles are derived from the raw protocol row during refresh, before
+    /// display fallbacks are substituted, so a synthesized `"Unknown"` can
+    /// never become attribution authority. The lookup is deliberately
+    /// non-blocking: a contended refresh returns `None`, so Last.fm
+    /// attribution fails closed instead of waiting on the lifecycle state
+    /// lock that the registry holds while minting.
     pub(crate) fn catalogue_attribution_profile(
         &self,
         track_id: &TrackId,
     ) -> Option<PlaybackAttributionProfile> {
         let cache = self.cache.try_read().ok()?;
-        cache
-            .attribution_profiles
-            .get(track_id)
-            .cloned()
-            .or_else(|| cache.search_attribution_profiles.get(track_id).cloned())
+        cache.attribution_profiles.get(track_id).cloned()
     }
 }
 
@@ -555,210 +499,12 @@ fn invalid_playlist_response(message: &'static str) -> BackendError {
 
 #[async_trait]
 impl crate::architecture::MediaBackend for SubsonicBackend {
-    fn name(&self) -> &str {
-        &self.display_name
-    }
-
-    fn backend_type(&self) -> &str {
-        "subsonic"
-    }
-
-    async fn ping(&self) -> BackendResult<()> {
-        self.client.get("ping.view").await?;
-        Ok(())
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> BackendResult<SearchResults> {
-        let limit_str = limit.to_string();
-        let env = self
-            .client
-            .get_with_params(
-                "search3.view",
-                &[
-                    ("query", query),
-                    ("artistCount", &limit_str),
-                    ("albumCount", &limit_str),
-                    ("songCount", &limit_str),
-                ],
-            )
-            .await?;
-
-        let sr = env
-            .response
-            .search_result3
-            .unwrap_or_else(|| super::api::SearchResult3 {
-                artist: Vec::new(),
-                album: Vec::new(),
-                song: Vec::new(),
-            });
-
-        let results = SearchResults {
-            artists: sr
-                .artist
-                .iter()
-                .map(|a| Artist {
-                    id: deterministic_uuid(&a.id),
-                    name: a.name.clone(),
-                    album_count: a.album_count.unwrap_or(0),
-                    track_count: 0,
-                    cover_art_url: None,
-                })
-                .collect(),
-            albums: sr
-                .album
-                .iter()
-                .map(|a| {
-                    album_entry_to_album(
-                        a,
-                        deterministic_uuid(&a.id),
-                        a.artist_id.as_deref().map(deterministic_uuid),
-                    )
-                })
-                .collect(),
-            tracks: sr
-                .song
-                .iter()
-                .filter_map(|s| {
-                    let track_id = TrackId::remote(s.id.clone()).ok()?;
-                    let uuid = deterministic_uuid(&s.id);
-                    Some(song_to_track(
-                        s,
-                        track_id,
-                        uuid,
-                        s.artist_id.as_deref().map(deterministic_uuid),
-                        s.album_id.as_deref().map(deterministic_uuid),
-                    ))
-                })
-                .collect(),
-        };
-
-        // Search results may include entities outside the initially loaded
-        // catalogue. Retain their native locators before exposing the generic
-        // models so selecting one can still resolve at playback time.
-        let mut cache = self.cache.write().await;
-        for song in &sr.song {
-            let Ok(track_id) = TrackId::remote(song.id.clone()) else {
-                continue;
-            };
-            cache
-                .stream_locator_by_track_id
-                .insert(track_id.clone(), song.id.clone());
-            // Same authority as the full sync: the song's suffix from
-            // library metadata labels the stream, so a search-discovered
-            // track resolves to the same representation it would have after
-            // a sync. A present suffix replaces the cached representation;
-            // an absent one must not overwrite a known descriptor with
-            // unknown — only a search-only track gets the explicit unknown
-            // seeded.
-            match song.suffix.as_deref().filter(|suffix| !suffix.is_empty()) {
-                Some(suffix) => {
-                    cache.representation_by_track_id.insert(
-                        track_id.clone(),
-                        MediaRepresentation::buffered_from_suffix(suffix),
-                    );
-                }
-                None => {
-                    cache
-                        .representation_by_track_id
-                        .entry(track_id.clone())
-                        .or_insert_with(MediaRepresentation::buffered_unknown);
-                }
-            }
-            if let Some(cover_art_id) = &song.cover_art {
-                cache
-                    .track_artwork_locator_by_track_id
-                    .insert(track_id.clone(), cover_art_id.clone());
-            } else {
-                cache.track_artwork_locator_by_track_id.remove(&track_id);
-            }
-            // Retained rows outside the refreshed catalogue still need Last.fm
-            // attribution authority: freeze the profile from the raw accepted
-            // row, and drop a stale profile when the row no longer carries
-            // enough provenance. Search rows land in the bounded search-only
-            // store so unbounded search traffic can neither grow retention
-            // without limit nor evict refreshed catalogue profiles.
-            if let Some(profile) = PlaybackAttributionProfile::from_remote_row(
-                song.title.clone(),
-                song.artist.clone(),
-                song.album.clone(),
-                None,
-                song.track,
-                song.duration,
-            ) {
-                cache.search_attribution_profiles.insert(track_id, profile);
-            } else {
-                cache.search_attribution_profiles.remove(&track_id);
-            }
-        }
-
-        Ok(results)
-    }
-
     async fn list_tracks(&self) -> BackendResult<Vec<Track>> {
         Ok(self.cache.read().await.tracks.clone())
     }
 
     fn rating_capability(&self) -> RatingCapability {
         RatingCapability::ReadOnly
-    }
-
-    async fn list_albums(&self, sort: SortField, order: SortOrder) -> BackendResult<Vec<Album>> {
-        let cache = self.cache.read().await;
-        let mut albums = cache.albums.clone();
-
-        albums.sort_by(|a, b| {
-            let cmp = match sort {
-                SortField::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                SortField::Artist => a
-                    .artist_name
-                    .to_lowercase()
-                    .cmp(&b.artist_name.to_lowercase()),
-                SortField::Year => a.year.cmp(&b.year),
-                _ => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-            };
-            match order {
-                SortOrder::Ascending => cmp,
-                SortOrder::Descending => cmp.reverse(),
-            }
-        });
-
-        Ok(albums)
-    }
-
-    async fn list_artists(&self) -> BackendResult<Vec<Artist>> {
-        Ok(self.cache.read().await.artists.clone())
-    }
-
-    async fn get_album_tracks(&self, album_id: &Uuid) -> BackendResult<Vec<Track>> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .tracks
-            .iter()
-            .filter(|t| t.album_id.as_ref() == Some(album_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_artist_tracks(&self, artist_id: &Uuid) -> BackendResult<Vec<Track>> {
-        let cache = self.cache.read().await;
-        Ok(cache
-            .tracks
-            .iter()
-            .filter(|t| t.artist_id.as_ref() == Some(artist_id))
-            .cloned()
-            .collect())
-    }
-
-    async fn get_stats(&self) -> BackendResult<LibraryStats> {
-        let cache = self.cache.read().await;
-        let total_duration: u64 = cache.tracks.iter().filter_map(|t| t.duration_secs).sum();
-
-        Ok(LibraryStats {
-            total_tracks: cache.tracks.len() as u64,
-            total_albums: cache.albums.len() as u64,
-            total_artists: cache.artists.len() as u64,
-            total_duration_secs: total_duration,
-        })
     }
 }
 
@@ -855,20 +601,6 @@ fn song_to_track(
     }
 }
 
-fn album_entry_to_album(entry: &AlbumEntry, id: Uuid, artist_id: Option<Uuid>) -> Album {
-    Album {
-        id,
-        title: entry.name.clone(),
-        artist_name: entry.artist.clone().unwrap_or_default(),
-        artist_id,
-        year: entry.year,
-        genre: entry.genre.clone(),
-        cover_art_url: None,
-        track_count: entry.song_count.unwrap_or(0),
-        total_duration_secs: entry.duration,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
@@ -877,7 +609,6 @@ mod tests {
     use crate::architecture::media::MediaContainer;
     use crate::architecture::MediaBackend as _;
     use crate::http_test_service::{MockHttpService, MockResponse, MockRoute};
-    use crate::source_registry::MAX_SEARCH_ATTRIBUTION_PROFILES;
 
     use super::*;
 
@@ -912,7 +643,6 @@ mod tests {
         password: &str,
     ) -> SubsonicBackend {
         SubsonicBackend::connect(
-            "fixture",
             &format!("{}{prefix}", service.base_url()),
             username,
             password,
@@ -922,16 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn converted_models_do_not_expose_remote_credentials_or_urls() {
+    fn converted_track_does_not_expose_remote_credentials_or_urls() {
         let song: SongEntry = serde_json::from_value(serde_json::json!({
             "id": "song-id",
             "title": "Song",
-            "coverArt": "cover-id"
-        }))
-        .unwrap();
-        let album: AlbumEntry = serde_json::from_value(serde_json::json!({
-            "id": "album-id",
-            "name": "Album",
             "coverArt": "cover-id"
         }))
         .unwrap();
@@ -943,11 +667,9 @@ mod tests {
             None,
             None,
         );
-        let album = album_entry_to_album(&album, Uuid::new_v4(), None);
 
         assert!(track.stream_url.is_none());
         assert!(track.cover_art_url.is_none());
-        assert!(album.cover_art_url.is_none());
     }
 
     #[tokio::test]
@@ -1003,39 +725,13 @@ mod tests {
                         }
                     }
                 }))),
-            MockRoute::get("/rest/search3.view")
-                .with_query("query", "Song")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "searchResult3": {
-                            "artist": [{
-                                "id": "shared-native-id",
-                                "name": "Artist",
-                                "coverArt": "search-artist-cover"
-                            }],
-                            "album": [{
-                                "id": "shared-native-id",
-                                "name": "Album",
-                                "coverArt": "search-album-cover"
-                            }],
-                            "song": [{
-                                "id": "shared-native-id",
-                                "title": "Song",
-                                "userRating": 3,
-                                "coverArt": "search-song-cover"
-                            }]
-                        }
-                    }
-                }))),
         ])
         .await;
 
         let fixture_secret = Uuid::new_v4().to_string();
-        let backend =
-            SubsonicBackend::connect("fixture", &service.base_url(), "user", &fixture_secret)
-                .await
-                .expect("connect to fixture");
+        let backend = SubsonicBackend::connect(&service.base_url(), "user", &fixture_secret)
+            .await
+            .expect("connect to fixture");
         let shared_id = TrackId::remote("shared-native-id").expect("track ID");
         assert_eq!(backend.rating_capability(), RatingCapability::ReadOnly);
         let published = crate::architecture::load_track_catalog(&backend)
@@ -1053,23 +749,8 @@ mod tests {
             .expect("full-library artwork");
         assert_eq!(resolved_media_id(&initial), "full-song-cover");
 
-        let results = backend.search("Song", 10).await.expect("search fixture");
-        assert_eq!(results.tracks.len(), 1);
-        assert_eq!(results.albums.len(), 1);
-        assert_eq!(results.artists.len(), 1);
-        assert_eq!(
-            results.tracks[0].rating,
-            TrackRating::read_only(Some(Rating::new(60).unwrap()))
-        );
-        let searched = backend
-            .resolve_artwork(&shared_id)
-            .await
-            .expect("resolve searched artwork")
-            .expect("searched artwork");
-        assert_eq!(resolved_media_id(&searched), "search-song-cover");
-
         let requests = service.requests();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         for request in requests {
             let query = request
                 .uri
@@ -1143,7 +824,7 @@ mod tests {
             })),
         )])
         .await;
-        let error = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+        let error = SubsonicBackend::connect(&service.base_url(), "user", &password)
             .await
             .err()
             .expect("fixture authentication must fail");
@@ -1213,7 +894,6 @@ mod tests {
         .await;
         let password = Uuid::new_v4().to_string();
         let backend = SubsonicBackend::connect(
-            "fixture",
             &format!("{}/gateway/", service.base_url()),
             "user",
             &password,
@@ -1224,11 +904,6 @@ mod tests {
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), 1);
         assert_eq!(cache.tracks[0].title, "Healthy Track");
-        assert_eq!(cache.albums.len(), 1);
-        assert_eq!(cache.albums[0].title, "Healthy Album");
-        assert_eq!(cache.artists.len(), 1);
-        assert_eq!(cache.artists[0].name, "Healthy Artist");
-        assert_eq!(cache.artists[0].album_count, 2);
         let track_id = cache.tracks[0]
             .native_track_id
             .clone()
@@ -1313,7 +988,7 @@ mod tests {
             album_listing("solo", &["duet-2", "solo-1"]),
         ])
         .await;
-        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", "pw")
+        let backend = SubsonicBackend::connect(&service.base_url(), "user", "pw")
             .await
             .expect("connect to fixture");
 
@@ -1328,14 +1003,13 @@ mod tests {
         assert!(cache.tracks[..2]
             .iter()
             .all(|track| track.artist_id == Some(first_uuid)));
-        let album_titles: Vec<_> = cache.albums.iter().map(|a| a.title.as_str()).collect();
-        assert_eq!(album_titles, ["duet", "solo"]);
-        let track_counts: Vec<_> = cache
-            .artists
-            .iter()
-            .map(|artist| (artist.name.as_str(), artist.track_count))
-            .collect();
-        assert_eq!(track_counts, [("First", 2), ("Second", 1)]);
+        assert_eq!(
+            cache.tracks[2].artist_id,
+            Some(deterministic_uuid("second"))
+        );
+        let album_ids: Vec<_> = cache.tracks.iter().map(|track| track.album_id).collect();
+        let (duet, solo) = (deterministic_uuid("duet"), deterministic_uuid("solo"));
+        assert_eq!(album_ids, [Some(duet), Some(duet), Some(solo)]);
         drop(cache);
         service.finish().await;
     }
@@ -1491,7 +1165,7 @@ mod tests {
     async fn attribution_profiles_are_frozen_from_raw_rows_before_display_fallbacks() {
         let service = MockHttpService::start(raw_row_routes()).await;
         let password = Uuid::new_v4().to_string();
-        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
+        let backend = SubsonicBackend::connect(&service.base_url(), "user", &password)
             .await
             .expect("raw-row fixture connects");
 
@@ -1513,7 +1187,6 @@ mod tests {
         let service = MockHttpService::start(descriptor_catalogue_routes()).await;
         let password = Uuid::new_v4().to_string();
         let backend = SubsonicBackend::connect(
-            "fixture",
             &format!("{}/gateway/", service.base_url()),
             "user",
             &password,
@@ -1541,58 +1214,6 @@ mod tests {
                 .await
                 .expect("descriptor resolution");
             assert_resolved_descriptor_matches_library(&resolved, &title);
-        }
-        service.finish().await;
-    }
-
-    #[tokio::test]
-    async fn search_results_carry_the_library_container_descriptor() {
-        let service = MockHttpService::start(descriptor_search_catalogue_routes()).await;
-        let password = Uuid::new_v4().to_string();
-        let backend = SubsonicBackend::connect(
-            "fixture",
-            &format!("{}/gateway/", service.base_url()),
-            "user",
-            &password,
-        )
-        .await
-        .expect("descriptor fixture catalogue");
-
-        // These tracks exist only in the search response — never synced — so
-        // their representations must come from the search path itself. The
-        // third result ("Lossless") is the already-synced flac-track with its
-        // suffix omitted by the search payload.
-        let results = backend.search("Search", 10).await.expect("search fixture");
-        assert_eq!(results.tracks.len(), 3);
-        for track in &results.tracks {
-            let track_id = track
-                .native_track_id
-                .clone()
-                .expect("search result retains its native ID");
-            let resolved = backend
-                .resolve_stream(&track_id)
-                .await
-                .expect("resolve search result");
-            match track.title.as_str() {
-                "Search Lossless" => assert_eq!(
-                    resolved.representation(),
-                    MediaRepresentation::buffered(MediaContainer::Flac),
-                    "search suffix flac must label the resolved stream"
-                ),
-                "Lossless" => assert_eq!(
-                    resolved.representation(),
-                    MediaRepresentation::buffered(MediaContainer::Flac),
-                    "an absent search suffix must preserve the synced flac descriptor"
-                ),
-                _ => {
-                    assert_eq!(track.title, "Search Opaque");
-                    assert_eq!(
-                        resolved.representation(),
-                        MediaRepresentation::buffered_unknown(),
-                        "an unrecognized search suffix must stay explicitly unknown"
-                    );
-                }
-            }
         }
         service.finish().await;
     }
@@ -1659,40 +1280,6 @@ mod tests {
                     }
                 }
             })))
-    }
-
-    fn descriptor_search_route() -> MockRoute {
-        MockRoute::get("/gateway/rest/search3.view")
-            .with_query("query", "Search")
-            .reply(MockResponse::json(serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "searchResult3": {
-                        "song": [
-                            {
-                                "id": "search-flac-track",
-                                "title": "Search Lossless",
-                                "suffix": "flac"
-                            },
-                            {
-                                "id": "search-ape-track",
-                                "title": "Search Opaque",
-                                "suffix": "ape"
-                            },
-                            {
-                                "id": "flac-track",
-                                "title": "Lossless"
-                            }
-                        ]
-                    }
-                }
-            })))
-    }
-
-    fn descriptor_search_catalogue_routes() -> Vec<MockRoute> {
-        let mut routes = descriptor_catalogue_routes();
-        routes.push(descriptor_search_route());
-        routes
     }
 
     fn assert_resolved_descriptor_matches_library(resolved: &ResolvedHttpRequest, title: &str) {
@@ -2153,264 +1740,6 @@ mod tests {
         assert!(!rendered.contains(&password));
         service.finish().await;
     }
-
-    fn search_outside_catalogue_routes() -> Vec<MockRoute> {
-        vec![
-            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
-                serde_json::json!({"subsonic-response": {"status": "ok"}}),
-            )),
-            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
-                "subsonic-response": {"status": "ok", "artists": {"index": []}}
-            }))),
-            MockRoute::get("/rest/search3.view")
-                .with_query("query", "Song")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "searchResult3": {
-                            "song": [
-                                {
-                                    "id": "search-complete",
-                                    "title": "Search Complete",
-                                    "artist": "Search Artist",
-                                    "album": "Search Album",
-                                    "track": 7,
-                                    "duration": 222
-                                },
-                                {
-                                    "id": "search-gap"
-                                }
-                            ]
-                        }
-                    }
-                }))),
-        ]
-    }
-
-    fn assert_search_row_provenance_profiles(backend: &SubsonicBackend) {
-        // A searched row that never went through the catalogue refresh still
-        // carries its raw provenance as Last.fm attribution authority.
-        let complete_id = TrackId::remote("search-complete").expect("bounded track ID");
-        let profile = backend
-            .catalogue_attribution_profile(&complete_id)
-            .expect("searched row outside the catalogue retains its provenance profile");
-        assert_eq!(profile.title(), "Search Complete");
-        assert_eq!(profile.artist(), "Search Artist");
-        assert_eq!(profile.album(), Some("Search Album"));
-
-        // A searched row without enough raw provenance fails closed instead
-        // of becoming attribution authority.
-        let gap_id = TrackId::remote("search-gap").expect("bounded track ID");
-        assert!(backend.catalogue_attribution_profile(&gap_id).is_none());
-    }
-
-    #[tokio::test]
-    async fn search_retains_provenance_profiles_for_rows_outside_the_catalogue() {
-        let service = MockHttpService::start(search_outside_catalogue_routes()).await;
-        let password = Uuid::new_v4().to_string();
-        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
-            .await
-            .expect("connect search fixture");
-
-        let results = backend
-            .search("Song", 10)
-            .await
-            .expect("search the fixture server");
-        assert_eq!(results.tracks.len(), 2);
-        assert_search_row_provenance_profiles(&backend);
-
-        assert_eq!(service.requests().len(), 3);
-        service.finish().await;
-    }
-
-    fn search_eviction_routes() -> Vec<MockRoute> {
-        let mut routes = search_eviction_catalogue_routes();
-        routes.push(search_eviction_catalogue_album_route());
-        routes.extend(search_eviction_fresh_routes());
-        routes
-    }
-
-    fn search_eviction_catalogue_routes() -> Vec<MockRoute> {
-        vec![
-            MockRoute::get("/rest/ping.view").reply(MockResponse::json(
-                serde_json::json!({"subsonic-response": {"status": "ok"}}),
-            )),
-            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "artists": {"index": [{"artist": [
-                        {"id": "eviction-artist", "name": "Eviction Artist"}
-                    ]}]}
-                }
-            }))),
-            MockRoute::get("/rest/getArtist.view")
-                .with_query("id", "eviction-artist")
-                .reply(MockResponse::json(serde_json::json!({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "artist": {
-                            "id": "eviction-artist",
-                            "name": "Eviction Artist",
-                            "album": [{"id": "eviction-album", "name": "Catalogue Album"}]
-                        }
-                    }
-                }))),
-        ]
-    }
-
-    fn search_eviction_catalogue_album_route() -> MockRoute {
-        MockRoute::get("/rest/getAlbum.view")
-            .with_query("id", "eviction-album")
-            .reply(MockResponse::json(serde_json::json!({
-                "subsonic-response": {
-                    "status": "ok",
-                    "album": {
-                        "id": "eviction-album",
-                        "name": "Catalogue Album",
-                        "song": [{
-                            "id": "catalogue-song",
-                            "title": "Catalogue Song",
-                            "artist": "Eviction Artist",
-                            "album": "Catalogue Album",
-                            "track": 1,
-                            "duration": 100
-                        }]
-                    }
-                }
-            })))
-    }
-
-    fn search_eviction_fresh_routes() -> Vec<MockRoute> {
-        vec![
-            MockRoute::get("/rest/search3.view")
-                .with_query("query", "Fresh A")
-                .replies([
-                    // The repeat search below hits the same query again.
-                    MockResponse::json(eviction_search_song("fresh-a", "Fresh A", 2, 120)),
-                    MockResponse::json(eviction_search_song("fresh-a", "Fresh A", 2, 120)),
-                ]),
-            MockRoute::get("/rest/search3.view")
-                .with_query("query", "Fresh B")
-                .reply(MockResponse::json(eviction_search_song(
-                    "fresh-b", "Fresh B", 3, 130,
-                ))),
-        ]
-    }
-
-    fn eviction_search_song(id: &str, title: &str, track: i64, duration: i64) -> serde_json::Value {
-        serde_json::json!({
-            "subsonic-response": {
-                "status": "ok",
-                "searchResult3": {"song": [{
-                    "id": id,
-                    "title": title,
-                    "artist": "Fresh Artist",
-                    "album": "Fresh Album",
-                    "track": track,
-                    "duration": duration
-                }]}
-            }
-        })
-    }
-
-    /// Pre-fill the bounded search-only store so a couple of real searches
-    /// cross the production bound without needing thousands of requests.
-    async fn fill_search_attribution_store_to_bound(backend: &SubsonicBackend) {
-        let mut cache = backend.cache.write().await;
-        for index in 0..MAX_SEARCH_ATTRIBUTION_PROFILES {
-            let track_id = TrackId::remote(format!("fill-{index}")).expect("bounded track ID");
-            let profile = PlaybackAttributionProfile::from_remote_row(
-                Some(format!("Fill {index}")),
-                Some("Fill Artist".to_owned()),
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("fill profile is bounded");
-            cache.search_attribution_profiles.insert(track_id, profile);
-        }
-    }
-
-    async fn assert_search_store_state(
-        backend: &SubsonicBackend,
-        present: &[&str],
-        absent: &[&str],
-    ) {
-        let cache = backend.cache.read().await;
-        assert_eq!(
-            cache.search_attribution_profiles.len(),
-            MAX_SEARCH_ATTRIBUTION_PROFILES,
-            "search-only retention stays capped at the bound"
-        );
-        for id in present {
-            let track_id = TrackId::remote(*id).expect("bounded track ID");
-            assert!(
-                cache.search_attribution_profiles.contains_key(&track_id),
-                "{id} should still be retained"
-            );
-        }
-        for id in absent {
-            let track_id = TrackId::remote(*id).expect("bounded track ID");
-            assert!(
-                !cache.search_attribution_profiles.contains_key(&track_id),
-                "{id} should have been evicted"
-            );
-        }
-    }
-
-    async fn assert_catalogue_profile_survives_search_traffic(backend: &SubsonicBackend) {
-        let catalogue_id = TrackId::remote("catalogue-song").expect("bounded track ID");
-        let cache = backend.cache.read().await;
-        let profile = cache
-            .attribution_profiles
-            .get(&catalogue_id)
-            .cloned()
-            .expect("the refreshed catalogue profile is never evicted by search traffic");
-        drop(cache);
-        assert_eq!(profile.title(), "Catalogue Song");
-        assert_eq!(
-            backend
-                .catalogue_attribution_profile(&catalogue_id)
-                .expect("catalogue authority stays resolvable")
-                .title(),
-            "Catalogue Song"
-        );
-    }
-
-    #[tokio::test]
-    async fn search_attribution_profiles_stay_bounded_and_never_evict_catalogue() {
-        let service = MockHttpService::start(search_eviction_routes()).await;
-        let password = Uuid::new_v4().to_string();
-        let backend = SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
-            .await
-            .expect("eviction fixture connects");
-
-        fill_search_attribution_store_to_bound(&backend).await;
-        assert_search_store_state(&backend, &["fill-0"], &[]).await;
-        assert_catalogue_profile_survives_search_traffic(&backend).await;
-
-        backend.search("Fresh A", 10).await.expect("first search");
-        // A genuinely new identity evicts only the oldest search-only entry.
-        assert_search_store_state(&backend, &["fresh-a", "fill-1"], &["fill-0"]).await;
-        assert_catalogue_profile_survives_search_traffic(&backend).await;
-
-        // A repeat search replaces its own entry in place, evicting nothing.
-        backend.search("Fresh A", 10).await.expect("repeat search");
-        assert_search_store_state(&backend, &["fresh-a", "fill-1"], &["fill-0"]).await;
-
-        // The next fresh identity evicts the next-oldest search-only entry.
-        backend.search("Fresh B", 10).await.expect("second search");
-        assert_search_store_state(
-            &backend,
-            &["fresh-a", "fresh-b", "fill-2"],
-            &["fill-0", "fill-1"],
-        )
-        .await;
-        assert_catalogue_profile_survives_search_traffic(&backend).await;
-
-        service.finish().await;
-    }
     /// A `tracing` layer capturing the rendered fields of every WARN- or
     /// ERROR-level event emitted under it.
     fn capture_diagnostics(body: impl FnOnce()) -> Vec<String> {
@@ -2430,7 +1759,7 @@ mod tests {
 
     /// A catalogue whose single artist reports `songCount` as a string — a
     /// server-controlled wrong type — carrying `sentinel` as that value.
-    async fn catalogue_with_wrong_type_song_count(sentinel: &str) -> MockHttpService {
+    async fn catalogue_with_wrong_type_album_list(sentinel: &str) -> MockHttpService {
         MockHttpService::start(vec![
             MockRoute::get("/rest/ping.view").reply(MockResponse::json(
                 serde_json::json!({"subsonic-response": {"status": "ok"}}),
@@ -2451,11 +1780,7 @@ mod tests {
                         "artist": {
                             "id": "artist-id",
                             "name": "Fixture Artist",
-                            "album": [{
-                                "id": "album-id",
-                                "name": "Fixture Album",
-                                "songCount": sentinel
-                            }]
+                            "album": sentinel
                         }
                     }
                 }))),
@@ -2475,11 +1800,10 @@ mod tests {
             .expect("fixture runtime");
         let captured = capture_diagnostics(|| {
             runtime.block_on(async {
-                let service = catalogue_with_wrong_type_song_count(sentinel).await;
+                let service = catalogue_with_wrong_type_album_list(sentinel).await;
                 let password = Uuid::new_v4().to_string();
                 let backend =
-                    SubsonicBackend::connect("fixture", &service.base_url(), "user", &password)
-                        .await;
+                    SubsonicBackend::connect(&service.base_url(), "user", &password).await;
                 assert!(backend.is_ok(), "per-artist parse failure is skipped");
                 service.finish().await;
             });

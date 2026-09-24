@@ -3,8 +3,6 @@
 //! Only the subset of fields Tributary actually uses are deserialized;
 //! unknown fields are silently ignored via `serde(default)`.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 // ── POST /Users/AuthenticateByName ──────────────────────────────────────
@@ -32,8 +30,6 @@ pub struct JellyfinAuthResponse {
 pub struct JellyfinAuthUser {
     #[serde(rename = "Id")]
     pub id: String,
-    #[serde(rename = "Name")]
-    pub name: String,
 }
 
 // ── GET /Users/{UserId}/Views ───────────────────────────────────────────
@@ -80,15 +76,11 @@ pub struct JellyfinLibraryItem {
 pub struct JellyfinItemsResponse {
     #[serde(rename = "Items", default)]
     pub items: Vec<JellyfinItem>,
-
-    #[serde(rename = "TotalRecordCount", default)]
-    pub total_record_count: u32,
 }
 
 /// A single item from the Jellyfin library.
 ///
-/// Used for tracks (`Audio`), albums (`MusicAlbum`), and artists
-/// (`MusicArtist`). Fields that don't apply to a given type will be
+/// Tributary requests only `Audio` items; absent optional fields are
 /// `None` / default.
 #[derive(Debug, Deserialize)]
 pub struct JellyfinItem {
@@ -98,16 +90,11 @@ pub struct JellyfinItem {
     #[serde(rename = "Name", default)]
     pub name: Option<String>,
 
-    /// Item type: `"Audio"`, `"MusicAlbum"`, `"MusicArtist"`, etc.
-    #[serde(rename = "Type", default)]
-    pub item_type: Option<String>,
-
-    // ── Track fields ────────────────────────────────────────────────
-    /// Album name (for tracks).
+    /// Album name.
     #[serde(rename = "Album", default)]
     pub album: Option<String>,
 
-    /// Album ID (for tracks).
+    /// Album ID.
     #[serde(rename = "AlbumId", default)]
     pub album_id: Option<String>,
 
@@ -115,7 +102,7 @@ pub struct JellyfinItem {
     #[serde(rename = "AlbumArtist", default)]
     pub album_artist: Option<String>,
 
-    /// Artist items array (for tracks — first entry is the primary artist).
+    /// Artist items array (the first entry is the primary artist).
     #[serde(rename = "ArtistItems", default)]
     pub artist_items: Vec<JellyfinNameId>,
 
@@ -147,23 +134,9 @@ pub struct JellyfinItem {
     #[serde(rename = "MediaSources", default)]
     pub media_sources: Vec<JellyfinMediaSource>,
 
-    // ── Album fields ────────────────────────────────────────────────
-    /// Number of child items (track count for albums).
-    #[serde(rename = "ChildCount", default)]
-    pub child_count: Option<u32>,
-
-    /// Image tags — presence of `"Primary"` means cover art exists.
-    #[serde(rename = "ImageTags", default)]
-    pub image_tags: Option<serde_json::Value>,
-
     /// Date the item was created on the server (ISO 8601).
     #[serde(rename = "DateCreated", default)]
     pub date_created: Option<String>,
-
-    // ── Artist fields ───────────────────────────────────────────────
-    /// Number of albums (for artist items).
-    #[serde(rename = "AlbumCount", default)]
-    pub album_count: Option<u32>,
 
     /// Play count.
     #[serde(rename = "UserData", default)]
@@ -197,9 +170,6 @@ pub struct JellyfinMediaStream {
 
     #[serde(rename = "SampleRate", default)]
     pub sample_rate: Option<u32>,
-
-    #[serde(rename = "BitRate", default)]
-    pub bit_rate: Option<u32>,
 }
 
 /// User-specific data (play count, etc.).
@@ -221,8 +191,6 @@ pub struct JellyfinUserData {
 /// Response from Jellyfin UDP broadcast discovery on port 7359.
 #[derive(Debug, Deserialize)]
 pub struct JellyfinDiscoveryResponse {
-    #[serde(rename = "Id")]
-    pub id: String,
     #[serde(rename = "Address")]
     pub address: String,
     #[serde(rename = "Name")]

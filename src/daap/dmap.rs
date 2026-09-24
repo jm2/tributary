@@ -9,13 +9,16 @@
 //! | 8+    | Content (container, string, or integer)     |
 //!
 //! This module parses only the subset of tags that Tributary needs.
-//! Unknown tags are stored as raw bytes and silently skipped.
+//! Unknown tags keep their position in the tree but not their payload.
+//!
+//! The decoded tree is bounded independently of the input size: every node
+//! is charged against a node-count and byte budget (see [`MAX_NODES`] and
+//! [`MAX_TREE_BYTES`]) so a hostile body cannot amplify into a much larger
+//! in-memory tree.
 
 use nom::bytes::complete::take;
-use nom::multi::many0;
 use nom::number::complete::be_u32;
 use nom::IResult;
-use nom::Parser;
 
 use crate::architecture::error::BackendError;
 
@@ -27,6 +30,18 @@ use crate::architecture::error::BackendError;
 /// worker-thread stack — an uncatchable abort that crashes the whole app.
 /// Real DAAP responses nest only a handful of levels, so 32 is generous.
 const MAX_DEPTH: usize = 32;
+
+/// Maximum number of nodes one parse may decode.
+///
+/// A track item is about 15 nodes (the `mlit` container plus the requested
+/// fields), so this admits catalogues of about 280,000 tracks while stopping a
+/// flood of minimal 8-byte nodes from becoming tens of millions of entries.
+pub const MAX_NODES: usize = 4 * 1024 * 1024;
+
+/// Maximum decoded tree size in bytes, charged per node as the node struct
+/// plus any retained payload. `Vec` growth slack is not charged and is at most
+/// the same again.
+pub const MAX_TREE_BYTES: usize = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -49,13 +64,8 @@ pub enum DmapValue {
     U8(u8),
     U16(u16),
     U32(u32),
-    U64(u64),
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    /// Fallback for unknown or unneeded tags.
-    Raw(Vec<u8>),
+    /// An unclassified tag. Its payload is skipped, not retained.
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,18 +80,13 @@ enum DmapType {
     U8,
     U16,
     U32,
-    U64,
-    I8,
-    I16,
-    I32,
-    I64,
-    Raw,
+    Unknown,
 }
 
 /// Classify a 4-byte tag into its expected content type.
 ///
 /// Only the tags Tributary actually uses are classified; everything
-/// else falls through to [`DmapType::Raw`].
+/// else falls through to [`DmapType::Unknown`].
 fn tag_type(tag: &[u8; 4]) -> DmapType {
     match tag {
         // Containers
@@ -102,10 +107,6 @@ fn tag_type(tag: &[u8; 4]) -> DmapType {
         b"mstt" => DmapType::U32, // status code
         b"mimc" => DmapType::U32, // item count
         b"msau" => DmapType::U8,  // authentication method (0 = none)
-        b"mikd" => DmapType::I8,  // media item kind
-
-        // I64 integers
-        b"mper" => DmapType::I64, // persistent id
 
         // U16 integers
         b"astn" => DmapType::U16, // song track number
@@ -123,7 +124,7 @@ fn tag_type(tag: &[u8; 4]) -> DmapType {
         b"asgn" => DmapType::String, // song genre
         b"asfm" => DmapType::String, // song format
 
-        _ => DmapType::Raw,
+        _ => DmapType::Unknown,
     }
 }
 
@@ -131,16 +132,59 @@ fn tag_type(tag: &[u8; 4]) -> DmapType {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Remaining decode allowance for one parse.
+struct ParseBudget {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl ParseBudget {
+    /// Charge one node: the node struct counts against both allowances.
+    fn node<'a>(&mut self, input: &'a [u8]) -> Result<(), nom::Err<nom::error::Error<&'a [u8]>>> {
+        self.nodes = self
+            .nodes
+            .checked_sub(1)
+            .ok_or_else(|| budget_exceeded(input))?;
+        self.payload(input, std::mem::size_of::<DmapNode>())
+    }
+
+    /// Charge `bytes` of retained heap payload.
+    fn payload<'a>(
+        &mut self,
+        input: &'a [u8],
+        bytes: usize,
+    ) -> Result<(), nom::Err<nom::error::Error<&'a [u8]>>> {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| budget_exceeded(input))?;
+        Ok(())
+    }
+}
+
+fn budget_exceeded(input: &[u8]) -> nom::Err<nom::error::Error<&[u8]>> {
+    nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Count))
+}
+
 /// Parse a byte buffer into a list of DMAP nodes.
 ///
 /// This is the top-level entry point. It consumes the entire input and
-/// returns `BackendError::ParseError` on malformed data.
+/// returns `BackendError::ParseError` on malformed data or when the decoded
+/// tree would exceed [`MAX_NODES`] or [`MAX_TREE_BYTES`].
 pub fn parse_dmap(input: &[u8]) -> Result<Vec<DmapNode>, BackendError> {
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
+    parse_dmap_within(input, MAX_NODES, MAX_TREE_BYTES)
+}
 
-    match parse_nodes(input, 0) {
+fn parse_dmap_within(
+    input: &[u8],
+    max_nodes: usize,
+    max_bytes: usize,
+) -> Result<Vec<DmapNode>, BackendError> {
+    let mut budget = ParseBudget {
+        nodes: max_nodes,
+        bytes: max_bytes,
+    };
+    match parse_nodes(input, 0, &mut budget) {
         Ok((remaining, nodes)) => {
             if !remaining.is_empty() {
                 return Err(BackendError::ParseError {
@@ -162,6 +206,9 @@ pub fn parse_dmap(input: &[u8]) -> Result<Vec<DmapNode>, BackendError> {
                 nom::Err::Failure(error) if error.code == nom::error::ErrorKind::TooLarge => {
                     "container nesting exceeds the supported limit"
                 }
+                nom::Err::Failure(error) if error.code == nom::error::ErrorKind::Count => {
+                    "response exceeds the supported decoded size"
+                }
                 nom::Err::Failure(error) if error.code == nom::error::ErrorKind::Eof => {
                     "truncated nested container"
                 }
@@ -180,17 +227,39 @@ pub fn parse_dmap(input: &[u8]) -> Result<Vec<DmapNode>, BackendError> {
     }
 }
 
-/// Parse zero or more consecutive DMAP nodes from the input.
-fn parse_nodes(input: &[u8], depth: usize) -> IResult<&[u8], Vec<DmapNode>> {
-    many0(move |i| parse_single_node(i, depth)).parse(input)
+/// Parse consecutive DMAP nodes until the input is exhausted or a node's
+/// framing fails. A framing failure stops the sequence and leaves the rest
+/// unconsumed for the caller to reject; budget, depth, and nested-container
+/// failures abort the whole parse.
+fn parse_nodes<'a>(
+    mut input: &'a [u8],
+    depth: usize,
+    budget: &mut ParseBudget,
+) -> IResult<&'a [u8], Vec<DmapNode>> {
+    let mut nodes = Vec::new();
+    while !input.is_empty() {
+        match parse_single_node(input, depth, budget) {
+            Ok((remaining, node)) => {
+                nodes.push(node);
+                input = remaining;
+            }
+            Err(nom::Err::Error(_)) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((input, nodes))
 }
 
 /// Parse a single DMAP TLV node.
-fn parse_single_node(input: &[u8], depth: usize) -> IResult<&[u8], DmapNode> {
+fn parse_single_node<'a>(
+    input: &'a [u8],
+    depth: usize,
+    budget: &mut ParseBudget,
+) -> IResult<&'a [u8], DmapNode> {
     // Bound recursion depth.  Surface an unrecoverable `Failure` (not a
-    // recoverable `Error`, which `many0` would silently swallow) so the
-    // whole parse aborts with a clean `ParseError` instead of recursing
-    // until the thread stack overflows.
+    // recoverable `Error`, which ends a node sequence) so the whole parse
+    // aborts with a clean `ParseError` instead of recursing until the thread
+    // stack overflows.
     if depth > MAX_DEPTH {
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
@@ -209,24 +278,26 @@ fn parse_single_node(input: &[u8], depth: usize) -> IResult<&[u8], DmapNode> {
     // Take exactly `length` bytes of content
     let (input, content) = take(length as usize)(input)?;
 
-    let data = decode_value(&tag, content, depth)?;
+    budget.node(content)?;
+    let data = decode_value(&tag, content, depth, budget)?;
 
     Ok((input, DmapNode { tag, data }))
 }
 
 /// Decode the content bytes of a node according to its tag type.
 ///
-/// Returns `Err` for an unrecoverable depth-limit `Failure` or for malformed
-/// framing inside a known container. Silently accepting the successfully
-/// parsed prefix of a truncated container would let a response reach the
-/// client as an empty/partial listing.
+/// Returns `Err` for an unrecoverable depth-limit or budget `Failure` or for
+/// malformed framing inside a known container. Silently accepting the
+/// successfully parsed prefix of a truncated container would let a response
+/// reach the client as an empty/partial listing.
 fn decode_value<'a>(
     tag: &[u8; 4],
     content: &'a [u8],
     depth: usize,
+    budget: &mut ParseBudget,
 ) -> Result<DmapValue, nom::Err<nom::error::Error<&'a [u8]>>> {
     let value = match tag_type(tag) {
-        DmapType::Container => match parse_nodes(content, depth + 1) {
+        DmapType::Container => match parse_nodes(content, depth + 1, budget) {
             Ok(([], children)) => DmapValue::Container(children),
             Ok((remaining, _)) => {
                 return Err(nom::Err::Failure(nom::error::Error::new(
@@ -234,8 +305,8 @@ fn decode_value<'a>(
                     nom::error::ErrorKind::Eof,
                 )))
             }
-            // A depth-limit breach is an unrecoverable `Failure` — pass it up
-            // so the whole parse aborts instead of stack-overflowing.
+            // Depth and budget breaches are unrecoverable `Failure`s — pass
+            // them up so the whole parse aborts.
             Err(e @ nom::Err::Failure(_)) => return Err(e),
             // Known containers must be structurally complete. Promote a
             // recoverable nested parse failure so the outer parser cannot
@@ -243,16 +314,15 @@ fn decode_value<'a>(
             Err(nom::Err::Error(error)) => return Err(nom::Err::Failure(error)),
             Err(nom::Err::Incomplete(needed)) => return Err(nom::Err::Incomplete(needed)),
         },
-        DmapType::String => DmapValue::String(String::from_utf8_lossy(content).into_owned()),
+        DmapType::String => {
+            let value = String::from_utf8_lossy(content).into_owned();
+            budget.payload(content, value.len())?;
+            DmapValue::String(value)
+        }
         DmapType::U8 => DmapValue::U8(u8::from_be_bytes(exact_scalar_bytes(content)?)),
         DmapType::U16 => DmapValue::U16(u16::from_be_bytes(exact_scalar_bytes(content)?)),
         DmapType::U32 => DmapValue::U32(u32::from_be_bytes(exact_scalar_bytes(content)?)),
-        DmapType::U64 => DmapValue::U64(u64::from_be_bytes(exact_scalar_bytes(content)?)),
-        DmapType::I8 => DmapValue::I8(i8::from_be_bytes(exact_scalar_bytes(content)?)),
-        DmapType::I16 => DmapValue::I16(i16::from_be_bytes(exact_scalar_bytes(content)?)),
-        DmapType::I32 => DmapValue::I32(i32::from_be_bytes(exact_scalar_bytes(content)?)),
-        DmapType::I64 => DmapValue::I64(i64::from_be_bytes(exact_scalar_bytes(content)?)),
-        DmapType::Raw => DmapValue::Raw(content.to_vec()),
+        DmapType::Unknown => DmapValue::Unknown,
     };
     Ok(value)
 }
@@ -332,6 +402,19 @@ pub fn find_containers<'a>(nodes: &'a [DmapNode], tag: &[u8; 4]) -> Vec<&'a [Dma
         .filter(|n| &n.tag == tag)
         .filter_map(|n| match &n.data {
             DmapValue::Container(children) => Some(children.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Move the children of all container nodes matching the given tag out of
+/// `nodes`, so large listings are not copied while the parsed tree is alive.
+pub fn into_containers(nodes: Vec<DmapNode>, tag: &[u8; 4]) -> Vec<Vec<DmapNode>> {
+    nodes
+        .into_iter()
+        .filter(|n| &n.tag == tag)
+        .filter_map(|n| match n.data {
+            DmapValue::Container(children) => Some(children),
             _ => None,
         })
         .collect()
@@ -422,31 +505,80 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_tag_stored_as_raw() {
+    fn test_unknown_tag_keeps_position_but_not_payload() {
         let blob = make_tlv(b"zzzz", &[0xDE, 0xAD, 0xBE, 0xEF]);
 
         let nodes = parse_dmap(&blob).expect("parse should succeed");
         assert_eq!(nodes.len(), 1);
         assert_eq!(&nodes[0].tag, b"zzzz");
+        assert!(matches!(nodes[0].data, DmapValue::Unknown));
+    }
 
-        match &nodes[0].data {
-            DmapValue::Raw(bytes) => assert_eq!(bytes, &[0xDE, 0xAD, 0xBE, 0xEF]),
-            other => panic!("expected Raw, got {other:?}"),
+    #[test]
+    fn node_budget_rejects_a_flood_of_minimal_nodes() {
+        // Twenty empty unknown nodes inside one known container: 21 nodes.
+        let mut flood = Vec::new();
+        for _ in 0..20 {
+            flood.extend_from_slice(&make_tlv(b"zzzz", b""));
         }
+        let blob = make_tlv(b"mlcl", &flood);
+
+        let nodes = parse_dmap_within(&blob, 21, usize::MAX).expect("exact node budget parses");
+        assert_eq!(nodes.len(), 1);
+
+        let error = parse_dmap_within(&blob, 20, usize::MAX)
+            .expect_err("one node past the budget must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the supported decoded size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn byte_budget_charges_nodes_and_retained_string_payloads() {
+        let node = std::mem::size_of::<DmapNode>();
+        let blob = make_tlv(b"mlit", &make_tlv(b"minm", b"12345678"));
+
+        parse_dmap_within(&blob, usize::MAX, 2 * node + 8).expect("exact byte budget parses");
+        let error = parse_dmap_within(&blob, usize::MAX, 2 * node + 7)
+            .expect_err("one retained byte past the budget must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the supported decoded size"),
+            "unexpected error: {error}"
+        );
+
+        // Unknown payloads are not retained, so they cost only their node.
+        let unknown = make_tlv(b"mlit", &make_tlv(b"zzzz", &[0; 64]));
+        parse_dmap_within(&unknown, usize::MAX, 2 * node).expect("unknown payload is free");
+    }
+
+    #[test]
+    fn into_containers_moves_matching_children_out_of_the_tree() {
+        let mut mlcl_content = make_tlv(b"mlit", &make_tlv(b"minm", b"Song A"));
+        mlcl_content.extend_from_slice(&make_tlv(b"zzzz", b"skip"));
+        mlcl_content.extend_from_slice(&make_tlv(b"mlit", &make_tlv(b"minm", b"Song B")));
+        let blob = make_tlv(b"mlcl", &mlcl_content);
+
+        let mut nodes = parse_dmap(&blob).expect("parse should succeed");
+        let DmapValue::Container(children) = nodes.remove(0).data else {
+            panic!("expected container");
+        };
+        let items = into_containers(children, b"mlit");
+        assert_eq!(items.len(), 2);
+        assert_eq!(find_string(&items[0], b"minm").as_deref(), Some("Song A"));
+        assert_eq!(find_string(&items[1], b"minm").as_deref(), Some("Song B"));
     }
 
     #[test]
     fn known_integer_tags_require_their_exact_scalar_width() {
         // One representative tag for every integer type used by Tributary.
-        // `mstt` is included explicitly because accepting it as Raw or
+        // `mstt` is included explicitly because accepting it as unknown or
         // parsing a four-byte prefix would bypass response-status handling.
-        for (tag, width) in [
-            (b"msau", 1_usize),
-            (b"mikd", 1),
-            (b"astn", 2),
-            (b"mstt", 4),
-            (b"mper", 8),
-        ] {
+        for (tag, width) in [(b"msau", 1_usize), (b"astn", 2), (b"mstt", 4)] {
             parse_dmap(&make_tlv(tag, &vec![0; width]))
                 .unwrap_or_else(|error| panic!("{tag:?}: exact width must parse: {error}"));
 
@@ -507,28 +639,6 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(find_string(&nodes, b"minm"), Some("Hello".to_string()));
         assert_eq!(find_u32(&nodes, b"miid"), Some(99));
-    }
-
-    #[test]
-    fn test_i8_extraction() {
-        let blob = make_tlv(b"mikd", &[0xFF]); // -1 as i8
-        let nodes = parse_dmap(&blob).expect("parse should succeed");
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0].data {
-            DmapValue::I8(v) => assert_eq!(*v, -1),
-            other => panic!("expected I8, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_i64_extraction() {
-        let blob = make_tlv(b"mper", &42i64.to_be_bytes());
-        let nodes = parse_dmap(&blob).expect("parse should succeed");
-        assert_eq!(nodes.len(), 1);
-        match &nodes[0].data {
-            DmapValue::I64(v) => assert_eq!(*v, 42),
-            other => panic!("expected I64, got {other:?}"),
-        }
     }
 
     #[test]
