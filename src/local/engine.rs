@@ -221,10 +221,6 @@ impl RootReauthorizationRequest {
         }
     }
 
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
     pub fn old_path(&self) -> &Path {
         &self.old_path
     }
@@ -972,6 +968,7 @@ async fn forget_tracks_outside_library_roots(
     Ok(forgotten.len())
 }
 
+#[cfg(test)]
 async fn resolve_root_reauthorization(
     db: &DatabaseConnection,
     request: &RootReauthorizationRequest,
@@ -2371,6 +2368,7 @@ fn scan_root(root: PathBuf) -> RootScan {
     )
 }
 
+#[cfg(test)]
 fn scan_root_with_identity_probe<F>(root: PathBuf, identity_probe: F) -> RootScan
 where
     F: FnMut(&Path) -> std::io::Result<String>,
@@ -3003,6 +3001,7 @@ fn reconciliation_is_authoritative(
 /// unconfirmed until an explicit-trust UX can resolve the intended volume:
 /// even a complete path/size/mtime clone cannot prove physical identity. A
 /// different device never silently replaces a confirmed identity.
+#[cfg(test)]
 fn scan_confirms_identity(
     scan: &RootScan,
     previous: Option<&library_root::Model>,
@@ -5646,10 +5645,6 @@ impl WatcherRootCache {
             .enumerate()
             .find(|(_, entry)| path.starts_with(&entry.root))
             .map(|(index, entry)| (index, entry.root.clone(), entry.state.clone()))
-    }
-
-    fn exact_root(&self, root: &Path) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.root == root)
     }
 
     fn authority_lease(&self, index: usize) -> Option<Arc<RootAuthorityLease>> {

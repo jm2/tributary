@@ -315,11 +315,12 @@ impl SmartTrack for crate::db::entities::track::Model {
 /// Returns the matching tracks after applying the three evaluation stages in
 /// order: filter, limit selection/membership, then final compound ordering.
 /// A `LimitSort::Random` limit draws a fresh selection on every call.
+#[cfg(test)]
 pub fn evaluate<T: SmartTrack + Clone>(rules: &SmartRules, tracks: &[T]) -> Vec<T> {
     evaluate_seeded(rules, tracks, fastrand::u64(..))
 }
 
-/// [`evaluate`] with a caller-owned seed for a `LimitSort::Random` limit.
+/// Evaluate with a caller-owned seed for a `LimitSort::Random` limit.
 ///
 /// Each track's random rank depends only on the seed and its own identity,
 /// so re-evaluating with the same seed selects the same tracks, and tracks

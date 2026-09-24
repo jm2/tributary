@@ -145,24 +145,28 @@ impl PlaybackHistoryProgress {
     ///
     /// It becomes immutable when the first positive duration is accepted.
     #[must_use]
+    #[cfg(test)]
     pub const fn threshold_ms(&self) -> u64 {
         self.threshold_ms
     }
 
     /// Credited forward playback, capped at the threshold.
     #[must_use]
+    #[cfg(test)]
     pub const fn credited_ms(&self) -> u64 {
         self.credited_ms
     }
 
     /// Whether a forward seek has supplied skip evidence.
     #[must_use]
+    #[cfg(test)]
     pub const fn observed_forward_skip(&self) -> bool {
         self.observed_forward_skip
     }
 
     /// Whether this occurrence has already produced its one count signal.
     #[must_use]
+    #[cfg(test)]
     pub const fn is_counted(&self) -> bool {
         self.counted
     }

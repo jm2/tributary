@@ -758,6 +758,7 @@ impl<'a> ImportedTrackMatchIndex<'a> {
 /// non-empty imported album is an additional exact constraint. When duration
 /// is present it is a hard ±5-second gate and only a unique nearest candidate
 /// wins. Without duration, duplicate metadata matches remain ambiguous.
+#[cfg(test)]
 pub(super) fn match_imported_track<'a>(
     imported: &ImportedTrack,
     tracks: &'a [track::Model],

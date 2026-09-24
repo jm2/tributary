@@ -81,7 +81,6 @@ mod install_id;
 #[allow(dead_code)]
 mod jellyfin;
 pub(crate) mod lastfm;
-#[allow(dead_code)]
 mod local;
 mod panic_reporting;
 mod paths;

@@ -81,6 +81,7 @@ fn tag_text(value: Option<&str>) -> Option<String> {
 /// `catch_unwind` isolation is added here. Callers that invoke this directly
 /// on the GTK main thread rely on that contract; the scan paths additionally
 /// run it inside `spawn_blocking`, which already isolates any panic.
+#[cfg(test)]
 pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open audio file {}", path.display()))?;

@@ -652,6 +652,7 @@ impl TempFile {
     /// Error contexts name the target by `target_label`, never by `target`:
     /// an authority-based caller's target is a native mount path that must
     /// not leak into logs (see `replacement_path`).
+    #[cfg(any(test, not(unix)))]
     fn create_beside(target: &Path, target_label: &str) -> Result<(Self, std::fs::File)> {
         let directory = target.parent().unwrap_or_else(|| Path::new("."));
 
@@ -794,6 +795,7 @@ impl TempFile {
     /// Atomically move the temp file onto `target`, disarming the cleanup.
     ///
     /// On failure `self` is dropped, so the temp file is still removed.
+    #[cfg(any(test, not(unix)))]
     fn persist_to(&mut self, target: &Path) -> Result<()> {
         std::fs::rename(&self.path, target).with_context(|| {
             format!(
@@ -818,6 +820,7 @@ impl TempFile {
     /// A capability check is successful only when cleanup succeeds. Returning
     /// success while leaving a private sibling behind would make merely
     /// opening Properties mutate the library indefinitely.
+    #[cfg(any(test, not(unix)))]
     fn remove(mut self) -> Result<()> {
         std::fs::remove_file(&self.path).with_context(|| {
             format!(
@@ -891,6 +894,7 @@ pub fn supports_tag_writes(path: &Path) -> bool {
 /// Batch callers should validate every distinct track, run
 /// [`preflight_tag_write_target_access`] for every track, then call
 /// [`preflight_tag_write_directory`] once per distinct parent directory.
+#[cfg(any(test, not(unix)))]
 pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightError> {
     if !supports_tag_writes(path) {
         return Err(TagWritePreflightError::UnsupportedFormat);
@@ -922,6 +926,7 @@ pub fn validate_tag_write_target(path: &Path) -> Result<(), TagWritePreflightErr
 /// validation above because permissions are applied after tagging.
 ///
 /// This performs blocking filesystem I/O and must not run on the GTK thread.
+#[cfg(any(test, not(unix)))]
 pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePreflightError> {
     validate_tag_write_target(path)?;
 
@@ -973,6 +978,7 @@ pub fn preflight_tag_write_target_access(path: &Path) -> Result<(), TagWritePref
 /// grants, ACLs, FUSE filesystems, or Windows access rules.
 ///
 /// This performs blocking filesystem I/O and must not run on the GTK thread.
+#[cfg(any(test, not(unix)))]
 pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePreflightError> {
     validate_tag_write_target(path)?;
 
@@ -1015,6 +1021,7 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
 }
 
 /// Check whether the complete atomic tag writer can currently operate.
+#[cfg(any(test, not(unix)))]
 pub fn preflight_tag_write(path: &Path) -> Result<(), TagWritePreflightError> {
     preflight_tag_write_target_access(path)?;
     preflight_tag_write_directory(path)
@@ -1691,6 +1698,7 @@ fn classify_local_write_failure(
 /// whatever the path currently names. The properties dialog uses
 /// [`LocalMutationTarget`] instead, so a file replaced after selection is
 /// refused rather than silently rewritten.
+#[cfg(test)]
 pub fn write_tags(path: &Path, edits: &TagEdits) -> Result<()> {
     if edits.is_empty() {
         return Ok(());
@@ -2089,6 +2097,7 @@ fn create_retained_sibling_exclusive(
 /// target is a native mount path that must not leak into logs, so contexts
 /// name the target by `target_label` instead. Path-based callers pass the
 /// user-visible pathname's own text.
+#[cfg(any(test, not(unix)))]
 fn atomic_tag_replacement(
     source: File,
     target_path: &Path,
@@ -2186,6 +2195,7 @@ fn copy_source_into_destination(
 /// object whose bytes were copied — never from a lookup at the target's name,
 /// which an external writer can retarget between admission and commit. Error
 /// contexts name the target by `target_label`, never by its native pathname.
+#[cfg(any(test, not(unix)))]
 fn flush_and_prepare_tagged_copy(
     temp: &TempFile,
     target_label: &str,
@@ -2215,6 +2225,7 @@ fn flush_and_prepare_tagged_copy(
 /// `FlushFileBuffers`, which requires `GENERIC_WRITE`, so syncing through a
 /// read-only handle fails with access-denied and would break every tag write on
 /// that platform.
+#[cfg(any(test, not(unix)))]
 fn flush_to_disk(path: &Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)
@@ -2229,6 +2240,7 @@ fn flush_to_disk(path: &Path) -> std::io::Result<()> {
 /// the target's own directory — a native mount directory for
 /// authority-based callers — and formatting it would leak exactly the
 /// location the redacted label exists to protect.
+#[cfg(any(test, not(unix)))]
 fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Result<()> {
     let mut tagged_file = lofty::read_from_path(temp_path)
         .with_context(|| format!("Failed to read tags from {target_label}"))?;

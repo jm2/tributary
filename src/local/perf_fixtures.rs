@@ -450,11 +450,6 @@ impl ResponsivenessReport {
         }
         rendered
     }
-
-    /// Recorded metrics.
-    pub fn metrics(&self) -> &[Metric] {
-        &self.metrics
-    }
 }
 
 /// Approximate bytes retained by a published catalogue snapshot.

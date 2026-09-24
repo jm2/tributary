@@ -184,6 +184,7 @@ impl PlaylistSidebarSnapshot {
         self.revision
     }
 
+    #[cfg(test)]
     pub const fn state(&self) -> &PlaylistSidebarState {
         &self.state
     }
