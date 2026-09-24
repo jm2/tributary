@@ -4264,6 +4264,57 @@ mod tests {
         assert_no_quarantine_sibling_remains(&directory);
     }
 
+    /// A competing writer that edits the admitted file in place inside the
+    /// commit section — after the leaf was confirmed, before anything is
+    /// displaced — keeps the leaf's identity, so only the revision gate can
+    /// see it. The commit must refuse and leave the competing edit in place.
+    #[cfg(unix)]
+    #[test]
+    fn commit_replacement_refuses_an_in_place_edit_after_confirm_and_keeps_it() {
+        let directory = TestDirectory::new("mutation-post-confirm-edit");
+        let song = directory.path().join("song.flac");
+        fs::write(&song, b"original audio").expect("write song");
+
+        let authority =
+            Arc::new(MountedRootAuthority::acquire(directory.path()).expect("acquire authority"));
+        let target = authority
+            .open_mutation_target(Path::new("song.flac"))
+            .expect("open mutation target");
+        let selected_revision = target.content_revision().expect("capture the revision");
+
+        let staged = directory.path().join(".song.tributary-tag-tmp.flac");
+        fs::write(&staged, b"tagged audio").expect("stage the replacement");
+        let watched_leaf = song.clone();
+
+        with_post_confirm_interpose(
+            Box::new(move |commit| {
+                if commit.target.path != watched_leaf {
+                    return;
+                }
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&commit.target.path)
+                    .expect("open the confirmed leaf for a competing edit");
+                std::io::Write::write_all(&mut file, b" + competing edit")
+                    .expect("edit the confirmed leaf in place");
+            }),
+            || {
+                let mut commit = target.begin_commit().expect("begin commit section");
+                commit
+                    .commit_replacement_checked(&staged, None, Some(&selected_revision), None)
+                    .expect_err("an in-place edit after confirm must refuse the commit");
+            },
+        );
+
+        assert_eq!(
+            fs::read(&song).expect("read the leaf back"),
+            b"original audio + competing edit",
+            "the competing edit must be preserved"
+        );
+        fs::remove_file(&staged).expect("remove the staged copy");
+        assert_no_quarantine_sibling_remains(&directory);
+    }
+
     /// The replacement must stay conditional on the destination remaining
     /// vacant through the quarantine-to-install window: an external writer
     /// that recreates the leaf after the confirmed original was displaced —

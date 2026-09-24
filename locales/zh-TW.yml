@@ -2,6 +2,9 @@
 app:
   not_playing: "未在播放"
   scanning: "正在掃描音樂庫…"
+  unsupported_file_names_skipped:
+    one: "已略過 %{count} 個音訊檔案：檔案名稱不是有效的 UTF-8"
+    other: "已略過 %{count} 個音訊檔案：檔案名稱不是有效的 UTF-8"
   live: "直播"
 
 # ── Header bar ─────────────────────────────────────────────────────
@@ -204,6 +207,7 @@ playlist_io:
   import_success_heading: "已匯入 XSPF 播放清單"
   import_warning_heading: "已匯入 XSPF 播放清單，但有警告"
   import_success_body: "已匯入「%{name}」。\n\n已配對：%{matched}\n未配對（已保留）：%{unmatched}\n失敗（未匯入）：%{failed}"
+  import_skipped_unsupported_names: "已略過（檔案名稱不是有效的 UTF-8）：%{count}"
   import_failed_heading: "無法匯入 XSPF 播放清單"
   import_rollback_body: "%{error}\n\n未提交播放清單或任何項目；所有資料庫變更均已回復。"
   import_worker_failed_body: "匯入程序在回報結果前已停止：%{error}\n\n未顯示任何已提交的播放清單。"

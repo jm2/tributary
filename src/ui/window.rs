@@ -2605,6 +2605,7 @@ pub(crate) fn build_window(
                 server_playlist_recovery.clone(),
                 server_playlist_browser.clone(),
                 shutdown_started.clone(),
+                toast_overlay.clone(),
             );
             return;
         }
@@ -3817,6 +3818,7 @@ pub(crate) fn build_window(
         server_playlist_recovery,
         server_playlist_browser,
         shutdown_started,
+        toast_overlay,
     );
 }
 
@@ -4432,6 +4434,7 @@ fn setup_library_events(
     server_playlist_recovery: super::server_playlist_recovery::ServerPlaylistRecoveryController,
     server_playlist_browser: super::server_playlists::ServerPlaylistBrowserController,
     window_closing: Rc<Cell<bool>>,
+    toasts: adw::ToastOverlay,
 ) {
     let window = window.clone();
     let browser_widget = browser_widget.clone();
@@ -4591,6 +4594,13 @@ fn setup_library_events(
                     info!("Library scan complete");
                     scan_spinner.set_spinning(false);
                     scan_spinner.set_visible(false);
+                }
+
+                LibraryEvent::UnsupportedFileNamesSkipped(count) => {
+                    toasts.add_toast(adw::Toast::new(&unsupported_file_names_message(
+                        &rust_i18n::locale(),
+                        count,
+                    )));
                 }
 
                 LibraryEvent::PlaybackHistoryUpdated(track)
@@ -4849,6 +4859,17 @@ fn setup_library_events(
             }
         }
     });
+}
+
+/// The notice for audio files the library refused because their names are
+/// not valid UTF-8.
+fn unsupported_file_names_message(locale: &str, count: usize) -> String {
+    let key = super::l10n::plural_key(
+        "app.unsupported_file_names_skipped",
+        locale,
+        &count.to_string(),
+    );
+    rust_i18n::t!(key.as_str(), locale = locale, count = count).into_owned()
 }
 
 fn show_closing_notice(toasts: &adw::ToastOverlay) {
@@ -5438,6 +5459,27 @@ mod identity_tests {
         LastFmApplicationAdmissionError, LastFmApplicationCommandError, LastFmApplicationPhase,
     };
     use crate::local::playlist_sidebar::{PlaylistSidebarEntry, PlaylistSidebarKind};
+
+    #[test]
+    fn unsupported_file_name_notice_selects_the_plural_form_in_every_catalog() {
+        assert_eq!(
+            unsupported_file_names_message("en", 1),
+            "1 audio file skipped: its name isn’t valid UTF-8"
+        );
+        assert_eq!(
+            unsupported_file_names_message("en", 3),
+            "3 audio files skipped: their names aren’t valid UTF-8"
+        );
+        for locale in rust_i18n::available_locales!() {
+            for count in [1, 2, 5, 22] {
+                let message = unsupported_file_names_message(&locale, count);
+                assert!(
+                    message.contains(&count.to_string()) && !message.contains("%{"),
+                    "{locale} {count}: {message}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn library_interaction_wiring_precedes_window_realization_and_audio_setup() {

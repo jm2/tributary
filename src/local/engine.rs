@@ -84,6 +84,10 @@ pub enum LibraryEvent {
     ScanProgress(u64, u64),
     /// Initial scan complete.
     ScanComplete,
+    /// A scan or the watcher refused this many audio files, not reported
+    /// before in this session, because their names are not valid UTF-8 and
+    /// so cannot be stored as an exact library path.
+    UnsupportedFileNamesSkipped(usize),
     /// Playlists and their authoritative editability/link presentation loaded
     /// from one joined database snapshot.
     PlaylistsLoaded(PlaylistSidebarSnapshot),
@@ -1472,6 +1476,8 @@ struct RootScan {
     audio_files: Vec<(PathBuf, String)>,
     /// Private siblings an interrupted tag save left behind.
     tag_write_debris: Vec<PathBuf>,
+    /// Audio files refused because their names are not valid UTF-8.
+    unsupported_names: Vec<PathBuf>,
     errors: Vec<String>,
     device_id: Option<String>,
     mount_generation: Option<u64>,
@@ -2411,6 +2417,7 @@ where
             root,
             audio_files: Vec::new(),
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             device_id: None,
             mount_generation: None,
             authority_lease: None,
@@ -2430,6 +2437,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 tag_write_debris: Vec::new(),
+                unsupported_names: Vec::new(),
                 device_id: None,
                 mount_generation: None,
                 authority_lease: None,
@@ -2456,6 +2464,7 @@ where
                         root,
                         audio_files: Vec::new(),
                         tag_write_debris: Vec::new(),
+                        unsupported_names: Vec::new(),
                         device_id,
                         mount_generation: None,
                         authority_lease: None,
@@ -2479,6 +2488,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 tag_write_debris: Vec::new(),
+                unsupported_names: Vec::new(),
                 device_id,
                 mount_generation: None,
                 authority_lease,
@@ -2500,6 +2510,7 @@ where
                 root,
                 audio_files: Vec::new(),
                 tag_write_debris: Vec::new(),
+                unsupported_names: Vec::new(),
                 device_id,
                 mount_generation: Some(mount_generation),
                 authority_lease,
@@ -2521,8 +2532,12 @@ where
         }
     };
 
-    let (audio_files, tag_write_debris, traversal_errors) =
-        enumerate_audio_files(&root, root_boundary, exclusions);
+    let AudioFileEnumeration {
+        audio_files,
+        private_siblings: tag_write_debris,
+        unsupported_names,
+        errors: traversal_errors,
+    } = enumerate_audio_files(&root, root_boundary, exclusions);
     errors.extend(traversal_errors);
     let audio_files = audio_files
         .into_iter()
@@ -2567,6 +2582,7 @@ where
         root,
         audio_files,
         tag_write_debris,
+        unsupported_names,
         errors,
         device_id,
         mount_generation: Some(mount_generation),
@@ -2576,8 +2592,61 @@ where
     }
 }
 
+/// What one traversal found under a library scope.
+#[derive(Debug, Default)]
+struct AudioFileEnumeration {
+    /// Indexable audio files.
+    audio_files: Vec<PathBuf>,
+    /// Private siblings an interrupted tag save left behind.
+    private_siblings: Vec<PathBuf>,
+    /// Audio files refused because their names are not valid UTF-8.
+    unsupported_names: Vec<PathBuf>,
+    errors: Vec<String>,
+}
+
+/// Whether the library can index `path`.
+///
+/// A library row stores its path as UTF-8 text, and that text is the file's
+/// identity for scanning, playback, and tag writes. A native name that is not
+/// valid UTF-8 has no exact text form: a lossy conversion would collapse
+/// distinct names into one row, or alias a file literally named with U+FFFD.
+/// Such a file is refused rather than indexed under a false identity.
+fn is_indexable_library_path(path: &Path) -> bool {
+    path.to_str().is_some()
+}
+
+/// Unsupported names already logged and reported in this session, so repeated
+/// scans and watcher events report each file once.
+static REPORTED_UNSUPPORTED_NAMES: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Log each unsupported name not reported before in this session and return
+/// how many were new. A name is logged only in its escaped debug form, so no
+/// raw non-UTF-8 bytes reach the log.
+fn register_unsupported_names<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> usize {
+    let mut reported = REPORTED_UNSUPPORTED_NAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut newly_reported = 0;
+    for path in paths {
+        if reported.insert(path.clone()) {
+            warn!(
+                path = ?path,
+                "Skipping an audio file whose name is not valid UTF-8; the library cannot index it"
+            );
+            newly_reported += 1;
+        }
+    }
+    newly_reported
+}
+
 /// Enumerate the audio files under `directory` using the one indexing policy
 /// every scope shares, together with any private tag-write siblings.
+///
+/// An audio file whose name is not valid UTF-8 is never returned as indexable
+/// (see [`is_indexable_library_path`]); it is listed in `unsupported_names` so
+/// the caller can report it. That refusal is policy, not a traversal error, so
+/// it leaves the scope's completeness unchanged.
 ///
 /// Symlinks are never followed: the notify watcher does not follow them either,
 /// so following here would index files that are never watched for changes, and
@@ -2594,7 +2663,7 @@ fn enumerate_audio_files(
     directory: &Path,
     boundary: Option<u64>,
     exclusions: &[PathBuf],
-) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+) -> AudioFileEnumeration {
     enumerate_audio_files_with_observer(directory, boundary, exclusions, |_| Ok(()))
 }
 
@@ -2607,13 +2676,12 @@ fn enumerate_audio_files_with_observer<F>(
     boundary: Option<u64>,
     exclusions: &[PathBuf],
     mut observe: F,
-) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>)
+) -> AudioFileEnumeration
 where
     F: FnMut(&Path) -> Result<(), String>,
 {
-    let mut audio_files = Vec::new();
-    let mut private_siblings = Vec::new();
-    let mut errors = Vec::new();
+    let mut found = AudioFileEnumeration::default();
+    let errors = &mut found.errors;
 
     let mut entries = WalkDir::new(directory).follow_links(false).into_iter();
     while let Some(entry) = entries.next() {
@@ -2653,21 +2721,25 @@ where
                 }
             }
             Ok(entry) if entry.file_type().is_file() && is_private_write_sibling(entry.path()) => {
-                private_siblings.push(entry.into_path());
+                found.private_siblings.push(entry.into_path());
             }
             Ok(entry) if entry.file_type().is_file() && tag_parser::is_audio_file(entry.path()) => {
                 let path = entry.into_path();
+                if !is_indexable_library_path(&path) {
+                    found.unsupported_names.push(path);
+                    continue;
+                }
                 if let Err(error) = observe(&path) {
                     errors.push(error);
                 }
-                audio_files.push(path);
+                found.audio_files.push(path);
             }
             Ok(_) => {}
             Err(error) => errors.push(error.to_string()),
         }
     }
 
-    (audio_files, private_siblings, errors)
+    found
 }
 
 /// Traversal of the destination of a paired directory rename.
@@ -2770,22 +2842,27 @@ fn scan_renamed_directory(
     // No exclusions: a pair whose subtree owns another scan scope is rejected
     // before it reaches this traversal (`subtree_owns_another_scope`).
     let mut observed_files = HashMap::new();
-    let (audio_files, _, mut errors) =
-        enumerate_audio_files_with_observer(directory, Some(boundary), &[], |path| {
-            let bound_file = lease.open_regular_file(path).map_err(|error| {
-                format!(
-                    "failed to bind renamed file beneath its retained root {}: {error}",
-                    path.display()
-                )
-            })?;
-            let key = path.to_string_lossy().into_owned();
-            if observed_files.insert(key.clone(), bound_file).is_some() {
-                return Err(format!(
-                    "multiple renamed files collapse to the persisted path key: {key}"
-                ));
-            }
-            Ok(())
-        });
+    // Files refused for unsupported names were never indexed, so no row can
+    // follow them here; the scan that first met them already reported them.
+    let AudioFileEnumeration {
+        audio_files,
+        mut errors,
+        ..
+    } = enumerate_audio_files_with_observer(directory, Some(boundary), &[], |path| {
+        let bound_file = lease.open_regular_file(path).map_err(|error| {
+            format!(
+                "failed to bind renamed file beneath its retained root {}: {error}",
+                path.display()
+            )
+        })?;
+        let key = path.to_string_lossy().into_owned();
+        if observed_files.insert(key.clone(), bound_file).is_some() {
+            return Err(format!(
+                "multiple renamed files collapse to the persisted path key: {key}"
+            ));
+        }
+        Ok(())
+    });
     if destination.validate(lease).is_err() {
         errors.push(format!(
             "renamed directory changed during traversal: {}",
@@ -5582,6 +5659,19 @@ async fn initial_scan_with_control(
             .send(LibraryEvent::RootTrustRequired(trust_requests))
             .await;
     }
+    // Only a root whose content this scan could index has files it refused;
+    // an unauthorized root indexes nothing, whatever its names.
+    let skipped = register_unsupported_names(
+        root_scans
+            .iter()
+            .filter(|scan| scan.content_authorized)
+            .flat_map(|scan| &scan.unsupported_names),
+    );
+    if skipped > 0 {
+        let _ = tx
+            .send(LibraryEvent::UnsupportedFileNamesSkipped(skipped))
+            .await;
+    }
     let _ = tx.send(LibraryEvent::ScanComplete).await;
 
     info!(scanned, "Initial scan complete");
@@ -6367,6 +6457,9 @@ struct WatcherBatch {
     /// exact destination replacement invalidates every descendant mapping.
     dirty_directory_scopes: HashSet<PathBuf>,
     identity_changed_roots: HashSet<PathBuf>,
+    /// Audio files seen under names that are not valid UTF-8. They never
+    /// enter the sets above (see [`WatcherBatch::admit_indexable_path`]).
+    unsupported_names: HashSet<PathBuf>,
     tracked_rename_from: HashMap<usize, PathBuf>,
     adjacent_untracked_rename_from: Option<PathBuf>,
     reconciliation_required: bool,
@@ -6393,6 +6486,7 @@ impl WatcherBatch {
                 true
             }
         });
+        event.paths.retain(|path| self.admit_indexable_path(path));
         if event.paths.is_empty() {
             self.adjacent_untracked_rename_from = None;
             return;
@@ -6506,6 +6600,31 @@ impl WatcherBatch {
             }
             _ => {}
         }
+    }
+
+    /// Keep only paths the library can index (see
+    /// [`is_indexable_library_path`]), so no rename, removal, or upsert is
+    /// ever keyed by a lossy rendering of a native name.
+    ///
+    /// A refused audio file is remembered for the user-facing report. A
+    /// refused directory may hold audio files the report should count, so it
+    /// asks for the scan that finds them. Anything else — a vanished name, or
+    /// a non-audio file — has nothing to index or report. A rename with one
+    /// refused side never pairs: its supported side is handled on its own, as
+    /// a removal, an upsert, or a reconciliation scan, which is exact because
+    /// the refused name never had a row.
+    fn admit_indexable_path(&mut self, path: &Path) -> bool {
+        if is_indexable_library_path(path) {
+            return true;
+        }
+        match watcher_upsert_path_kind(path) {
+            Ok(WatcherUpsertPathKind::Directory) => self.reconciliation_required = true,
+            Ok(WatcherUpsertPathKind::RegularFile) if tag_parser::is_audio_file(path) => {
+                self.unsupported_names.insert(path.to_path_buf());
+            }
+            _ => {}
+        }
+        false
     }
 
     fn record_remove(&mut self, path: PathBuf) {
@@ -7310,6 +7429,13 @@ async fn process_directory_events(
             warn!("Filesystem watcher ingress overflowed during debounce");
             reconciliation_pending = true;
             continue;
+        }
+
+        let skipped = register_unsupported_names(&batch.unsupported_names);
+        if skipped > 0 {
+            let _ = tx
+                .send(LibraryEvent::UnsupportedFileNamesSkipped(skipped))
+                .await;
         }
 
         if batch.is_empty() {
@@ -8340,11 +8466,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    // Rows are persisted through `to_string_lossy`, so a non-UTF-8 name never
-    // round-trips back to its original bytes. Matching in the database's own
-    // lossy namespace keeps those rows reachable; matching through `Path` keeps
-    // the prefix component-wise, so `/music/Album` cannot capture the sibling
-    // `/music/Album2`.
+    // The watcher pairs only indexable paths, which are valid UTF-8, so this
+    // text is exact. Matching through `Path` keeps the prefix component-wise,
+    // so `/music/Album` cannot capture the sibling `/music/Album2`.
     let from_prefix = PathBuf::from(from.to_string_lossy().into_owned());
     let to_prefix = PathBuf::from(to.to_string_lossy().into_owned());
     if from_prefix.starts_with(&to_prefix) || to_prefix.starts_with(&from_prefix) {
@@ -10355,12 +10479,326 @@ mod tests {
         std::fs::write(&track, b"audio").expect("create public audio path");
         std::fs::write(&sibling, b"copy").expect("create private tag sibling");
 
-        let (audio_files, private_siblings, errors) =
-            enumerate_audio_files(library.path(), None, &[]);
+        let found = enumerate_audio_files(library.path(), None, &[]);
 
-        assert!(errors.is_empty());
-        assert_eq!(audio_files, vec![track]);
-        assert_eq!(private_siblings, vec![sibling]);
+        assert!(found.errors.is_empty());
+        assert_eq!(found.audio_files, vec![track]);
+        assert_eq!(found.private_siblings, vec![sibling]);
+    }
+
+    /// `stem` followed by one byte that can never appear in UTF-8, then
+    /// `.extension`: a native name with no exact text form.
+    #[cfg(target_os = "linux")]
+    fn non_utf8_name(stem: &str, invalid_byte: u8, extension: &str) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = stem.as_bytes().to_vec();
+        bytes.push(invalid_byte);
+        bytes.push(b'.');
+        bytes.extend_from_slice(extension.as_bytes());
+        std::ffi::OsString::from_vec(bytes)
+    }
+
+    /// Two names that differ only in an invalid byte collapse to the same
+    /// lossy text, which is also the exact text of a third file literally
+    /// named with U+FFFD. Only that literal name is exact, so only it is
+    /// indexable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enumeration_refuses_names_that_are_not_utf8_but_keeps_a_literal_replacement_character() {
+        let library = TestDirectory::new("unsupported-names-enumeration");
+        let first = library.path().join(non_utf8_name("a", 0xff, "wav"));
+        let second = library.path().join(non_utf8_name("a", 0xfe, "wav"));
+        let literal = library.path().join("a\u{FFFD}.wav");
+        for path in [&first, &second, &literal] {
+            write_minimal_wav(path);
+        }
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        assert_eq!(first.to_string_lossy(), literal.to_string_lossy());
+
+        let mut found = enumerate_audio_files(library.path(), None, &[]);
+        found.unsupported_names.sort();
+
+        assert!(
+            found.errors.is_empty(),
+            "a refusal is not a traversal error"
+        );
+        assert_eq!(found.audio_files, vec![literal]);
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(found.unsupported_names, expected);
+    }
+
+    /// End to end through the scanner: neither colliding invalid name gets a
+    /// row, the literal U+FFFD file is indexed under its exact path, and the
+    /// UI hears about the two refusals once per session, before the scan
+    /// completes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scan_indexes_no_unsupported_name_and_reports_each_once() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("unsupported-names-scan");
+        create_root_marker(directory.path()).expect("create root marker");
+        write_minimal_wav(&directory.path().join(non_utf8_name("a", 0xff, "wav")));
+        write_minimal_wav(&directory.path().join(non_utf8_name("a", 0xfe, "wav")));
+        let literal = directory.path().join("a\u{FFFD}.wav");
+        write_minimal_wav(&literal);
+        let music_dirs = [directory.path().to_path_buf()];
+        let (event_tx, event_rx) = async_channel::unbounded();
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("first scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        let paths: Vec<&str> = rows.iter().map(|row| row.file_path.as_str()).collect();
+        assert_eq!(paths, vec![literal.to_str().expect("UTF-8 literal name")]);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let reported = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::UnsupportedFileNamesSkipped(2)))
+            .unwrap_or_else(|| panic!("the scan reports both refusals: {events:?}"));
+        let completed = events
+            .iter()
+            .position(|event| matches!(event, LibraryEvent::ScanComplete))
+            .expect("the scan completes");
+        assert!(reported < completed);
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("second scan");
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LibraryEvent::UnsupportedFileNamesSkipped(_))),
+            "names already reported this session are not reported again: {events:?}"
+        );
+        assert_eq!(
+            track::Entity::find()
+                .all(&db)
+                .await
+                .expect("query tracks")
+                .len(),
+            1
+        );
+    }
+
+    /// Canonically equivalent names in different Unicode normalization forms
+    /// are distinct files on Linux. Each is valid UTF-8, so each keeps its
+    /// own exact row; nothing is normalized into a shared identity.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scan_keeps_differently_normalized_names_as_distinct_tracks() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("normalization-scan");
+        create_root_marker(directory.path()).expect("create root marker");
+        let composed = directory.path().join("caf\u{e9}.wav");
+        let decomposed = directory.path().join("cafe\u{301}.wav");
+        write_minimal_wav(&composed);
+        write_minimal_wav(&decomposed);
+        let (event_tx, _event_rx) = async_channel::unbounded();
+
+        initial_scan(
+            &db,
+            &[directory.path().to_path_buf()],
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        let paths: HashSet<&str> = rows.iter().map(|row| row.file_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            HashSet::from([
+                composed.to_str().expect("UTF-8 name"),
+                decomposed.to_str().expect("UTF-8 name"),
+            ])
+        );
+    }
+
+    /// An earlier build stored an invalid name through a lossy conversion.
+    /// The file is still there, but the stored text names no file, and the
+    /// refused name no longer keeps that row alive as playable: the next
+    /// authoritative scan removes it like any other missing track.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_authoritative_scan_removes_a_legacy_lossy_row() {
+        let db = rename_test_database().await;
+        let directory = TestDirectory::new("unsupported-names-legacy-row");
+        create_root_marker(directory.path()).expect("create root marker");
+        let present = directory.path().join("present.wav");
+        write_minimal_wav(&present);
+        let invalid = directory.path().join(non_utf8_name("legacy", 0xff, "wav"));
+        write_minimal_wav(&invalid);
+        let music_dirs = [directory.path().to_path_buf()];
+        let (event_tx, _event_rx) = async_channel::unbounded();
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("enrolling scan");
+        let lossy = invalid.to_string_lossy().into_owned();
+        insert_rename_test_track(&db, "legacy-lossy", &lossy, "Legacy", 4).await;
+
+        initial_scan(
+            &db,
+            &music_dirs,
+            &event_tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("reconciling scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        let paths: Vec<&str> = rows.iter().map(|row| row.file_path.as_str()).collect();
+        assert_eq!(paths, vec![present.to_str().expect("UTF-8 fixture")]);
+    }
+
+    /// The watcher applies the same boundary: an invalid name never reaches
+    /// the upsert, removal, or rename sets, so no row is keyed by its lossy
+    /// text; a rename with one refused side degrades to the other side on its
+    /// own; and a refused directory asks for the scan that reports its files.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watcher_batch_refuses_names_that_are_not_utf8() {
+        use notify::event::{CreateKind, RenameMode};
+
+        let library = TestDirectory::new("unsupported-names-watcher");
+        let invalid = library.path().join(non_utf8_name("a", 0xff, "flac"));
+        let literal = library.path().join("a\u{FFFD}.flac");
+        std::fs::write(&invalid, b"audio").expect("create invalid name");
+        std::fs::write(&literal, b"audio").expect("create literal name");
+
+        let mut created = WatcherBatch::default();
+        for path in [&invalid, &literal] {
+            created.collect(
+                notify::Event::new(notify::EventKind::Create(CreateKind::File))
+                    .add_path(path.clone()),
+            );
+        }
+        created.finish();
+        assert_eq!(created.upsert_paths, HashSet::from([literal.clone()]));
+        assert_eq!(created.unsupported_names, HashSet::from([invalid.clone()]));
+        assert!(!created.reconciliation_required);
+
+        let song = library.path().join("song.flac");
+        let renamed = library.path().join(non_utf8_name("song", 0xfe, "flac"));
+        std::fs::write(&renamed, b"audio").expect("create renamed file");
+        let mut rename = WatcherBatch::default();
+        let mut from = rename_event(RenameMode::From, &[], Some(9));
+        from = from.add_path(song.clone());
+        let mut to = rename_event(RenameMode::To, &[], Some(9));
+        to = to.add_path(renamed.clone());
+        rename.collect(from);
+        rename.collect(to);
+        rename.finish();
+        assert!(rename.rename_pairs.is_empty());
+        assert_eq!(rename.remove_paths, HashSet::from([song]));
+        assert_eq!(rename.unsupported_names, HashSet::from([renamed]));
+        assert!(!rename.reconciliation_required);
+
+        let folder = library.path().join(non_utf8_name("album", 0xff, "d"));
+        std::fs::create_dir(&folder).expect("create invalid folder");
+        let mut directory = WatcherBatch::default();
+        directory.collect(
+            notify::Event::new(notify::EventKind::Create(CreateKind::Folder)).add_path(folder),
+        );
+        directory.finish();
+        assert!(directory.reconciliation_required);
+        assert!(directory.deferred_paths.is_empty() && directory.unsupported_names.is_empty());
+    }
+
+    /// End to end through the watcher loop: a new file with an invalid name
+    /// is reported to the UI without a row, an upsert, or a library rescan.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn watcher_reports_an_unsupported_name_without_indexing_or_rescanning() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("unsupported-names-watcher-loop");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+        let invalid = root.join(non_utf8_name("new", 0xff, "flac"));
+        std::fs::write(
+            &invalid,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/audio/silence.flac"
+            )),
+        )
+        .expect("write track with an invalid name");
+
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(idle_backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let watcher = DirectoryWatcher {
+            watcher: idle_backend,
+            rx: event_rx,
+            ingress_overflowed: Arc::new(AtomicBool::new(false)),
+            watched_directories: HashSet::new(),
+            root_presence: HashMap::new(),
+            root_probe_interval: ROOT_PROBE_INTERVAL,
+        };
+        event_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(invalid)))
+            .await
+            .expect("queue create event");
+        drop(event_tx);
+
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let mut completed_commands = HashMap::new();
+        process_directory_events(
+            &db,
+            std::slice::from_ref(&root),
+            &library_events,
+            &command_rx,
+            &mut completed_commands,
+            watcher,
+            &test_playlist_sidebar_refresh(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("watcher loop exits cleanly");
+
+        let events: Vec<LibraryEvent> =
+            std::iter::from_fn(|| library_event_rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [LibraryEvent::UnsupportedFileNamesSkipped(1)]
+            ),
+            "{events:?}"
+        );
+        assert!(track::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("query tracks")
+            .is_empty());
     }
 
     #[test]
@@ -16410,6 +16848,7 @@ mod tests {
             root: nested.clone(),
             audio_files: Vec::new(),
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             errors: vec!["simulated permission error".to_string()],
             device_id: Some("simulated-device".to_string()),
             mount_generation: Some(0),
@@ -16587,6 +17026,7 @@ mod tests {
             root: root.clone(),
             audio_files: Vec::new(),
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             errors: Vec::new(),
             device_id: Some("underlying-mountpoint".to_string()),
             mount_generation: Some(0),
@@ -16608,6 +17048,7 @@ mod tests {
             root: root.clone(),
             audio_files: vec![(root.join("song.mp3"), String::new())],
             tag_write_debris: Vec::new(),
+            unsupported_names: Vec::new(),
             errors: Vec::new(),
             device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
             mount_generation: Some(0),

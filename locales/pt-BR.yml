@@ -2,6 +2,9 @@
 app:
   not_playing: "Nada tocando"
   scanning: "Escaneando biblioteca…"
+  unsupported_file_names_skipped:
+    one: "%{count} arquivo de áudio ignorado: o nome não é UTF-8 válido"
+    other: "%{count} arquivos de áudio ignorados: os nomes não são UTF-8 válido"
   live: "AO VIVO"
 
 # ── Header bar ─────────────────────────────────────────────────────
@@ -204,6 +207,7 @@ playlist_io:
   import_success_heading: "Lista de reprodução XSPF importada"
   import_warning_heading: "Lista de reprodução XSPF importada com avisos"
   import_success_body: "\"%{name}\" foi importada.\n\nCorrespondências: %{matched}\nSem correspondência (preservadas): %{unmatched}\nFalhas (não importadas): %{failed}"
+  import_skipped_unsupported_names: "Ignoradas (nome de arquivo não é UTF-8 válido): %{count}"
   import_failed_heading: "Não foi possível importar a lista de reprodução XSPF"
   import_rollback_body: "%{error}\n\nNenhuma lista de reprodução ou entrada foi confirmada; todas as alterações no banco de dados foram revertidas."
   import_worker_failed_body: "O processo de importação foi interrompido antes de informar um resultado: %{error}\n\nNenhuma lista de reprodução confirmada foi exibida."

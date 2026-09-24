@@ -29,6 +29,33 @@
 //!   DACL before the first audio byte is copied.
 //! - **The replacement is durable**: the tagged copy is `fsync`ed before the
 //!   rename, so a crash cannot leave a truncated file in place of the original.
+//!
+//! # Residual races
+//!
+//! A local Properties save ([`LocalMutationTarget`]) refuses a file that was
+//! replaced, renamed, or edited, or whose folder chain changed, at every point
+//! it can observe: capture, preflight, write start, and a final gate inside
+//! the commit lock. Ordinary filesystems offer no atomic "replace only if
+//! unchanged" primitive, so some windows remain:
+//!
+//! - **Gate to replacement.** The content revision is checked once more just
+//!   before the admitted file is moved aside, not atomically with the move. A
+//!   process that already holds the file open can still write to it after
+//!   that check; its write lands in the displaced original, which the commit
+//!   then retires, so that edit is lost. Other editors do not honor
+//!   Tributary's commit lock, which only serializes Tributary's own saves.
+//! - **Revision granularity.** The revision is the byte length plus the
+//!   modification time. An in-place edit that keeps the exact length and
+//!   lands within a coarse timestamp's granularity is not detected.
+//! - **Pathname proofs.** The folder chain above the containing directory is
+//!   re-resolved by pathname, and on platforms without retained directory
+//!   handles (Windows) the replacement itself goes through pathnames. Each
+//!   step is proved, and a displaced object that is not the admitted file is
+//!   restored and refused, but the proofs and renames are separate system
+//!   calls rather than one atomic operation.
+//! - **Crash cleanup.** A process killed mid-save can leave a private sibling
+//!   behind. Scans never index its reserved name, and an authoritative scan
+//!   sweeps it once it is too old to belong to a save still in progress.
 
 use std::ffi::OsStr;
 use std::fs::File;
