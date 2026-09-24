@@ -68,19 +68,16 @@ mod audio;
 mod daap;
 mod db;
 mod desktop_integration;
-#[allow(dead_code)]
 mod device;
 mod discovery;
 mod external_file;
 pub(crate) mod http_body;
 pub(crate) mod http_security;
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) mod http_test_service;
 mod install_id;
 mod jellyfin;
 pub(crate) mod lastfm;
-#[allow(dead_code)]
 mod local;
 mod panic_reporting;
 mod paths;
@@ -89,9 +86,7 @@ mod plex;
 mod radio;
 mod remote_rating_wire;
 mod removable;
-#[allow(dead_code)]
 mod server_playlist_coordinator;
-#[allow(dead_code)]
 mod source_lifecycle;
 mod source_registry;
 mod subsonic;

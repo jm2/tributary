@@ -39,6 +39,7 @@ pub struct ServerPlaylistLocalCopy {
     entry_count: usize,
 }
 
+#[cfg(test)]
 impl ServerPlaylistLocalCopy {
     pub fn playlist_id(&self) -> &str {
         &self.playlist_id
@@ -90,6 +91,7 @@ impl ServerPlaylistSyncTicket {
         &self.native_playlist_id
     }
 
+    #[cfg(test)]
     pub const fn state_revision(&self) -> i64 {
         self.state_revision
     }
@@ -115,14 +117,11 @@ pub struct ServerPlaylistSyncPreparation {
 }
 
 impl ServerPlaylistSyncPreparation {
-    pub const fn link(&self) -> &ServerPlaylistLink {
-        &self.link
-    }
-
     pub const fn ticket(&self) -> &ServerPlaylistSyncTicket {
         &self.ticket
     }
 
+    #[cfg(test)]
     pub fn into_parts(self) -> (ServerPlaylistLink, ServerPlaylistSyncTicket) {
         (self.link, self.ticket)
     }
@@ -320,6 +319,7 @@ impl PlaylistManager {
 
     /// Create a detached, immediately editable regular playlist from one
     /// exact-session server snapshot.
+    #[cfg(test)]
     pub async fn import_server_playlist_copy_if_authorized<Authorize>(
         &self,
         pull: &ServerPlaylistPull,
@@ -366,6 +366,7 @@ impl PlaylistManager {
         .await
     }
 
+    #[cfg(test)]
     async fn import_server_playlist_copy_from_snapshot_if_authorized<Authority, Authorize>(
         &self,
         source_id: SourceId,
@@ -424,6 +425,7 @@ impl PlaylistManager {
     /// final race arbiter. A sequential duplicate returns the existing link;
     /// a concurrent losing insertion rolls its newly-created playlist and
     /// every staged entry back with the surrounding transaction.
+    #[cfg(test)]
     pub async fn create_server_playlist_mirror_if_authorized<Authorize>(
         &self,
         pull: &ServerPlaylistPull,
@@ -465,6 +467,7 @@ impl PlaylistManager {
         .await
     }
 
+    #[cfg(test)]
     async fn create_server_playlist_mirror_from_snapshot_if_authorized<Authority, Authorize>(
         &self,
         source_id: SourceId,
@@ -542,6 +545,7 @@ impl PlaylistManager {
     }
 
     /// Apply a fresh detail snapshot only to the exact prepared link revision.
+    #[cfg(test)]
     pub async fn apply_server_playlist_pull_if_authorized<Authorize>(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -586,48 +590,7 @@ impl PlaylistManager {
         .await
     }
 
-    /// Explicit conflict resolution which discards local divergence in favor
-    /// of one newly-fetched current server snapshot.
-    pub async fn replace_local_with_server_if_authorized<Authorize>(
-        &self,
-        ticket: ServerPlaylistSyncTicket,
-        pull: &ServerPlaylistPull,
-        authorize: Authorize,
-    ) -> Result<ServerPlaylistPullOutcome, DbErr>
-    where
-        Authorize: FnOnce() -> Option<ServerPlaylistCommitAuthority>,
-    {
-        self.apply_server_playlist_pull_if_authorized(
-            ticket,
-            pull,
-            ServerPlaylistPullPolicy::ReplaceLocal,
-            authorize,
-        )
-        .await
-    }
-
-    /// Replace a divergent local copy only after the caller's final admission
-    /// and the exact source session are jointly held through commit.
-    pub async fn replace_local_with_server_if_admitted<Guard, Admit, Admission>(
-        &self,
-        ticket: ServerPlaylistSyncTicket,
-        pull: &ServerPlaylistPull,
-        admit: Admit,
-    ) -> Result<ServerPlaylistPullOutcome, DbErr>
-    where
-        Admit: FnOnce() -> Admission,
-        Admission: Future<Output = Option<(ServerPlaylistCommitAuthority, Guard)>>,
-        Guard: Send + 'static,
-    {
-        self.apply_server_playlist_pull_if_admitted(
-            ticket,
-            pull,
-            ServerPlaylistPullPolicy::ReplaceLocal,
-            admit,
-        )
-        .await
-    }
-
+    #[cfg(test)]
     async fn apply_server_playlist_snapshot_if_authorized<Authority, Authorize>(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -757,6 +720,7 @@ impl PlaylistManager {
 
     /// Persist exact server absence only when it was proven by a successful
     /// complete listing and the pre-request revision remains current.
+    #[cfg(test)]
     pub async fn mark_server_playlist_missing_if_authorized<Authorize>(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -799,6 +763,7 @@ impl PlaylistManager {
         .await
     }
 
+    #[cfg(test)]
     async fn mark_server_playlist_missing_identity_if_authorized<Authority, Authorize>(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -871,6 +836,7 @@ impl PlaylistManager {
 
     /// Remove only the pull link at an exact observed revision, retaining the
     /// current local playlist and every occurrence as an editable copy.
+    #[cfg(test)]
     pub async fn unlink_server_playlist(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -927,6 +893,7 @@ impl PlaylistManager {
 
     /// Explicitly delete one linked local copy and its entries at the exact
     /// revision shown to the caller.
+    #[cfg(test)]
     pub async fn remove_local_server_playlist(
         &self,
         ticket: ServerPlaylistSyncTicket,
@@ -1633,17 +1600,6 @@ mod tests {
             .is_err());
         assert!(manager
             .remove_entries(copy.playlist_id(), &[before[0].id.clone()])
-            .await
-            .is_err());
-        assert!(manager
-            .reorder_entries(
-                copy.playlist_id(),
-                &before
-                    .iter()
-                    .rev()
-                    .map(|row| row.id.clone())
-                    .collect::<Vec<_>>(),
-            )
             .await
             .is_err());
         let rules = SmartRules {

@@ -11,7 +11,7 @@ use sea_orm::sea_query::Query;
 use sea_orm::{
     ActiveValue::Set, ConnectionTrait, DatabaseTransaction, QueryOrder, Statement, TransactionTrait,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::playlist_io::{ImportedTrack, ImportedTrackMatchIndex};
@@ -144,6 +144,7 @@ impl PlaylistEntryInput {
         }
     }
 
+    #[cfg(test)]
     fn local(track: &track::Model) -> Result<Self, DbErr> {
         let track_id = TrackId::new(track.id.clone())
             .map_err(|error| DbErr::Custom(format!("Local track identity is invalid: {error}")))?;
@@ -560,6 +561,7 @@ impl PlaylistManager {
     }
 
     /// List all playlists ordered by creation date.
+    #[cfg(test)]
     pub async fn list_playlists(&self) -> Result<Vec<playlist::Model>, DbErr> {
         playlist::Entity::find()
             .order_by_asc(playlist::Column::CreatedAt)
@@ -580,10 +582,10 @@ impl PlaylistManager {
     ///
     /// Stores fingerprint data (title, artist, album, duration) for
     /// rediscovery after a library rebuild.
+    #[cfg(test)]
     pub async fn add_track(&self, playlist_id: &str, track: &track::Model) -> Result<(), DbErr> {
         let input = PlaylistEntryInput::local(track)?;
         self.add_entries(playlist_id, &[input]).await?;
-        debug!(playlist = %playlist_id, track = %track.title, "Track added to playlist");
         Ok(())
     }
 
@@ -597,6 +599,7 @@ impl PlaylistManager {
     /// [`Self::add_entries_if_authorized`] so live catalogue authority is
     /// acquired only after these writes are staged and retained through the
     /// commit.
+    #[cfg(test)]
     pub async fn add_entries(
         &self,
         playlist_id: &str,
@@ -763,16 +766,6 @@ impl PlaylistManager {
         Ok(PlaylistEntryAddOutcome::Committed(inserted))
     }
 
-    /// Remove an entry from its owning regular playlist and close the gap.
-    pub async fn remove_entry(&self, entry_id: &str) -> Result<(), DbErr> {
-        let entry = playlist_entry::Entity::find_by_id(entry_id.to_string())
-            .one(&self.db)
-            .await?
-            .ok_or_else(|| DbErr::RecordNotFound(format!("Entry {entry_id} not found")))?;
-        self.remove_entries(&entry.playlist_id, &[entry_id.to_string()])
-            .await
-    }
-
     /// Remove exact durable occurrences atomically and restore contiguous
     /// positions. Every ID must be unique and belong to `playlist_id`.
     pub async fn remove_entries(
@@ -834,35 +827,6 @@ impl PlaylistManager {
         Ok(())
     }
 
-    /// Reorder every occurrence in a playlist. `entry_ids` must be one exact,
-    /// duplicate-free permutation of the playlist's durable entry IDs.
-    pub async fn reorder_entries(
-        &self,
-        playlist_id: &str,
-        entry_ids: &[String],
-    ) -> Result<(), DbErr> {
-        let txn = crate::db::begin_write(&self.db).await?;
-        require_editable_regular_playlist(&txn, playlist_id).await?;
-        let current = playlist_entry::Entity::find()
-            .filter(playlist_entry::Column::PlaylistId.eq(playlist_id))
-            .all(&txn)
-            .await?;
-        let requested: HashSet<&str> = entry_ids.iter().map(String::as_str).collect();
-        let current_ids: HashSet<&str> = current.iter().map(|entry| entry.id.as_str()).collect();
-        if requested.len() != entry_ids.len()
-            || entry_ids.len() != current.len()
-            || requested != current_ids
-        {
-            return Err(DbErr::Custom(format!(
-                "Playlist {playlist_id} reorder must contain each entry exactly once"
-            )));
-        }
-
-        assign_contiguous_positions(&txn, playlist_id, entry_ids).await?;
-        txn.commit().await?;
-        Ok(())
-    }
-
     /// Persist the playlist-sidebar presentation order.
     ///
     /// `ordered_ids` must be one exact, duplicate-free permutation of every
@@ -915,6 +879,7 @@ impl PlaylistManager {
 
     /// Load every durable regular-playlist occurrence in stored order.
     /// Unmatched and currently unavailable entries are retained.
+    #[cfg(test)]
     pub async fn get_playlist_entries(
         &self,
         playlist_id: &str,
@@ -999,20 +964,6 @@ impl PlaylistManager {
             tracks.push(local_track);
         }
         Ok(LocalPlaylistExport::Ready(tracks))
-    }
-
-    /// Get all matched tracks for a regular playlist (ordered by position).
-    ///
-    /// This compatibility projection is deliberately local-only. It returns
-    /// entries with a valid local foreign-key cache and excludes remote or
-    /// unresolved occurrences until mixed-source UI projection lands.
-    pub async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<track::Model>, DbErr> {
-        Ok(self
-            .load_playlist_entries(playlist_id)
-            .await?
-            .into_iter()
-            .filter_map(|entry| entry.local_track)
-            .collect())
     }
 
     // ── Smart playlist management ────────────────────────────────────
@@ -1670,9 +1621,9 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     use super::{
-        orphan_reconciliation_query, recently_played_default_rules, stored_sidebar_order,
-        top_25_most_played_default_rules, LocalPlaylistExport, PlaylistEntryAddOutcome,
-        PlaylistEntryInput, PlaylistManager, StoredPlaylistEntry,
+        assign_contiguous_positions, orphan_reconciliation_query, recently_played_default_rules,
+        stored_sidebar_order, top_25_most_played_default_rules, LocalPlaylistExport,
+        PlaylistEntryAddOutcome, PlaylistEntryInput, PlaylistManager, StoredPlaylistEntry,
     };
     use crate::architecture::{MediaKey, SourceId, TrackId};
     use crate::db::entities::{playlist, playlist_entry, server_playlist_link, track};
@@ -2731,17 +2682,6 @@ mod tests {
             .await
             .expect("load typed entries");
         assert_eq!(stored, inserted);
-        let projected = manager
-            .get_playlist_tracks(&playlist.id)
-            .await
-            .expect("load local compatibility projection");
-        assert_eq!(
-            projected
-                .iter()
-                .map(|track| track.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![local.id.as_str()]
-        );
 
         // A remote occurrence waiting for live-session projection must never
         // be fingerprint-reconciled to a similarly named local row.
@@ -3288,7 +3228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reorder_yields_unique_contiguous_positions() {
+    async fn contiguous_position_assignment_applies_a_full_permutation() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
 
@@ -3305,7 +3245,7 @@ mod tests {
 
         // Moving the last entry to the front would, under a naive sequential
         // update, immediately collide with position 0 against the new UNIQUE
-        // index — exercising the two-phase reorder path.
+        // index — exercising the two-phase parking path.
         let new_order = vec![
             ids[4].clone(),
             ids[2].clone(),
@@ -3313,10 +3253,11 @@ mod tests {
             ids[3].clone(),
             ids[1].clone(),
         ];
-        manager
-            .reorder_entries(&playlist.id, &new_order)
+        let txn = crate::db::begin_write(&db).await.expect("begin write");
+        assign_contiguous_positions(&txn, &playlist.id, &new_order)
             .await
-            .expect("reorder must not violate UNIQUE(playlist_id, position)");
+            .expect("reassignment must not violate UNIQUE(playlist_id, position)");
+        txn.commit().await.expect("commit reassignment");
 
         let entries = playlist_entry::Entity::find()
             .filter(playlist_entry::Column::PlaylistId.eq(&playlist.id))
@@ -3424,7 +3365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reorder_and_remove_require_exact_occurrence_ids_and_rollback_invalid_requests() {
+    async fn remove_requires_exact_occurrence_ids_and_rolls_back_invalid_requests() {
         let db = in_memory_db().await;
         let manager = PlaylistManager::new(db.clone());
         let playlist = manager
@@ -3434,31 +3375,6 @@ mod tests {
         for (position, id) in ["first", "second", "third"].into_iter().enumerate() {
             insert_entry(&db, &playlist.id, id, position as i32).await;
         }
-        let original_ids = vec![
-            "first".to_string(),
-            "second".to_string(),
-            "third".to_string(),
-        ];
-
-        assert!(manager
-            .reorder_entries(
-                &playlist.id,
-                &[
-                    "first".to_string(),
-                    "first".to_string(),
-                    "third".to_string()
-                ],
-            )
-            .await
-            .is_err());
-        assert_eq!(
-            playlist_entries(&db, &playlist.id)
-                .await
-                .into_iter()
-                .map(|entry| entry.id)
-                .collect::<Vec<_>>(),
-            original_ids
-        );
 
         assert!(manager
             .remove_entries(&playlist.id, &["second".to_string(), "second".to_string()])

@@ -29,7 +29,7 @@ use super::playlist_manager::{
     PlaylistManager, ServerPlaylistCreateOutcome, ServerPlaylistImportOutcome,
 };
 use super::playlist_sidebar::{PlaylistSidebarRefresh, PlaylistSidebarRefreshRequest};
-use super::server_playlist_runtime::{ServerPlaylistLinkInspection, ServerPlaylistOperations};
+use super::server_playlist_runtime::ServerPlaylistOperations;
 
 /// Maximum commands waiting for the single browser owner.
 const SERVER_PLAYLIST_BROWSER_COMMAND_CAPACITY: usize = 32;
@@ -134,10 +134,6 @@ impl ServerPlaylistBrowserEntry {
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
     }
-
-    pub const fn advertised_track_count(&self) -> Option<u64> {
-        self.advertised_track_count
-    }
 }
 
 impl fmt::Debug for ServerPlaylistBrowserEntry {
@@ -237,10 +233,6 @@ pub struct ServerPlaylistBrowseSubmission {
 }
 
 impl ServerPlaylistBrowseSubmission {
-    pub const fn status(&self) -> ServerPlaylistBrowserRequestStatus {
-        self.status
-    }
-
     pub async fn completion(self) -> ServerPlaylistBrowseOutcome {
         match self.status {
             ServerPlaylistBrowserRequestStatus::Busy => ServerPlaylistBrowseOutcome::Busy,
@@ -270,6 +262,7 @@ pub struct ServerPlaylistBrowserActionSubmission {
 }
 
 impl ServerPlaylistBrowserActionSubmission {
+    #[cfg(test)]
     pub const fn status(&self) -> ServerPlaylistBrowserRequestStatus {
         self.status
     }
@@ -481,10 +474,6 @@ impl ServerPlaylistUiRuntime {
 
     pub fn browser(&self) -> ServerPlaylistBrowserHandle {
         self.browser.clone()
-    }
-
-    pub async fn inspect_link(&self, playlist_id: impl AsRef<str>) -> ServerPlaylistLinkInspection {
-        self.operations.inspect_link(playlist_id).await
     }
 }
 

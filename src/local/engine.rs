@@ -221,10 +221,6 @@ impl RootReauthorizationRequest {
         }
     }
 
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
     pub fn old_path(&self) -> &Path {
         &self.old_path
     }
@@ -972,6 +968,7 @@ async fn forget_tracks_outside_library_roots(
     Ok(forgotten.len())
 }
 
+#[cfg(test)]
 async fn resolve_root_reauthorization(
     db: &DatabaseConnection,
     request: &RootReauthorizationRequest,
@@ -1604,12 +1601,11 @@ enum ScanDiscoveryStage {
     /// await. Regression seam for the suspended-mid-transaction state the
     /// command-service selector must not switch branches at.
     CommitGuard,
-    /// Parked at the root-status boundary's command-settlement wait, before
-    /// the write transaction opens. Regression seam for the post-settlement
-    /// admission re-check (PR #286 round-4 finding j9j81). Signalled, not
-    /// held: the scan parks itself at the reciprocal settlement wait
-    /// immediately after, so holding here would deadlock every scan
-    /// regression that does not release this stage.
+    /// Parked at the root-status boundary's command-settlement wait, before the
+    /// write transaction opens. Regression seam for the post-settlement
+    /// admission re-check. Signalled, not held: the scan parks itself at the
+    /// reciprocal settlement wait immediately after, so holding here would
+    /// deadlock every scan regression that does not release this stage.
     CommandSettlement,
 }
 
@@ -1701,16 +1697,16 @@ impl ScanDiscoveryHold {
 /// `select!` disables the command branch entirely and keeps polling the scan
 /// until the transaction settles: servicing a library command meanwhile would
 /// queue its write behind the open transaction and fail at the production
-/// five-second busy timeout (PR #286 finding jq5lG).
+/// five-second busy timeout.
 ///
-/// `command_in_flight` is the reciprocal invariant (PR #286 round-3 finding
-/// cid 4051684281): it is held while *dispatched* command work is still
-/// settling inside the selector's interleave. The scan's write boundaries
-/// consult it just before opening a write transaction and park THERE — still
-/// polled, never holding a connection — until the work settles. Without it,
-/// the scan could cross a write boundary after a command was dispatched, park
-/// across a retained-authority probe, and hold the writer while the command's
-/// own DB write queued at the same five-second busy timeout.
+/// `command_in_flight` is the reciprocal invariant: it is held while
+/// *dispatched* command work is still settling inside the selector's
+/// interleave. The scan's write boundaries consult it just before opening a
+/// write transaction and park THERE — still polled, never holding a connection
+/// — until the work settles. Without it, the scan could cross a write boundary
+/// after a command was dispatched, park across a retained-authority probe, and
+/// hold the writer while the command's own DB write queued at the same
+/// five-second busy timeout.
 ///
 /// The scan and the command selector share one engine task, so both flags can
 /// only change while the selector is polling the scan.
@@ -1831,14 +1827,14 @@ async fn wait_for_command_settlement(gate: &ScanWriteTxnGate) {
 /// settles. A command arriving mid-transaction is therefore deferred to the
 /// transaction boundary — never raced into the open SQLite write, where its
 /// own connection acquisition would queue behind the scan's lock and fail at
-/// the busy timeout (PR #286 finding jq5lG).
+/// the busy timeout.
 ///
 /// The channel receive future is created once and retained across polls.
 /// `async_channel::Recv` only keeps its channel listener alive while the
 /// future lives, so constructing it fresh inside `poll` would unregister the
 /// listener every time the poll returned `Pending`: a command sent while the
 /// scan branch was parked could not wake this branch at all, and service
-/// would stall until the scan's next own wake (PR #286 thread jq0TgN).
+/// would stall until the scan's next own wake.
 struct GatedCommandRecv<'a> {
     // `+ Send`: the engine run future is spawned on the multi-thread GTK
     // bridge runtime (src/ui/window.rs), so every future it composes must
@@ -2371,6 +2367,7 @@ fn scan_root(root: PathBuf) -> RootScan {
     )
 }
 
+#[cfg(test)]
 fn scan_root_with_identity_probe<F>(root: PathBuf, identity_probe: F) -> RootScan
 where
     F: FnMut(&Path) -> std::io::Result<String>,
@@ -3003,6 +3000,7 @@ fn reconciliation_is_authoritative(
 /// unconfirmed until an explicit-trust UX can resolve the intended volume:
 /// even a complete path/size/mtime clone cannot prove physical identity. A
 /// different device never silently replaces a confirmed identity.
+#[cfg(test)]
 fn scan_confirms_identity(
     scan: &RootScan,
     previous: Option<&library_root::Model>,
@@ -4238,24 +4236,23 @@ async fn process_library_commands_without_watcher(
 ///
 /// A scan write transaction is the one exception. Some scan mutations keep a
 /// SQLite write transaction open across an await point — the retained-authority
-/// probes inside a track upsert, root-status persist, or stale-row delete —
-/// and a library command serviced at that moment would queue its own write
-/// behind the open transaction and fail at the production five-second busy
-/// timeout (PR #286 finding jq5lG). `scan_write_txn` is held exactly over
-/// those spans; while it is open the command branch is disabled entirely and
-/// the loop keeps polling the scan until the transaction settles. The flag can
-/// only change while the scan is being polled, so a command that arrives during
-/// a transaction is serviced immediately after it commits — never lost, never
-/// starved behind a stuck one.
+/// probes inside a track upsert, root-status persist, or stale-row delete — and
+/// a library command serviced at that moment would queue its own write behind
+/// the open transaction and fail at the production five-second busy timeout.
+/// `scan_write_txn` is held exactly over those spans; while it is open the
+/// command branch is disabled entirely and the loop keeps polling the scan
+/// until the transaction settles. The flag can only change while the scan is
+/// being polled, so a command that arrives during a transaction is serviced
+/// immediately after it commits — never lost, never starved behind a stuck one.
 ///
 /// The invariant is reciprocal. A command dispatched while the scan is between
 /// write boundaries keeps its `command_in_flight` arm held for as long as its
 /// work settles, and every scan write boundary parks there — still polled,
 /// holding no connection — instead of opening a transaction the in-flight
-/// work's own writes would queue behind (PR #286 round-3 finding
-/// cid 4051684281). Command service and scan mutations therefore never hold
-/// competing SQLite write transactions in either direction, and the wait
-/// always resolves because dispatched command work is finite.
+/// work's own writes would queue behind. Command service and scan mutations
+/// therefore never hold competing SQLite write transactions in either
+/// direction, and the wait always resolves because dispatched command work is
+/// finite.
 ///
 /// `Flush` is the reserved drain marker. By the time the loop receives it,
 /// every earlier admitted command has settled in FIFO order, so the loop waits
@@ -4310,19 +4307,17 @@ where
                 // scan's queued acquire; a grant held inside a future that is
                 // no longer polled would trap the connection and starve the
                 // command at the acquire timeout (observed as a 30s sqlx pool
-                // timeout in the jq5lG regression). Interleave both futures;
-                // if the scan settles first, the pool is idle and the
-                // Remaining work finishes alone before the scan result is
-                // returned.
+                // timeout). Interleave both futures; if the scan settles first,
+                // the pool is idle and the Remaining work finishes alone before
+                // the scan result is returned.
                 //
                 // Hold the reciprocal write-boundary invariant for the whole
-                // interleave (PR #286 round-3 finding cid 4051684281): while
-                // this work is still settling, the scan's write boundaries
-                // park instead of opening a transaction the work's own writes
-                // would queue behind. Declared before `work` so the guard
-                // outlives it and clears — waking any parked boundary — on
-                // every exit path, including the scan-settled-first
-                // abandonment below.
+                // interleave: while this work is still settling, the scan's
+                // write boundaries park instead of opening a transaction the
+                // work's own writes would queue behind. Declared before `work`
+                // so the guard outlives it and clears — waking any parked
+                // boundary — on every exit path, including the
+                // scan-settled-first abandonment below.
                 let _command_in_flight_guard = CommandInFlightGuard::arm(scan_write_txn);
                 let mut work = Box::pin(async {
                     if let Some(pending) = process_library_command(
@@ -4830,12 +4825,12 @@ async fn initial_scan_with_control(
         // durable device identity for the next startup.
         //
         // Admission is re-checked before EVERY root-status mutation, not once
-        // before the loop (PR #286 finding jq5ld): when shutdown is observed
-        // mid-loop — for example while an earlier root's persist was settling
-        // — the remaining roots must not receive status writes that would
-        // present them as freshly checked. Fail the remaining scans closed
-        // (marked cancelled) and stop without an error: the close drain
-        // acknowledges cancelled scans that committed nothing.
+        // before the loop: when shutdown is observed mid-loop — for example
+        // while an earlier root's persist was settling — the remaining roots
+        // must not receive status writes that would present them as freshly
+        // checked. Fail the remaining scans closed (marked cancelled) and stop
+        // without an error: the close drain acknowledges cancelled scans that
+        // committed nothing.
         if !admit_scan_mutation(cancellation) {
             let root_display = scan.root.display().to_string();
             mark_scan_cancelled(
@@ -4849,23 +4844,21 @@ async fn initial_scan_with_control(
             return Ok(());
         }
         // The status persist opens a SQLite write transaction across an await
-        // point (the marker probe inside). Hold the write-transaction gate
-        // over the whole span so the command-service selector does not
-        // dispatch a library command into the open transaction (jq5lG). The
-        // RootStatus rendezvous is a test-only seam parked at this boundary.
-        // Reciprocal invariant: if a command was already dispatched, park
-        // here — outside the transaction — until its work settles instead of
-        // making its own writes queue behind this transaction (cid 4051684281).
-        // The CommandSettlement seam is a test-only signal fired at this
-        // boundary, before the wait: a regression driver learns the pre-wait
-        // admission check passed and the scan is about to park on the
-        // reciprocal settlement wait (PR #286 round-4 finding j9j81).
+        // point (the marker probe inside). Hold the write-transaction gate over
+        // the whole span so the command-service selector does not dispatch a
+        // library command into the open transaction. The RootStatus rendezvous
+        // is a test-only seam parked at this boundary. Reciprocal invariant: if
+        // a command was already dispatched, park here — outside the transaction
+        // — until its work settles instead of making its own writes queue
+        // behind this transaction. The CommandSettlement seam is a test-only
+        // signal fired at this boundary, before the wait: a regression driver
+        // learns the pre-wait admission check passed and the scan is about to
+        // park on the reciprocal settlement wait.
         discovery.signal(ScanDiscoveryStage::CommandSettlement);
         wait_for_command_settlement(scan_write_txn).await;
-        // Re-check admission once the wait resolves (PR #286 round-4 finding
-        // j9j81): the park can span the shutdown cancellation, so refusing
-        // only before the wait would still open a post-cancellation write
-        // transaction and delay the close drain.
+        // Re-check admission once the wait resolves: the park can span the
+        // shutdown cancellation, so refusing only before the wait would still
+        // open a post-cancellation write transaction and delay the close drain.
         if !admit_scan_mutation(cancellation) {
             let root_display = scan.root.display().to_string();
             mark_scan_cancelled(
@@ -5192,14 +5185,13 @@ async fn initial_scan_with_control(
                     // the commit guard probes the retained authority handle, so
                     // the write-transaction gate spans the whole call: the
                     // command-service selector defers library commands until the
-                    // transaction commits or rolls back (jq5lG). Reciprocally,
-                    // park here while a dispatched command's work is still in
-                    // flight (cid 4051684281).
+                    // transaction commits or rolls back. Reciprocally, park here
+                    // while a dispatched command's work is still in flight.
                     wait_for_command_settlement(scan_write_txn).await;
-                    // Re-check admission once the wait resolves (PR #286
-                    // round-4 finding j9j81): the park can span the shutdown
-                    // cancellation, so refusing only before the wait would
-                    // still open a post-cancellation write transaction.
+                    // Re-check admission once the wait resolves: the park can
+                    // span the shutdown cancellation, so refusing only before
+                    // the wait would still open a post-cancellation write
+                    // transaction.
                     if !admit_scan_mutation(cancellation) {
                         mark_scan_cancelled(
                             &mut root_scans,
@@ -5373,14 +5365,13 @@ async fn initial_scan_with_control(
             // The absence proof is read-only blocking filesystem work against a
             // possibly removable or network root; the kernel call can block
             // well past window close. It therefore obeys the shutdown settle
-            // budget like the traversal and parse jobs (PR #286 finding jq5lT):
-            // when the budget is exhausted, abandon the probe, fail the scan
-            // closed, and PRESERVE the row — an unproven absence never deletes.
+            // budget like the traversal and parse jobs: when the budget is
+            // exhausted, abandon the probe, fail the scan closed, and PRESERVE
+            // the row — an unproven absence never deletes.
             let absence = match await_readonly_blocking(
                 cancellation,
                 spawn_authority_probe(move || {
-                    // Test-only seam: park the probe the way a hung kernel call
-                    // would (jq5lT regression).
+                    // Test-only seam: park the probe the way a hung kernel call would.
                     #[cfg(test)]
                     tests::hold_stale_absence_probe(&proof_path);
                     proof_lease.prove_absent(&proof_path).map(Arc::new)
@@ -5451,13 +5442,11 @@ async fn initial_scan_with_control(
             let mut authority_task_failed = false;
             // The delete keeps its SQLite write transaction open while the
             // commit guard revalidates the absence proof and the root lease, so
-            // the write-transaction gate spans the whole call (jq5lG).
-            // Reciprocally, park here while a dispatched command's work is
-            // still in flight (cid 4051684281).
+            // the write-transaction gate spans the whole call. Reciprocally,
+            // park here while a dispatched command's work is still in flight.
             wait_for_command_settlement(scan_write_txn).await;
-            // Re-check admission once the wait resolves (PR #286 round-4
-            // finding j9j81): the park can span the shutdown cancellation, so
-            // refusing only before the wait would still open a
+            // Re-check admission once the wait resolves: the park can span the shutdown
+            // cancellation, so refusing only before the wait would still open a
             // post-cancellation write transaction and delay the close drain.
             if !admit_scan_mutation(cancellation) {
                 mark_scan_cancelled(
@@ -5654,10 +5643,6 @@ impl WatcherRootCache {
             .enumerate()
             .find(|(_, entry)| path.starts_with(&entry.root))
             .map(|(index, entry)| (index, entry.root.clone(), entry.state.clone()))
-    }
-
-    fn exact_root(&self, root: &Path) -> Option<usize> {
-        self.entries.iter().position(|entry| entry.root == root)
     }
 
     fn authority_lease(&self, index: usize) -> Option<Arc<RootAuthorityLease>> {
@@ -18042,6 +18027,8 @@ mod tests {
         }
     }
 
+    // Its only caller removes a watched root, which Windows forbids.
+    #[cfg(not(windows))]
     async fn wait_for_root_status(events: &async_channel::Receiver<LibraryEvent>, available: bool) {
         loop {
             if let LibraryEvent::RootStatusChanged(statuses) =

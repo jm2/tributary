@@ -429,10 +429,12 @@ pub struct ServerPlaylistOperationContext {
 }
 
 impl ServerPlaylistOperationContext {
+    #[cfg(test)]
     pub const fn key_class(&self) -> ServerPlaylistOperationKeyClass {
         self.key_class
     }
 
+    #[cfg(test)]
     pub const fn generation(&self) -> ServerPlaylistOperationGeneration {
         self.generation
     }
