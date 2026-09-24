@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   have Tributary watch the partition. If another client changes the song or the playback options,
   or Tributary loses contact with the partition, it stops controlling that output until you
   select it again.
+- **Seek bar and artwork in the system media controls** — The desktop's media controls (MPRIS on
+  Linux, the Windows media overlay, and macOS Now Playing) now show the track's length, position,
+  and cover art, and seeking there moves playback.
 - **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure and
   connecting or disconnecting an account. Current release builds don't include Last.fm
   application credentials, so the group shows the feature as unavailable.
@@ -146,6 +149,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rescan to finish.
 - **Playlist edits during a scan** — Creating, renaming, deleting, importing, or editing playlists
   while a scan is running now waits briefly instead of failing with "database is locked".
+- **Edits during library refreshes** — Ratings and play counts no longer wait for a library refresh
+  that file changes started, such as after syncing music into a library folder.
 - **Upgrading libraries from 0.5.x** — A deleted song with a blank artist tag in an old playlist no
   longer stops the upgrade and leaves the library empty. If the library database can't be opened
   or upgraded, Tributary now shows an error instead of an empty library.

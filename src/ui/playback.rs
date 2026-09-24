@@ -3063,7 +3063,7 @@ fn update_now_playing_ui(
     }
 
     if let Some(ref mut ctrl) = *ctx.media_ctrl.borrow_mut() {
-        ctrl.update_metadata(&item.title, &item.artist, &item.album);
+        ctrl.update_metadata(&item.title, &item.artist, &item.album, item.duration_ms);
         // The OS transports have no buffering state. Publish Playing when a
         // load is accepted and let a later Paused/Stopped event correct it.
         ctrl.update_playback(true);
