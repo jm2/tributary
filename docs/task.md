@@ -82,7 +82,7 @@ GitHub.
 These need a person, a live service, or real hardware; CI can't produce them. Record the date,
 the exact commit or artifact, the environment, and the result on the linked issue or release PR.
 
-- **O1 — Merge gate policy.** Required checks and admin bypass are tracked in #339.
+- **O1 — Merge gate policy.** Settled in #339: eleven required checks including Coverage, strict mode off, admin bypass through pull requests only. See "Merge gate" in `docs/refinery-config.md`.
 - **O2 — Live CI timeout and check names.** Done (#288).
 - **V1 — Removable media.** Browse, play, and detach/reconnect on real removable hardware.
 - **V2 — Flatpak.** Portal, custom-root, and USB permissions in an installed Flatpak.
