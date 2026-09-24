@@ -209,6 +209,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tributary now loads only the tracks. Large iTunes (DAAP) shares use less memory while loading.
 - **Internet radio when a directory server is down** — Radio views now try another Radio-Browser
   server when one is unavailable, instead of always using the same one.
+- **Downloads a server refuses** — When a server refuses to let tracks be downloaded, a notice
+  after the download summary now says so instead of counting them only as failed. For Subsonic
+  servers such as Navidrome, it suggests asking the server's administrator to allow downloads for
+  your account.
 
 ### Security
 

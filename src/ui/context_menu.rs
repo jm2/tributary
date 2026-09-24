@@ -1413,8 +1413,7 @@ fn build_download_action(
     selection: &SelectionSnapshot,
     mutation_context: &PlaylistMutationContext,
 ) {
-    let remote_sources =
-        super::downloads::remote_server_source_ids(&mutation_context.sidebar_store);
+    let remote_sources = super::downloads::remote_server_sources(&mutation_context.sidebar_store);
     let tracks: Vec<_> = selection
         .positions
         .iter()

@@ -273,6 +273,12 @@ download:
   progress: "正在下载（%{done}/%{total}）…"
   finished: "下载已完成。已下载：%{downloaded}，已跳过：%{skipped}，失败：%{failed}。"
   cancelled: "下载已取消。已下载：%{downloaded}，已跳过：%{skipped}，失败：%{failed}。"
+  refused:
+    one: "服务器拒绝了 %{count} 首曲目的下载。"
+    other: "服务器拒绝了 %{count} 首曲目的下载。"
+  refused_permission:
+    one: "服务器拒绝了 %{count} 首曲目的下载。请让服务器管理员为此账户开启下载权限。"
+    other: "服务器拒绝了 %{count} 首曲目的下载。请让服务器管理员为此账户开启下载权限。"
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "复制到设备"

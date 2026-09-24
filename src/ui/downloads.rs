@@ -6,7 +6,7 @@
 //! queued track.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -30,18 +30,29 @@ pub(super) struct RemoteTrack {
     session_epoch: u64,
     track_id: TrackId,
     naming: TrackNaming,
+    /// Whether the source is Subsonic-family, whose `download.view` is
+    /// subject to the account's download permission.
+    subsonic: bool,
 }
 
-/// The sources in the sidebar that are remote servers, by exact identity.
-pub(super) fn remote_server_source_ids(sidebar_store: &gtk::gio::ListStore) -> HashSet<SourceId> {
+/// The sources in the sidebar that are remote servers, by exact identity,
+/// each with whether it is Subsonic-family.
+pub(super) fn remote_server_sources(
+    sidebar_store: &gtk::gio::ListStore,
+) -> HashMap<SourceId, bool> {
     (0..sidebar_store.n_items())
         .filter_map(|position| {
             sidebar_store
                 .item(position)
                 .and_downcast::<super::objects::SourceObject>()
         })
-        .filter(|source| REMOTE_SERVER_BACKENDS.contains(&source.backend_type().as_str()))
-        .filter_map(|source| source.source_id())
+        .filter_map(|source| {
+            let backend = source.backend_type();
+            if !REMOTE_SERVER_BACKENDS.contains(&backend.as_str()) {
+                return None;
+            }
+            Some((source.source_id()?, backend == "subsonic"))
+        })
         .collect()
 }
 
@@ -49,11 +60,13 @@ pub(super) fn remote_server_source_ids(sidebar_store: &gtk::gio::ListStore) -> H
 /// and unavailable rows.
 pub(super) fn remote_track(
     track: &TrackObject,
-    remote_sources: &HashSet<SourceId>,
+    remote_sources: &HashMap<SourceId, bool>,
 ) -> Option<RemoteTrack> {
-    let source_id = track.source_id().filter(|id| remote_sources.contains(id))?;
+    let source_id = track.source_id()?;
+    let subsonic = *remote_sources.get(&source_id)?;
     Some(RemoteTrack {
         source_id,
+        subsonic,
         session_epoch: track.source_session_epoch()?,
         track_id: TrackId::remote(track.track_id()).ok()?,
         naming: TrackNaming {
@@ -72,16 +85,27 @@ pub(super) fn remote_track(
 struct Tally {
     downloaded: usize,
     skipped: usize,
+    /// Every failure, refusals included.
     failed: usize,
+    /// Failures the server refused.
+    refused: usize,
+    /// Whether a Subsonic-family server refused one, so the account's
+    /// download permission is the likely cause.
+    subsonic_refused: bool,
     cancelled: usize,
 }
 
 impl Tally {
-    const fn record(&mut self, outcome: DownloadOutcome) {
+    const fn record(&mut self, outcome: DownloadOutcome, subsonic: bool) {
         match outcome {
             DownloadOutcome::Downloaded => self.downloaded += 1,
             DownloadOutcome::Skipped => self.skipped += 1,
             DownloadOutcome::Failed => self.failed += 1,
+            DownloadOutcome::Refused => {
+                self.failed += 1;
+                self.refused += 1;
+                self.subsonic_refused |= subsonic;
+            }
             DownloadOutcome::Cancelled => self.cancelled += 1,
         }
     }
@@ -99,6 +123,8 @@ struct Batch {
     /// Destinations already queued, so a track selected twice (or two rows
     /// naming the same file) is downloaded once.
     queued: HashSet<PathBuf>,
+    /// Sources of queued Subsonic-family tracks.
+    subsonic_sources: HashSet<SourceId>,
     total: usize,
     tally: Tally,
 }
@@ -170,6 +196,9 @@ impl Downloads {
             };
             if batch.queue.try_send(item).is_ok() {
                 batch.total += 1;
+                if track.subsonic {
+                    batch.subsonic_sources.insert(track.source_id);
+                }
             }
         }
         batch.show_progress();
@@ -209,14 +238,15 @@ impl Downloads {
             cancel,
             toast,
             queued: HashSet::new(),
+            subsonic_sources: HashSet::new(),
             total: 0,
             tally: Tally::default(),
         });
 
         let downloads = self.clone();
         gtk::glib::MainContext::default().spawn_local(async move {
-            while let Ok(outcome) = outcomes.recv().await {
-                if downloads.record(outcome) {
+            while let Ok((source_id, outcome)) = outcomes.recv().await {
+                if downloads.record(source_id, outcome) {
                     break;
                 }
             }
@@ -225,13 +255,14 @@ impl Downloads {
     }
 
     /// Count one outcome; returns whether that finished the batch.
-    fn record(&self, outcome: DownloadOutcome) -> bool {
+    fn record(&self, source_id: SourceId, outcome: DownloadOutcome) -> bool {
         let finished = {
             let mut slot = self.batch.borrow_mut();
             let Some(batch) = slot.as_mut() else {
                 return true;
             };
-            batch.tally.record(outcome);
+            let subsonic = batch.subsonic_sources.contains(&source_id);
+            batch.tally.record(outcome, subsonic);
             batch.show_progress();
             if batch.tally.done() < batch.total {
                 return false;
@@ -253,6 +284,9 @@ impl Downloads {
             "download.finished"
         };
         self.show_toast(&summary(key, batch.tally));
+        if let Some(notice) = refusal_notice(&rust_i18n::locale(), batch.tally) {
+            self.show_toast(&notice);
+        }
         if batch.tally.downloaded > 0
             && super::preferences::add_download_library_path(&self.config, &batch.folder)
         {
@@ -276,14 +310,30 @@ fn summary(key: &str, tally: Tally) -> String {
     .into_owned()
 }
 
+/// The toast after the summary when the server refused downloads. It is a
+/// toast of its own because a toast title is one ellipsized line, too short
+/// for the summary and this together.
+fn refusal_notice(locale: &str, tally: Tally) -> Option<String> {
+    if tally.refused == 0 {
+        return None;
+    }
+    let base = if tally.subsonic_refused {
+        "download.refused_permission"
+    } else {
+        "download.refused"
+    };
+    let key = super::l10n::plural_key(base, locale, &tally.refused.to_string());
+    Some(rust_i18n::t!(key.as_str(), locale = locale, count = tally.refused).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn only_rows_of_remote_servers_with_a_session_are_downloadable() {
-        let server = SourceId::random();
-        let remote_sources = HashSet::from([server]);
+        let (server, other_server) = (SourceId::random(), SourceId::random());
+        let remote_sources = HashMap::from([(server, true), (other_server, false)]);
         let row = |source_id: SourceId, epoch: Option<u64>| {
             let track = TrackObject::new(
                 4, "Song", 0, "Artist", "Album", "", "", 0, "", 0, 0, 0, "flac", "",
@@ -298,14 +348,71 @@ mod tests {
 
         let remote = remote_track(&row(server, Some(7)), &remote_sources).expect("remote row");
         assert_eq!(remote.source_id, server);
+        assert!(remote.subsonic);
         assert_eq!(remote.session_epoch, 7);
         assert_eq!(remote.track_id.as_str(), "song-4");
         assert_eq!(
             remote.naming.relative_stem(),
             std::path::Path::new("Artist/Album/04 Song")
         );
+        let other = remote_track(&row(other_server, Some(2)), &remote_sources).expect("remote row");
+        assert!(!other.subsonic);
         assert!(remote_track(&row(server, None), &remote_sources).is_none());
         assert!(remote_track(&row(SourceId::local(), Some(7)), &remote_sources).is_none());
         assert!(remote_track(&row(SourceId::radio_browser(), Some(7)), &remote_sources).is_none());
+    }
+
+    #[test]
+    fn refusals_add_a_notice_after_the_summary() {
+        let mut tally = Tally::default();
+        tally.record(DownloadOutcome::Downloaded, true);
+        tally.record(DownloadOutcome::Failed, true);
+        assert_eq!(
+            summary("download.finished", tally),
+            "Downloads finished. Downloaded: 1, skipped: 0, failed: 1."
+        );
+        assert_eq!(refusal_notice("en", tally), None, "other failures");
+
+        tally.record(DownloadOutcome::Refused, false);
+        assert_eq!(
+            summary("download.cancelled", tally),
+            "Downloads cancelled. Downloaded: 1, skipped: 0, failed: 2."
+        );
+        assert_eq!(
+            refusal_notice("en", tally).as_deref(),
+            Some("The server refused 1 download.")
+        );
+
+        tally.record(DownloadOutcome::Refused, true);
+        assert_eq!(
+            refusal_notice("en", tally).as_deref(),
+            Some(
+                "The server refused 2 downloads. \
+                 Ask its administrator to allow downloads for this account."
+            ),
+            "a Subsonic-family refusal names the download permission"
+        );
+
+        for locale in rust_i18n::available_locales!() {
+            for count in [1, 2, 5, 22] {
+                let notice = |subsonic_refused| {
+                    let tally = Tally {
+                        failed: count,
+                        refused: count,
+                        subsonic_refused,
+                        ..Tally::default()
+                    };
+                    refusal_notice(&locale, tally).expect("notice")
+                };
+                let (plain, permission) = (notice(false), notice(true));
+                assert_ne!(plain, permission, "{locale} {count}");
+                for notice in [plain, permission] {
+                    assert!(
+                        notice.contains(&count.to_string()) && !notice.contains("%{"),
+                        "{locale} {count}: {notice}"
+                    );
+                }
+            }
+        }
     }
 }

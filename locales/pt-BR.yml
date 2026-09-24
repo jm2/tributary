@@ -273,6 +273,12 @@ download:
   progress: "Baixando %{done} de %{total}…"
   finished: "Downloads concluídos. Baixadas: %{downloaded}, ignoradas: %{skipped}, com falha: %{failed}."
   cancelled: "Downloads cancelados. Baixadas: %{downloaded}, ignoradas: %{skipped}, com falha: %{failed}."
+  refused:
+    one: "O servidor recusou %{count} download."
+    other: "O servidor recusou %{count} downloads."
+  refused_permission:
+    one: "O servidor recusou %{count} download. Peça ao administrador do servidor para permitir downloads nesta conta."
+    other: "O servidor recusou %{count} downloads. Peça ao administrador do servidor para permitir downloads nesta conta."
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "Copiar para o dispositivo"

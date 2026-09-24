@@ -17,6 +17,7 @@ use tracing::warn;
 use crate::architecture::media::{MediaContainer, MediaRequest, ResolvedHttpRequest};
 use crate::architecture::{SourceId, TrackId};
 use crate::audio::cast_http_server::UpstreamMediaClient;
+use crate::http_body::read_limited;
 use crate::local::tag_parser::AUDIO_EXTENSIONS;
 use crate::source_registry::{ResolvedSourceStream, SourceRegistry, StreamResolutionClass};
 
@@ -28,6 +29,10 @@ const CONCURRENT_DOWNLOADS: usize = 2;
 
 /// Largest accepted file, so a misbehaving server cannot fill the disk.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Largest non-audio body read to look for a Subsonic refusal; an error
+/// envelope is a few hundred bytes.
+const MAX_ERROR_BODY_BYTES: u64 = 16 * 1024;
 
 /// Longest file or folder name written, in bytes. Most filesystems allow 255;
 /// the margin leaves room for the extension and `.part` suffix.
@@ -149,18 +154,22 @@ pub enum DownloadOutcome {
     /// A file with the same name and any audio extension already exists.
     Skipped,
     Failed,
+    /// The server refused the download: HTTP 401 or 403, or a Subsonic
+    /// authorization error.
+    Refused,
     Cancelled,
 }
 
 /// Download queued items [`CONCURRENT_DOWNLOADS`] at a time until the queue
-/// closes, reporting each outcome as it completes. Items still queued after
-/// `cancel` fires report [`DownloadOutcome::Cancelled`] without any I/O.
+/// closes, reporting each outcome with its item's source as it completes.
+/// Items still queued after `cancel` fires report
+/// [`DownloadOutcome::Cancelled`] without any I/O.
 pub async fn run_queue(
     registry: SourceRegistry,
     http: UpstreamMediaClient,
     queue: async_channel::Receiver<DownloadItem>,
     cancel: CancellationToken,
-    outcomes: async_channel::Sender<DownloadOutcome>,
+    outcomes: async_channel::Sender<(SourceId, DownloadOutcome)>,
 ) {
     let workers = (0..CONCURRENT_DOWNLOADS).map(|_| {
         let (registry, http, queue, cancel, outcomes) = (
@@ -172,8 +181,9 @@ pub async fn run_queue(
         );
         async move {
             while let Ok(item) = queue.recv().await {
+                let source_id = item.source_id;
                 let outcome = download_track(&registry, &http, item, &cancel).await;
-                if outcomes.send(outcome).await.is_err() {
+                if outcomes.send((source_id, outcome)).await.is_err() {
                     break;
                 }
             }
@@ -214,12 +224,20 @@ async fn download_track(
             return DownloadOutcome::Failed;
         }
     };
-    match fetch_to_file(http, request, &item.stem, cancel).await {
+    fetch_outcome(fetch_to_file(http, request, &item.stem, cancel).await)
+}
+
+fn fetch_outcome(fetched: Result<PathBuf, FetchError>) -> DownloadOutcome {
+    match fetched {
         Ok(_) => DownloadOutcome::Downloaded,
         Err(FetchError::Cancelled) => DownloadOutcome::Cancelled,
         Err(error) => {
             warn!(?error, "Track download failed");
-            DownloadOutcome::Failed
+            if error == FetchError::Refused {
+                DownloadOutcome::Refused
+            } else {
+                DownloadOutcome::Failed
+            }
         }
     }
 }
@@ -254,9 +272,13 @@ enum FetchError {
     /// Connection, deadline, or body failure. The reqwest error is dropped
     /// because it can display the credential-bearing URL.
     Transport,
-    /// A non-success HTTP status.
+    /// A non-success HTTP status other than a refusal.
     Status(u16),
-    /// The response is not audio, for example a Subsonic JSON error body.
+    /// The server refused the request: HTTP 401 or 403, or a Subsonic
+    /// authorization error body. For Subsonic the cause can be the account's
+    /// download permission, which `download.view` is subject to.
+    Refused,
+    /// The response is not audio, for example an HTML error page.
     NotAudio,
     /// Audio of a container the library cannot index.
     UnknownContainer,
@@ -284,8 +306,15 @@ async fn fetch_to_file(
         () = cancel.cancelled() => return Err(FetchError::Cancelled),
         response = http.fetch(request) => response.ok_or(FetchError::Transport)?,
     };
-    if !response.status().is_success() {
-        return Err(FetchError::Status(response.status().as_u16()));
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err(FetchError::Refused);
+    }
+    if !status.is_success() {
+        return Err(FetchError::Status(status.as_u16()));
     }
     if response
         .content_length()
@@ -297,7 +326,21 @@ async fn fetch_to_file(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let container = download_container(content_type, resolved_container)?;
+    let container = match download_container(content_type, resolved_container) {
+        // Subsonic reports errors in a small JSON body sent with status 200.
+        Err(FetchError::NotAudio) => {
+            let deadline = http.body_idle_timeout();
+            let body = tokio::select! {
+                () = cancel.cancelled() => return Err(FetchError::Cancelled),
+                body = read_limited(response, MAX_ERROR_BODY_BYTES, deadline) => body,
+            };
+            return Err(match body {
+                Ok(body) if crate::subsonic::is_refusal_body(&body) => FetchError::Refused,
+                _ => FetchError::NotAudio,
+            });
+        }
+        container => container?,
+    };
     let target = with_suffix(stem, file_extension(container));
     let part = with_suffix(&target, "part");
     if let Some(folder) = target.parent() {
@@ -592,34 +635,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_authentication_failure_writes_nothing() {
-        let service = MockHttpService::start(vec![download_route().replies([
-            // Subsonic reports errors in a JSON body with status 200.
+    async fn server_refusals_are_told_apart_from_other_failures() {
+        // Subsonic reports errors in a JSON body with status 200.
+        let subsonic_error = |code: i32| {
             MockResponse::json(serde_json::json!({
                 "subsonic-response": {
                     "status": "failed",
-                    "error": {"code": 40, "message": "Wrong username or password"}
+                    "error": {"code": code, "message": "Error"}
                 }
-            })),
-            MockResponse::status(StatusCode::UNAUTHORIZED),
-        ])])
-        .await;
+            }))
+        };
+        let (responses, expected): (Vec<_>, Vec<_>) = [
+            (subsonic_error(50), DownloadOutcome::Refused),
+            (subsonic_error(40), DownloadOutcome::Refused),
+            (
+                MockResponse::status(StatusCode::FORBIDDEN),
+                DownloadOutcome::Refused,
+            ),
+            (
+                MockResponse::status(StatusCode::UNAUTHORIZED),
+                DownloadOutcome::Refused,
+            ),
+            (subsonic_error(70), DownloadOutcome::Failed),
+            (
+                MockResponse::text("<html>Bad gateway</html>")
+                    .with_header(header::CONTENT_TYPE, HeaderValue::from_static("text/html")),
+                DownloadOutcome::Failed,
+            ),
+            (
+                MockResponse::status(StatusCode::INTERNAL_SERVER_ERROR),
+                DownloadOutcome::Failed,
+            ),
+            (audio_response(), DownloadOutcome::Downloaded),
+        ]
+        .into_iter()
+        .unzip();
+        let service = MockHttpService::start(vec![download_route().replies(responses)]).await;
         let root = tempfile::tempdir().expect("root");
         let stem = root.path().join("Artist/Album/01 Title");
         let http = UpstreamMediaClient::new().expect("client");
-        for expected in [FetchError::NotAudio, FetchError::Status(401)] {
-            assert_eq!(
-                fetch_to_file(
-                    &http,
-                    subsonic_download_request(&service),
-                    &stem,
-                    &CancellationToken::new()
-                )
-                .await,
-                Err(expected)
-            );
+
+        let mut outcomes = Vec::new();
+        for _ in &expected {
+            let request = subsonic_download_request(&service);
+            let fetched = fetch_to_file(&http, request, &stem, &CancellationToken::new()).await;
+            outcomes.push(fetch_outcome(fetched));
         }
-        assert!(files_under(root.path()).is_empty());
+        assert_eq!(outcomes, expected);
+        assert_eq!(
+            files_under(root.path()),
+            vec![root.path().join("Artist/Album/01 Title.flac")],
+            "only the audio body is written"
+        );
         service.finish().await;
     }
 
@@ -666,8 +733,9 @@ mod tests {
         // A copy in another container still counts; the registry has no
         // sessions, so the other track fails to resolve.
         std::fs::write(with_suffix(&existing, "mp3"), AUDIO).expect("existing copy");
-        let item = |stem: PathBuf| DownloadItem {
-            source_id: SourceId::random(),
+        let (existing_source, other_source) = (SourceId::random(), SourceId::random());
+        let item = |source_id: SourceId, stem: PathBuf| DownloadItem {
+            source_id,
             session_epoch: 1,
             track_id: TrackId::remote("song").expect("track"),
             stem,
@@ -682,9 +750,14 @@ mod tests {
         ] {
             let (queue, queue_rx) = async_channel::unbounded();
             let (outcome_tx, outcomes) = async_channel::unbounded();
-            queue.try_send(item(existing.clone())).expect("queue");
             queue
-                .try_send(item(root.path().join("Artist/Album/02 Other")))
+                .try_send(item(existing_source, existing.clone()))
+                .expect("queue");
+            queue
+                .try_send(item(
+                    other_source,
+                    root.path().join("Artist/Album/02 Other"),
+                ))
                 .expect("queue");
             drop(queue);
             let cancel = CancellationToken::new();
@@ -703,10 +776,12 @@ mod tests {
             while let Ok(outcome) = outcomes.try_recv() {
                 reported.push(outcome);
             }
-            reported.sort_by_key(|outcome| format!("{outcome:?}"));
-            let mut expected = expected.to_vec();
-            expected.sort_by_key(|outcome| format!("{outcome:?}"));
-            assert_eq!(reported, expected);
+            // Each outcome names its item's source.
+            reported.sort_by_key(|(source_id, _)| *source_id != existing_source);
+            assert_eq!(
+                reported,
+                [(existing_source, expected[0]), (other_source, expected[1])]
+            );
         }
     }
 }

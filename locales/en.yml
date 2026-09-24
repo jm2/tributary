@@ -282,6 +282,12 @@ download:
   progress: "Downloading %{done} of %{total}…"
   finished: "Downloads finished. Downloaded: %{downloaded}, skipped: %{skipped}, failed: %{failed}."
   cancelled: "Downloads cancelled. Downloaded: %{downloaded}, skipped: %{skipped}, failed: %{failed}."
+  refused:
+    one: "The server refused %{count} download."
+    other: "The server refused %{count} downloads."
+  refused_permission:
+    one: "The server refused %{count} download. Ask its administrator to allow downloads for this account."
+    other: "The server refused %{count} downloads. Ask its administrator to allow downloads for this account."
 # ── Copy to device ─────────────────────────────────────────────────
 device_copy:
   menu_heading: "Copy to Device"
