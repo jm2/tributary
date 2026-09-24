@@ -28,6 +28,7 @@ use crate::ui::header_bar::RepeatMode;
 use super::browser;
 use super::folder_browser;
 use super::header_bar;
+use super::local_row_batch::LocalRowBatch;
 use super::objects::{HeaderKind, SourceObject, TrackObject};
 use super::output_dialogs::{load_saved_outputs_reporting, show_add_output_dialog};
 use super::persistence::{
@@ -4304,6 +4305,37 @@ fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
         .and_then(|u| u.to_file_path().ok())
 }
 
+/// Most per-row events folded into one batch, so a steady stream still
+/// yields to the main loop between batches.
+const MAX_LOCAL_ROW_BATCH: usize = 4096;
+
+/// Fold `first` and the per-row events already queued behind it into one
+/// batch. Returns the first other event read, which the caller must handle
+/// next.
+fn coalesce_local_row_events(
+    first: LibraryEvent,
+    engine_rx: &async_channel::Receiver<LibraryEvent>,
+) -> (LocalRowBatch, Option<LibraryEvent>) {
+    let mut batch = LocalRowBatch::default();
+    let mut next = Some(first);
+    while let Some(event) = next.take() {
+        match event {
+            LibraryEvent::TrackUpserted(track) => batch.upsert(arch_track_to_object(&track)),
+            LibraryEvent::TrackRemoved(path) => batch.remove(
+                url::Url::from_file_path(&path)
+                    .map(|uri| uri.to_string())
+                    .unwrap_or_default(),
+            ),
+            other => return (batch, Some(other)),
+        }
+        if batch.len() >= MAX_LOCAL_ROW_BATCH {
+            break;
+        }
+        next = engine_rx.try_recv().ok();
+    }
+    (batch, None)
+}
+
 /// Spawn the library event receiver loop on the GTK main thread.
 #[allow(clippy::too_many_arguments)]
 fn setup_library_events(
@@ -4344,7 +4376,16 @@ fn setup_library_events(
 
     glib::MainContext::default().spawn_local(async move {
         let mut playlist_sidebar_reducer = PlaylistSidebarUiReducer::default();
-        while let Ok(event) = engine_rx.recv().await {
+        // The event that ended a coalesced row burst, handled next.
+        let mut deferred = None;
+        loop {
+            let event = match deferred.take() {
+                Some(event) => event,
+                None => match engine_rx.recv().await {
+                    Ok(event) => event,
+                    Err(_) => break,
+                },
+            };
             // `Receiver::close` wakes this loop but still exposes buffered
             // values. Once close starts, discard those values rather than
             // mutating or reopening UI on an inert window.
@@ -4366,69 +4407,55 @@ fn setup_library_events(
                     );
                 }
 
-                LibraryEvent::TrackUpserted(track) => {
-                    let obj = arch_track_to_object(&track);
-                    let uri = obj.uri();
+                event @ (LibraryEvent::TrackUpserted(_) | LibraryEvent::TrackRemoved(_)) => {
+                    let (batch, next) = coalesce_local_row_events(event, &engine_rx);
+                    deferred = next;
 
-                    refresh_active_playlist_uris(
-                        &active_source_key,
-                        &master_tracks,
-                        std::slice::from_ref(&obj),
-                    );
+                    // A rename keeps a track's identity and moves its path,
+                    // so an open playlist and a queue holding it must follow
+                    // the track, not the path they captured.
+                    let upserted = batch.upserted();
+                    if !upserted.is_empty() {
+                        refresh_active_playlist_uris(&active_source_key, &master_tracks, upserted);
+                        refresh_playback_queue(&playback_session, upserted);
+                    }
 
-                    // A single-file rename keeps the track's identity and moves
-                    // its path, so a queue holding it must follow the track, not
-                    // the path it was captured at.
-                    refresh_playback_queue(&playback_session, std::slice::from_ref(&obj));
-
-                    // Update source_tracks["local"].
                     {
-                        let mut st = source_tracks.borrow_mut();
-                        let local = st.entry("local".to_string()).or_default();
-                        // Replace existing (by URI) or append.
-                        if let Some(pos) = local.iter().position(|t| t.uri() == uri) {
-                            local[pos] = obj.clone();
+                        let mut sources = source_tracks.borrow_mut();
+                        let local = if upserted.is_empty() {
+                            sources.get_mut("local")
                         } else {
-                            local.push(obj.clone());
+                            Some(sources.entry("local".to_string()).or_default())
+                        };
+                        if let Some(local) = local {
+                            batch.apply_to_rows(local);
                         }
                     }
 
-                    // If local is the active source, update the visible tracklist.
                     if *active_source_key.borrow() == "local" {
                         // Update master tracks FIRST: a browser filter emit
                         // recomposes the visible list from master, so master
-                        // must already carry the upserted row.
-                        let st = source_tracks.borrow();
-                        let local_tracks = st.get("local").cloned().unwrap_or_default();
-                        drop(st);
-                        *master_tracks.borrow_mut() = local_tracks.clone();
+                        // must already carry the batch.
+                        let local_tracks = source_tracks
+                            .borrow()
+                            .get("local")
+                            .cloned()
+                            .unwrap_or_default();
+                        *master_tracks.borrow_mut() = local_tracks;
 
-                        if browser_state.is_filter_active() {
+                        if browser_state.is_filter_active() && !upserted.is_empty() {
                             // An active browser filter must gate what enters
                             // the visible list: recompose it from the updated
-                            // master instead of appending an unfiltered row
+                            // master instead of appending unfiltered rows
                             // (issue #250).
                             browser_state.emit();
                         } else {
-                            // No filter active: the appended/updated row IS
-                            // the composed result — update the store directly
-                            // instead of splicing the whole list.
-                            let mut found = false;
-                            for i in 0..track_store.n_items() {
-                                if let Some(existing) =
-                                    track_store.item(i).and_downcast_ref::<TrackObject>()
-                                {
-                                    if existing.uri() == uri {
-                                        track_store.remove(i);
-                                        track_store.insert(i, &obj);
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !found {
-                                track_store.append(&obj);
-                            }
+                            // Without a filter the batch IS the composed
+                            // change; a removal is safe under a filter too (a
+                            // removed row either leaves or was filtered out).
+                            // Edit the store in place instead of splicing the
+                            // whole list.
+                            batch.apply_to_store(&track_store);
                         }
 
                         // Debounce browser refresh + status update (500 ms).
@@ -4436,95 +4463,8 @@ fn setup_library_events(
                         // only the 3-pane browser and status bar are deferred.
                         // Same-source refresh: preserves still-valid browser
                         // selections instead of resetting them to "All"
-                        // (issue #250).
-                        let gen = browser_rebuild_gen.get().wrapping_add(1);
-                        browser_rebuild_gen.set(gen);
-
-                        let gen_rc = browser_rebuild_gen.clone();
-                        let source_tracks = source_tracks.clone();
-                        let browser_widget = browser_widget.clone();
-                        let browser_state = browser_state.clone();
-                        let app_config = app_config.clone();
-                        let active_source_key = active_source_key.clone();
-                        let source_navigation = source_navigation.clone();
-                        let navigation_request = source_navigation.borrow().latest_request("local");
-                        let pending_connection = pending_connection.clone();
-
-                        glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                            let Some(navigation_request) = navigation_request else {
-                                return;
-                            };
-                            let pending_request = pending_connection
-                                .borrow()
-                                .as_ref()
-                                .map(|pending| pending.request().clone());
-                            let may_refresh = source_navigation.borrow().may_refresh_visible(
-                                "local",
-                                &navigation_request,
-                                pending_request.as_ref(),
-                            );
-                            if gen_rc.get() != gen
-                                || *active_source_key.borrow() != "local"
-                                || !may_refresh
-                            {
-                                return; // Superseded by a newer event.
-                            }
-                            let st = source_tracks.borrow();
-                            let local_tracks = st.get("local").cloned().unwrap_or_default();
-                            drop(st);
-                            let (folder_model, _) =
-                                build_folder_model(&app_config, &browser_state, &local_tracks);
-                            browser::refresh_local_browser_data(
-                                &browser_widget,
-                                &browser_state,
-                                &local_tracks,
-                                folder_model,
-                            );
-                        });
-                    }
-                }
-
-                LibraryEvent::TrackRemoved(path) => {
-                    // Build the file:// URI for comparison.
-                    let removed_uri = url::Url::from_file_path(&path)
-                        .map(|u| u.to_string())
-                        .unwrap_or_default();
-
-                    // Remove from source_tracks["local"].
-                    {
-                        let mut st = source_tracks.borrow_mut();
-                        if let Some(local) = st.get_mut("local") {
-                            local.retain(|t| t.uri() != removed_uri);
-                        }
-                    }
-
-                    // If local is the active source, remove from visible tracklist.
-                    if *active_source_key.borrow() == "local" {
-                        for i in 0..track_store.n_items() {
-                            if let Some(existing) =
-                                track_store.item(i).and_downcast_ref::<TrackObject>()
-                            {
-                                if existing.uri() == removed_uri {
-                                    track_store.remove(i);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Update master tracks immediately.
-                        let st = source_tracks.borrow();
-                        let local_tracks = st.get("local").cloned().unwrap_or_default();
-                        drop(st);
-                        *master_tracks.borrow_mut() = local_tracks.clone();
-
-                        // Debounce browser refresh + status update (500 ms).
-                        // The direct removal above is safe under an active
-                        // filter (a removed row either exists and leaves, or
-                        // was already filtered out). Same-source refresh:
-                        // preserves still-valid browser selections instead of
-                        // resetting them to "All" (issue #250); its emit also
-                        // recomposes the filtered status count, so no manual
-                        // unfiltered update_status here.
+                        // (issue #250); its emit also recomposes the filtered
+                        // status count.
                         let gen = browser_rebuild_gen.get().wrapping_add(1);
                         browser_rebuild_gen.set(gen);
 
@@ -5627,7 +5567,7 @@ mod identity_tests {
             .expect("local fallback body");
         let full_sync = window_source
             .split_once("LibraryEvent::FullSync(tracks) => {")
-            .and_then(|(_, rest)| rest.split_once("LibraryEvent::TrackUpserted(track) => {"))
+            .and_then(|(_, rest)| rest.split_once("event @ (LibraryEvent::TrackUpserted(_)"))
             .map(|(body, _)| body)
             .expect("full-sync body");
         // The FullSync publication unit lives directly before the local
@@ -6309,6 +6249,66 @@ mod identity_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].track_id(), retained.track_id());
         assert_eq!(rows[0].play_count(), 2);
+    }
+
+    fn library_track(path: &str) -> Track {
+        Track {
+            id: uuid::Uuid::nil(),
+            native_track_id: Some(crate::architecture::TrackId::new(path).unwrap()),
+            title: "Title".to_string(),
+            artist_name: "Artist".to_string(),
+            album_artist_name: None,
+            artist_id: None,
+            album_title: "Album".to_string(),
+            album_id: None,
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_secs: Some(180),
+            composer: None,
+            genre: None,
+            year: None,
+            file_path: Some(path.to_string()),
+            stream_url: None,
+            cover_art_url: None,
+            date_added: None,
+            date_modified: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: None,
+            rating: TrackRating::writable(None),
+            last_played: None,
+        }
+    }
+
+    /// A burst of per-row events already queued is folded into one batch;
+    /// the first other event ends it and is handed back, and events behind
+    /// that stay queued for later.
+    #[test]
+    fn queued_row_events_coalesce_until_another_event() {
+        let (tx, rx) = async_channel::unbounded();
+        for event in [
+            LibraryEvent::TrackRemoved("/music/b.flac".to_string()),
+            LibraryEvent::TrackUpserted(Box::new(library_track("/music/c.flac"))),
+            LibraryEvent::ScanComplete,
+            LibraryEvent::TrackRemoved("/music/d.flac".to_string()),
+        ] {
+            tx.try_send(event).unwrap();
+        }
+        let first = LibraryEvent::TrackUpserted(Box::new(library_track("/music/a.flac")));
+
+        let (batch, next) = coalesce_local_row_events(first, &rx);
+
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(next, Some(LibraryEvent::ScanComplete)));
+        assert!(
+            matches!(rx.try_recv(), Ok(LibraryEvent::TrackRemoved(path)) if path == "/music/d.flac")
+        );
+
+        let mut rows = vec![arch_track_to_object(&library_track("/music/b.flac"))];
+        batch.apply_to_rows(&mut rows);
+        let uris: Vec<_> = rows.iter().map(TrackObject::uri).collect();
+        assert_eq!(uris, ["file:///music/a.flac", "file:///music/c.flac"]);
     }
 
     fn disconnected_visible_snapshot(
