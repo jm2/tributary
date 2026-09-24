@@ -17,6 +17,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 |---------|--------|
 | GTK4 / libadwaita UI (Rhythmbox-style `GtkColumnView`) | ✅ |
 | Browser filtering (Genre → Artist → Album) and folder browsing | ✅ |
+| Album artwork in the browser (Small, Medium, or Large) | ✅ Optional, off by default |
 | Local library with FS `date_modified` scanning | ✅ |
 | Real-time filesystem watching (`notify`) | ✅ |
 | SQLite persistence (`SeaORM`) | ✅ |
@@ -67,18 +68,18 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Local playback history (play counts and last-played times) | ✅ |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
 | Track ratings | ✅ Editable for local tracks; Subsonic, Jellyfin, and Plex ratings are read-only |
-| Last.fm scrobbling | 🚧 Internal foundation only — not yet available to users |
+| Last.fm scrobbling | 🚧 Settings exist, but release builds can't connect yet |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
-Last.fm scrobbling is being built behind the scenes and nothing is user-visible yet: no
-settings, no sign-in, and no network activity. The
-[Last.fm design](docs/lastfm-scrobbling.md) records what exists and what remains. The
-[implementation roadmap](docs/roadmap.md) lists the audited open backlog and current limitations,
-and [`docs/task.md`](docs/task.md) is the countable working list.
+Last.fm scrobbling is not usable yet. Preferences has a Last.fm group, but release builds don't
+include Last.fm application credentials, so it shows the feature as unavailable and Tributary never
+contacts Last.fm. The [Last.fm design](docs/lastfm-scrobbling.md) records what exists and what
+remains. Planned work is tracked in [GitHub issues](https://github.com/jm2/tributary/issues); the
+[roadmap](docs/roadmap.md) summarizes product direction and current limitations.
 
 ## Architecture
 
@@ -116,6 +117,24 @@ registry seam in detail.
 
 ## Installation
 
+### Supported platforms
+
+| Platform | Architectures | Release packages |
+|----------|---------------|------------------|
+| Linux | x86_64, aarch64 | Flatpak, `.deb`, `.rpm` (both architectures); Arch package (x86_64 only) |
+| Windows | x86_64, aarch64 | Installer (`.exe`) and `.zip` |
+| macOS | Apple Silicon (aarch64) only | `.dmg` |
+
+- **Intel Macs are not supported.** There is no x86_64 macOS build, so the `.dmg` does not run on
+  Intel Macs.
+- **Windows on ARM** builds are compiled and packaged by CI, but CI runs the test suite only on
+  x86_64, so the aarch64 build is less tested.
+- **Native Linux packages** need GTK 4.16 or newer and libadwaita 1.6 or newer, which Debian 12,
+  Ubuntu 24.04, and Linux Mint 22.x don't provide. Use the Flatpak (GNOME 50 runtime) there.
+- **The `.deb` is built on Debian unstable**, so its binary needs a recent glibc: the 0.6.2 `.deb`
+  needs glibc 2.39 or newer. The package does not declare this, so on an older system it can
+  install but then fail to start. Later releases may raise this floor.
+
 ### Fedora (COPR)
 
 Tributary is available from the [jmsqrd/tributary](https://copr.fedorainfracloud.org/coprs/jmsqrd/tributary/) COPR repository:
@@ -152,6 +171,10 @@ winget install jm2.Tributary
 ### Other Platforms
 
 Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.exe installer, .zip) are also available on the [Releases](https://github.com/jm2/tributary/releases) page.
+The `.deb` and `.rpm` packages need GTK 4.16+ and libadwaita 1.6+; the `.deb` is built on Debian
+unstable and declares the glibc version it needs. Release assets published after 0.6.2 carry a
+GitHub build-provenance attestation, which `gh attestation verify <file> --repo jm2/tributary`
+checks.
 
 > **macOS note:** The macOS `.dmg` is ad-hoc signed but not notarized, so macOS Gatekeeper will block it on first launch. After mounting the DMG and dragging Tributary to Applications, run:
 > ```bash
@@ -336,6 +359,23 @@ RUST_LOG=tributary=debug ./target/release/tributary
 RUST_LOG=tributary=trace ./target/release/tributary
 ```
 
+### Library database, upgrades, and crashes
+
+Tributary keeps your library, play counts, ratings, and playlists in `library.db` in the
+`tributary` folder of your data directory (usually `~/.local/share` on Linux,
+`~/Library/Application Support` on macOS, and `%APPDATA%` on Windows). Before a new version
+changes that database, Tributary saves a copy to the `backups` folder next to it, named after
+the schema version it was copied from, and keeps the three newest copies.
+
+**Downgrades are not supported.** An older version cannot open a database that a newer
+version has upgraded. To go back to an older version, quit Tributary and replace `library.db`
+with a copy from the `backups` folder made before the upgrade; changes made after that copy
+are lost.
+
+If Tributary crashes, it appends a line with the source location of the failure to
+`crash.log` in the `tributary` folder of your cache directory (usually `~/.cache` on Linux,
+`~/Library/Caches` on macOS, and `%LOCALAPPDATA%` on Windows). Include it in bug reports.
+
 
 ---
 
@@ -519,7 +559,7 @@ build-aux/
 └── packaging/              # Forbidden bundled-component list
 
 data/                        # .desktop, AppStream metainfo, icons
-docs/                        # Design contracts, roadmap, and the active backlog
+docs/                        # Design contracts, roadmap, and the backlog index
 ```
 
 ---
@@ -534,6 +574,27 @@ panes** above the tracklist to filter by Genre → Artist → Album, or browse t
 In the folder pane, double-click a root or directory to descend (Enter works on the focused row
 too), and use the `…` row to go back up one level.
 Click any column header to sort; click again to reverse; click a third time to clear the sort.
+
+To show cover art in the Album pane, turn on **Album pane artwork** under Preferences → Browser
+Views and choose Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for
+server libraries, from the server.
+
+### Library Folders
+
+When Tributary first indexes a library folder, it writes a small hidden file named
+`.tributary-root-id` at the top of that folder. The file lets Tributary recognize the same folder
+after a remount or a reauthorization, and tell an unplugged or replaced drive apart from a folder
+that is really empty, so it doesn't forget your ratings, play counts, and playlist entries by
+mistake. Leave the file in place and don't copy it into another library folder. If it is removed
+or replaced, Tributary asks before trusting that folder's contents again.
+
+A folder that Tributary cannot write to, and that has no `.tributary-root-id` yet (for example a
+read-only network share), can't be added: its tracks don't appear in the library. Add it once
+from a writable mount so the file can be created; after that, read-only access is enough.
+
+Renaming or moving a file inside a library folder keeps its play count, rating, and playlist
+entries when Tributary sees the rename while it is running on Linux or Windows. On macOS, and for
+changes made while Tributary is closed, a renamed file is treated as a new track.
 
 ### Browsing Removable Media
 
@@ -554,13 +615,25 @@ Remote servers are discovered automatically via mDNS (DAAP, Subsonic, Plex) and 
 
 To manually add a server, click the **+** button in the sidebar toolbar and enter the server type (Subsonic, Jellyfin, or Plex), URL, and credentials. Manually-added servers are persisted across launches (credentials are entered in the UI only — they are not stored on disk).
 
+### Internet Radio
+
+The **Internet Radio** entries in the sidebar list stations from the public
+[Radio-Browser](https://www.radio-browser.info/) directory. **Stations Near Me** needs your
+approximate location, so Tributary asks before its first use. When you allow it, Tributary asks
+ipapi.co for your location, falling back to ipwho.is and then freeipapi.com if a service does not
+answer; every service it contacts receives your public IP address. The approximate coordinates,
+country, and region that come back are sent to Radio-Browser to find nearby stations. Choosing
+**No Thanks** is remembered, while closing the prompt asks again next time. You can turn the
+location lookup on or off at any time under **Privacy** in Preferences.
+
 ### Searching Your Library
 
 Use the **search bar** above the browser panes to filter tracks in real-time. The search matches across title, artist, album, and genre simultaneously, and composes with any active browser pane selections. Clear the search by clicking the ✕ button or pressing Escape.
 
 ### Editing Song Metadata
 
-Right-click any local track and select **Properties…** to view and edit its metadata. The Properties dialog supports:
+Right-click any local track, or a track on a removable drive, and select **Properties…** to view
+and edit its metadata. The Properties dialog supports:
 
 - **Single-track editing** — Title, Artist, Album, Genre, Composer, Year, Track #, Disc # (plus
   read-only Format, Bitrate, Sample Rate, Duration, and File Path)
@@ -697,8 +770,10 @@ Open **Preferences** from the hamburger menu (☰) to:
   links inside a library folder are not followed. Removing a folder forgets its tracks, with their
   play counts and ratings, at the next start; playlists keep those entries as unmatched items.
 - Reauthorize a library folder or import from Rhythmbox
-- Toggle browser filter panes (Genre, Artist, Album)
+- Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
 - Show/hide tracklist columns
+- Set up the equalizer for playback on this computer
+- Turn the location lookup for Stations Near Me on or off (see [Internet Radio](#internet-radio))
 
 ---
 

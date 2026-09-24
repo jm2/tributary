@@ -176,6 +176,7 @@ impl DesktopAuthorizedSession {
         Ok(staged)
     }
 
+    #[cfg(test)]
     pub(super) fn username(&self) -> &str {
         &self.username
     }
@@ -296,6 +297,7 @@ impl LastFmClientError {
         )
     }
 
+    #[cfg(test)]
     pub const fn requires_reauthentication(self) -> bool {
         matches!(self, Self::ReauthenticationRequired)
     }
@@ -1295,6 +1297,10 @@ impl AuthResponse for SessionEnvelope {
 /// Fuzzing entry point: the results are dropped here, so neither provider
 /// bytes nor parsed secrets leave the parser.
 #[doc(hidden)]
+#[allow(
+    dead_code,
+    reason = "called only by the fuzz target through the library crate"
+)]
 pub fn fuzz_auth_responses(body: &[u8]) {
     let _ = parse_auth_response::<TokenResponse>(StatusCode::OK, body);
     let _ = parse_auth_response::<SessionEnvelope>(StatusCode::OK, body);

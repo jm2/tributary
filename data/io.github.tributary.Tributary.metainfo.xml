@@ -48,9 +48,9 @@
       <description>
         <p>Compatibility and maintenance release:</p>
         <ul>
-          <li>Restore DAAP library loading when OwnTone serves gzip-compressed cached catalogues</li>
-          <li>Move to SeaORM 2.0.1 and Rust 1.94 while preserving the SQLite schema and synchronized build locks</li>
-          <li>Harden dependency-update, security-advisory, and workflow-action maintenance</li>
+          <li>Load music libraries from OwnTone DAAP servers again when they send compressed catalogues</li>
+          <li>Update the database library and Rust toolchain; existing libraries carry over unchanged</li>
+          <li>Routine dependency and build maintenance</li>
         </ul>
       </description>
     </release>

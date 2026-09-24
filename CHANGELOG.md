@@ -9,362 +9,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Equalizer** — A ten-band equalizer in Preferences for playback on this computer, with
-  Flat, Pop, Rock, Jazz, and Classical presets, a preamp, and optional soft clip protection.
-  Changes apply to the playing track immediately and are remembered between sessions.
-- **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure
-  and connecting, reconnecting, or disconnecting an account. Builds without Last.fm application
-  credentials, including current releases, show the feature as unavailable.
-- **Display-backed GTK test gate** — A dedicated CI job runs the crate's production
-  widget contracts under a real X (Xvfb) display on one GTK-owning thread with
-  `TRIBUTARY_GTK_GATE=require`, so a widget test that cannot reach a display fails the
-  job instead of skipping silently. The widget session now refuses to reuse an
-  initialized GTK from a different thread, and recognizes Broadway as a display server
-  for local headless runs.
-- **Broader parser fuzzing** — The weekly fuzz run now also covers the XSPF playlist,
-  Rhythmbox import, Last.fm sign-in response, and cast streaming URL and byte-range parsers,
-  each started from committed sample inputs and stopped at fixed time and iteration limits.
-- **Folder browsing** — Browse the local library by configured root and folder, with
-  distinct identities for multiple roots, lazy navigation, and visible reasons when a root
-  is unavailable or has changed identity.
-- **Playlist drag and drop** — Drop selected tracks onto an editable local playlist in
-  their displayed order, and reorder playlists in the sidebar with persistent ordering.
-- **Chromecast IPv6** — Discover receivers and publish media over routable IPv6, choosing
-  the local interface that reaches the selected receiver on multihomed networks.
-- **Build and run helpers** — Add `--run` on Linux and macOS to build with locked
-  dependencies, validate the native binary, and launch it with logs in the terminal.
-  The macOS development route uses Homebrew libraries and skips app packaging.
-- **MPD outputs can now be supervised while under the user's explicit exclusive-control
-  confirmation** (`src/audio/mpd_output.rs`, `src/ui/output_dialogs.rs`,
-  `src/ui/output_switch.rs`, `locales/*.yml`). The user's explicit confirmation remains the
-  ONLY grant of partition authority: automatic authority is declared infeasible because MPD
-  offers no ownership lock, lease, token, or atomic conditional partition mutation. The
-  `detection_enabled` persisted field now opts an exclusive output into a revoke-only
-  supervisor: a foreign current song, any of `repeat`/`random`/`single`/`consume` flipped away
-  from the enforced defaults, or an observation gap beyond `MAX_SUPERVISION_GAP = 2 s` lapses
-  the supervisor, which revokes playback control — loads and partition-global playback
-  controls are refused with the exclusive-control-required error and orphan cleanup retains
-  the queue entry — until the user explicitly reconfirms by re-selecting the output. Quiet
-  status polling never grants or restores authority, and a lapsed supervisor is terminal for
-  the output instance. The 2 s supervision age is enforced eagerly at every authority gate —
-  public loads, public playback controls, worker commands, and orphan cleanup — so a
-  confirmation whose clean evidence has gone stale is refused immediately (and lapses the
-  supervisor) instead of staying valid until the next poll observes the gap, and a `status`
-  reply that omits any of the four partition-option fields fails the poll rather than
-  defaulting the omission to a clean `false`. The `exclusive_control: false` default, the fail-closed load gate, the
-  refuse-before-Buffering/epoch/enqueue ordering, and the relinquish-without-racy-stop rule
-  for a foreign current song are all preserved; legacy `outputs.json` entries continue to
-  deserialize with `detection_enabled: false`, and a legacy `detection_enabled: true` entry
-  without the exclusive confirmation fails closed to `Unconfirmed`. The Add Output dialog
-  saves supervision only together with the exclusive confirmation, paired with a localized
-  warning/confirmation message in every supported catalog (13 locales).
-- **Backlog consistency check** — Add a read-only `scripts/check_backlog_consistency.py`
-  (run in the CI `audit` job) that verifies unique record IDs, the literal completion
-  counters — including a mechanical recount of the archived remediation counter from its
-  archived source document — and internal links/anchors in the tracked Markdown, and can
-  optionally report missing issue/bead/PR mappings (with explicit `"pr": null` meaning
-  "not yet published"), merged-but-unreconciled records, and stale review heads from a
-  ledger snapshot. It never edits the index, closes a parent record, or assigns a
-  worker. The checker reports a top-level checkbox without a stable ID instead of
-  silently skipping it, resolves angle-bracket link destinations that contain spaces
-  (inline links and reference definitions), tracks fenced code blocks by delimiter
-  character and run length (closing fences may carry trailing tabs), requires link
-  targets to stay inside the repository root (including through symlinks), and
-  enumerates only tracked Markdown files in a Git checkout (falling back to a
-  recursive walk outside Git); exit `2` for a missing task index or ledger snapshot
-  is documented.
-- **Large-library responsiveness fixtures** — Add a deterministic test-only fixture that
-  generates fixed 10k/100k-track libraries, a latency-injecting `MediaBackend` wrapper, and
-  an opt-in measurement harness that records scan time, backend source/filter/rebuild
-  latency, retained catalogue bytes, update bursts, and a delayed filesystem/parser pass
-  (Q4, #275). Pass/fail budgets are agreed separately on a named runner; no production
-  behavior changes.
+  distinct identities for multiple roots, lazy navigation, and a visible notice when a
+  root is unavailable.
+- **Album artwork in the browser** — The Album pane can show cover art for local and server
+  albums. Turn it on under Preferences → Browser Views and choose Small, Medium, or Large.
+- **Folder browsing** — A Folder pane browses the local library by library folder and
+  subfolder, on Windows as well as Linux and macOS. Double-click a folder or press Enter to open
+  it, and use the `…` row to go back up.
+- **Equalizer** — A ten-band equalizer in Preferences for playback on this computer, with Flat,
+  Pop, Rock, Jazz, and Classical presets, a preamp, and optional soft clip protection. Changes
+  apply to the playing track immediately and are remembered between sessions.
+- **Drag and drop onto playlists** — Drag selected tracks onto a playlist in the sidebar to add
+  them in the order shown, and drag playlists to reorder the sidebar.
+- **Chromecast over IPv6** — Chromecast receivers are discovered and can play over IPv6, and
+  Tributary picks the network interface that reaches the selected receiver.
+- **Tag editing on removable drives** — Properties can now edit tracks on USB drives and other
+  removable media. The save is refused if the drive was unplugged or remounted, or the file was
+  replaced, in the meantime.
+- **Optional MPD supervision** — When you add an MPD output with exclusive control, you can also
+  have Tributary watch the partition. If another client changes the song or the playback options,
+  or Tributary loses contact with the partition, it stops controlling that output until you
+  select it again.
+- **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure and
+  connecting or disconnecting an account. Current release builds don't include Last.fm
+  application credentials, so the group shows the feature as unavailable.
 
 ### Changed
 
-- **AirPlay outputs need a sender** — AirPlay receivers are listed in the output selector only
-  when the installed GStreamer provides `raopsink`, so builds without it no longer offer rows that
-  fail on play. The README describes routing to AirPlay through the operating system meanwhile.
-- **Implementation backlog** — Reconcile completed slices and Gas City dependencies, add eleven
-  corrective and seven engineering records, and expose operator/release acceptance separately.
-  Preserve the prior detailed contracts and delivery history in an archive; no feature is marked
-  complete by this documentation update.
-- **Build helper routing** — Reject conflicting quick-exit, launch, and packaging flags
-  before setup. Formatting needs only Cargo, and macOS builds work when invoked from
-  outside the repository.
-- **Last.fm preparation** — Persist consent and per-source policy generations for future
-  scrobbling activation, with transactional updates and validation. Scrobbling remains disabled.
-- **Dependency maintenance** — Refresh Rust dependencies and the release-upload action.
-- **Stricter dependency auto-merge and leaner CI** — Dependabot pull requests auto-merge only
-  for patch updates, and a push by anyone else turns auto-merge off until a maintainer reviews
-  it. The Security Audit check now runs only the advisory audit, and documentation-only changes
-  skip the native build matrix.
-- **Single dependency lockfile** — The fuzz harness now shares the application's Cargo
-  workspace and lockfile, so Dependabot updates no longer need a manual fuzz-lock repair and
-  the security audit covers one lock.
-- **macOS packaging throughput** — Inspect each immutable Homebrew dylib source once per
-  bundle build instead of once per plugin that links it, and apply each binary's equivalent
-  `install_name_tool -change` edits in a single invocation. Forbidden-component policy is
-  unchanged: a rejected source still aborts before any copy or edit is applied.
-- **Browser and tracklist presentation** (`src/ui/browser.rs`, `src/ui/tracklist.rs`,
-  `src/ui/preferences.rs`, `src/ui/style.css`) — Align the library browser and tracklist
-  with the GNOME HIG. Tracklist rows drop the per-row separator lines in favor of Adwaita's
-  dense-list vertical rhythm, so the list no longer reads as a grid. Browser panes are
-  divided by a 1px low-opacity gutter that reads as a gutter rather than a hard divider;
-  when a pane is disabled, the panes on either side keep exactly one gutter between them
-  and no gutter dangles at a window edge. Item counts in the browser panes render as dimmed
-  secondary caption text with a raised legibility floor so they stay readable at small
-  sizes, and rows without a count render no "(0)". The tracklist status bar aligns to the
-  column gutter via the `.statusbar-box` rule instead of custom per-widget margins. Screen
-  readers announce each browser row as a single utterance ("Artist Name, (12)") at the
-  list-row boundary, and recycled rows never announce a stale label.
-- **Acceptance evidence for the presentation refinements** (`docs/acceptance-p2.3-c.md`) —
-  Record the display-backed acceptance evidence for the #29 presentation work:
-  a negative control proving the widget-contract skip gate, broadway-backed
-  runs where the consolidated GTK contract genuinely executes (full suite
-  included, plus dark/legacy-theme and 200%-scale variants), the disposition of
-  each original issue ask, and the operator manual matrix for checks that
-  require a physical desktop session.
+- **AirPlay outputs need a sender** — AirPlay receivers appear in the output selector only when
+  the installed GStreamer can send to them, so builds without that support no longer list rows that
+  fail on play. The README explains how to reach AirPlay speakers through your operating system.
+- **Browser and track list look** — The track list drops its grid lines, browser panes have lighter
+  dividers and dimmed item counts, and screen readers announce each browser row once.
+- **Confirm before deleting** — Deleting a playlist or removing a saved server from the sidebar now
+  asks for confirmation first, with Cancel as the default.
+- **Maintenance** — Dependencies were refreshed, the fuzz tests now cover more file and network
+  parsers, and CI runs the interface tests on a real display, checks one shared lockfile, and
+  auto-merges only patch-level dependency updates.
 
 ### Fixed
 
-- **Subsonic albums with several artists** — Songs on an album credited to more than one
-  album artist (common on Navidrome) no longer appear twice, and no longer make every
-  playlist entry from that server show as unavailable.
-- **Password-protected Rhythmbox shares** — Tributary can now load the library from a
-  Rhythmbox share that requires a password, instead of failing with a sign-in error right
-  after the password is accepted.
-- **Unplayable tracks no longer stop the queue** — When the next track can't be opened (for
-  example, its file was deleted or its drive is unplugged) or can't be decoded, Tributary now
-  says so and skips to the following track. It stops with a message after several failures in
-  a row; a track you pick yourself is reported but not skipped.
-- **Now-playing controls** — The time and scrubber reset as soon as a track changes, streams
-  whose length can't be measured show the library's track length instead of "LIVE", and only
-  live radio disables the scrubber. Track changes no longer replace your selection in the track
-  list, the play button's tooltip says Pause while playing, and Escape clears the search.
-- **Very large playlist selections** — Adding more than about 32,000 tracks to a playlist
-  at once, or removing that many entries, no longer fails.
-- **XSPF import and export** — Exports keep an existing file's permissions, new exports are
-  readable by other programs, and exporting over a symlink updates the file it points to. A
-  playlist with one bad duration still imports, and files over 64 MiB are refused with a clear
-  message.
-- **Playlist housekeeping** — The default smart playlists no longer come back after you delete
-  them, Rhythmbox imports keep their original playlist order, and file changes no longer re-read
-  the whole library whenever some playlist entries are unmatched.
-- **Views keep their place** — Counting a play, rating a track, or a change to the library
-  folders no longer empties the open playlist or library view, clears its search and filters,
-  or jumps back to the top. A smart playlist limited to random songs keeps the same songs
-  until you edit its rules or restart Tributary.
-- **MPD and Chromecast after a network stall** — If a brief stall ends playback with an
-  error while the device keeps playing, Stop (or quitting Tributary) now reconnects and stops
-  it. A supervised MPD output no longer refuses to play when you wait more than two seconds
-  after selecting it, or after a track or the queue ends.
-- **Jellyfin 12 sign-in** — Tributary now signs in to, browses, and streams from Jellyfin
-  12 servers, which by default reject the older authentication header Tributary used to
-  send. Earlier Jellyfin versions keep working.
-- **One device per install** — Each Tributary install now presents its own device identity
-  to Jellyfin and Plex, so signing in on a second computer, or adding the same Jellyfin
-  server twice, no longer signs out your other Tributary sessions.
-- **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row from
-  the output selector, and receivers or Chromecasts that share a display name no longer hide each
-  other.
-- **Chromecast track changes** — Moving to the next track keeps the receiver's media app
-  open instead of closing and relaunching it, so TVs and displays no longer drop back to
-  their ambient screen between tracks. Tributary also stops resetting the speaker's own
-  volume on every track, and Previous now restarts a Chromecast track after three seconds.
-- **Year edits** — Changing or clearing the year in Properties now takes effect for MP3
-  and M4A files, and replaces the existing date on FLAC and Ogg files instead of being
-  hidden by it.
-- **Legacy ID3v1 tags** — Editing an MP3 that only has an ID3v1 tag keeps its title,
-  artist and album. Blank ID3v1 fields now fall back to the file name and "Unknown"
-  names, so these files are no longer rejected on removable devices or when opened from
-  the file manager.
-- **Playlist edits during a library scan** — Creating, renaming, deleting, importing, or
-  editing playlists (and other library changes) while a scan is running now waits
-  briefly for the scan instead of failing at once with "database is locked".
-- **Upgrading libraries from 0.5.x** — A playlist entry whose song was deleted and had a
-  blank artist tag no longer stops the upgrade and leaves the library empty; such
-  entries, which could never be matched again, are removed during the upgrade. If the
-  library database cannot be opened or upgraded, Tributary now shows an error instead
-  of an empty library.
-- **Rating column in non-English languages** — The Rating column no longer stays hidden
-  when Tributary runs in a language other than English, so ratings can be edited again.
-  Track list column titles and the Preferences column checkboxes are now translated, and
-  saved column visibility, order and sort carry over unchanged.
-- **Confirm before deleting a playlist or removing a server** — Deleting a playlist or
-  removing a saved server from the sidebar now asks for confirmation first, with Cancel
-  as the default, so a misclick no longer discards it immediately.
-- **Library folders** — A library folder that is itself a symbolic link (for example
-  `~/Music` pointing to another disk) is now indexed instead of showing an empty library.
-  Removing a library folder now forgets its unplayable tracks at the next start, while a
-  folder that is only temporarily unavailable, such as an unmounted drive, keeps them.
-- **Library rescans after tag edits and syncs** — Saving a tag edit, or a sync tool such as
-  rsync or Syncthing finishing a download into your music folder, now updates just that
-  track instead of rescanning the whole library.
-- **Responsiveness on slow or network drives** — Starting Tributary no longer holds up
-  ratings and other edits while it sets up folder watching, and closing the window no
-  longer waits for a library rescan to finish.
-- **Browser filter desynchronization** (`src/ui/browser.rs`, `src/ui/window.rs`) —
-  Selecting a genre/artist/album or typing in the browser search left the three
-  panes and the track list disagreeing: typing a search dropped the picked album
-  from the composed filter while the album pane still displayed it; a source
-  replacement (rescan, full sync, external change) and the album-artist toggle
-  reset the panes' displayed "All" selections but left the shared filter state
-  (artist/album/search/folder prefix) stale, so the next search re-narrowed by
-  an artist from the replaced source; and an upsert under an active filter
-  appended the new row to the visible list unfiltered. All browser axes now
-  live in one shared state object with a single composition rule — every
-  selection, search, and refresh emits the same composed filter that both the
-  visible list splice and the status count derive from. Source replacement
-  (`reset_browser_data`) clears every axis, the entry text, the folder pane
-  (navigation returns to the roots level so the displayed directory agrees
-  with the cleared folder filter), and pending search debounces, emitting
-  nothing (the caller splices the full set);
-  same-source refresh (`refresh_browser_data`, used by debounced upsert and
-  delete) preserves still-valid selections, drops vanished axes as if the
-  user had cleared them (most specific first: album → artist → genre), and
-  always recomposes. Upserts under an active filter recompose instead of
-  appending; unfiltered upserts keep the direct single-row store update.
-  The search debounce timer now arms on the browser's thread-default main
-  context rather than the global default. Six production-widget contracts
-  (selection vs. search, source replacement, refresh preserve/drop, full-sync
-  reset, pending-debounce invalidation, folder-pane reset on source
-  replacement) run in the consolidated GTK session.
-  (#250)
-
-- **Folder rows navigate on activation, not selection** (`src/ui/browser.rs`,
-  `src/ui/objects/browser_item.rs`) —
-  Activating the folder row that was already selected could never
-  navigate: the pane's selection model auto-selects the first row, and
-  the old navigation fired only on selection changes, so re-activating
-  the sole/first root — or the Up row, which is the ONLY row inside an
-  empty leaf — was a no-op and left browsing stuck. Navigation now fires
-  on explicit row activation (double-click, or Enter on the focused row)
-  through the production `ListView::activate` signal, independent of
-  selection. Folder rows also carry typed identities (root / directory /
-  up / status) instead of being interpreted from their display labels: a
-  genuine directory named `…` now descends where the label comparison
-  treated it as Up, root rows resolve positionally against the attached
-  model, and status rows (detached-model notice, empty-roots notice,
-  unavailable or renamed markers) refuse activation. Three
-  production-widget contracts (typed activation end-to-end, status-row
-  refusal, same-source refresh preserving the folder axis) run in the
-  consolidated GTK session. (#251)
-
-- **Initial scan no longer delays commands or window close** (`src/local/engine.rs`,
-  `src/ui/library_commands.rs`, `src/ui/tracklist.rs`, `src/ui/root_trust.rs`,
-  `src/ui/rhythmbox_migration.rs`, `src/ui/window.rs`) — The engine awaited the
-  whole initial traversal/parse before servicing any UI command, so a slow or
-  stalled filesystem operation could hold a rating or playback-history edit
-  until the window closed, and the command FIFO was unbounded. Admitted
-  commands are now serviced *while* the scan runs (both branches share one
-  engine task, so catalogue mutations stay serialized), the FIFO is bounded
-  with an explicitly reported overload outcome and a reserved shutdown slot for
-  the `Flush` marker, and the reserved close drain waits for the scan to settle
-  before acknowledging. Cancellation gained an explicit durable-mutation
-  admission boundary: a read-only parser that settles inside its shutdown grace
-  can no longer start a new upsert and its unbounded authority probes, and
-  pre-deletion authority probes are bounded too. A cancelled scan still fails
-  closed, preserving the incomplete-scan/no-deletion semantics.
-- **Windows folder browsing** (`src/ui/folder_browser.rs`, `src/ui/browser.rs`) — Folder
-  navigation split stored track paths on `/` only, but placement keeps native separators,
-  so on Windows every level below a configured root was lost: no folder children were ever
-  offered below the root. Derivation now compares over native path components, while the
-  navigation `dir` strings keep a deliberately portable `/`-separated form. The folder
-  filter prefix joins through the same native path logic, so filtering can no longer mix
-  separators on Windows either, and `..` clamps at the root (with the platform's native
-  separator refused inside a `dir` component) keeping the no-escape contract. Covered by
-  native-component fixtures on every platform and Windows-only drive-root fixtures
-  (spaces, Unicode, prefix-sibling names, drive roots, URI containment).
-- **Chromecast control saturation** (`src/audio/chromecast_output.rs`) — A slow
-  but responsive Cast receiver could previously lose the final seek or volume
-  intent when the bounded worker ingress saturated: the oldest transient
-  command was evicted without proving that a later same-kind intent superseded
-  it, and an incoming volume could evict itself while still reporting
-  `Enqueued`. The ingress now reserves two final-intent slots at the back of
-  the bounded deque, so the newest seek and volume stay admissible — and the
-  cached volume stays truthful — even while a flood of non-transient
-  play/pause/toggle commands fills the ordinary admission line. A queued
-  transient is evicted only when a later same-kind instance supersedes it
-  without crossing a lifecycle barrier, and a command that cannot be admitted
-  without discarding final intent is reported `Saturated` and logged instead
-  of being published as a terminal player error — an overload can no longer
-  tear down stable external playback. Stop/Shutdown reserved admission, epoch
-  purge, and the exact FIFO below capacity are unchanged.
-- **Local tag saves retarget a replaced or edited file** (`src/ui/properties_dialog.rs`,
-  `src/ui/context_menu.rs`, `src/local/tag_writer.rs`, `src/local/root_authority.rs`) — Properties
-  snapshotted a bare pathname, so a file moved or replaced while the dialog was open was silently
-  edited at its old name, and a competing in-place edit between the staged copy and the commit was
-  overwritten. Each local row now captures the selected file's exact object identity, its containing
-  directory's identity, and its content revision, and Save re-admits the file through the same
-  retained authority used for removable media before staging or committing. A replaced file, a
-  changed containing directory, or a competing edit now refuses with a localized conflict, leaves
-  every competing file/update byte-for-byte intact, and surfaces a "changed on disk" message instead
-  of a generic failure. A changed selection is classified by the pre-write probe — not collapsed
-  into a generic read-only/unavailable result — so the localized conflict guidance appears before
-  any byte is written. A successful save drops its target before any retry and post-save
-  availability is recomputed over the remaining targets only, so one committed file can no longer
-  disable retry for the recoverable files that still need it. The changed-on-disk heading, bodies,
-  and capability label are localized in every shipped catalog. Residual race stated
-  honestly: a coarse modification timestamp can miss an in-place edit that keeps the exact byte
-  length and lands inside the timestamp granularity; the length is always compared.
-- **Remote JSON parse diagnostics** (`src/architecture/remote_json.rs`,
-  `src/subsonic/client.rs`, `src/plex/client.rs`, `src/jellyfin/client.rs`) —
-  Subsonic, Plex, and Jellyfin response bodies now decode through one
-  content-free parser that reports only a fixed failure category and the safe
-  line/column. `serde_json`'s wrong-type diagnostics quote the offending value,
-  which can be private catalogue metadata or an echoed credential; they are no
-  longer retained in the error message, `Debug`, error chain, tracing, or UI
-  projection. Last.fm's existing strict parser is unchanged.
-- **Supervised MPD control TOCTOU** (`src/audio/mpd_output.rs`) — A playback
-  control (play/pause/toggle/seek) whose own pre-control `status` observed
-  partition-option drift or a foreign current song lapsed the supervisor yet was
-  still issued. Authority is now rechecked immediately after the authoritative
-  status is applied and before the control goes to the wire; a just-lapsed
-  supervisor receives the exclusive-control-required error and no command, the
-  same refusal shape as the worker gate.
-- **Supervised MPD cleanup rechecks authority on fresh evidence**
-  (`src/audio/mpd_output.rs`) — The shutdown-time `status` in
-  `cleanup_unconditionally` (and the `status` fetched by the Stop command's
-  `StopOwned` cleanup in `cleanup_session`) is now applied to the supervisor
-  before any mutation decision, and authority is rechecked before the teardown
-  `stop` and again before the targeted `delete`. A supervisor that is fresh at
-  the initial gate but whose own teardown observation (option drift, foreign
-  song, or the round-trip time past the 2 s window) supplies disqualifying
-  evidence now retains the orphan and issues neither command.
-- **Lapsed supervised MPD outputs rebuild on same-target reselection**
-  (`src/audio/output.rs`, `src/audio/mpd_output.rs`, `src/ui/output_switch.rs`)
-  — After supervision lapsed, the documented recovery — re-select the output —
-  never reached the constructor, because clicking the already-active row was
-  swallowed as a non-perturbing no-op and every later command stayed refused.
-  The selector now detects a lapsed supervisor on the active MPD row and routes
-  the reselection through a dedicated same-target rebuild that keeps the
-  committed-switch ordering (session proof cleared before coordinator ingress,
-  predecessor retired, stopped, replaced) while re-arming authority via the
-  fresh construction. Healthy supervisors and non-MPD targets keep the old
-  no-op behavior.
-
-- **macOS local playback** — Bundle the dynamically loaded libsoup runtime and its
-  dependencies so protected streams can use the required HTTP source on Macs without
-  Homebrew. The signed package probe now verifies direct HTTP routing, audio decoding,
-  and end-of-stream with the bundled plugins.
-- **Imported metadata** — Recognize standard Ogg/FLAC recording dates as years and remove
-  trailing whitespace from tag text while preserving meaningful leading and internal spaces.
-- **Column ordering** — Save reordered columns after the drag completes so an interrupted
-  save cannot lose the column in flight.
-- **Track dragging** — Start playlist transfers only in the track-row area, preventing
-  drags from empty space or column headers from transferring the existing selection.
-- **Release verification** — Verify that manual releases build the requested tag and stop
-  artifact publication when checksum generation fails.
+- **Safer library upgrades** — Tributary now copies the library database to a `backups` folder
+  before upgrading it, keeping the three newest copies, and an upgrade interrupted partway can
+  be retried. An older version opened on a newer library now says so and points to the copies,
+  instead of showing an empty library.
+- **Opening and closing** — Opening a web or network address Tributary can't play shows a
+  message instead of nothing, and launching Tributary while it is closing says so. Logging out
+  and Ctrl+C close Tributary normally so pending changes are saved, closing stops waiting after
+  30 seconds, a macOS cache problem no longer stops the app from starting, and crashes are
+  recorded with their location in a crash log.
+- **Smart playlist rules** — The smart playlist editor now refuses numbers and dates it can't
+  read, explaining why and keeping OK disabled, instead of silently saving 0 or 30 or a date
+  that never matches. Dates are entered as YYYY-MM-DD and match your local calendar day.
+- **Properties and MusicBrainz Lookup** — Lookup now searches the title and artist as currently
+  typed, prefers the release matching the album, fills in usable track and disc numbers, and
+  says which release it used. Properties has its own message when it can't open, and editing
+  several tracks can now clear a field whose values differ.
+- **Server sign-in** — Jellyfin accounts without a password can now connect, and the Connect
+  and Add Server dialogs stay open with a message about what's missing instead of silently
+  discarding what you typed.
+- **Last.fm keeps queued scrobbles** — Scrobbles saved while offline are no longer deleted when
+  Last.fm rejects the app's key or signature or the daily scrobble limit is reached; they wait and
+  are sent later. Brief storage errors and web error pages are retried instead of stopping
+  delivery. Last.fm remains unavailable in current builds.
+- **Library folders that come and go** — A library folder on a drive or network share that
+  connects after Tributary starts, or is remounted, is now watched and scanned within about
+  half a minute, and the folder browser shows it as unavailable while it is away and keeps
+  up with added, removed and renamed folders. The main menu also has a Rescan Library item.
+- **Local library edge cases** — Changing only the letter case of a file name no longer
+  duplicates the track, files left hidden by an interrupted tag save are put back, tag
+  editing is reported as unavailable on Windows FAT and exFAT drives instead of failing on
+  save, and a folder that used to be a separate drive is scanned again once it is not.
+- **Settings are no longer lost silently** — An unreadable settings or outputs file is kept aside
+  with a notice instead of being replaced, and a failed save or unreachable MPD server when adding
+  an output is reported. Preferences changes no longer disturb the radio station layout, closing
+  the Stations Near Me location prompt no longer counts as declining, and a new Privacy switch in
+  Preferences turns the location lookup on or off.
+- **Track context menu on large selections** — Right-clicking many tracks no longer stalls or reads
+  every selected file; Properties does that work only when you choose it. Add to Playlist is no
+  longer offered for tracks that can't be added to a playlist.
+- **Linux packages** — Fedora COPR builds now carry plain version numbers, so they update an
+  installed release RPM instead of always ranking below it. The `.deb` has a short description
+  and declares the system libraries, including glibc, that the program needs.
+- **Jellyfin 12 sign-in** — Tributary signs in to, browses, and streams from Jellyfin 12 servers,
+  which reject the older sign-in header Tributary used to send. Earlier Jellyfin versions keep
+  working.
+- **One device per install** — Each install now has its own device identity on Jellyfin and Plex,
+  so signing in on a second computer, or adding the same server twice, no longer signs out your
+  other Tributary sessions.
+- **Subsonic albums with several artists** — Songs on an album credited to more than one album
+  artist (common on Navidrome) no longer appear twice or make every playlist entry from that
+  server show as unavailable.
+- **Password-protected Rhythmbox shares** — Tributary can load a Rhythmbox share that needs a
+  password instead of failing right after the password is accepted.
+- **Unplayable tracks no longer stop the queue** — When the next track can't be opened or decoded,
+  Tributary says so and skips to the one after it, stopping with a message after several failures
+  in a row. A track you pick yourself is reported but not skipped.
+- **Now-playing controls** — The time and scrubber reset as soon as the track changes, tracks whose
+  length the output can't measure show their library length instead of "LIVE", the play button's
+  tooltip says Pause while playing, and Escape clears the search. Track changes no longer replace
+  your selection in the track list.
+- **Views keep their place** — Counting a play, rating a track, or a library rescan no longer
+  empties the open view, clears its search and filters, or scrolls back to the top. A smart
+  playlist limited to random songs keeps the same songs until you edit it or restart Tributary.
+- **Browser filters stay consistent** — The Genre, Artist, and Album panes, the search, and the
+  track list now always agree after you type a search, pick an album, or the library changes.
+- **Library folders** — A library folder that is itself a symbolic link (such as `~/Music` pointing
+  to another disk) is now indexed. Removing a library folder forgets its tracks at the next start,
+  while a folder that is only temporarily unavailable, such as an unmounted drive, keeps them.
+- **No full rescan after tag edits and syncs** — Saving a tag edit, or a sync tool such as rsync or
+  Syncthing finishing a download into your music folder, now updates just that track.
+- **Responsiveness during scans** — Ratings, play counts, and other edits no longer wait for the
+  startup scan or for folder watching to be set up, and closing the window no longer waits for a
+  rescan to finish.
+- **Playlist edits during a scan** — Creating, renaming, deleting, importing, or editing playlists
+  while a scan is running now waits briefly instead of failing with "database is locked".
+- **Upgrading libraries from 0.5.x** — A deleted song with a blank artist tag in an old playlist no
+  longer stops the upgrade and leaves the library empty. If the library database can't be opened
+  or upgraded, Tributary now shows an error instead of an empty library.
+- **Tag edits of changed files** — If a file is moved, replaced, or edited by another program while
+  Properties is open, Save now reports that it changed on disk instead of editing the wrong file or
+  overwriting the other change.
+- **Year edits** — Changing or clearing the year now works for MP3 and M4A files, and replaces the
+  existing date on FLAC and Ogg files instead of being hidden by it.
+- **ID3v1-only MP3 files** — Editing an MP3 that only has an ID3v1 tag keeps its title, artist, and
+  album, and blank ID3v1 fields fall back to the file name and "Unknown" names.
+- **Imported metadata** — Standard Ogg and FLAC recording dates are read as the year, and trailing
+  spaces are trimmed from tag text.
+- **Rating column in other languages** — The Rating column no longer stays hidden when Tributary
+  runs in a language other than English. Column titles are now translated, and saved column
+  settings carry over.
+- **Column reordering** — A reordered column is saved once the drag finishes, so an interrupted
+  save can't lose it.
+- **Very large playlist selections** — Adding or removing more than about 32,000 tracks at once no
+  longer fails.
+- **XSPF import and export** — Exports keep an existing file's permissions, new exports are readable
+  by other programs, and exporting over a symbolic link updates the file it points to. A playlist
+  with one bad duration still imports, and files over 64 MiB are refused with a clear message.
+- **Playlist housekeeping** — Deleted default smart playlists no longer come back, Rhythmbox imports
+  keep their playlist order, and file changes no longer re-read the whole library when some playlist
+  entries are unmatched.
+- **Chromecast track changes** — Moving to the next track keeps the receiver's media app open, so
+  TVs and displays no longer return to their ambient screen between tracks. Tributary no longer
+  resets the speaker's own volume on every track, and Previous restarts a Chromecast track after
+  three seconds.
+- **Chromecast formats** — Server tracks whose stream address has no file extension are sent with
+  their real format (FLAC, Ogg, AAC, or MP3) instead of always being labelled MP3.
+- **Slow Chromecast receivers** — A slow receiver no longer loses your last seek or volume change,
+  and a burst of button presses no longer ends playback with an error.
+- **MPD and Chromecast after a network stall** — If a brief stall ends playback with an error while
+  the device keeps playing, Stop or quitting Tributary now stops the device.
+- **AirPlay output rows** — Losing one AirPlay receiver no longer removes every AirPlay row, and
+  receivers or Chromecasts that share a name no longer hide each other.
+- **macOS playback of protected streams** — The macOS app now bundles the HTTP support that server
+  streams need, so they play on Macs without Homebrew.
 
 ### Security
 
-- **Discovered Plex servers** — Signing in to a Plex server found on the network no longer
-  sends your Plex account token to it. Tributary first confirms through plex.tv that the server
-  is one of yours, then connects securely with that server's own access.
+- **Release builds** — Release packages are built from exact, reviewed versions of the build
+  actions, Rust compiler, and packaging tools, and each published file has a GitHub
+  build-provenance attestation that `gh attestation verify` can check.
+- **Discovered Plex servers** — Signing in to a Plex server found on the network no longer sends
+  your Plex account token to it. Tributary first confirms through plex.tv that the server is one of
+  yours, then connects securely with that server's own access.
 - **Network discovery and saved servers** — Servers announced on the network can no longer
-  redirect a server you added yourself. Losing or updating an announcement no longer
-  disconnects a working session unless it was using an address that went away.
+  redirect a server you added yourself, and a changed or lost announcement no longer disconnects a
+  working session unless the address it was using went away.
+- **Server error messages** — When Subsonic, Plex, or Jellyfin returns malformed data, error
+  messages and logs no longer quote parts of the response, which could contain private details.
+- **Chromecast connections** — Tributary no longer writes Chromecast TLS session keys to the file
+  named by `SSLKEYLOGFILE`.
+- **TLS library update** — The TLS library was updated to fix a TLS 1.3 handshake-validation
+  advisory (RUSTSEC-2026-0285).
 
 ## [0.6.2] — 2026-09-01
 
@@ -506,8 +322,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Library integrity** — Incomplete or unavailable scans no longer delete tracks or metadata;
-  renames preserve IDs, history, and playlist membership; startup watcher events are replayed; and
-  root replacement or remount mutations are revalidated before commit.
+  renames that the file watcher sees while Tributary is running keep IDs, history, and playlist
+  membership on Linux and Windows (not on macOS, and not for renames made while Tributary is
+  closed); startup watcher events are replayed; and root replacement or remount mutations are
+  revalidated before commit.
 - **Playlist import and export** — Matching is deterministic and ambiguity-safe, imports commit
   atomically while retaining usable unmatched entries, and exports are rendered before atomically
   replacing the destination.

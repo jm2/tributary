@@ -178,15 +178,17 @@ The implemented internal foundation includes:
 - one oldest-first delivery worker, batches of at most 50 rows, and at most one request in flight.
   The worker prepares and submits data but cannot mutate SQLite; the actor owns exact-receipt
   terminal settlement, durable rescheduling, and bounded accepted/ignored/rejected counters;
-- a closed delivery classification: only timeout, transport, provider codes 8/11/16/29, and HTTP
-  temporary-service/rate-limit failures retry, using durable 30-second exponential backoff capped
-  at one hour. Accepted,
-  ignored, and recognized terminal service results settle; incompatible HTTP/body/response results
-  retain and quarantine the exact batch; and code 9 retains the queue for reauthorization. When
-  SQLite accepts a pause, its commit precedes worker stop, survives restart without spawning a
-  worker, and clears only through exact reauthorization or an opaque category- and runtime-bound
-  explicit recovery command. If persistence fails, the actor closes admission, reports a fixed
-  storage/capability failure, and stops the worker without claiming a restart-stable pause;
+- a closed delivery classification (see [Submission, retry, and response
+  handling](#submission-retry-and-response-handling)): timeout, transport, provider codes
+  8/11/16/29, and HTTP error pages retry on a durable 30-second exponential backoff capped at one
+  hour. Accepted and finally ignored items settle; daily-limit ignores wait for the next UTC day;
+  only provider codes 6 and 7 settle a batch as rejected; credential and key codes pause with the
+  whole queue kept; other provider codes and unparseable responses quarantine the exact batch; and
+  code 9 keeps the queue for reauthorization. When SQLite accepts a pause, its commit precedes
+  worker stop, survives restart without spawning a worker, and clears only through exact
+  reauthorization or an opaque category- and runtime-bound explicit recovery command. If
+  persistence fails, the actor closes admission, reports a fixed storage/capability failure, and
+  stops the worker without claiming a restart-stable pause;
 - a same-account live-reauthorization handoff that preserves the opaque account binding, admits one
   secret-bearing transition through completion, atomically excludes disconnect while it owns the
   transition, keeps queue admission open for that same binding while network delivery is stopped,
@@ -631,8 +633,8 @@ gate. Its only fields are the singleton slot, the same one-way account-binding d
 numeric category: reauthentication, compatibility, capability, or credential cleanup required. It
 contains no username, credential, listening metadata, response, endpoint, or diagnostic text.
 Result-driven pause writes validate the exact receipt; worker-failure pauses validate the current
-account. A successful transaction commits before a Stop acknowledgement or durable paused status
-is published. If that write fails, the actor closes admission and stops delivery with a fixed
+account. A transient SQLite failure never creates a pause (see below). A successful transaction
+commits before a Stop acknowledgement or durable paused status is published. If that write fails, the actor closes admission and stops delivery with a fixed
 capability/storage failure, but does not describe the uncommitted state as restart-stable. Startup
 reads the queue and marker coherently and restores a committed fixed phase without spawning a
 delivery worker. The cleanup
@@ -674,10 +676,14 @@ maps each returned scrobble to its request position before changing durable stat
 The result policy is closed and exhaustive:
 
 - an explicitly accepted item is terminal-success and is deleted transactionally;
-- an item carrying any nonzero `ignoredMessage` code, including an unknown future ignored code, is
-  terminal-ignored and is deleted without automatic modification or resubmission;
-- HTTP 429 or 5xx without a recognized provider error envelope is transient and retains the
-  complete batch for retry; a recognized provider envelope retains its own closed classification;
+- an item carrying ignored code 5 (daily scrobble limit) is kept with its attempt count unchanged
+  and becomes eligible at the next UTC midnight. Because the oldest row blocks newer ones, the
+  whole queue waits until then and the runtime reports `BackingOff`;
+- an item carrying any other nonzero `ignoredMessage` code, including an unknown future ignored
+  code, is terminal-ignored and is deleted without automatic modification or resubmission;
+- an HTTP error status without a recognized provider error envelope, such as a CDN block page or a
+  5xx or 429 response, is transient and retains the complete batch for retry; a recognized provider
+  envelope retains its own closed classification;
 - top-level service codes 8, 11, and 16 and rate-limit code 29 are transient and retain the complete
   batch for retry;
 - DNS, connect, TLS, timeout, and response-body stream interruption retain the complete batch for
@@ -685,14 +691,22 @@ The result policy is closed and exhaustive:
   failures rather than transient transport outcomes;
 - top-level code 9 retains the complete queue, closes network admission, and pauses delivery until
   the same account is successfully reauthorized;
-- every other recognized top-level Last.fm error is terminal for that submitted batch and is not
-  retried; and
+- top-level codes 6 (invalid parameters) and 7 (invalid resource) reject the submitted request
+  itself; that batch is deleted, counted as rejected, and not retried;
+- top-level codes 4, 10, 13, 14, 17, and 26 (authentication failed, invalid API key, invalid
+  signature, unauthorized token, login required, suspended API key) reject the build's credentials
+  or access level rather than the rows. They retain the complete queue behind a durable capability
+  pause;
+- every other recognized top-level code names a service, method, format, or radio feature that
+  scrobbling does not use. It proves nothing about the rows, so the batch is retained behind a
+  durable compatibility pause; and
 - a fully received but structurally incoherent success response cannot safely prove which rows
   were accepted. It retains and quarantines the batch, pauses automatic delivery with a visible
   compatibility failure, and never guesses from aggregate accepted/ignored counts.
 
 Accepted and ignored items are classified independently for bounded aggregate counters, but one
-complete structurally valid terminal response settles its complete exact receipt atomically. The
+complete structurally valid response settles its exact receipt in one transaction that deletes the
+settled rows and postpones any daily-limit rows. The
 durable mutation is committed before another batch starts. Terminal errors and ignored items update
 only bounded aggregate status; raw response text and metadata are not copied into logs or a failure
 ledger.
@@ -711,6 +725,13 @@ and a clock-based not-before value are committed using a deterministic exponenti
 starts at 30 seconds and caps at one hour. Restart preserves that schedule; a successful batch
 resets progression for the next head. Tests inject the clock and transport and do not depend on
 sleeping or Internet access.
+
+A transient SQLite failure is never recorded as a durable pause. The worker re-reads the queue
+after 1, 10, and 60 seconds, and the actor retries each settle or reschedule write twice after a
+short pause. If the failure outlasts those retries, delivery stops with a `Paused` status and a queue
+failure, new plays are still admitted, and the next runtime start resumes delivery. Durable
+capability pauses remain for proven local faults: a corrupt or stale queue, an account mismatch,
+an invalid clock, or an unexpected worker exit.
 
 Delivery is at least once, not exactly once. A request can reach Last.fm and then lose its response,
 or the process can stop after Last.fm accepts a batch but before SQLite commits deletion. Those rows

@@ -134,11 +134,26 @@ pub enum LibraryEvent {
         outcome: RootReauthorizationOutcome,
         message: Option<String>,
     },
+    /// Whether each configured library root currently backs playable tracks,
+    /// as the engine last established it. Sent after every scan and whenever
+    /// the periodic availability probe sees a root go away.
+    RootStatusChanged(Vec<LibraryRootStatus>),
     /// The library database could not be opened or upgraded, so the engine
     /// never started. The detailed error is only logged.
     DatabaseUnavailable(crate::db::connection::DatabaseInitFailure),
     /// An error occurred.
     Error(String),
+}
+
+/// One configured library root's availability as the engine established it.
+///
+/// `available` matches the playback resolver's rule: the root's identity is
+/// confirmed, it is available, and its last scan completed. A root the engine
+/// has never recorded is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryRootStatus {
+    pub path: PathBuf,
+    pub available: bool,
 }
 
 /// Why an exact configured library root requires explicit trust.
@@ -323,6 +338,9 @@ pub enum LibraryCommand {
     /// Apply one opaque, exact-state Rhythmbox preview through the same FIFO
     /// as app-owned history and rating mutations.
     ApplyRhythmboxMigration(Box<super::rhythmbox_migration::RhythmboxMigrationRequest>),
+    /// Re-probe the configured roots and run a full library scan. A request
+    /// that arrives while the startup scan is still running is covered by it.
+    Rescan,
     /// Acknowledge only after every command queued before this marker has
     /// finished. Normal application shutdown uses this FIFO barrier so an
     /// already-admitted playback-history or rating mutation cannot be lost
@@ -544,6 +562,10 @@ impl LibraryEngine {
         // engine task, so catalogue mutations stay serialized — except while
         // the scan has a write transaction open across an await point, when
         // the shared gate defers commands to the transaction boundary.
+        // Report the last known root availability before the startup scan
+        // refreshes it, so the folder view is right while the scan runs.
+        publish_root_status(db.as_ref(), &music_dirs, &tx).await;
+
         let mut watcher = None;
         let mut watcher_error = None;
         let mut completed_commands = HashMap::new();
@@ -1450,6 +1472,8 @@ struct RootScan {
     /// Each discovered audio file with its RFC 3339 mtime, read by the
     /// traversal worker so the scan loop never stats files on the engine task.
     audio_files: Vec<(PathBuf, String)>,
+    /// Private siblings an interrupted tag save left behind.
+    tag_write_debris: Vec<PathBuf>,
     errors: Vec<String>,
     device_id: Option<String>,
     mount_generation: Option<u64>,
@@ -2293,24 +2317,28 @@ fn mounted_subroots(_configured_roots: &[PathBuf]) -> std::io::Result<Vec<PathBu
     Ok(Vec::new())
 }
 
-fn expanded_scan_roots(
+/// Split persisted roots into those still in force and nested scopes a former
+/// mount left behind: a scope strictly inside a configured root that is no
+/// longer mounted and holds no track rows would otherwise keep its folder out
+/// of the enclosing root forever. A scope that still holds rows stays, so its
+/// rows keep their own availability while the mount is away.
+fn partition_stale_mount_scopes(
     configured_roots: &[PathBuf],
-    persisted_roots: &[library_root::Model],
-) -> std::io::Result<Vec<PathBuf>> {
-    expanded_scan_roots_with_mount_result(
-        configured_roots,
-        persisted_roots,
-        mounted_subroots(configured_roots),
-    )
-}
-
-fn expanded_scan_roots_with_mount_result(
-    configured_roots: &[PathBuf],
-    persisted_roots: &[library_root::Model],
-    mounted_roots: std::io::Result<Vec<PathBuf>>,
-) -> std::io::Result<Vec<PathBuf>> {
-    mounted_roots.map(|mounted_roots| {
-        expanded_scan_roots_with_mounts(configured_roots, persisted_roots, mounted_roots)
+    persisted_roots: Vec<library_root::Model>,
+    mounted_roots: &[PathBuf],
+    tracks: &[track::Model],
+) -> (Vec<library_root::Model>, Vec<library_root::Model>) {
+    persisted_roots.into_iter().partition(|state| {
+        let scope = Path::new(&state.path);
+        let nested = configured_roots
+            .iter()
+            .any(|root| scope != root && scope.starts_with(root));
+        !nested
+            || configured_roots.iter().any(|root| root == scope)
+            || mounted_roots.iter().any(|mounted| mounted == scope)
+            || tracks
+                .iter()
+                .any(|track| Path::new(&track.file_path).starts_with(scope))
     })
 }
 
@@ -2384,6 +2412,7 @@ where
             )],
             root,
             audio_files: Vec::new(),
+            tag_write_debris: Vec::new(),
             device_id: None,
             mount_generation: None,
             authority_lease: None,
@@ -2402,6 +2431,7 @@ where
                 )],
                 root,
                 audio_files: Vec::new(),
+                tag_write_debris: Vec::new(),
                 device_id: None,
                 mount_generation: None,
                 authority_lease: None,
@@ -2427,6 +2457,7 @@ where
                         )],
                         root,
                         audio_files: Vec::new(),
+                        tag_write_debris: Vec::new(),
                         device_id,
                         mount_generation: None,
                         authority_lease: None,
@@ -2449,6 +2480,7 @@ where
                 )],
                 root,
                 audio_files: Vec::new(),
+                tag_write_debris: Vec::new(),
                 device_id,
                 mount_generation: None,
                 authority_lease,
@@ -2469,6 +2501,7 @@ where
                 )],
                 root,
                 audio_files: Vec::new(),
+                tag_write_debris: Vec::new(),
                 device_id,
                 mount_generation: Some(mount_generation),
                 authority_lease,
@@ -2490,7 +2523,8 @@ where
         }
     };
 
-    let (audio_files, traversal_errors) = enumerate_audio_files(&root, root_boundary, exclusions);
+    let (audio_files, tag_write_debris, traversal_errors) =
+        enumerate_audio_files(&root, root_boundary, exclusions);
     errors.extend(traversal_errors);
     let audio_files = audio_files
         .into_iter()
@@ -2534,6 +2568,7 @@ where
     RootScan {
         root,
         audio_files,
+        tag_write_debris,
         errors,
         device_id,
         mount_generation: Some(mount_generation),
@@ -2544,7 +2579,7 @@ where
 }
 
 /// Enumerate the audio files under `directory` using the one indexing policy
-/// every scope shares.
+/// every scope shares, together with any private tag-write siblings.
 ///
 /// Symlinks are never followed: the notify watcher does not follow them either,
 /// so following here would index files that are never watched for changes, and
@@ -2561,7 +2596,7 @@ fn enumerate_audio_files(
     directory: &Path,
     boundary: Option<u64>,
     exclusions: &[PathBuf],
-) -> (Vec<PathBuf>, Vec<String>) {
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
     enumerate_audio_files_with_observer(directory, boundary, exclusions, |_| Ok(()))
 }
 
@@ -2574,11 +2609,12 @@ fn enumerate_audio_files_with_observer<F>(
     boundary: Option<u64>,
     exclusions: &[PathBuf],
     mut observe: F,
-) -> (Vec<PathBuf>, Vec<String>)
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>)
 where
     F: FnMut(&Path) -> Result<(), String>,
 {
     let mut audio_files = Vec::new();
+    let mut private_siblings = Vec::new();
     let mut errors = Vec::new();
 
     let mut entries = WalkDir::new(directory).follow_links(false).into_iter();
@@ -2618,6 +2654,9 @@ where
                     entries.skip_current_dir();
                 }
             }
+            Ok(entry) if entry.file_type().is_file() && is_private_write_sibling(entry.path()) => {
+                private_siblings.push(entry.into_path());
+            }
             Ok(entry) if entry.file_type().is_file() && tag_parser::is_audio_file(entry.path()) => {
                 let path = entry.into_path();
                 if let Err(error) = observe(&path) {
@@ -2630,7 +2669,7 @@ where
         }
     }
 
-    (audio_files, errors)
+    (audio_files, private_siblings, errors)
 }
 
 /// Traversal of the destination of a paired directory rename.
@@ -2733,7 +2772,7 @@ fn scan_renamed_directory(
     // No exclusions: a pair whose subtree owns another scan scope is rejected
     // before it reaches this traversal (`subtree_owns_another_scope`).
     let mut observed_files = HashMap::new();
-    let (audio_files, mut errors) =
+    let (audio_files, _, mut errors) =
         enumerate_audio_files_with_observer(directory, Some(boundary), &[], |path| {
             let bound_file = lease.open_regular_file(path).map_err(|error| {
                 format!(
@@ -2810,6 +2849,21 @@ fn collect_audio_files(root_scans: &[RootScan]) -> Vec<(PathBuf, String)> {
     audio_files.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     audio_files.dedup_by(|(left, _), (right, _)| left == right);
     audio_files
+}
+
+/// Whether `alias` opens the same file object as `file`: on a case-insensitive
+/// filesystem, the old spelling of a case-only rename does.
+fn path_names_same_file(alias: &Path, file: &File) -> bool {
+    let Ok(alias_file) = File::open(alias) else {
+        return false;
+    };
+    matches!(
+        (
+            super::root_authority::object_identity(&alias_file),
+            super::root_authority::object_identity(file),
+        ),
+        (Ok(alias_identity), Ok(identity)) if alias_identity == identity
+    )
 }
 
 /// Return the most specific configured root containing `path`.
@@ -4015,6 +4069,16 @@ async fn process_library_command(
             let _ = completion.send(()).await;
             return None;
         }
+        // Only the watcher-less command loop reaches this arm: the watcher
+        // loop turns a rescan into its own cancellable reconciliation, and
+        // the startup scan already covers one.
+        LibraryCommand::Rescan => {
+            info!("Rescanning library on request");
+            if let Err(error) = initial_scan(db, music_dirs, tx, playlist_sidebar_refresh).await {
+                warn!(%error, "Requested library rescan failed");
+            }
+            return None;
+        }
     };
 
     if let Some(completion) = completed_commands.get(&request.request_id).cloned() {
@@ -4233,6 +4297,11 @@ where
                 let result = scan.as_mut().await;
                 let _ = completion.send(()).await;
                 return result;
+            }
+            Ok(LibraryCommand::Rescan) => {
+                info!(
+                    "Library rescan requested during the startup scan; the running scan covers it"
+                );
             }
             Ok(command) => {
                 // Service the command while KEEPING THE SCAN POLLED. The
@@ -4467,11 +4536,34 @@ async fn initial_scan_with_control(
     // mounts remain independent reconciliation scopes even while unmounted.
     let existing_tracks = track::Entity::find().all(db).await?;
     let persisted_roots = library_root::Entity::find().all(db).await?;
-    let dirs = expanded_scan_roots(&configured_dirs, &persisted_roots).map_err(|error| {
+    let mounted_roots = mounted_subroots(&configured_dirs).map_err(|error| {
         anyhow::anyhow!(
             "failed to inspect mounted library scopes; scan disabled to protect metadata: {error}"
         )
     })?;
+    let (persisted_roots, stale_scopes) = partition_stale_mount_scopes(
+        &configured_dirs,
+        persisted_roots,
+        &mounted_roots,
+        &existing_tracks,
+    );
+    if !stale_scopes.is_empty() && admit_scan_mutation(cancellation) {
+        wait_for_command_settlement(scan_write_txn).await;
+        for scope in &stale_scopes {
+            match library_root::Entity::delete_by_id(scope.path.clone())
+                .exec(db)
+                .await
+            {
+                Ok(_) => {
+                    info!(scope = %scope.path, "Dropped a former mount scope that holds no tracks");
+                }
+                Err(error) => {
+                    warn!(scope = %scope.path, %error, "Could not drop a former mount scope");
+                }
+            }
+        }
+    }
+    let dirs = expanded_scan_roots_with_mounts(&configured_dirs, &persisted_roots, mounted_roots);
     let all_roots = dirs.clone();
 
     // Collect a separate traversal result for every root. Never infer scan
@@ -4825,12 +4917,58 @@ async fn initial_scan_with_control(
         }
     }
 
+    // Only a root whose identity this scan re-confirmed may have Tributary's
+    // private tag-save leftovers repaired or removed.
+    if content_mutations_allowed && admit_scan_mutation(cancellation) {
+        for scan in &mut root_scans {
+            if scan.tag_write_debris.is_empty() || !scan.reconciliation_authoritative {
+                continue;
+            }
+            let Some(lease) = scan.authority_lease.clone() else {
+                continue;
+            };
+            let debris = std::mem::take(&mut scan.tag_write_debris);
+            let sweep = tokio::task::spawn_blocking(move || {
+                if lease.validate().is_err() {
+                    return Vec::new();
+                }
+                sweep_tag_write_debris(&debris, std::time::SystemTime::now())
+            });
+            match await_readonly_blocking(cancellation, sweep).await {
+                Some(Ok(restored)) => scan.audio_files.extend(restored),
+                Some(Err(error)) => {
+                    warn!(root = %scan.root.display(), %error, "Tag-save debris sweep task failed");
+                }
+                None => {
+                    info!(root = %scan.root.display(), "Tag-save debris sweep abandoned at shutdown");
+                }
+            }
+        }
+    }
+
     let audio_files = collect_audio_files(&root_scans);
     let total = audio_files.len() as u64;
     info!(total, "Found authorized audio files to scan");
 
     let mut scanned: u64 = 0;
     let mut on_disk_paths = HashSet::new();
+
+    // After a case-only rename on a case-insensitive filesystem the old row's
+    // path still opens the renamed file, so it can never be proven stale.
+    // Rows without a file of their own are indexed by folded path so a newly
+    // seen spelling can take the row over instead of duplicating the track.
+    let mut case_alias_rows: HashMap<String, Vec<&track::Model>> = HashMap::new();
+    {
+        let enumerated: HashSet<&Path> = audio_files.iter().map(|(p, _)| p.as_path()).collect();
+        for row in &existing_tracks {
+            if !enumerated.contains(Path::new(&row.file_path)) {
+                case_alias_rows
+                    .entry(row.file_path.to_lowercase())
+                    .or_default()
+                    .push(row);
+            }
+        }
+    }
 
     for (path, mtime) in &audio_files {
         // Check the shutdown boundary before admitting the next parse/upsert.
@@ -4848,11 +4986,25 @@ async fn initial_scan_with_control(
             return Ok(());
         }
 
+        // Count the file before any skip below, so progress reaches the total
+        // even when some files are rejected or fail to parse.
+        scanned += 1;
+        if scanned.is_multiple_of(50) || scanned == total {
+            let _ = tx.send(LibraryEvent::ScanProgress(scanned, total)).await;
+        }
+
         let path_str = path.to_string_lossy().to_string();
         on_disk_paths.insert(path_str.clone());
 
         // Look up the existing row (if any) in the preloaded map.
-        let existing = existing_by_path.get(path_str.as_str()).copied();
+        let mut existing = existing_by_path.get(path_str.as_str()).copied();
+        let case_alias = if existing.is_none() {
+            case_alias_rows
+                .get_mut(&path_str.to_lowercase())
+                .and_then(Vec::pop)
+        } else {
+            None
+        };
 
         let needs_update = match existing {
             // Compare the traversal's mtime with the stored date_modified.
@@ -4913,15 +5065,28 @@ async fn initial_scan_with_control(
             };
             let open_lease = authority_lease.clone();
             let open_path = path.clone();
+            let alias_path = case_alias.map(|row| PathBuf::from(&row.file_path));
             let open_job = tokio::task::spawn_blocking(move || {
                 let observed_file = Arc::new(open_lease.open_regular_file(&open_path)?);
                 let parse_file = observed_file.try_clone_file()?;
-                Ok::<_, std::io::Error>((observed_file, parse_file))
+                let alias_is_same_file =
+                    alias_path.is_some_and(|alias| path_names_same_file(&alias, &parse_file));
+                Ok::<_, std::io::Error>((observed_file, parse_file, alias_is_same_file))
             });
             let (observed_file, parse_file) = match await_readonly_blocking(cancellation, open_job)
                 .await
             {
-                Some(Ok(Ok(opened))) => opened,
+                Some(Ok(Ok((observed_file, parse_file, alias_is_same_file)))) => {
+                    if let Some(row) = case_alias.filter(|_| alias_is_same_file) {
+                        // Retarget the old spelling's row, keeping its
+                        // identity, history, rating and playlist links. Its
+                        // old path is not stale: it names this same file.
+                        info!(from = %row.file_path, to = %path_str, "Retargeting track after a case-only rename");
+                        on_disk_paths.insert(row.file_path.clone());
+                        existing = Some(row);
+                    }
+                    (observed_file, parse_file)
+                }
                 Some(Ok(Err(error))) => {
                     warn!(path = %path.display(), %error, "Audio file could not be opened and cloned through retained root authority — upsert discarded");
                     continue;
@@ -5113,11 +5278,6 @@ async fn initial_scan_with_control(
                 }
             }
         }
-
-        scanned += 1;
-        if scanned.is_multiple_of(50) || scanned == total {
-            let _ = tx.send(LibraryEvent::ScanProgress(scanned, total)).await;
-        }
     }
 
     // A cancelled scan is incomplete by contract. Never enter the destructive
@@ -5221,7 +5381,7 @@ async fn initial_scan_with_control(
                     // Test-only seam: park the probe the way a hung kernel call
                     // would (jq5lT regression).
                     #[cfg(test)]
-                    tests::hold_stale_absence_probe();
+                    tests::hold_stale_absence_probe(&proof_path);
                     proof_lease.prove_absent(&proof_path).map(Arc::new)
                 }),
             )
@@ -5363,6 +5523,10 @@ async fn initial_scan_with_control(
             }
         }
     }
+
+    // Root availability goes first, so the snapshot's folder view is built
+    // against it.
+    publish_root_status(db, &configured_dirs, tx).await;
 
     // Send full sync. A transient failure here is logged but still lets the
     // scan finish (reconcile + ScanComplete) so the UI settles into a synced
@@ -5834,6 +5998,113 @@ fn same_audio_extension(from: &Path, to: &Path) -> bool {
 /// learn that the public path next to them changed.
 fn is_private_write_sibling(path: &Path) -> bool {
     tag_writer::is_tag_write_temp_file(path) || super::root_authority::is_quarantine_file(path)
+}
+
+/// Tag-write debris younger than this may belong to a save still in progress
+/// and is left alone.
+const TAG_WRITE_DEBRIS_MIN_AGE: Duration = Duration::from_hours(1);
+
+/// Clean up what interrupted tag saves left under an authoritative root.
+///
+/// A quarantined original whose public name is vacant is moved back, so the
+/// track is found where its row says it is instead of being reconciled away.
+/// Otherwise staged copies, and quarantined originals whose public name is
+/// occupied, are removed once they are older than
+/// [`TAG_WRITE_DEBRIS_MIN_AGE`]. Returns each restored public path with its
+/// mtime, ready to join the scan's audio files.
+///
+/// Blocking — worker threads only.
+fn sweep_tag_write_debris(
+    debris: &[PathBuf],
+    now: std::time::SystemTime,
+) -> Vec<(PathBuf, String)> {
+    let mut restored = Vec::new();
+    for path in debris {
+        if super::root_authority::is_quarantine_file(path) {
+            let Some(public) = quarantined_public_path(path) else {
+                continue;
+            };
+            match rename_to_vacant_name(path, &public) {
+                Ok(()) => {
+                    info!(path = %public.display(), "Restored a file left hidden by an interrupted tag save");
+                    let mtime = get_mtime(&public);
+                    restored.push((public, mtime));
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "Could not restore a file left hidden by an interrupted tag save");
+                    continue;
+                }
+            }
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if metadata.is_file()
+            && debris_age(&metadata, now).is_some_and(|age| age >= TAG_WRITE_DEBRIS_MIN_AGE)
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => info!(path = %path.display(), "Removed leftover tag-save debris"),
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "Could not remove leftover tag-save debris");
+                }
+            }
+        }
+    }
+    restored
+}
+
+/// The public path a quarantined original was displaced from, when its name
+/// records the whole original leaf. Quarantine names keep at most 96 bytes of
+/// the leaf, so a longer prefix may be truncated and is not trusted; a lossy
+/// (non-UTF-8) leaf cannot be rebuilt either.
+fn quarantined_public_path(quarantine: &Path) -> Option<PathBuf> {
+    const QUARANTINE_SUFFIX_LEN: usize = ".tributary-replaced-".len() + 32;
+    let name = quarantine.file_name()?.to_str()?;
+    let leaf = name
+        .get(1..name.len().checked_sub(QUARANTINE_SUFFIX_LEN)?)
+        .filter(|leaf| {
+            !leaf.is_empty() && leaf.len() <= 92 && !leaf.contains(char::REPLACEMENT_CHARACTER)
+        })?;
+    Some(quarantine.with_file_name(leaf))
+}
+
+/// Move `from` to `to` only while `to` is vacant, failing with
+/// `AlreadyExists` instead of replacing an occupant.
+fn rename_to_vacant_name(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    match rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(rustix::io::Errno::EXIST) => {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        // The filesystem may lack the no-replace flag; the link form below
+        // refuses an occupied name just the same.
+        Err(_) => {}
+    }
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
+}
+
+/// How long ago `metadata` was last changed. On Unix the inode change time
+/// also moves on rename, so a just-displaced original counts as fresh.
+fn debris_age(metadata: &std::fs::Metadata, now: std::time::SystemTime) -> Option<Duration> {
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        std::time::UNIX_EPOCH
+            .checked_add(Duration::from_secs(u64::try_from(metadata.ctime()).ok()?))?
+    };
+    #[cfg(not(unix))]
+    let changed = metadata.modified().ok()?;
+    now.duration_since(changed).ok()
 }
 
 async fn prepare_watcher_rename_guard(
@@ -6402,12 +6673,77 @@ async fn settle_playlist_projections_after_watcher_batch(
 const WATCHER_EVENT_CAPACITY: usize = 256;
 const WATCHER_DEBOUNCE_MS: u64 = 1500;
 const WATCHER_RECONCILIATION_RETRY_MS: u64 = 1000;
+/// How often the watcher re-probes configured roots. Nothing notifies the
+/// watcher when a volume is mounted, and notify drops a watch silently when
+/// its volume is unmounted.
+const ROOT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A cheap observation of one configured root for the availability probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootPresence {
+    /// The configured path is not a directory.
+    Missing,
+    /// The path is a directory on `boundary` (a mount ID on Linux, a device
+    /// number on other Unix platforms). Unmounting changes the boundary even
+    /// when an empty mountpoint stays behind, and removes the root marker.
+    Present { boundary: u64, marked: bool },
+}
+
+fn probe_root_presence(root: &Path) -> RootPresence {
+    if !root.is_dir() {
+        return RootPresence::Missing;
+    }
+    match filesystem_boundary_id(root) {
+        Ok(boundary) => RootPresence::Present {
+            boundary,
+            marked: root_identity_path(root).is_file(),
+        },
+        Err(_) => RootPresence::Missing,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootProbeAction {
+    Unchanged,
+    /// The root disappeared, or an empty mountpoint replaced its marked
+    /// volume: mark it unavailable without scanning, so its rows survive.
+    Gone,
+    /// The root appeared or was remounted: watch it again and rescan.
+    Arrived,
+}
+
+fn root_probe_action(previous: RootPresence, current: RootPresence) -> RootProbeAction {
+    match (previous, current) {
+        _ if previous == current => RootProbeAction::Unchanged,
+        (_, RootPresence::Missing)
+        | (
+            RootPresence::Present { marked: true, .. },
+            RootPresence::Present { marked: false, .. },
+        ) => RootProbeAction::Gone,
+        _ => RootProbeAction::Arrived,
+    }
+}
+
+/// What one availability probe asks of the watcher loop.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct RootProbeOutcome {
+    /// Roots to persist as unavailable. Their rows are never deleted.
+    gone: Vec<PathBuf>,
+    /// A root appeared, was remounted, or gained its watch, so a scan is due.
+    rescan: bool,
+}
 
 struct DirectoryWatcher {
     watcher: RecommendedWatcher,
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
     ingress_overflowed: Arc<AtomicBool>,
+    /// Roots with a registered watch. After an unmount the registration may
+    /// be dead; an `Arrived` probe replaces it.
     watched_directories: HashSet<PathBuf>,
+    /// What the last probe saw at each configured root. Recorded before the
+    /// startup scan, so a root that changes during it is rescanned.
+    root_presence: HashMap<PathBuf, RootPresence>,
+    root_probe_interval: Duration,
 }
 
 impl DirectoryWatcher {
@@ -6420,13 +6756,58 @@ impl DirectoryWatcher {
                 warn!(dir = %dir.display(), "Library folder does not exist — skipping watch");
                 continue;
             }
-            if let Err(error) = self.watcher.watch(dir.as_ref(), RecursiveMode::Recursive) {
-                warn!(dir = %dir.display(), %error, "Failed to watch directory — skipping");
-                continue;
-            }
-            self.watched_directories.insert(dir.clone());
-            info!(dir = %dir.display(), "Watching directory");
+            self.watch_directory(dir);
         }
+    }
+
+    fn watch_directory(&mut self, dir: &Path) -> bool {
+        if let Err(error) = self.watcher.watch(dir, RecursiveMode::Recursive) {
+            warn!(dir = %dir.display(), %error, "Failed to watch directory — skipping");
+            return false;
+        }
+        self.watched_directories.insert(dir.to_path_buf());
+        info!(dir = %dir.display(), "Watching directory");
+        true
+    }
+
+    /// Probe every configured root, re-watching roots that appeared or were
+    /// remounted. Blocking — the probe stats roots and a recursive watch
+    /// walks the whole tree.
+    fn reprobe_roots(&mut self, music_dirs: &[PathBuf]) -> RootProbeOutcome {
+        let mut outcome = RootProbeOutcome::default();
+        for dir in music_dirs {
+            let current = probe_root_presence(dir);
+            let previous = self
+                .root_presence
+                .insert(dir.clone(), current)
+                .unwrap_or(RootPresence::Missing);
+            match root_probe_action(previous, current) {
+                RootProbeAction::Unchanged => {
+                    // Retry a watch that failed earlier, but never on an
+                    // unmarked mountpoint left behind by an unmount.
+                    if matches!(current, RootPresence::Present { marked: true, .. })
+                        && !self.watched_directories.contains(dir)
+                        && self.watch_directory(dir)
+                    {
+                        outcome.rescan = true;
+                    }
+                }
+                RootProbeAction::Gone => {
+                    info!(dir = %dir.display(), "Library folder went away");
+                    outcome.gone.push(dir.clone());
+                }
+                RootProbeAction::Arrived => {
+                    info!(dir = %dir.display(), "Library folder appeared or was remounted");
+                    if self.watched_directories.remove(dir) {
+                        // The old registration is usually dead already.
+                        let _ = self.watcher.unwatch(dir);
+                    }
+                    self.watch_directory(dir);
+                    outcome.rescan = true;
+                }
+            }
+        }
+        outcome
     }
 }
 
@@ -6476,6 +6857,11 @@ fn install_directory_watcher(music_dirs: &[PathBuf]) -> notify::Result<Directory
         rx: notify_rx,
         ingress_overflowed,
         watched_directories: HashSet::new(),
+        root_presence: music_dirs
+            .iter()
+            .map(|dir| (dir.clone(), probe_root_presence(dir)))
+            .collect(),
+        root_probe_interval: ROOT_PROBE_INTERVAL,
     };
 
     // Watch each directory independently. A missing or unwatchable directory
@@ -6610,6 +6996,68 @@ async fn reconcile_root_marker_mutations(
     }
 }
 
+/// What woke the watcher loop.
+enum WatcherWake {
+    Command(Result<LibraryCommand, async_channel::RecvError>),
+    RootProbe,
+    Event(Option<notify::Result<notify::Event>>),
+}
+
+/// Run one availability probe on a blocking worker, persist roots that went
+/// away as unavailable, and report whether a rescan is due.
+async fn reprobe_watched_roots(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+    mut watcher: DirectoryWatcher,
+) -> anyhow::Result<(DirectoryWatcher, bool)> {
+    let dirs = music_dirs.to_vec();
+    let (watcher, outcome) = tokio::task::spawn_blocking(move || {
+        let outcome = watcher.reprobe_roots(&dirs);
+        (watcher, outcome)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("library root probe task failed: {error}"))?;
+    if !outcome.gone.is_empty() {
+        for root in &outcome.gone {
+            mark_root_path_unavailable_if_active(db, root).await;
+        }
+        publish_root_status(db, music_dirs, tx).await;
+    }
+    Ok((watcher, outcome.rescan))
+}
+
+/// Tell the UI which configured roots currently back playable tracks.
+async fn publish_root_status(
+    db: &DatabaseConnection,
+    music_dirs: &[PathBuf],
+    tx: &async_channel::Sender<LibraryEvent>,
+) {
+    let states = match library_root::Entity::find().all(db).await {
+        Ok(states) => states,
+        Err(error) => {
+            warn!(%error, "Could not load library root state to publish");
+            return;
+        }
+    };
+    let statuses = music_dirs
+        .iter()
+        .map(|root| {
+            let key = root.to_string_lossy();
+            LibraryRootStatus {
+                path: root.clone(),
+                available: states.iter().any(|state| {
+                    state.path == key
+                        && state.identity_confirmed
+                        && state.is_available
+                        && state.last_scan_complete
+                }),
+            }
+        })
+        .collect();
+    let _ = tx.send(LibraryEvent::RootStatusChanged(statuses)).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_directory_events(
     db: &Arc<DatabaseConnection>,
@@ -6629,6 +7077,12 @@ async fn process_directory_events(
     let mut reconciliation_pending = false;
     let mut pending_trust_scan: Option<PendingRootTrustScan> = None;
     let mut commands_open = true;
+    let mut rescan_requested = false;
+    let mut root_probe = tokio::time::interval_at(
+        tokio::time::Instant::now() + watcher.root_probe_interval,
+        watcher.root_probe_interval,
+    );
+    root_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if let Some(pending) = pending_trust_scan.take() {
             // The conversion scan intentionally performed no track writes.
@@ -6652,6 +7106,10 @@ async fn process_directory_events(
         // per batch boundary so it cannot interleave with a watcher mutation.
         if commands_open {
             match command_rx.try_recv() {
+                Ok(LibraryCommand::Rescan) => {
+                    rescan_requested = true;
+                    continue;
+                }
                 Ok(command) => {
                     pending_trust_scan = process_library_command(
                         db.as_ref(),
@@ -6667,6 +7125,15 @@ async fn process_directory_events(
                 Err(async_channel::TryRecvError::Empty) => {}
                 Err(async_channel::TryRecvError::Closed) => commands_open = false,
             }
+        }
+
+        // A requested rescan first re-probes the roots, so one that has just
+        // appeared is watched before the scan indexes it.
+        if std::mem::take(&mut rescan_requested) {
+            info!("Rescanning library on request");
+            let (returned, _) = reprobe_watched_roots(db.as_ref(), music_dirs, tx, watcher).await?;
+            watcher = returned;
+            reconciliation_pending = true;
         }
 
         let overflowed = watcher.ingress_overflowed.swap(false, Ordering::AcqRel);
@@ -6689,31 +7156,43 @@ async fn process_directory_events(
             continue;
         }
 
-        // Wait for either the next watcher batch or the next serialized UI
-        // command. A closed command channel must not stop filesystem watching.
-        let first = if commands_open {
-            tokio::select! {
-                biased;
-                command = command_rx.recv() => {
-                    match command {
-                        Ok(command) => {
-                            pending_trust_scan = process_library_command(
-                                db.as_ref(),
-                                music_dirs,
-                                tx,
-                                playlist_sidebar_refresh,
-                                completed_commands,
-                                command,
-                            ).await;
-                        }
-                        Err(_) => commands_open = false,
-                    }
-                    continue;
-                }
-                first = watcher.rx.recv() => first,
+        // Wait for the next serialized UI command, root probe, or watcher
+        // batch. A closed command channel must not stop filesystem watching.
+        let wake = tokio::select! {
+            biased;
+            command = command_rx.recv(), if commands_open => WatcherWake::Command(command),
+            _ = root_probe.tick() => WatcherWake::RootProbe,
+            first = watcher.rx.recv() => WatcherWake::Event(first),
+        };
+        let first = match wake {
+            WatcherWake::Command(Ok(LibraryCommand::Rescan)) => {
+                rescan_requested = true;
+                continue;
             }
-        } else {
-            watcher.rx.recv().await
+            WatcherWake::Command(Ok(command)) => {
+                pending_trust_scan = process_library_command(
+                    db.as_ref(),
+                    music_dirs,
+                    tx,
+                    playlist_sidebar_refresh,
+                    completed_commands,
+                    command,
+                )
+                .await;
+                continue;
+            }
+            WatcherWake::Command(Err(_)) => {
+                commands_open = false;
+                continue;
+            }
+            WatcherWake::RootProbe => {
+                let (returned, rescan) =
+                    reprobe_watched_roots(db.as_ref(), music_dirs, tx, watcher).await?;
+                watcher = returned;
+                reconciliation_pending |= rescan;
+                continue;
+            }
+            WatcherWake::Event(first) => first,
         };
         let Some(first) = first else { break };
 
@@ -7447,7 +7926,11 @@ async fn process_directory_events(
             )
             .await
             {
-                warn!(%error, "Watcher-triggered library reconciliation failed");
+                // Retry like a lost stream: this batch's changes are only
+                // reflected once a reconciliation succeeds.
+                warn!(%error, "Watcher-triggered library reconciliation failed; retry remains pending");
+                reconciliation_pending = true;
+                tokio::time::sleep(Duration::from_millis(WATCHER_RECONCILIATION_RETRY_MS)).await;
             }
             continue;
         }
@@ -7982,25 +8465,54 @@ mod tests {
 
     use super::*;
 
-    /// jq5lT regression seam: when armed, the stale-deletion absence probe
-    /// parks its blocking worker thread the way a removable/network root
-    /// parks the kernel call, so the shutdown settle budget becomes
-    /// observable. The flag is never armed outside the regression test, and
-    /// the closure reference is compiled only under `cfg(test)`.
-    static STALE_ABSENCE_PROBE_HELD: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    /// Regression seam: while a root is armed here, a stale-deletion absence
+    /// probe for a path under that root parks its blocking worker thread the
+    /// way a removable/network root parks the kernel call, so the shutdown
+    /// settle budget becomes observable. Scoped to one root so concurrently
+    /// running scan tests never park, and released by `StaleAbsenceProbeHold`
+    /// even if the arming test panics.
+    static STALE_ABSENCE_PROBE_HELD: std::sync::Mutex<Option<PathBuf>> =
+        std::sync::Mutex::new(None);
 
-    /// Set just before the armed probe starts spinning, so the regression
+    /// Set just before an armed probe starts spinning, so the regression
     /// driver knows the scan is parked inside the absence proof.
     static STALE_ABSENCE_PROBE_ARRIVED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    pub(super) fn hold_stale_absence_probe() {
-        if STALE_ABSENCE_PROBE_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+    fn stale_absence_probe_held(path: &Path) -> bool {
+        STALE_ABSENCE_PROBE_HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(|root| path.starts_with(root))
+    }
+
+    pub(super) fn hold_stale_absence_probe(path: &Path) {
+        if stale_absence_probe_held(path) {
             STALE_ABSENCE_PROBE_ARRIVED.store(true, std::sync::atomic::Ordering::SeqCst);
-            while STALE_ABSENCE_PROBE_HELD.load(std::sync::atomic::Ordering::SeqCst) {
+            while stale_absence_probe_held(path) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+        }
+    }
+
+    /// Arms the absence-probe hold for one root until dropped.
+    struct StaleAbsenceProbeHold;
+
+    impl StaleAbsenceProbeHold {
+        fn arm(root: &Path) -> Self {
+            *STALE_ABSENCE_PROBE_HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.to_path_buf());
+            Self
+        }
+    }
+
+    impl Drop for StaleAbsenceProbeHold {
+        fn drop(&mut self) {
+            *STALE_ABSENCE_PROBE_HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 
@@ -9465,6 +9977,8 @@ mod tests {
             rx: event_rx,
             ingress_overflowed: Arc::new(AtomicBool::new(false)),
             watched_directories: HashSet::new(),
+            root_presence: HashMap::new(),
+            root_probe_interval: ROOT_PROBE_INTERVAL,
         };
 
         let (library_events, library_event_rx) = async_channel::unbounded();
@@ -9756,10 +10270,12 @@ mod tests {
         std::fs::write(&track, b"audio").expect("create public audio path");
         std::fs::write(&sibling, b"copy").expect("create private tag sibling");
 
-        let (audio_files, errors) = enumerate_audio_files(library.path(), None, &[]);
+        let (audio_files, private_siblings, errors) =
+            enumerate_audio_files(library.path(), None, &[]);
 
         assert!(errors.is_empty());
         assert_eq!(audio_files, vec![track]);
+        assert_eq!(private_siblings, vec![sibling]);
     }
 
     #[test]
@@ -10018,6 +10534,8 @@ mod tests {
             rx: event_rx,
             ingress_overflowed: Arc::new(AtomicBool::new(false)),
             watched_directories: HashSet::new(),
+            root_presence: HashMap::new(),
+            root_probe_interval: ROOT_PROBE_INTERVAL,
         };
         for event in tag_commit_events(
             &track_path,
@@ -12610,7 +13128,7 @@ mod tests {
         let scan_write_txn = ScanWriteTxnGate::default();
         let mut completed = HashMap::new();
 
-        STALE_ABSENCE_PROBE_HELD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let probe_hold = StaleAbsenceProbeHold::arm(directory.path());
         let no_hold = ScanDiscoveryHold::none();
         let engine = service_commands_while_scanning(
             initial_scan_shutdown_aware(
@@ -12664,7 +13182,7 @@ mod tests {
         });
         scan_result.expect("a scan whose absence probe was abandoned returns cleanly");
         // Let the abandoned probe thread exit before its fixtures drop.
-        STALE_ABSENCE_PROBE_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(probe_hold);
 
         let preserved = track::Entity::find_by_id("stale-absent-track")
             .one(&db)
@@ -14024,6 +14542,8 @@ mod tests {
             rx: event_rx,
             ingress_overflowed: Arc::clone(&ingress_overflowed),
             watched_directories: HashSet::new(),
+            root_presence: HashMap::new(),
+            root_probe_interval: ROOT_PROBE_INTERVAL,
         };
 
         // A healthy watcher stream queues evidence for the track before the
@@ -15541,18 +16061,6 @@ mod tests {
     }
 
     #[test]
-    fn mount_discovery_failure_aborts_root_expansion() {
-        let configured = vec![PathBuf::from("/music")];
-        let result = expanded_scan_roots_with_mount_result(
-            &configured,
-            &[],
-            Err(std::io::Error::other("simulated mountinfo failure")),
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn persisted_nested_root_remains_a_separate_scope_while_unmounted() {
         let configured = vec![PathBuf::from("/music")];
         let persisted = vec![library_root::Model {
@@ -15581,6 +16089,7 @@ mod tests {
         let child_scan = RootScan {
             root: nested.clone(),
             audio_files: Vec::new(),
+            tag_write_debris: Vec::new(),
             errors: vec!["simulated permission error".to_string()],
             device_id: Some("simulated-device".to_string()),
             mount_generation: Some(0),
@@ -15757,6 +16266,7 @@ mod tests {
         let empty_mountpoint = RootScan {
             root: root.clone(),
             audio_files: Vec::new(),
+            tag_write_debris: Vec::new(),
             errors: Vec::new(),
             device_id: Some("underlying-mountpoint".to_string()),
             mount_generation: Some(0),
@@ -15777,6 +16287,7 @@ mod tests {
         let mounted_volume = RootScan {
             root: root.clone(),
             audio_files: vec![(root.join("song.mp3"), String::new())],
+            tag_write_debris: Vec::new(),
             errors: Vec::new(),
             device_id: Some(format!("{ROOT_IDENTITY_PREFIX}{}", Uuid::new_v4())),
             mount_generation: Some(0),
@@ -17474,5 +17985,537 @@ mod tests {
             .expect("final artist group present");
         assert_eq!(last_artist.album_count, 1);
         assert_eq!(last_artist.track_count, 4);
+    }
+
+    // ── Root availability, rescans and engine edge cases ──────────────
+
+    const SILENCE_FLAC: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/silence.flac"
+    ));
+
+    fn probe_test_watcher(
+        backend: RecommendedWatcher,
+        rx: mpsc::Receiver<notify::Result<notify::Event>>,
+        roots: &[PathBuf],
+        interval: Duration,
+    ) -> DirectoryWatcher {
+        DirectoryWatcher {
+            watcher: backend,
+            rx,
+            ingress_overflowed: Arc::new(AtomicBool::new(false)),
+            watched_directories: HashSet::new(),
+            root_presence: roots
+                .iter()
+                .map(|root| (root.clone(), probe_root_presence(root)))
+                .collect(),
+            root_probe_interval: interval,
+        }
+    }
+
+    async fn wait_for_root_status(events: &async_channel::Receiver<LibraryEvent>, available: bool) {
+        loop {
+            if let LibraryEvent::RootStatusChanged(statuses) =
+                events.recv().await.expect("library events stay open")
+            {
+                if statuses.iter().all(|status| status.available == available) {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_probe_rescans_arrivals_and_only_marks_departures() {
+        use RootPresence::{Missing, Present};
+
+        let mounted = Present {
+            boundary: 7,
+            marked: true,
+        };
+        let empty_mountpoint = Present {
+            boundary: 3,
+            marked: false,
+        };
+        assert_eq!(
+            root_probe_action(mounted, mounted),
+            RootProbeAction::Unchanged
+        );
+        assert_eq!(
+            root_probe_action(Missing, Missing),
+            RootProbeAction::Unchanged
+        );
+
+        // Appearing, or coming back on a new mount, calls for a scan.
+        assert_eq!(
+            root_probe_action(Missing, mounted),
+            RootProbeAction::Arrived
+        );
+        assert_eq!(
+            root_probe_action(empty_mountpoint, mounted),
+            RootProbeAction::Arrived
+        );
+        assert_eq!(
+            root_probe_action(
+                mounted,
+                Present {
+                    boundary: 8,
+                    marked: true
+                }
+            ),
+            RootProbeAction::Arrived
+        );
+        assert_eq!(
+            root_probe_action(Missing, empty_mountpoint),
+            RootProbeAction::Arrived
+        );
+
+        // Disappearing, or leaving an empty mountpoint behind, does not: a
+        // scan of the mountpoint would only ask to trust a stranger.
+        assert_eq!(root_probe_action(mounted, Missing), RootProbeAction::Gone);
+        assert_eq!(
+            root_probe_action(mounted, empty_mountpoint),
+            RootProbeAction::Gone
+        );
+    }
+
+    #[test]
+    fn reprobe_watches_a_root_that_appears_and_reports_one_that_leaves() {
+        let fixture = TestDirectory::new("root-reprobe");
+        let root = fixture.path().join("late");
+        let (_event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let roots = [root.clone()];
+        let mut watcher = probe_test_watcher(backend, event_rx, &roots, ROOT_PROBE_INTERVAL);
+
+        assert_eq!(watcher.reprobe_roots(&roots), RootProbeOutcome::default());
+
+        std::fs::create_dir(&root).expect("root appears");
+        create_root_marker(&root).expect("root carries a marker");
+        let outcome = watcher.reprobe_roots(&roots);
+        assert!(outcome.rescan && outcome.gone.is_empty());
+        assert!(watcher.watched_directories.contains(&root));
+        assert_eq!(watcher.reprobe_roots(&roots), RootProbeOutcome::default());
+
+        // Losing the marker is how an unmount leaves its mountpoint.
+        std::fs::remove_file(root_identity_path(&root)).expect("marker disappears");
+        let outcome = watcher.reprobe_roots(&roots);
+        assert_eq!(outcome.gone, std::slice::from_ref(&root));
+        assert!(!outcome.rescan);
+
+        // The marker coming back is a remount: watch again and rescan.
+        create_root_marker(&root).expect("marker returns");
+        assert!(watcher.reprobe_roots(&roots).rescan);
+
+        std::fs::remove_dir_all(&root).expect("root goes away");
+        assert_eq!(watcher.reprobe_roots(&roots).gone, [root]);
+    }
+
+    /// A root missing when watching starts is picked up by the periodic
+    /// probe: watched, scanned and reported available. When it goes away it
+    /// is reported unavailable and its tracks are kept. Not on Windows: a
+    /// watched directory is held open there, so the fixture cannot remove the
+    /// root out from under the live watcher the way an unmount does.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn root_probe_scans_a_late_root_and_keeps_its_rows_when_it_leaves() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("root-probe-late-root");
+        let root = fixture.path().join("late");
+        let audio_path = root.join("late.flac");
+
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let watcher = probe_test_watcher(
+            backend,
+            event_rx,
+            std::slice::from_ref(&root),
+            Duration::from_millis(100),
+        );
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (_command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        let playlist_sidebar_refresh = test_playlist_sidebar_refresh();
+        let mut completed_commands = HashMap::new();
+
+        let driver = async {
+            std::fs::create_dir(&root).expect("root appears after startup");
+            std::fs::write(&audio_path, SILENCE_FLAC).expect("write audio fixture");
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                wait_for_root_status(&library_event_rx, true),
+            )
+            .await
+            .expect("the probe scans the new root");
+            std::fs::remove_dir_all(&root).expect("root goes away");
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                wait_for_root_status(&library_event_rx, false),
+            )
+            .await
+            .expect("the probe reports the root unavailable");
+            drop(event_tx);
+        };
+        let never_cancelled = CancellationToken::new();
+        let (loop_result, ()) = tokio::join!(
+            process_directory_events(
+                &db,
+                std::slice::from_ref(&root),
+                &library_events,
+                &command_rx,
+                &mut completed_commands,
+                watcher,
+                &playlist_sidebar_refresh,
+                &never_cancelled,
+            ),
+            driver,
+        );
+        loop_result.expect("watcher loop exits cleanly");
+
+        let root_state = library_root::Entity::find_by_id(root.to_string_lossy().as_ref())
+            .one(db.as_ref())
+            .await
+            .expect("query root state")
+            .expect("the scan recorded the root");
+        assert!(root_state.identity_confirmed);
+        assert!(!root_state.is_available);
+        assert!(track::Entity::find()
+            .filter(track::Column::FilePath.eq(audio_path.to_string_lossy().as_ref()))
+            .one(db.as_ref())
+            .await
+            .expect("query track")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn rescan_command_indexes_what_the_watcher_missed() {
+        let db = Arc::new(rename_test_database().await);
+        let fixture = TestDirectory::new("rescan-command");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+        let audio_path = root.join("missed.flac");
+        std::fs::write(&audio_path, SILENCE_FLAC).expect("write audio fixture");
+
+        let (event_tx, event_rx) = mpsc::channel(WATCHER_EVENT_CAPACITY);
+        let Some(backend) = idle_watcher_backend_or_skip() else {
+            return;
+        };
+        let watcher = probe_test_watcher(
+            backend,
+            event_rx,
+            std::slice::from_ref(&root),
+            ROOT_PROBE_INTERVAL,
+        );
+        let (library_events, library_event_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::unbounded::<LibraryCommand>();
+        command_tx
+            .send(LibraryCommand::Rescan)
+            .await
+            .expect("queue rescan");
+        let playlist_sidebar_refresh = test_playlist_sidebar_refresh();
+        let mut completed_commands = HashMap::new();
+
+        let driver = async {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if let LibraryEvent::FullSync(tracks) = library_event_rx
+                        .recv()
+                        .await
+                        .expect("library events stay open")
+                    {
+                        break tracks;
+                    }
+                }
+            })
+            .await
+            .expect("the rescan publishes a snapshot")
+        };
+        let never_cancelled = CancellationToken::new();
+        let loop_future = process_directory_events(
+            &db,
+            std::slice::from_ref(&root),
+            &library_events,
+            &command_rx,
+            &mut completed_commands,
+            watcher,
+            &playlist_sidebar_refresh,
+            &never_cancelled,
+        );
+        let tracks = tokio::select! {
+            result = loop_future => panic!("the watcher loop ended early: {result:?}"),
+            tracks = driver => tracks,
+        };
+        drop(event_tx);
+        assert!(tracks.iter().any(|track| {
+            track.file_path.as_deref() == Some(audio_path.to_string_lossy().as_ref())
+        }));
+    }
+
+    /// On a case-insensitive filesystem (the macOS default) the old spelling
+    /// already opens the renamed file; elsewhere a symlink stands in for that:
+    /// the old spelling opens the renamed file but is not enumerated as a file
+    /// of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn case_only_rename_retargets_the_existing_row() {
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("case-only-rename");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+
+        let renamed = root.join("Song.flac");
+        let old_spelling = root.join("song.flac");
+        std::fs::write(&renamed, SILENCE_FLAC).expect("write renamed audio");
+        let case_insensitive = old_spelling.exists();
+        if !case_insensitive {
+            std::os::unix::fs::symlink(&renamed, &old_spelling).expect("alias the old spelling");
+        }
+        insert_rename_test_track(
+            &db,
+            "case-rename",
+            old_spelling.to_str().unwrap(),
+            "Kept",
+            7,
+        )
+        .await;
+
+        // A different file whose old spelling is really gone is not an alias.
+        // A case-insensitive filesystem cannot hold that distinction, so the
+        // vanished row there names a file that exists under no spelling.
+        let replaced = root.join("Other.flac");
+        std::fs::write(&replaced, SILENCE_FLAC).expect("write unrelated audio");
+        let gone = if case_insensitive {
+            root.join("vanished.flac")
+        } else {
+            root.join("other.flac")
+        };
+        insert_rename_test_track(&db, "gone", gone.to_str().unwrap(), "Gone", 1).await;
+
+        let (tx, _rx) = async_channel::unbounded();
+        initial_scan(
+            &db,
+            std::slice::from_ref(&root),
+            &tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("scan");
+
+        let rows = track::Entity::find().all(&db).await.expect("query tracks");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let kept = rows
+            .iter()
+            .find(|row| row.id == "case-rename")
+            .expect("the renamed track keeps its identity");
+        assert_eq!(kept.file_path, renamed.to_string_lossy());
+        assert_eq!(kept.play_count, 7);
+        assert!(rows.iter().all(|row| row.id != "gone"));
+        assert!(rows
+            .iter()
+            .any(|row| row.file_path == replaced.to_string_lossy()));
+    }
+
+    #[test]
+    fn former_mount_scopes_without_rows_are_dropped() {
+        let configured = vec![PathBuf::from("/music")];
+        let scope = |path: &str| library_root::Model {
+            path: path.to_string(),
+            device_id: Some("remembered-volume".to_string()),
+            identity_confirmed: true,
+            is_available: false,
+            last_scan_complete: false,
+            last_checked_at: "2026-07-10T00:00:00Z".to_string(),
+        };
+        let persisted = vec![
+            scope("/music"),
+            scope("/music/old-mount"),
+            scope("/music/away"),
+            scope("/music/live"),
+            scope("/elsewhere/x"),
+        ];
+        let track = track::Model {
+            id: "away".to_string(),
+            file_path: "/music/away/song.flac".to_string(),
+            title: "Away".to_string(),
+            artist_name: "Artist".to_string(),
+            album_artist_name: None,
+            album_title: "Album".to_string(),
+            genre: None,
+            composer: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_secs: None,
+            bitrate_kbps: None,
+            sample_rate_hz: None,
+            format: None,
+            play_count: 0,
+            last_played_at_ms: None,
+            rating: None,
+            date_added: "2025-01-02T03:04:05Z".to_string(),
+            date_modified: "2025-01-02T03:04:05Z".to_string(),
+            file_size_bytes: None,
+        };
+
+        let (kept, stale) = partition_stale_mount_scopes(
+            &configured,
+            persisted,
+            &[PathBuf::from("/music/live")],
+            &[track],
+        );
+
+        let paths = |states: &[library_root::Model]| {
+            states
+                .iter()
+                .map(|state| state.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&kept),
+            ["/music", "/music/away", "/music/live", "/elsewhere/x"]
+        );
+        assert_eq!(paths(&stale), ["/music/old-mount"]);
+    }
+
+    #[test]
+    fn tag_write_debris_sweep_restores_vacant_originals_and_ages_out_the_rest() {
+        let directory = TestDirectory::new("tag-write-debris");
+        let hidden_original = directory
+            .path()
+            .join(".song.flac.tributary-replaced-0123456789abcdef0123456789abcdef");
+        std::fs::write(&hidden_original, b"original").expect("write hidden original");
+        let published = directory.path().join("kept.flac");
+        std::fs::write(&published, b"tagged").expect("write published copy");
+        let displaced = directory
+            .path()
+            .join(".kept.flac.tributary-replaced-fedcba9876543210fedcba9876543210");
+        std::fs::write(&displaced, b"displaced").expect("write displaced original");
+        let staged = directory
+            .path()
+            .join(".tributary-tag-00000000-0000-4000-8000-000000000000.flac");
+        std::fs::write(&staged, b"staged").expect("write staged copy");
+
+        // A vacant public name is refilled at once; young debris stays.
+        let debris = [hidden_original.clone(), displaced.clone(), staged.clone()];
+        let restored = sweep_tag_write_debris(&debris, std::time::SystemTime::now());
+        let public = directory.path().join("song.flac");
+        assert_eq!(
+            restored.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            [&public]
+        );
+        assert_eq!(std::fs::read(&public).expect("read restored"), b"original");
+        assert!(!hidden_original.exists());
+        assert!(displaced.exists() && staged.exists());
+
+        // Past the safety margin the rest is removed; published files stay.
+        let later =
+            std::time::SystemTime::now() + TAG_WRITE_DEBRIS_MIN_AGE + Duration::from_secs(60);
+        assert!(sweep_tag_write_debris(&[displaced.clone(), staged.clone()], later).is_empty());
+        assert!(!displaced.exists() && !staged.exists());
+        assert_eq!(
+            std::fs::read(&published).expect("read published"),
+            b"tagged"
+        );
+    }
+
+    #[test]
+    fn quarantine_names_rebuild_only_whole_public_names() {
+        let quarantine = |leaf: &str| {
+            PathBuf::from(format!(
+                "/music/.{leaf}.tributary-replaced-0123456789abcdef0123456789abcdef"
+            ))
+        };
+        assert_eq!(
+            quarantined_public_path(&quarantine("song.flac")),
+            Some(PathBuf::from("/music/song.flac"))
+        );
+        // Names are cut at 96 bytes, so a long prefix may be truncated.
+        assert_eq!(quarantined_public_path(&quarantine(&"a".repeat(96))), None);
+    }
+
+    /// A save interrupted between hiding the original and publishing the
+    /// tagged copy leaves the track's public name empty. The next scan puts
+    /// the original back instead of deleting the row.
+    #[tokio::test]
+    async fn scan_restores_an_original_hidden_by_an_interrupted_tag_save() {
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("interrupted-tag-save");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+        let public = root.join("song.flac");
+        let hidden = root.join(".song.flac.tributary-replaced-0123456789abcdef0123456789abcdef");
+        std::fs::write(&hidden, SILENCE_FLAC).expect("write hidden original");
+        insert_rename_test_track(&db, "hidden", public.to_str().unwrap(), "Hidden", 4).await;
+
+        let (tx, _rx) = async_channel::unbounded();
+        initial_scan(
+            &db,
+            std::slice::from_ref(&root),
+            &tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("scan");
+
+        assert!(public.is_file() && !hidden.exists());
+        let row = track::Entity::find_by_id("hidden")
+            .one(&db)
+            .await
+            .expect("query track")
+            .expect("the row survives");
+        assert_eq!(row.play_count, 4);
+    }
+
+    /// Progress counts every enumerated file, including one that is skipped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scan_progress_reaches_the_total_when_a_file_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db = rename_test_database().await;
+        let fixture = TestDirectory::new("scan-progress");
+        let root = fixture.path().to_path_buf();
+        let marker = create_root_marker(&root)
+            .expect("create durable root marker")
+            .identity;
+        insert_reauthorization_root(&db, &root, &marker, true).await;
+        std::fs::write(root.join("a.flac"), SILENCE_FLAC).expect("write audio");
+        let unreadable = root.join("z.flac");
+        std::fs::write(&unreadable, SILENCE_FLAC).expect("write audio");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("make unreadable");
+        if File::open(&unreadable).is_ok() {
+            eprintln!("skipping: permissions do not restrict this user");
+            return;
+        }
+
+        let (tx, rx) = async_channel::unbounded();
+        initial_scan(
+            &db,
+            std::slice::from_ref(&root),
+            &tx,
+            &test_playlist_sidebar_refresh(),
+        )
+        .await
+        .expect("scan");
+        let last_progress = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                LibraryEvent::ScanProgress(done, total) => Some((done, total)),
+                _ => None,
+            })
+            .last();
+        assert_eq!(last_progress, Some((2, 2)));
     }
 }

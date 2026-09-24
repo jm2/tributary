@@ -65,6 +65,7 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .name("idx_tracks_artist")
+                    .if_not_exists()
                     .table(Tracks::Table)
                     .col(Tracks::ArtistName)
                     .to_owned(),
@@ -75,6 +76,7 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .name("idx_tracks_album")
+                    .if_not_exists()
                     .table(Tracks::Table)
                     .col(Tracks::AlbumTitle)
                     .to_owned(),
@@ -85,6 +87,7 @@ impl MigrationTrait for Migration {
             .create_index(
                 Index::create()
                     .name("idx_tracks_genre")
+                    .if_not_exists()
                     .table(Tracks::Table)
                     .col(Tracks::Genre)
                     .to_owned(),

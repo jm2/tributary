@@ -6676,7 +6676,8 @@ mod tests {
             }
             LibraryCommand::ConfirmRootTrust(_)
             | LibraryCommand::SetTrackRating { .. }
-            | LibraryCommand::ApplyRhythmboxMigration(_) => {
+            | LibraryCommand::ApplyRhythmboxMigration(_)
+            | LibraryCommand::Rescan => {
                 panic!("expected a history command after drain")
             }
         }

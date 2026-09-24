@@ -65,3 +65,44 @@ pub async fn revalidate_critical_objects(
     m20260807_000019_playlist_sidebar_order::revalidate(db).await?;
     m20260903_000020_lastfm_policy::revalidate(db).await
 }
+
+#[cfg(test)]
+mod tests {
+    use sea_orm_migration::sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    use super::*;
+
+    /// sea-orm-migration does not wrap SQLite migrations in a transaction and
+    /// records the ledger row only after `up` returns. A process killed in
+    /// between leaves the schema change applied but unrecorded, so the next
+    /// start runs the same `up` again; every migration must accept that.
+    #[tokio::test]
+    async fn every_migration_can_rerun_after_its_ledger_row_was_lost() {
+        let migrations = Migrator::migrations();
+        for (index, migration) in migrations.iter().enumerate() {
+            let name = migration.name().to_string();
+            let db = Database::connect("sqlite::memory:")
+                .await
+                .expect("open in-memory database");
+            let through: u32 = (index + 1).try_into().expect("migration count fits u32");
+            Migrator::up(&db, Some(through))
+                .await
+                .unwrap_or_else(|error| panic!("apply through {name}: {error}"));
+            db.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "DELETE FROM seaql_migrations WHERE version = ?",
+                [name.clone().into()],
+            ))
+            .await
+            .expect("forget the ledger row");
+
+            Migrator::up(&db, Some(1))
+                .await
+                .unwrap_or_else(|error| panic!("rerun {name}: {error}"));
+            let applied = Migrator::get_migration_models(&db)
+                .await
+                .expect("read ledger");
+            assert_eq!(applied.len(), index + 1, "{name} is recorded again");
+        }
+    }
+}

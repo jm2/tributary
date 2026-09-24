@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sea_orm::{Database, DatabaseConnection};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -1347,5 +1347,243 @@ async fn panicking_delivery_task_is_sanitized_paused_and_retains_the_exact_queue
         format!("{:?}", LastFmDeliveryWorkerFailure::UnexpectedTaskExit),
         "UnexpectedTaskExit"
     );
+    shutdown.shutdown().await.unwrap();
+}
+
+/// Queue `rows` rows, answer the first request with `answer`, and return the
+/// status once `done` holds. The runtime is shut down before returning.
+async fn answer_first_request(
+    database: &DatabaseConnection,
+    session: &StoredSession,
+    rows: usize,
+    answer: Result<ScrobbleBatchResult, LastFmClientError>,
+    done: impl Fn(LastFmRuntimeStatus) -> bool,
+) -> LastFmRuntimeStatus {
+    let session = session.clone();
+    enqueue_rows(database, session.account_binding(), rows).await;
+    let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, active));
+    let (clock, _waits) = ManualClock::new(0);
+    let (handle, shutdown) = spawn_activated_runtime(database.clone(), store, transport, clock)
+        .await
+        .unwrap();
+    let mut status = handle.subscribe_status();
+    assert_eq!(receive(&calls).await.batch_size, rows.min(50));
+    responses.send(answer).await.unwrap();
+    let snapshot = wait_for_status(&mut status, done).await;
+    assert!(calls.try_recv().is_err(), "no request follows this answer");
+    shutdown.shutdown().await.unwrap();
+    snapshot
+}
+
+/// Phase restored by a fresh runtime over `database`, which must not send.
+async fn restarted_phase(
+    database: &DatabaseConnection,
+    session: &StoredSession,
+) -> LastFmRuntimePhase {
+    let session = session.clone();
+    let (transport, calls, _responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, active));
+    let (clock, _waits) = ManualClock::new(0);
+    let (handle, shutdown) = spawn_activated_runtime(database.clone(), store, transport, clock)
+        .await
+        .unwrap();
+    let phase = handle.subscribe_status().borrow().phase;
+    assert!(calls.try_recv().is_err());
+    shutdown.shutdown().await.unwrap();
+    phase
+}
+
+#[tokio::test]
+async fn credential_and_key_rejections_keep_the_whole_queue_across_restart() {
+    for code in [4, 10, 13, 14, 26] {
+        let database = database().await;
+        let session = session();
+        let paused = answer_first_request(
+            &database,
+            &session,
+            51,
+            Err(LastFmClientError::ServiceRejected { code }),
+            |snapshot| snapshot.phase == LastFmRuntimePhase::CapabilityPaused,
+        )
+        .await;
+        assert_eq!(
+            paused.failure,
+            Some(LastFmRuntimeCommandError::DeliveryCapability),
+            "code {code}"
+        );
+        assert_eq!(paused.pending_scrobbles, 51, "code {code}");
+        assert_eq!(paused.rejected_scrobbles, 0, "code {code}");
+        assert_eq!(storage::queue_len(&database).await.unwrap(), 51);
+        assert_eq!(
+            restarted_phase(&database, &session).await,
+            LastFmRuntimePhase::CapabilityPaused
+        );
+    }
+}
+
+#[tokio::test]
+async fn unrelated_codes_quarantine_and_only_malformed_requests_delete_rows() {
+    let quarantined_database = database().await;
+    let quarantined = answer_first_request(
+        &quarantined_database,
+        &session(),
+        2,
+        Err(LastFmClientError::ServiceRejected { code: 15 }),
+        |snapshot| snapshot.phase == LastFmRuntimePhase::CompatibilityPaused,
+    )
+    .await;
+    assert_eq!(quarantined.pending_scrobbles, 2);
+    assert_eq!(storage::queue_len(&quarantined_database).await.unwrap(), 2);
+
+    let database = database().await;
+    let settled = answer_first_request(
+        &database,
+        &session(),
+        2,
+        Err(LastFmClientError::ServiceRejected { code: 6 }),
+        |snapshot| snapshot.pending_scrobbles == 0,
+    )
+    .await;
+    assert_eq!(settled.phase, LastFmRuntimePhase::Active);
+    assert_eq!(settled.rejected_scrobbles, 2);
+    assert_eq!(storage::queue_len(&database).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn daily_limit_ignores_keep_their_rows_until_the_next_utc_day() {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 3).await;
+    let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session, active));
+    let (clock, waits) = ManualClock::new(3 * DAY_MS + 5_000);
+    let (handle, shutdown) =
+        spawn_activated_runtime(database.clone(), store, transport, clock.clone())
+            .await
+            .unwrap();
+    let mut status = handle.subscribe_status();
+
+    assert_eq!(receive(&calls).await.batch_size, 3);
+    let daily_limit = SubmissionResult::Ignored {
+        reason: IgnoredReason::DailyLimit,
+    };
+    responses
+        .send(Ok(ScrobbleBatchResult {
+            items: vec![
+                SubmissionResult::Accepted { corrected: false },
+                daily_limit,
+                daily_limit,
+            ],
+        }))
+        .await
+        .unwrap();
+    let deferred = wait_for_status(&mut status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::BackingOff
+    })
+    .await;
+    assert_eq!(deferred.failure, Some(LastFmRuntimeCommandError::Delivery));
+    assert_eq!(deferred.accepted_scrobbles, 1);
+    assert_eq!(deferred.ignored_scrobbles, 0);
+    assert_eq!(deferred.pending_scrobbles, 2);
+    assert_eq!(receive(&waits).await, 4 * DAY_MS);
+    let storage::LastFmBatchAvailability::Ready(kept) =
+        storage::batch_availability(&database, binding, 4 * DAY_MS, 50)
+            .await
+            .unwrap()
+    else {
+        panic!("the deferred rows are due at the next UTC day");
+    };
+    assert_eq!(
+        kept.rows()
+            .iter()
+            .map(|row| (row.track_title.as_str(), row.attempt_count))
+            .collect::<Vec<_>>(),
+        vec![("Track 1", 0), ("Track 2", 0)]
+    );
+
+    // A new play waits behind the deferred head.
+    handle
+        .try_enqueue(unbound_pending(3))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(receive(&waits).await, 4 * DAY_MS);
+    assert!(calls.try_recv().is_err());
+
+    clock.advance_to(4 * DAY_MS);
+    assert_eq!(receive(&calls).await.batch_size, 3);
+    responses.send(Ok(accepted(3))).await.unwrap();
+    let delivered = wait_for_status(&mut status, |snapshot| snapshot.pending_scrobbles == 0).await;
+    assert_eq!(delivered.phase, LastFmRuntimePhase::Active);
+    assert_eq!(delivered.accepted_scrobbles, 4);
+    shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_settle_write_stops_delivery_without_a_durable_pause() {
+    let rename = |from: &str, to: &str| {
+        sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!("ALTER TABLE {from} RENAME TO {to}"),
+        )
+    };
+    let database = database().await;
+    let session = session();
+    let binding = session.account_binding();
+    enqueue_rows(&database, binding, 1).await;
+    let (transport, calls, responses, _retired, active) = GatedTransport::new(session.clone());
+    let store = Arc::new(TestCredentialStore::new(session.clone(), active));
+    let (clock, _waits) = ManualClock::new(0);
+    let (handle, shutdown) =
+        spawn_activated_runtime(database.clone(), store.clone(), transport, clock)
+            .await
+            .unwrap();
+    let mut status = handle.subscribe_status();
+    assert_eq!(receive(&calls).await.batch_size, 1);
+
+    database
+        .execute_raw(rename("lastfm_scrobble_queue", "unavailable_queue"))
+        .await
+        .unwrap();
+    responses.send(Ok(accepted(1))).await.unwrap();
+    let stopped = wait_for_status(&mut status, |snapshot| {
+        snapshot.phase == LastFmRuntimePhase::Paused
+    })
+    .await;
+    assert_eq!(stopped.failure, Some(LastFmRuntimeCommandError::Queue));
+    assert_eq!(stopped.pending_scrobbles, 1);
+    database
+        .execute_raw(rename("unavailable_queue", "lastfm_scrobble_queue"))
+        .await
+        .unwrap();
+
+    // New plays are still admitted, and nothing durable blocks the next start.
+    handle
+        .try_enqueue(unbound_pending(1))
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(calls.try_recv().is_err());
+    let state = storage::validate_account_queue_state(&database, binding)
+        .await
+        .unwrap();
+    assert_eq!(state.durable_pause, None);
+    assert_eq!(state.pending_scrobbles, 2);
+    shutdown.shutdown().await.unwrap();
+
+    let (transport, calls, responses, _retired, _active) = GatedTransport::new(session);
+    let (clock, _waits) = ManualClock::new(0);
+    let (handle, shutdown) = spawn_activated_runtime(database.clone(), store, transport, clock)
+        .await
+        .unwrap();
+    let mut status = handle.subscribe_status();
+    assert_eq!(receive(&calls).await.batch_size, 2);
+    responses.send(Ok(accepted(2))).await.unwrap();
+    wait_for_status(&mut status, |snapshot| snapshot.pending_scrobbles == 0).await;
     shutdown.shutdown().await.unwrap();
 }

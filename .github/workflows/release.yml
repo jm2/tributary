@@ -23,6 +23,10 @@ env:
   RUST_BACKTRACE: 1
   FLATPAK_CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
   FLATPAK_CARGO_GENERATOR_SHA256: b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
+  # The exact stable Rust release for every rustup-based release build. Bump it
+  # deliberately to a release CI's stable jobs have already run on; it must not
+  # fall below Cargo.toml's rust-version.
+  RUST_RELEASE_TOOLCHAIN: "1.98.1"
 
 jobs:
   # Resolve the event tag once, validate it against the tagged source, and
@@ -66,7 +70,7 @@ jobs:
             echo "dry_run=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ steps.release.outputs.tag }}
           fetch-depth: 1
@@ -157,7 +161,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
@@ -203,7 +207,7 @@ jobs:
             Cargo.lock -o build-aux/flatpak/cargo-sources.json
 
       - name: Build Flatpak bundle
-        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           bundle: tributary-linux-${{ matrix.arch }}.flatpak
           manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
@@ -217,7 +221,7 @@ jobs:
           tributary-linux-${{ matrix.arch }}.flatpak
 
       - name: Upload Flatpak as workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tributary-linux-${{ matrix.arch }}-flatpak
           path: tributary-linux-${{ matrix.arch }}.flatpak
@@ -238,7 +242,7 @@ jobs:
             runner: macos-15
             rust_target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
@@ -249,14 +253,17 @@ jobs:
           brew install gtk4 libadwaita pkg-config create-dmg \
             gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav \
             adwaita-icon-theme
+          # Record the exact Homebrew formulae bundled into the .dmg.
+          brew list --versions
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -273,7 +280,7 @@ jobs:
         run: mv dist/Tributary.dmg dist/tributary-macos-${{ matrix.arch }}.dmg
 
       - name: Upload DMG as workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tributary-macos-${{ matrix.arch }}-dmg
           path: dist/tributary-macos-${{ matrix.arch }}.dmg
@@ -310,13 +317,13 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
 
       - name: Set up MSYS2 (${{ matrix.msystem }})
-        uses: msys2/setup-msys2@v2.32.0
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
         env:
           # Pin pacman to the canonical Cloudflare CDN (repo.msys2.org) instead of
           # the flaky secondary mirrors (ftp2.osuosl.org, mirror.msys2.org) that
@@ -338,13 +345,17 @@ jobs:
             ${{ matrix.pkg_prefix }}-pkg-config
             ${{ matrix.pkg_prefix }}-toolchain
 
+      - name: Record MSYS2 package versions
+        run: pacman -Q
+
       - name: Install Rust (${{ matrix.rust_target }})
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -358,7 +369,7 @@ jobs:
         run: |
           export PKG_CONFIG_ALLOW_CROSS="1"
           export PKG_CONFIG_PATH="/${{ matrix.msys_env }}/lib/pkgconfig"
-          cargo build --release --target ${{ matrix.rust_target }}
+          cargo build --release --locked --target ${{ matrix.rust_target }}
 
       - name: Bundle DLLs, validate app resources, and create zip
         run: |
@@ -376,7 +387,9 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
+          # The runner image preinstalls Inno Setup. An explicit version replaces
+          # an older preinstalled release, and --allow-downgrade a newer one.
+          choco install innosetup --version 6.7.1 --allow-downgrade -y --no-progress
           echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Resolve MSYS2 root for Inno Setup
@@ -400,7 +413,7 @@ jobs:
           Move-Item dist/tributary-setup.exe dist/tributary-windows-${{ matrix.arch }}-setup.exe
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tributary-windows-${{ matrix.arch }}
           path: |
@@ -435,19 +448,21 @@ jobs:
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             libdbus-1-dev
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        run: cargo install cargo-deb --locked --version 3.8.0
 
       - name: Cache Cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -458,7 +473,12 @@ jobs:
           restore-keys: release-deb-${{ matrix.arch }}-cargo-
 
       - name: Build .deb package
-        run: cargo deb -o target/debian/tributary-${{ matrix.deb_arch }}.deb
+        run: |
+          cargo deb --locked -o "target/debian/tributary-${{ matrix.deb_arch }}.deb"
+          # $auto depends degrade to nothing, with only a warning, when
+          # dpkg-shlibdeps is missing; require the glibc floor it derives.
+          dpkg-deb --field "target/debian/tributary-${{ matrix.deb_arch }}.deb" Depends \
+            | grep -F 'libc6 (>='
 
       - name: Validate completed .deb payload
         run: >-
@@ -466,7 +486,7 @@ jobs:
           target/debian/tributary-${{ matrix.deb_arch }}.deb
 
       - name: Upload .deb as workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tributary-${{ matrix.deb_arch }}-deb
           path: target/debian/tributary-${{ matrix.deb_arch }}.deb
@@ -497,19 +517,21 @@ jobs:
             gstreamer1-devel gstreamer1-plugins-base-devel \
             pkgconf-pkg-config git curl
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
 
       - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked --version 0.21.0
 
       - name: Cache Cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -520,15 +542,10 @@ jobs:
           restore-keys: release-rpm-${{ matrix.arch }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Generate .rpm package
-        run: cargo generate-rpm
-
-      - name: Rename .rpm for release
-        run: |
-          RPM_FILE=$(ls target/generate-rpm/*.rpm | head -1)
-          mv "$RPM_FILE" "target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm"
+        run: cargo generate-rpm -o "target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm"
 
       - name: Validate completed .rpm payload
         run: >-
@@ -536,7 +553,7 @@ jobs:
           target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
 
       - name: Upload .rpm as workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tributary-${{ matrix.rpm_arch }}-rpm
           path: target/generate-rpm/tributary-${{ matrix.rpm_arch }}.rpm
@@ -556,13 +573,13 @@ jobs:
           pacman -Syu --noconfirm binutils git libarchive gtk4 libadwaita gstreamer sqlite \
             gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav dbus rust
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
 
       - name: Cache Cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -579,18 +596,19 @@ jobs:
           chown -R builder:builder /home/builder/tributary
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-          # Copy PKGBUILD and build
+          # The PKGBUILD takes pkgver from the checkout's Cargo.toml, which the
+          # prepare job matched against the release tag.
           cd /home/builder/tributary
           cp build-aux/arch/PKGBUILD .
-          # Set the version from the validated, checked-out release source.
-          VERSION="${{ needs.prepare.outputs.version }}"
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
-
           su builder -c "BUILDDIR=/tmp/makepkg makepkg -sf --noconfirm --skipchecksums"
 
       - name: Collect package
         run: |
-          PKG_FILE=$(ls /home/builder/tributary/*.pkg.tar.zst | head -1)
+          PKG_FILE="$(su builder -c 'cd /home/builder/tributary && makepkg --packagelist')"
+          if [[ -z "$PKG_FILE" || "$PKG_FILE" == *$'\n'* || ! -f "$PKG_FILE" ]]; then
+            echo "Expected exactly one built package; makepkg lists: ${PKG_FILE}" >&2
+            exit 1
+          fi
           mkdir -p dist
           cp "$PKG_FILE" dist/tributary-x86_64.pkg.tar.zst
 
@@ -600,7 +618,7 @@ jobs:
           dist/tributary-x86_64.pkg.tar.zst
 
       - name: Upload Arch package as workflow artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tributary-x86_64-arch
           path: dist/tributary-x86_64.pkg.tar.zst
@@ -609,13 +627,13 @@ jobs:
   checksums:
     name: SHA256 Checksums
     runs-on: ubuntu-24.04
-    needs: [flatpak, macos, windows, linux-deb, linux-rpm, linux-arch]
+    needs: [prepare, flatpak, macos, windows, linux-deb, linux-rpm, linux-arch]
     if: needs.prepare.outputs.dry_run != 'true'
     permissions:
       contents: read
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
 
@@ -681,25 +699,48 @@ jobs:
           cat ../SHA256SUMS.txt
 
       - name: Upload SHA256SUMS as artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: SHA256SUMS
           path: SHA256SUMS.txt
           if-no-files-found: error
 
+  # Signs SLSA build provenance for exactly the checksummed release assets, so
+  # `gh attestation verify <asset> --repo jm2/tributary` ties a download to
+  # this workflow run. The only job that can mint an OIDC signing token.
+  attest:
+    name: Attest build provenance
+    if: github.event_name == 'release'
+    needs: checksums
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: SHA256SUMS
+
+      - name: Attest every release asset
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: SHA256SUMS.txt
+
   # The only job with a repository write token. It checks out no project or
-  # build code and uses immutable action revisions only to transfer completed
-  # artifacts to the already-created GitHub release.
+  # build code and uses immutable action revisions only to transfer completed,
+  # attested artifacts to the already-created GitHub release.
   publish:
     name: Publish release assets
     if: github.event_name == 'release'
-    needs: [prepare, checksums]
+    needs: [prepare, checksums, attest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - name: Download verified build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release-assets
           merge-multiple: true

@@ -20,6 +20,7 @@ header:
   main_menu: "主選單"
   playback_position: "播放位置"
   volume: "音量"
+  rescan_library: "重新掃描音樂庫"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "專輯"
   folder: "資料夾"
   all: "全部"
+  folder_root_unavailable: "%{name}（無法使用）"
+  folder_unavailable_notice: "此資料夾目前無法使用"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -115,6 +118,13 @@ preferences:
   browser_views: "瀏覽器檢視"
   visible_columns: "可見欄位"
   reset_to_defaults: "恢復預設值"
+  privacy: "隱私"
+  location_title: "附近電台的位置"
+  location_subtitle: "透過 ipapi.co、ipwho.is 或 freeipapi.com，依據您的 IP 位址查詢大致位置。"
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "無法讀取 %{file}，因此正在使用預設設定。無法讀取的檔案已保留為 %{copy}。"
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -130,6 +140,9 @@ dialogs:
   enter_password: "輸入共用密碼（若無請留空）"
   username: "使用者名稱"
   password: "密碼"
+  missing_server_url: "請輸入有效的伺服器位址，例如 https://music.example.com。"
+  missing_username: "請輸入使用者名稱。"
+  missing_password: "請輸入密碼。"
   new_playlist_heading: "新建播放清單"
   playlist_name: "播放清單名稱"
   rename_playlist_heading: "重新命名播放清單"
@@ -154,6 +167,8 @@ dialogs:
   output_exclusive_control_confirmation: "我確認 Tributary 獨佔控制此 MPD 播放分割區。"
   output_detection_warning: "啟用監督後，Tributary 會在播放期間持續觀察分割區：外部當前歌曲、外部選項變更或觀察視窗遺失都會撤銷播放控制並保留任何孤兒佇列項目。監督只能撤銷，永不授予：出現此類證據後，輸出將拒絕命令，直到你重新選擇它以再次確認。"
   output_detection_confirmation: "監督此獨占輸出，並在偵測到其他控制器的證據時撤銷其控制。"
+  output_probe_failed: "無法連線到 %{host}:%{port} 上的 MPD。未新增此輸出。"
+  output_save_failed: "無法儲存輸出「%{name}」。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -250,6 +265,12 @@ properties:
   save_conflict_all: "自開啟屬性以來，%{total} 個檔案中有 %{conflicts} 個已在磁碟上變更。發生衝突的檔案保持不變——請重新開啟屬性以編輯目前的檔案。"
   save_conflict_mixed: "%{total} 個檔案中有 %{conflicts} 個已在磁碟上變更，另有 %{other} 個檔案無法儲存；所有檔案均保持不變。請為已變更的檔案重新開啟屬性。"
   save_failure: "%{total} 個檔案中有 %{failed} 個無法儲存，均已保持不變。"
+  refused_heading: "無法開啟屬性"
+  refused_unavailable: "在屬性開啟之前，某個所選檔案已變更或變得無法使用。未進行任何變更。"
+  refused_selection_changed: "在屬性開啟之前，所選內容已變更。未進行任何變更。請重新選取曲目以進行編輯。"
+  mixed_cleared: "將在所有曲目中清除"
+  musicbrainz_applied: "已根據 MusicBrainz 發行版「%{release}」填入。儲存前請檢查各欄位。"
+  musicbrainz_title_only: "沒有與該專輯相符的 MusicBrainz 發行版，因此只填入了標題和藝人。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -261,6 +282,10 @@ smart_playlist:
   add_rule: "新增規則"
   remove_rule: "刪除規則"
   limit_to: "限制為"
+  rule_not_integer: "請輸入整數。"
+  rule_reversed_range: "第一個值不得大於第二個值。"
+  rule_not_positive: "請輸入大於或等於 1 的整數。"
+  rule_invalid_date: "請以 YYYY-MM-DD 格式輸入日期，例如 2024-01-15。"
 
 # ── 伺服器播放列表 ──────────────────────────────────────────────────
 server_playlists:
@@ -327,6 +352,11 @@ errors:
     heading: "音樂庫無法使用"
     open_failed: "Tributary 無法開啟音樂庫資料庫，因此無法顯示您的音樂庫和播放清單。詳細資訊請查看記錄檔。"
     upgrade_failed: "Tributary 無法為此版本升級音樂庫資料庫，因此無法顯示您的音樂庫和播放清單。詳細資訊請查看記錄檔。"
+    backup_saved: "升級前的音樂庫副本已儲存至 %{path}。"
+    newer_version: "此音樂庫資料庫由較新版本的 Tributary 建立，此版本無法開啟。請重新安裝較新的版本，或結束 Tributary 並以 %{path} 中較早的副本取代 library.db。"
+  open_files:
+    unsupported_location: "無法開啟此位置。Tributary 只能開啟這部電腦上的檔案。"
+    closing: "Tributary 正在關閉。請在關閉後再重新開啟。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

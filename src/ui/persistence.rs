@@ -1,9 +1,16 @@
-//! Settings persistence helpers — playback modes, sort state, CSS, HWND.
+//! Settings persistence helpers — playback modes, sort state, CSS, HWND,
+//! and the atomic reader/writer shared by the JSON settings files.
 //!
-//! All functions use best-effort file I/O (silently ignore errors) to
-//! persist small state values to `<data_dir>/tributary/`.
+//! Small single-value files (repeat, shuffle, sort, window geometry) use
+//! best-effort writes that ignore errors. The JSON settings files whose loss
+//! would reset user configuration (`config.json`, `outputs.json`,
+//! `servers.json`) go through [`write_atomic`] and [`read_settings_file`]
+//! instead, which report failures and never overwrite an unreadable file.
+
+use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
+use tracing::warn;
 
 use crate::ui::header_bar::RepeatMode;
 
@@ -22,6 +29,139 @@ fn write_setting(name: &str, content: &str) {
         }
         let _ = std::fs::write(path, content);
     }
+}
+
+// ── Atomic JSON settings files ──────────────────────────────────────
+
+/// Replace `path` with `contents` so that neither a failed write nor a crash
+/// leaves a truncated file: the bytes are written and synchronized to a
+/// temporary file in the same directory, which then atomically replaces
+/// `path`. On any error the previous file is untouched.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "settings file has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+
+    // Syncing the directory makes the rename durable across power loss. The
+    // replacement is already visible to this process, so a failure here is
+    // logged rather than reported as a failed save.
+    #[cfg(unix)]
+    if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        warn!(%error, path = %parent.display(), "Could not synchronize settings directory");
+    }
+    Ok(())
+}
+
+/// A settings file that could not be read and was moved aside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAsideFile {
+    pub original: PathBuf,
+    pub copy: PathBuf,
+}
+
+/// What reading a JSON settings file produced.
+#[derive(Debug)]
+pub enum SettingsRead<T> {
+    /// The file does not exist yet.
+    Missing,
+    Parsed(T),
+    /// The file exists but could not be read or parsed. It was moved to
+    /// `set_aside` (`None` when the move failed) so that the next save starts
+    /// a fresh file instead of overwriting what the user may want back.
+    Unreadable {
+        set_aside: Option<SetAsideFile>,
+    },
+}
+
+/// Read and parse the settings file at `path`, moving it aside when it
+/// exists but cannot be read or parsed.
+pub fn read_settings_file<T, E: std::fmt::Display>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T, E>,
+) -> SettingsRead<T> {
+    let error = match std::fs::read_to_string(path) {
+        Ok(raw) => match parse(&raw) {
+            Ok(value) => return SettingsRead::Parsed(value),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SettingsRead::Missing;
+        }
+        Err(error) => error.to_string(),
+    };
+    let set_aside = match set_aside_unreadable(path) {
+        Ok(copy) => {
+            warn!(
+                %error,
+                path = %path.display(),
+                copy = %copy.display(),
+                "Settings file is unreadable; moved it aside and using defaults"
+            );
+            Some(SetAsideFile {
+                original: path.to_path_buf(),
+                copy,
+            })
+        }
+        Err(move_error) => {
+            warn!(
+                %error,
+                %move_error,
+                path = %path.display(),
+                "Settings file is unreadable and could not be moved aside; using defaults"
+            );
+            None
+        }
+    };
+    SettingsRead::Unreadable { set_aside }
+}
+
+/// Rename `path` to `<name>.corrupt-<UTC timestamp>` beside it.
+fn set_aside_unreadable(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "settings file has no name",
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let mut copy = path.with_file_name(format!("{name}.corrupt-{stamp}"));
+    let mut attempt = 1;
+    while copy.exists() {
+        copy = path.with_file_name(format!("{name}.corrupt-{stamp}-{attempt}"));
+        attempt += 1;
+    }
+    std::fs::rename(path, &copy)?;
+    Ok(copy)
+}
+
+/// Localized notice that a settings file was unreadable and moved aside.
+pub fn set_aside_notice(file: &SetAsideFile, locale: &str) -> String {
+    let name = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    rust_i18n::t!(
+        "settings.file_set_aside",
+        locale = locale,
+        file = name(&file.original),
+        copy = name(&file.copy)
+    )
+    .into_owned()
 }
 
 // ── Repeat mode ─────────────────────────────────────────────────────
@@ -201,4 +341,103 @@ pub fn extract_hwnd(window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_
 #[cfg(not(target_os = "windows"))]
 pub fn extract_hwnd(_window: &adw::ApplicationWindow) -> Option<*mut std::ffi::c_void> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_reports_failure() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("nested").join("settings.json");
+
+        write_atomic(&path, b"first").expect("write into a new directory");
+        write_atomic(&path, b"second").expect("replace the file");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"second");
+
+        // A regular file where the parent directory should be makes the
+        // write fail, and the failure is reported rather than swallowed.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+        assert!(write_atomic(&blocker.join("settings.json"), b"lost").is_err());
+    }
+
+    #[test]
+    fn missing_and_valid_files_are_read_without_moving_anything() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("settings.json");
+        let parse = |raw: &str| serde_json::from_str::<Vec<u32>>(raw);
+
+        assert!(matches!(
+            read_settings_file(&path, parse),
+            SettingsRead::Missing
+        ));
+        std::fs::write(&path, "[1, 2]").expect("valid file");
+        assert!(matches!(
+            read_settings_file(&path, parse),
+            SettingsRead::Parsed(values) if values == [1, 2]
+        ));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn an_unparsable_file_is_moved_aside_with_its_bytes_intact() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{truncated").expect("corrupt file");
+
+        let SettingsRead::Unreadable {
+            set_aside: Some(first),
+        } = read_settings_file(&path, |raw| serde_json::from_str::<Vec<u32>>(raw))
+        else {
+            panic!("a corrupt file must be reported and moved aside");
+        };
+        assert_eq!(first.original, path);
+        assert!(
+            !path.exists(),
+            "the corrupt file no longer blocks a fresh save"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first.copy).expect("read the kept copy"),
+            "{truncated"
+        );
+        let copy_name = first.copy.file_name().unwrap().to_string_lossy();
+        assert!(
+            copy_name.starts_with("settings.json.corrupt-"),
+            "{copy_name}"
+        );
+
+        // A second corruption in the same second keeps both copies.
+        std::fs::write(&path, "also broken").expect("second corrupt file");
+        let SettingsRead::Unreadable {
+            set_aside: Some(second),
+        } = read_settings_file(&path, |raw| serde_json::from_str::<Vec<u32>>(raw))
+        else {
+            panic!("the second corrupt file must be moved aside too");
+        };
+        assert_ne!(first.copy, second.copy);
+        assert!(first.copy.exists() && second.copy.exists());
+    }
+
+    #[test]
+    fn set_aside_notice_is_translated_in_every_catalog() {
+        let file = SetAsideFile {
+            original: PathBuf::from("/data/tributary/config.json"),
+            copy: PathBuf::from("/data/tributary/config.json.corrupt-20260923T101500Z"),
+        };
+        let english = set_aside_notice(&file, "en");
+        for locale in rust_i18n::available_locales!() {
+            let text = set_aside_notice(&file, &locale);
+            assert!(!text.contains("%{"), "{locale} left a placeholder");
+            assert!(text.contains("config.json"), "{locale} names the file");
+            assert!(
+                text.contains("config.json.corrupt-20260923T101500Z"),
+                "{locale} names the kept copy"
+            );
+            if locale != "en" {
+                assert_ne!(text, english, "{locale} fell back to English");
+            }
+        }
+    }
 }

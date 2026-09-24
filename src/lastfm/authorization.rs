@@ -385,6 +385,7 @@ pub struct LastFmAuthorizationStart {
 }
 
 impl LastFmAuthorizationStart {
+    #[cfg(test)]
     pub fn flow(&self) -> LastFmAuthorizationFlow {
         self.flow.clone()
     }
@@ -541,6 +542,7 @@ struct HandleInner {
     commands: async_channel::Sender<Command>,
     ingress: Arc<Mutex<IngressGate>>,
     clock: Arc<dyn LastFmAuthorizationClock>,
+    #[cfg(test)]
     status: watch::Receiver<LastFmAuthorizationStatus>,
 }
 
@@ -711,10 +713,12 @@ impl LastFmAuthorizationHandle {
         }
     }
 
+    #[cfg(test)]
     pub fn close_and_flush(&self) -> bool {
         request_close(&self.inner)
     }
 
+    #[cfg(test)]
     pub fn subscribe_status(&self) -> watch::Receiver<LastFmAuthorizationStatus> {
         self.inner.status.clone()
     }
@@ -1705,6 +1709,7 @@ pub struct LastFmAuthorizationShutdown {
 }
 
 impl LastFmAuthorizationShutdown {
+    #[cfg(test)]
     pub fn barrier(&self) -> LastFmAuthorizationBarrier {
         LastFmAuthorizationBarrier {
             completion: self.completion.clone(),
@@ -1746,11 +1751,13 @@ impl fmt::Debug for LastFmAuthorizationShutdown {
 }
 
 /// Cloneable proof of normal drain or abnormal owner loss.
+#[cfg(test)]
 #[derive(Clone)]
 pub struct LastFmAuthorizationBarrier {
     completion: watch::Receiver<LastFmAuthorizationDrainState>,
 }
 
+#[cfg(test)]
 impl LastFmAuthorizationBarrier {
     pub fn state(&self) -> LastFmAuthorizationDrainState {
         *self.completion.borrow()
@@ -1774,6 +1781,7 @@ impl LastFmAuthorizationBarrier {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for LastFmAuthorizationBarrier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1819,7 +1827,9 @@ fn spawn_lastfm_authorization_with_options(
     options: AuthorizationSpawnOptions,
 ) -> (LastFmAuthorizationHandle, LastFmAuthorizationShutdown) {
     let (commands, receiver) = async_channel::bounded(AUTHORIZATION_COMMAND_CAPACITY);
-    let (status_sender, status) = watch::channel(LastFmAuthorizationStatus::INITIAL);
+    let (status_sender, _) = watch::channel(LastFmAuthorizationStatus::INITIAL);
+    #[cfg(test)]
+    let status = status_sender.subscribe();
     let ingress = Arc::new(Mutex::new(IngressGate {
         open: true,
         generation: 0,
@@ -1833,6 +1843,7 @@ fn spawn_lastfm_authorization_with_options(
         commands,
         ingress: Arc::clone(&ingress),
         clock: Arc::clone(&clock),
+        #[cfg(test)]
         status,
     });
     let mut owner = AuthorizationOwner {

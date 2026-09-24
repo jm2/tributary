@@ -319,6 +319,10 @@ pub fn build_header_bar() -> HeaderBarWidgets {
     // Modern GNOME primary menu (Ptyxis-style)
     let menu = gtk::gio::Menu::new();
     let section1 = gtk::gio::Menu::new();
+    section1.append(
+        Some(rust_i18n::t!("header.rescan_library").as_ref()),
+        Some("win.rescan-library"),
+    );
     section1.append(Some("_Preferences"), Some("win.show-preferences"));
     section1.append(Some("_About Tributary"), Some("app.about"));
     menu.append_section(None, &section1);

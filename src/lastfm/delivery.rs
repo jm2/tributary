@@ -16,8 +16,8 @@ use crate::db::entities::lastfm_scrobble::{
 };
 
 use super::client::{
-    LastFmClient, LastFmClientError, LastFmTrack, Scrobble, ScrobbleBatchResult, SubmissionResult,
-    MAX_SCROBBLES_PER_BATCH,
+    IgnoredReason, LastFmClient, LastFmClientError, LastFmTrack, Scrobble, ScrobbleBatchResult,
+    SubmissionResult, MAX_SCROBBLES_PER_BATCH,
 };
 use super::credentials::StoredSession;
 use super::storage::LastFmBatchReceipt;
@@ -27,6 +27,7 @@ const MAXIMUM_RETRY_DELAY_MS: i64 = 60 * 60 * 1_000;
 // 30 seconds shifted seven times is 64 minutes, so every later attempt is
 // already at the one-hour cap.
 const FIRST_CAPPED_RETRY_ATTEMPT: u32 = 7;
+const UTC_DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// Network boundary used by the single Last.fm delivery worker.
 ///
@@ -123,9 +124,12 @@ pub enum LastFmDeliveryPrimitiveError {
 /// or credentials and are therefore safe to publish in runtime status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LastFmDeliveryDisposition {
-    /// Delete the exact receipt after a valid success or recognized terminal
-    /// provider rejection.
+    /// Delete the exact receipt after a valid success or a provider rejection
+    /// of the submitted rows themselves.
     SettleTerminal,
+    /// Delete the rows Last.fm accepted or finally ignored, and keep the rows
+    /// it ignored for its daily scrobble limit until the next UTC day.
+    DeferDailyLimit,
     /// Retain the exact receipt and durably apply exponential backoff.
     RetryTransient,
     /// Retain the queue and wait for same-account reauthorization.
@@ -157,12 +161,20 @@ pub fn delivery_disposition(
             // Keep this match explicit rather than treating every present or
             // future response variant as terminal by default. Extending
             // `SubmissionResult` must force a reviewed delivery-policy choice.
+            let mut daily_limit = false;
             for item in &batch.items {
                 match item {
+                    SubmissionResult::Ignored {
+                        reason: IgnoredReason::DailyLimit,
+                    } => daily_limit = true,
                     SubmissionResult::Accepted { .. } | SubmissionResult::Ignored { .. } => {}
                 }
             }
-            LastFmDeliveryDisposition::SettleTerminal
+            if daily_limit {
+                LastFmDeliveryDisposition::DeferDailyLimit
+            } else {
+                LastFmDeliveryDisposition::SettleTerminal
+            }
         }
         Ok(_) => LastFmDeliveryDisposition::QuarantineCompatibility,
         Err(error) => disposition_for_client_error(*error),
@@ -172,9 +184,6 @@ pub fn delivery_disposition(
 /// Exhaustively map the closed client error set to durable delivery policy.
 #[must_use]
 pub const fn disposition_for_client_error(error: LastFmClientError) -> LastFmDeliveryDisposition {
-    // Keep the client's closed retry classification authoritative. In
-    // particular, an ordinary HTTP failure or an oversized response is not a
-    // network failure and must not cause an unbounded resubmission loop.
     if error.is_retryable() {
         return LastFmDeliveryDisposition::RetryTransient;
     }
@@ -183,13 +192,34 @@ pub const fn disposition_for_client_error(error: LastFmClientError) -> LastFmDel
         LastFmClientError::ReauthenticationRequired => {
             LastFmDeliveryDisposition::PauseForReauthentication
         }
-        LastFmClientError::ServiceRejected { .. } => LastFmDeliveryDisposition::SettleTerminal,
-        // None of these responses proves a trustworthy terminal mapping for
-        // the submitted rows. Retain the exact receipt and require explicit
-        // compatibility recovery instead of deleting or retrying it.
-        LastFmClientError::HttpStatus
-        | LastFmClientError::BodyLimit
-        | LastFmClientError::InvalidResponse => LastFmDeliveryDisposition::QuarantineCompatibility,
+        // Codes 6 (invalid parameters) and 7 (invalid resource) reject the
+        // submitted request itself, so resending the same rows cannot succeed.
+        LastFmClientError::ServiceRejected { code: 6 | 7 } => {
+            LastFmDeliveryDisposition::SettleTerminal
+        }
+        // Codes 4 (authentication failed), 10 (invalid API key), 13 (invalid
+        // signature), 14 (unauthorized token), 17 (login required), and 26
+        // (suspended API key) reject this build's credentials or access level,
+        // not the rows. Keep the whole queue for a fixed build or restored key.
+        LastFmClientError::ServiceRejected {
+            code: 4 | 10 | 13 | 14 | 17 | 26,
+        } => LastFmDeliveryDisposition::PauseCapabilityOrInternal,
+        // Every other recognized code names a service, method, format, or
+        // radio feature that `track.scrobble` does not use. None proves
+        // anything about the rows, so keep them for a compatibility recovery.
+        LastFmClientError::ServiceRejected { .. } => {
+            LastFmDeliveryDisposition::QuarantineCompatibility
+        }
+        // An HTTP error status without a Last.fm error code, such as a CDN
+        // block page, says nothing about the rows. Retry it on the capped
+        // durable schedule.
+        LastFmClientError::HttpStatus => LastFmDeliveryDisposition::RetryTransient,
+        // A complete answer that cannot be parsed or bounded proves no
+        // terminal mapping for the rows. Keep them for a compatibility
+        // recovery instead of deleting or resubmitting them.
+        LastFmClientError::BodyLimit | LastFmClientError::InvalidResponse => {
+            LastFmDeliveryDisposition::QuarantineCompatibility
+        }
         LastFmClientError::AppCredentialsUnavailable
         | LastFmClientError::ClientConstruction
         | LastFmClientError::InvalidInput => LastFmDeliveryDisposition::PauseCapabilityOrInternal,
@@ -282,6 +312,18 @@ pub fn next_retry_at_ms(
     receipt: &LastFmBatchReceipt,
 ) -> Result<i64, LastFmDeliveryPrimitiveError> {
     next_retry_at_for_attempt(now_unix_ms, receipt.maximum_attempt_count())
+}
+
+/// Start of the next UTC day, when rows ignored for Last.fm's daily scrobble
+/// limit become due again. Last.fm does not document when the limit resets;
+/// rows it still refuses are simply deferred to the following day.
+pub fn next_utc_day_ms(now_unix_ms: i64) -> Result<i64, LastFmDeliveryPrimitiveError> {
+    validate_retry_timestamp(now_unix_ms)?;
+    Ok(now_unix_ms
+        .div_euclid(UTC_DAY_MS)
+        .saturating_add(1)
+        .saturating_mul(UTC_DAY_MS)
+        .min(MAX_LASTFM_RETRY_AT_MS))
 }
 
 fn next_retry_at_for_attempt(
@@ -506,6 +548,20 @@ mod tests {
             LastFmDeliveryDisposition::SettleTerminal
         );
         assert_eq!(
+            delivery_disposition(
+                &receipt,
+                &Ok(ScrobbleBatchResult {
+                    items: vec![
+                        SubmissionResult::Accepted { corrected: false },
+                        SubmissionResult::Ignored {
+                            reason: IgnoredReason::DailyLimit,
+                        },
+                    ],
+                })
+            ),
+            LastFmDeliveryDisposition::DeferDailyLimit
+        );
+        assert_eq!(
             delivery_disposition(&receipt, &Ok(accepted_batch(1))),
             LastFmDeliveryDisposition::QuarantineCompatibility
         );
@@ -526,11 +582,10 @@ mod tests {
             LastFmDeliveryDisposition::PauseForReauthentication
         );
         assert_eq!(
-            disposition_for_client_error(LastFmClientError::ServiceRejected { code: 13 }),
-            LastFmDeliveryDisposition::SettleTerminal
+            disposition_for_client_error(LastFmClientError::HttpStatus),
+            LastFmDeliveryDisposition::RetryTransient
         );
         for error in [
-            LastFmClientError::HttpStatus,
             LastFmClientError::BodyLimit,
             LastFmClientError::InvalidResponse,
         ] {
@@ -569,10 +624,49 @@ mod tests {
                     disposition_for_client_error(error),
                     LastFmDeliveryDisposition::RetryTransient
                 ),
-                error.is_retryable(),
+                error.is_retryable() || error == LastFmClientError::HttpStatus,
                 "durable retry classification drifted for {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn provider_codes_delete_rows_only_when_the_request_itself_is_rejected() {
+        let classify =
+            |code| disposition_for_client_error(LastFmClientError::ServiceRejected { code });
+        for code in [6, 7] {
+            assert_eq!(classify(code), LastFmDeliveryDisposition::SettleTerminal);
+        }
+        for code in [4, 10, 13, 14, 17, 26] {
+            assert_eq!(
+                classify(code),
+                LastFmDeliveryDisposition::PauseCapabilityOrInternal,
+                "credential or access code {code} must keep the queue"
+            );
+        }
+        for code in [1, 2, 3, 5, 12, 15, 18, 19, 20, 21, 22, 23, 24, 25, 27] {
+            assert_eq!(
+                classify(code),
+                LastFmDeliveryDisposition::QuarantineCompatibility,
+                "code {code} says nothing about the rows"
+            );
+        }
+    }
+
+    #[test]
+    fn daily_limit_deferral_ends_at_the_next_utc_midnight() {
+        let day = 24 * 60 * 60 * 1_000;
+        assert_eq!(next_utc_day_ms(0).unwrap(), day);
+        assert_eq!(next_utc_day_ms(day - 1).unwrap(), day);
+        assert_eq!(next_utc_day_ms(day).unwrap(), 2 * day);
+        assert_eq!(
+            next_utc_day_ms(MAX_LASTFM_RETRY_AT_MS).unwrap(),
+            MAX_LASTFM_RETRY_AT_MS
+        );
+        assert_eq!(
+            next_utc_day_ms(-1),
+            Err(LastFmDeliveryPrimitiveError::ClockOutOfRange)
+        );
     }
 
     #[tokio::test]

@@ -224,7 +224,146 @@ fn rating_rule_from_editor(
     })
 }
 
-fn set_rating_entry_error(entry: &gtk::Entry, message: Option<&str>) {
+/// Why a rule row cannot be saved as typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleInputError {
+    Rating(RatingRuleInputError),
+    NotAnInteger,
+    ReversedRange,
+    NotPositive,
+    InvalidDate,
+}
+
+impl RuleInputError {
+    fn message(self, locale: &str) -> String {
+        let key = match self {
+            Self::Rating(error) => return error.message(locale),
+            Self::NotAnInteger => "smart_playlist.rule_not_integer",
+            Self::ReversedRange => "smart_playlist.rule_reversed_range",
+            Self::NotPositive => "smart_playlist.rule_not_positive",
+            Self::InvalidDate => "smart_playlist.rule_invalid_date",
+        };
+        rust_i18n::t!(key, locale = locale).into_owned()
+    }
+}
+
+fn index_to_text_operator(idx: u32) -> RuleOperator {
+    match idx {
+        0 => RuleOperator::Is,
+        1 => RuleOperator::IsNot,
+        3 => RuleOperator::DoesNotContain,
+        4 => RuleOperator::StartsWith,
+        5 => RuleOperator::EndsWith,
+        _ => RuleOperator::Contains,
+    }
+}
+
+fn index_to_number_operator(idx: u32) -> RuleOperator {
+    match idx {
+        1 => RuleOperator::IsNot,
+        2 => RuleOperator::GreaterThan,
+        3 => RuleOperator::LessThan,
+        4 => RuleOperator::InRange,
+        _ => RuleOperator::Is,
+    }
+}
+
+fn index_to_absolute_date_operator(idx: u32) -> RuleOperator {
+    match idx {
+        1 => RuleOperator::IsNot,
+        2 => RuleOperator::IsBefore,
+        3 => RuleOperator::IsAfter,
+        _ => RuleOperator::Is,
+    }
+}
+
+fn whole_number(raw: &str) -> Result<i64, RuleInputError> {
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|_| RuleInputError::NotAnInteger)
+}
+
+/// Build the rule one editor row describes. Input that is not exactly a
+/// value of the row's type is refused rather than replaced by a default, so
+/// a typo can never save a different predicate than the one the user wrote.
+fn rule_from_editor(
+    field: RuleField,
+    op_index: u32,
+    raw_value: &str,
+    raw_high: &str,
+    date_unit: DateUnit,
+) -> Result<SmartRule, RuleInputError> {
+    let (operator, value) = match field_type(&field) {
+        FieldType::Text => (
+            index_to_text_operator(op_index),
+            RuleValue::Text(raw_value.to_owned()),
+        ),
+        FieldType::Number => {
+            let operator = index_to_number_operator(op_index);
+            let value = if matches!(operator, RuleOperator::InRange) {
+                let low = whole_number(raw_value)?;
+                let high = whole_number(raw_high)?;
+                if low > high {
+                    return Err(RuleInputError::ReversedRange);
+                }
+                RuleValue::NumberRange(low, high)
+            } else {
+                RuleValue::Number(whole_number(raw_value)?)
+            };
+            (operator, value)
+        }
+        FieldType::Date if is_relative_date_index(op_index) => {
+            let amount = raw_value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|amount| *amount > 0)
+                .ok_or(RuleInputError::NotPositive)?;
+            (
+                relative_date_operator(op_index, amount, date_unit)
+                    .expect("relative date indexes are exhaustive"),
+                RuleValue::Number(i64::from(amount)),
+            )
+        }
+        FieldType::Date => {
+            let day = parse_rule_day(raw_value).ok_or(RuleInputError::InvalidDate)?;
+            (
+                index_to_absolute_date_operator(op_index),
+                RuleValue::Date(day.format("%Y-%m-%d").to_string()),
+            )
+        }
+        FieldType::Rating => {
+            return rating_rule_from_editor(op_index, raw_value, raw_high)
+                .map_err(RuleInputError::Rating);
+        }
+    };
+
+    Ok(SmartRule {
+        field,
+        operator,
+        value,
+    })
+}
+
+/// Whether the operator at `op_index` takes a second "to" value.
+fn is_range_operator(field: &RuleField, op_index: u32) -> bool {
+    match field_type(field) {
+        FieldType::Number => matches!(index_to_number_operator(op_index), RuleOperator::InRange),
+        FieldType::Rating => matches!(index_to_rating_operator(op_index), RuleOperator::InRange),
+        FieldType::Text | FieldType::Date => false,
+    }
+}
+
+/// Placeholder for the value entry, which shows the expected input form.
+fn value_placeholder(field: &RuleField, op_index: u32) -> &'static str {
+    match field_type(field) {
+        FieldType::Rating => "1–100",
+        FieldType::Date if !is_relative_date_index(op_index) => "YYYY-MM-DD",
+        _ => "value",
+    }
+}
+
+fn set_entry_error(entry: &gtk::Entry, message: Option<&str>) {
     if let Some(message) = message {
         entry.add_css_class("error");
         entry.update_property(&[gtk::accessible::Property::Description(message)]);
@@ -234,73 +373,101 @@ fn set_rating_entry_error(entry: &gtk::Entry, message: Option<&str>) {
     }
 }
 
+/// The widgets of one rendered rule row, found by widget name.
+struct RuleRowWidgets {
+    field: gtk::DropDown,
+    operator: gtk::DropDown,
+    value: gtk::Entry,
+    value2: gtk::Entry,
+    date_unit: gtk::DropDown,
+    error: gtk::Label,
+}
+
+impl RuleRowWidgets {
+    fn find(row: &gtk::Box) -> Option<Self> {
+        let mut field = None;
+        let mut operator = None;
+        let mut value = None;
+        let mut value2 = None;
+        let mut date_unit = None;
+        let mut error = None;
+
+        let mut child = row.first_child();
+        while let Some(widget) = child {
+            match widget.widget_name().as_str() {
+                "field" => field = widget.downcast_ref::<gtk::DropDown>().cloned(),
+                "operator" => operator = widget.downcast_ref::<gtk::DropDown>().cloned(),
+                "value" => value = widget.downcast_ref::<gtk::Entry>().cloned(),
+                "value2" => value2 = widget.downcast_ref::<gtk::Entry>().cloned(),
+                "date_unit" => date_unit = widget.downcast_ref::<gtk::DropDown>().cloned(),
+                "rule_error" => error = widget.downcast_ref::<gtk::Label>().cloned(),
+                _ => {}
+            }
+            child = widget.next_sibling();
+        }
+
+        Some(Self {
+            field: field?,
+            operator: operator?,
+            value: value?,
+            value2: value2?,
+            date_unit: date_unit?,
+            error: error?,
+        })
+    }
+
+    fn rule(&self) -> Result<SmartRule, RuleInputError> {
+        rule_from_editor(
+            index_to_field(self.field.selected()),
+            self.operator.selected(),
+            &self.value.text(),
+            &self.value2.text(),
+            index_to_date_unit(self.date_unit.selected()),
+        )
+    }
+}
+
 /// Validate one rendered row without changing either operand.
 ///
 /// The visible error label and each invalid entry's accessible description
 /// carry the same message. Presence predicates require no user input because
 /// the editor supplies their canonical inert placeholder itself.
-fn validate_rating_row(row: &gtk::Box) -> bool {
-    let mut field_dropdown: Option<gtk::DropDown> = None;
-    let mut op_dropdown: Option<gtk::DropDown> = None;
-    let mut value_entry: Option<gtk::Entry> = None;
-    let mut value2_entry: Option<gtk::Entry> = None;
-    let mut error_label: Option<gtk::Label> = None;
-
-    let mut child = row.first_child();
-    while let Some(widget) = child {
-        match widget.widget_name().as_str() {
-            "field" => field_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned(),
-            "operator" => op_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned(),
-            "value" => value_entry = widget.downcast_ref::<gtk::Entry>().cloned(),
-            "value2" => value2_entry = widget.downcast_ref::<gtk::Entry>().cloned(),
-            "rating_error" => error_label = widget.downcast_ref::<gtk::Label>().cloned(),
-            _ => {}
-        }
-        child = widget.next_sibling();
-    }
-
-    let (Some(field), Some(operator), Some(value), Some(high), Some(error)) = (
-        field_dropdown,
-        op_dropdown,
-        value_entry,
-        value2_entry,
-        error_label,
-    ) else {
+fn validate_rule_row(row: &gtk::Box) -> bool {
+    let Some(widgets) = RuleRowWidgets::find(row) else {
         return false;
     };
 
-    if index_to_field(field.selected()) != RuleField::Rating {
-        error.set_visible(false);
-        set_rating_entry_error(&value, None);
-        set_rating_entry_error(&high, None);
-        return true;
-    }
-
-    let validation = rating_rule_from_editor(operator.selected(), &value.text(), &high.text());
+    let validation = widgets.rule();
     let locale = rust_i18n::locale();
     let message = validation
         .as_ref()
         .err()
         .copied()
         .map(|error| error.message(locale.as_ref()));
-    error.set_label(message.as_deref().unwrap_or_default());
-    error.set_visible(message.is_some());
+    widgets
+        .error
+        .set_label(message.as_deref().unwrap_or_default());
+    widgets.error.set_visible(message.is_some());
 
-    let is_range = matches!(
-        index_to_rating_operator(operator.selected()),
-        RuleOperator::InRange
+    let is_range = is_range_operator(
+        &index_to_field(widgets.field.selected()),
+        widgets.operator.selected(),
     );
-    set_rating_entry_error(&value, message.as_deref());
-    set_rating_entry_error(&high, if is_range { message.as_deref() } else { None });
+    set_entry_error(&widgets.value, message.as_deref());
+    set_entry_error(
+        &widgets.value2,
+        if is_range { message.as_deref() } else { None },
+    );
     validation.is_ok()
 }
 
-fn refresh_rating_validation(dialog: &adw::AlertDialog, rules_box: &gtk::Box) -> bool {
+/// Revalidate every row and enable OK only when all of them can be saved.
+fn refresh_rule_validation(dialog: &adw::AlertDialog, rules_box: &gtk::Box) -> bool {
     let mut valid = true;
     let mut child = rules_box.first_child();
     while let Some(widget) = child {
         if let Some(row) = widget.downcast_ref::<gtk::Box>() {
-            valid &= validate_rating_row(row);
+            valid &= validate_rule_row(row);
         }
         child = widget.next_sibling();
     }
@@ -344,6 +511,11 @@ fn relative_date_unit(operator: &RuleOperator) -> Option<DateUnit> {
         }
         _ => None,
     }
+}
+
+/// Whether a date operator index is one of the relative "in the last" modes.
+fn is_relative_date_index(op_index: u32) -> bool {
+    matches!(op_index, 4 | 5)
 }
 
 fn relative_date_operator(op_index: u32, amount: u32, unit: DateUnit) -> Option<RuleOperator> {
@@ -484,7 +656,7 @@ pub fn show_smart_playlist_editor(
         let row = build_rule_row(Some(rule), rules_box_weak.clone(), dialog_weak.clone());
         rules_box.append(&row);
     }
-    refresh_rating_validation(&dialog, &rules_box);
+    refresh_rule_validation(&dialog, &rules_box);
 
     // ── Add rule button ─────────────────────────────────────────────
     let add_btn = gtk::Button::builder()
@@ -501,7 +673,7 @@ pub fn show_smart_playlist_editor(
             };
             let row = build_rule_row(None, rules_box.downgrade(), dialog.downgrade());
             rules_box.append(&row);
-            refresh_rating_validation(&dialog, &rules_box);
+            refresh_rule_validation(&dialog, &rules_box);
         });
     }
 
@@ -639,7 +811,7 @@ pub fn show_smart_playlist_editor(
         let Some(rules_box) = rules_box_for_save.upgrade() else {
             return;
         };
-        if !refresh_rating_validation(dialog, &rules_box) {
+        if !refresh_rule_validation(dialog, &rules_box) {
             return;
         }
 
@@ -735,11 +907,7 @@ fn update_rule_operator_widgets(
     }
     op_dropdown.set_selected(0);
     value.set_visible(true);
-    value.set_placeholder_text(if matches!(field_type(&field), FieldType::Rating) {
-        Some("1–100")
-    } else {
-        Some("value")
-    });
+    value.set_placeholder_text(Some(value_placeholder(&field, 0)));
     value2.set_visible(false);
     date_unit.set_visible(false);
 }
@@ -798,13 +966,13 @@ fn build_rule_row(
         .visible(false)
         .build();
 
-    let rating_error = gtk::Label::builder()
+    let rule_error = gtk::Label::builder()
         .css_classes(["error"])
         .halign(gtk::Align::Start)
         .wrap(true)
         .visible(false)
         .build();
-    rating_error.set_accessible_role(gtk::AccessibleRole::Alert);
+    rule_error.set_accessible_role(gtk::AccessibleRole::Alert);
 
     // Remove button.
     let remove_btn = gtk::Button::builder()
@@ -818,7 +986,7 @@ fn build_rule_row(
     row.append(&value_entry);
     row.append(&date_unit_dropdown);
     row.append(&value2_entry);
-    row.append(&rating_error);
+    row.append(&rule_error);
     row.append(&remove_btn);
 
     // Wire remove button.
@@ -832,7 +1000,7 @@ fn build_rule_row(
             };
             rules_box.remove(&row);
             if let Some(dialog) = dialog.upgrade() {
-                refresh_rating_validation(&dialog, &rules_box);
+                refresh_rule_validation(&dialog, &rules_box);
             }
         });
     }
@@ -892,15 +1060,8 @@ fn build_rule_row(
             };
             let field = index_to_field(field_dd.selected());
             let field_type = field_type(&field);
-            let is_range = match field_type {
-                FieldType::Number => dd.selected() == 4, // "in range"
-                FieldType::Rating => matches!(
-                    index_to_rating_operator(dd.selected()),
-                    RuleOperator::InRange
-                ),
-                _ => false,
-            };
-            value2.set_visible(is_range);
+            value2.set_visible(is_range_operator(&field, dd.selected()));
+            value.set_placeholder_text(Some(value_placeholder(&field, dd.selected())));
             let is_rating_presence = matches!(field_type, FieldType::Rating)
                 && matches!(
                     index_to_rating_operator(dd.selected()),
@@ -908,7 +1069,7 @@ fn build_rule_row(
                 );
             value.set_visible(!is_rating_presence);
             let is_relative_date =
-                matches!(field_type, FieldType::Date) && matches!(dd.selected(), 4 | 5);
+                matches!(field_type, FieldType::Date) && is_relative_date_index(dd.selected());
             date_unit.set_visible(is_relative_date);
         });
     }
@@ -984,9 +1145,9 @@ fn build_rule_row(
     value_entry.set_widget_name("value");
     date_unit_dropdown.set_widget_name("date_unit");
     value2_entry.set_widget_name("value2");
-    rating_error.set_widget_name("rating_error");
+    rule_error.set_widget_name("rule_error");
 
-    // Revalidate after every user-editable rating component changes. Field
+    // Revalidate after every user-editable component changes. Field
     // and operator handlers above run first, so visibility and operator sets
     // are already current when validation observes the row.
     {
@@ -996,7 +1157,7 @@ fn build_rule_row(
             let (Some(rules_box), Some(dialog)) = (rules_box.upgrade(), dialog.upgrade()) else {
                 return;
             };
-            refresh_rating_validation(&dialog, &rules_box);
+            refresh_rule_validation(&dialog, &rules_box);
         });
     }
     {
@@ -1006,7 +1167,7 @@ fn build_rule_row(
             let (Some(rules_box), Some(dialog)) = (rules_box.upgrade(), dialog.upgrade()) else {
                 return;
             };
-            refresh_rating_validation(&dialog, &rules_box);
+            refresh_rule_validation(&dialog, &rules_box);
         });
     }
     {
@@ -1016,7 +1177,7 @@ fn build_rule_row(
             let (Some(rules_box), Some(dialog)) = (rules_box.upgrade(), dialog.upgrade()) else {
                 return;
             };
-            refresh_rating_validation(&dialog, &rules_box);
+            refresh_rule_validation(&dialog, &rules_box);
         });
     }
     {
@@ -1026,115 +1187,17 @@ fn build_rule_row(
             let (Some(rules_box), Some(dialog)) = (rules_box.upgrade(), dialog.upgrade()) else {
                 return;
             };
-            refresh_rating_validation(&dialog, &rules_box);
+            refresh_rule_validation(&dialog, &rules_box);
         });
     }
 
     row
 }
 
-/// Extract a `SmartRule` from a rule row's widgets.
+/// Extract a `SmartRule` from a rule row's widgets, or `None` when the row
+/// does not hold a valid rule.
 fn extract_rule_from_row(row: &gtk::Box) -> Option<SmartRule> {
-    let mut field_dropdown: Option<gtk::DropDown> = None;
-    let mut op_dropdown: Option<gtk::DropDown> = None;
-    let mut value_entry: Option<gtk::Entry> = None;
-    let mut date_unit_dropdown: Option<gtk::DropDown> = None;
-    let mut value2_entry: Option<gtk::Entry> = None;
-
-    let mut child = row.first_child();
-    while let Some(widget) = child {
-        let name = widget.widget_name();
-        if name == "field" {
-            field_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
-        } else if name == "operator" {
-            op_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
-        } else if name == "value" {
-            value_entry = widget.downcast_ref::<gtk::Entry>().cloned();
-        } else if name == "date_unit" {
-            date_unit_dropdown = widget.downcast_ref::<gtk::DropDown>().cloned();
-        } else if name == "value2" {
-            value2_entry = widget.downcast_ref::<gtk::Entry>().cloned();
-        }
-        child = widget.next_sibling();
-    }
-
-    let field_dd = field_dropdown?;
-    let op_dd = op_dropdown?;
-    let val_entry = value_entry?;
-    let date_unit = date_unit_dropdown
-        .map(|dropdown| index_to_date_unit(dropdown.selected()))
-        .unwrap_or(DateUnit::Days);
-
-    let field = index_to_field(field_dd.selected());
-    let val_text = val_entry.text().to_string();
-    let val2_text = value2_entry
-        .map(|e| e.text().to_string())
-        .unwrap_or_default();
-
-    let (operator, value) = match field_type(&field) {
-        FieldType::Text => {
-            let op = match op_dd.selected() {
-                0 => RuleOperator::Is,
-                1 => RuleOperator::IsNot,
-                2 => RuleOperator::Contains,
-                3 => RuleOperator::DoesNotContain,
-                4 => RuleOperator::StartsWith,
-                5 => RuleOperator::EndsWith,
-                _ => RuleOperator::Contains,
-            };
-            (op, RuleValue::Text(val_text))
-        }
-        FieldType::Number => {
-            let op = match op_dd.selected() {
-                0 => RuleOperator::Is,
-                1 => RuleOperator::IsNot,
-                2 => RuleOperator::GreaterThan,
-                3 => RuleOperator::LessThan,
-                4 => RuleOperator::InRange,
-                _ => RuleOperator::Is,
-            };
-            if matches!(op, RuleOperator::InRange) {
-                let lo = val_text.parse::<i64>().unwrap_or(0);
-                let hi = val2_text.parse::<i64>().unwrap_or(0);
-                (op, RuleValue::NumberRange(lo, hi))
-            } else {
-                let n = val_text.parse::<i64>().unwrap_or(0);
-                (op, RuleValue::Number(n))
-            }
-        }
-        FieldType::Date => {
-            let op = match op_dd.selected() {
-                0 => RuleOperator::Is,
-                1 => RuleOperator::IsNot,
-                2 => RuleOperator::IsBefore,
-                3 => RuleOperator::IsAfter,
-                4 | 5 => relative_date_operator(
-                    op_dd.selected(),
-                    val_text.parse::<u32>().unwrap_or(30),
-                    date_unit,
-                )
-                .expect("relative date indexes are exhaustive"),
-                _ => RuleOperator::Is,
-            };
-            match &op {
-                RuleOperator::IsInTheLast { .. } | RuleOperator::IsNotInTheLast { .. } => {
-                    // Value is the amount (already embedded in the operator).
-                    (op, RuleValue::Number(val_text.parse::<i64>().unwrap_or(30)))
-                }
-                _ => (op, RuleValue::Date(val_text)),
-            }
-        }
-        FieldType::Rating => {
-            let rule = rating_rule_from_editor(op_dd.selected(), &val_text, &val2_text).ok()?;
-            (rule.operator, rule.value)
-        }
-    };
-
-    Some(SmartRule {
-        field,
-        operator,
-        value,
-    })
+    RuleRowWidgets::find(row)?.rule().ok()
 }
 
 // ── Sort row builder ────────────────────────────────────────────────
@@ -1291,6 +1354,67 @@ fn extract_sort_from_row(row: &gtk::Box) -> Option<SortCriterion> {
     Some(SortCriterion { field, direction })
 }
 
+/// GTK-touching contracts folded into the crate's single consolidated
+/// GTK-initializing test (browser.rs `gtk_widget_contracts_hold_on_one_session`);
+/// see `ui::widget_test_session`. Mirrors the caller's macOS gate so these
+/// helpers are never dead code there.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    use super::*;
+
+    fn rule_row_in_dialog() -> (adw::AlertDialog, gtk::Box, RuleRowWidgets) {
+        let dialog = adw::AlertDialog::new(None, None);
+        dialog.add_response("ok", "OK");
+        let rules_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let row = build_rule_row(None, rules_box.downgrade(), dialog.downgrade());
+        rules_box.append(&row);
+        let widgets = RuleRowWidgets::find(&row).expect("rule row widgets");
+        (dialog, rules_box, widgets)
+    }
+
+    /// Invalid number and date input disables OK and shows why, instead of
+    /// saving a coerced value; fixing it re-enables OK.
+    pub fn number_and_date_rows_gate_ok() {
+        let (dialog, rules_box, widgets) = rule_row_in_dialog();
+
+        widgets.field.set_selected(field_to_index(&RuleField::Year));
+        widgets.value.set_text("199O");
+        assert!(!dialog.is_response_enabled("ok"));
+        assert!(widgets.error.is_visible());
+        assert!(widgets.value.has_css_class("error"));
+        widgets.value.set_text("1990");
+        assert!(dialog.is_response_enabled("ok"));
+        assert!(!widgets.error.is_visible());
+        assert!(!widgets.value.has_css_class("error"));
+
+        widgets.operator.set_selected(4);
+        assert!(WidgetExt::is_visible(&widgets.value2));
+        widgets.value2.set_text("1980");
+        assert!(!dialog.is_response_enabled("ok"), "reversed range");
+        widgets.value2.set_text("1999");
+        assert!(dialog.is_response_enabled("ok"));
+
+        widgets
+            .field
+            .set_selected(field_to_index(&RuleField::DateAdded));
+        assert_eq!(
+            widgets.value.placeholder_text().as_deref(),
+            Some("YYYY-MM-DD")
+        );
+        widgets.value.set_text("01/15/2024");
+        assert!(!dialog.is_response_enabled("ok"));
+        widgets.value.set_text("2024-01-15");
+        assert!(dialog.is_response_enabled("ok"));
+        assert!(refresh_rule_validation(&dialog, &rules_box));
+
+        widgets.operator.set_selected(4);
+        assert_eq!(widgets.value.placeholder_text().as_deref(), Some("value"));
+        assert!(!dialog.is_response_enabled("ok"), "a date is not an amount");
+        widgets.value.set_text("3");
+        assert!(dialog.is_response_enabled("ok"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1302,6 +1426,15 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct RatingRuleCatalog {
         ratings: RatingRuleMessages,
+        smart_playlist: RuleInputMessages,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuleInputMessages {
+        rule_not_integer: String,
+        rule_reversed_range: String,
+        rule_not_positive: String,
+        rule_invalid_date: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1554,7 +1687,142 @@ mod tests {
                     path.display()
                 );
             }
+
+            let messages = catalog.smart_playlist;
+            for (error, expected) in [
+                (RuleInputError::NotAnInteger, messages.rule_not_integer),
+                (RuleInputError::ReversedRange, messages.rule_reversed_range),
+                (RuleInputError::NotPositive, messages.rule_not_positive),
+                (RuleInputError::InvalidDate, messages.rule_invalid_date),
+            ] {
+                assert!(!expected.trim().is_empty(), "{}: {error:?}", path.display());
+                assert_eq!(
+                    error.message(locale.as_ref()),
+                    expected,
+                    "rule validation fell back instead of using {}",
+                    path.display()
+                );
+            }
         }
+    }
+
+    fn editor_rule(
+        field: RuleField,
+        op_index: u32,
+        value: &str,
+        high: &str,
+    ) -> Result<SmartRule, RuleInputError> {
+        rule_from_editor(field, op_index, value, high, DateUnit::Days)
+    }
+
+    #[test]
+    fn number_rules_refuse_text_instead_of_saving_zero() {
+        for (field, raw) in [
+            (RuleField::Year, "199O"),
+            (RuleField::Duration, "3:30"),
+            (RuleField::PlayCount, ""),
+            (RuleField::Bitrate, "320kbps"),
+            (RuleField::FileSize, "1.5"),
+        ] {
+            for op_index in 0..=3 {
+                assert_eq!(
+                    editor_rule(field, op_index, raw, "").unwrap_err(),
+                    RuleInputError::NotAnInteger,
+                    "{field:?} {raw:?}"
+                );
+            }
+        }
+
+        let rule = editor_rule(RuleField::Duration, 2, " 210 ", "").expect("whole seconds");
+        assert!(matches!(rule.operator, RuleOperator::GreaterThan));
+        assert!(matches!(rule.value, RuleValue::Number(210)));
+        let rule = editor_rule(RuleField::Year, 0, "-5", "").expect("negative is a number");
+        assert!(matches!(rule.value, RuleValue::Number(-5)));
+    }
+
+    #[test]
+    fn number_ranges_need_two_whole_numbers_in_order() {
+        assert_eq!(
+            editor_rule(RuleField::Year, 4, "1990", "").unwrap_err(),
+            RuleInputError::NotAnInteger
+        );
+        assert_eq!(
+            editor_rule(RuleField::Year, 4, "", "1999").unwrap_err(),
+            RuleInputError::NotAnInteger
+        );
+        assert_eq!(
+            editor_rule(RuleField::Year, 4, "1999", "1990").unwrap_err(),
+            RuleInputError::ReversedRange
+        );
+
+        let rule = editor_rule(RuleField::Year, 4, "1990", "1999").expect("ordered range");
+        assert!(matches!(rule.operator, RuleOperator::InRange));
+        assert!(matches!(rule.value, RuleValue::NumberRange(1990, 1999)));
+        let single = editor_rule(RuleField::Year, 4, "1990", "1990").expect("one-value range");
+        assert!(matches!(single.value, RuleValue::NumberRange(1990, 1990)));
+        assert!(is_range_operator(&RuleField::Year, 4));
+        assert!(!is_range_operator(&RuleField::Year, 2));
+    }
+
+    #[test]
+    fn relative_date_amounts_refuse_anything_but_a_positive_whole_number() {
+        for raw in ["", "0", "-3", "two", "1.5", "99999999999"] {
+            for op_index in [4, 5] {
+                assert_eq!(
+                    editor_rule(RuleField::DateAdded, op_index, raw, "").unwrap_err(),
+                    RuleInputError::NotPositive,
+                    "{raw:?}"
+                );
+            }
+        }
+
+        let rule = rule_from_editor(RuleField::LastPlayed, 4, " 14 ", "", DateUnit::Weeks)
+            .expect("positive amount");
+        assert!(matches!(
+            rule.operator,
+            RuleOperator::IsInTheLast {
+                amount: 14,
+                unit: DateUnit::Weeks
+            }
+        ));
+        assert!(matches!(rule.value, RuleValue::Number(14)));
+    }
+
+    #[test]
+    fn absolute_dates_must_be_year_month_day_and_are_saved_canonically() {
+        for raw in ["", "01/15/2024", "15.01.2024", "2024-02-30", "last tuesday"] {
+            for op_index in 0..=3 {
+                assert_eq!(
+                    editor_rule(RuleField::DateAdded, op_index, raw, "").unwrap_err(),
+                    RuleInputError::InvalidDate,
+                    "{raw:?}"
+                );
+            }
+        }
+
+        for (op_index, expected) in [
+            (0, RuleOperator::Is),
+            (1, RuleOperator::IsNot),
+            (2, RuleOperator::IsBefore),
+            (3, RuleOperator::IsAfter),
+        ] {
+            let rule = editor_rule(RuleField::DateModified, op_index, " 2024-01-15 ", "")
+                .expect("ISO calendar date");
+            assert_eq!(
+                std::mem::discriminant(&rule.operator),
+                std::mem::discriminant(&expected)
+            );
+            assert!(matches!(&rule.value, RuleValue::Date(day) if day == "2024-01-15"));
+        }
+        assert_eq!(value_placeholder(&RuleField::DateAdded, 0), "YYYY-MM-DD");
+        assert_eq!(value_placeholder(&RuleField::DateAdded, 4), "value");
+    }
+
+    #[test]
+    fn text_rules_keep_their_value_verbatim() {
+        let rule = editor_rule(RuleField::Genre, 2, " Rock ", "").expect("text is never refused");
+        assert!(matches!(rule.operator, RuleOperator::Contains));
+        assert!(matches!(&rule.value, RuleValue::Text(text) if text == " Rock "));
     }
 
     #[test]

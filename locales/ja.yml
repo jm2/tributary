@@ -20,6 +20,7 @@ header:
   main_menu: "メインメニュー"
   playback_position: "再生位置"
   volume: "音量"
+  rescan_library: "ライブラリを再スキャン"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "アルバム"
   folder: "フォルダー"
   all: "すべて"
+  folder_root_unavailable: "%{name}（利用不可）"
+  folder_unavailable_notice: "このフォルダーは現在利用できません"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -115,6 +118,13 @@ preferences:
   browser_views: "ブラウザー表示"
   visible_columns: "表示する列"
   reset_to_defaults: "デフォルトに戻す"
+  privacy: "プライバシー"
+  location_title: "近くの局のための位置情報"
+  location_subtitle: "ipapi.co、ipwho.is、または freeipapi.com を使って、IP アドレスからおおよその位置を調べます。"
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "%{file} を読み込めなかったため、既定の設定を使用しています。読み込めなかったファイルは %{copy} として保存されています。"
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -130,6 +140,9 @@ dialogs:
   enter_password: "共有パスワードを入力してください（なければ空欄）"
   username: "ユーザー名"
   password: "パスワード"
+  missing_server_url: "有効なサーバーアドレスを入力してください（例: https://music.example.com）。"
+  missing_username: "ユーザー名を入力してください。"
+  missing_password: "パスワードを入力してください。"
   new_playlist_heading: "新しいプレイリスト"
   playlist_name: "プレイリスト名"
   rename_playlist_heading: "プレイリストの名前を変更"
@@ -154,6 +167,8 @@ dialogs:
   output_exclusive_control_confirmation: "Tributary がこの MPD 再生パーティションを排他的に制御することを確認します。"
   output_detection_warning: "監視を有効にすると、Tributary は再生中もパーティションを監視し続けます。外部の現在の曲、オプションの変更、または監視の途切れが検知されると、再生操作の権限を取り消し、孤立したキューエントリを保持します。監視は取り消しのみを行い、権限を付与することはありません。そのような証拠が検知された後は、再度選択して確認するまで、この出力はコマンドを拒否します。"
   output_detection_confirmation: "この排他出力を監視し、他のコントローラーの兆候を検知した場合にその制御を取り消します。"
+  output_probe_failed: "%{host}:%{port} の MPD に接続できませんでした。出力は追加されていません。"
+  output_save_failed: "出力「%{name}」を保存できませんでした。"
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -250,6 +265,12 @@ properties:
   save_conflict_all: "プロパティを開いてから %{total} 件中 %{conflicts} 件のファイルがディスク上で変更されました。競合したファイルはそのまま保持されています。現在のファイルを編集するには、プロパティを開き直してください。"
   save_conflict_mixed: "%{total} 件中 %{conflicts} 件のファイルがディスク上で変更され、残り %{other} 件のファイルを保存できませんでした。すべて変更されずに残っています。変更されたファイルについてはプロパティを開き直してください。"
   save_failure: "%{total} 件中 %{failed} 件のファイルを保存できず、変更されずに残っています。"
+  refused_heading: "プロパティを開けませんでした"
+  refused_unavailable: "プロパティを開く前に、選択したファイルが変更されたか利用できなくなりました。変更は行われませんでした。"
+  refused_selection_changed: "プロパティを開く前に選択範囲が変更されました。変更は行われませんでした。編集するにはトラックを選択し直してください。"
+  mixed_cleared: "すべてのトラックで消去されます"
+  musicbrainz_applied: "MusicBrainz のリリース「%{release}」から入力しました。保存する前に各項目を確認してください。"
+  musicbrainz_title_only: "アルバムに一致する MusicBrainz のリリースがなかったため、タイトルとアーティストのみ入力しました。"
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -261,6 +282,10 @@ smart_playlist:
   add_rule: "ルールを追加"
   remove_rule: "ルールを削除"
   limit_to: "制限"
+  rule_not_integer: "整数を入力してください。"
+  rule_reversed_range: "最初の値は2番目の値以下にしてください。"
+  rule_not_positive: "1以上の整数を入力してください。"
+  rule_invalid_date: "日付を YYYY-MM-DD 形式で入力してください（例: 2024-01-15）。"
 
 # ── サーバープレイリスト ──────────────────────────────────────────
 server_playlists:
@@ -327,6 +352,11 @@ errors:
     heading: "ライブラリを利用できません"
     open_failed: "Tributary がライブラリデータベースを開けなかったため、ライブラリとプレイリストを表示できません。詳細はログを確認してください。"
     upgrade_failed: "Tributary がこのバージョン用にライブラリデータベースを更新できなかったため、ライブラリとプレイリストを表示できません。詳細はログを確認してください。"
+    backup_saved: "アップグレード前のライブラリのコピーを %{path} に保存しました。"
+    newer_version: "このライブラリデータベースは新しいバージョンの Tributary で作成されたため、このバージョンでは開けません。新しいバージョンを再インストールするか、Tributary を終了して library.db を %{path} にある以前のコピーに置き換えてください。"
+  open_files:
+    unsupported_location: "この場所は開けません。Tributary で開けるのはこのコンピューター上のファイルだけです。"
+    closing: "Tributary を終了しています。終了してから、もう一度開いてください。"
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

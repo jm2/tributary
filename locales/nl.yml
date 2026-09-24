@@ -20,6 +20,7 @@ header:
   main_menu: "Hoofdmenu"
   playback_position: "Afspeelpositie"
   volume: "Volume"
+  rescan_library: "Bibliotheek opnieuw scannen"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "Album"
   folder: "Map"
   all: "Alles"
+  folder_root_unavailable: "%{name} (niet beschikbaar)"
+  folder_unavailable_notice: "Deze map is momenteel niet beschikbaar"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -115,6 +118,13 @@ preferences:
   browser_views: "Browserweergaven"
   visible_columns: "Zichtbare kolommen"
   reset_to_defaults: "Standaardinstellingen herstellen"
+  privacy: "Privacy"
+  location_title: "Locatie voor Stations in de buurt"
+  location_subtitle: "Bepaal uw geschatte locatie op basis van uw IP-adres via ipapi.co, ipwho.is of freeipapi.com."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "%{file} kon niet worden gelezen, dus de standaardinstellingen worden gebruikt. Het onleesbare bestand is bewaard als %{copy}."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -130,6 +140,9 @@ dialogs:
   enter_password: "Voer het wachtwoord in (laat leeg als er geen is)"
   username: "Gebruikersnaam"
   password: "Wachtwoord"
+  missing_server_url: "Voer een geldig serveradres in, zoals https://music.example.com."
+  missing_username: "Voer een gebruikersnaam in."
+  missing_password: "Voer een wachtwoord in."
   new_playlist_heading: "Nieuwe afspeellijst"
   playlist_name: "Naam afspeellijst"
   rename_playlist_heading: "Afspeellijst hernoemen"
@@ -154,6 +167,8 @@ dialogs:
   output_exclusive_control_confirmation: "Ik bevestig dat Tributary exclusieve controle over deze MPD-afspeelpartitie heeft."
   output_detection_warning: "Met toezicht ingeschakeld blijft Tributary de partitie observeren tijdens het afspelen: een vreemd huidig nummer, een vreemde optiewijziging of een verloren observatievenster trekt de afspeelcontrole in en behoudt elk wees-wachtrij-item. Toezicht kan alleen intrekken, nooit verlenen: na zulke aanwijzingen weigert de uitgang opdrachten totdat je hem opnieuw selecteert om opnieuw te bevestigen."
   output_detection_confirmation: "Houd deze exclusieve uitgang in de gaten en trek de controle in bij aanwijzingen van een andere controller."
+  output_probe_failed: "MPD op %{host}:%{port} is niet bereikbaar. De uitvoer is niet toegevoegd."
+  output_save_failed: "De uitvoer ‘%{name}’ kon niet worden opgeslagen."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -250,6 +265,12 @@ properties:
   save_conflict_all: "%{conflicts} van %{total} bestand(en) zijn op schijf gewijzigd sinds Eigenschappen werd geopend. De concurrerende bestanden zijn onaangeroerd gelaten — open Eigenschappen opnieuw om de huidige bestanden te bewerken."
   save_conflict_mixed: "%{conflicts} van %{total} bestand(en) zijn op schijf gewijzigd en %{other} ander(e) bestand(en) konden niet worden opgeslagen; alle zijn ongewijzigd gelaten. Open Eigenschappen opnieuw voor de gewijzigde bestanden."
   save_failure: "%{failed} van %{total} bestand(en) konden niet worden opgeslagen en zijn ongewijzigd gelaten."
+  refused_heading: "Eigenschappen kon niet worden geopend"
+  refused_unavailable: "Een geselecteerd bestand is gewijzigd of niet meer beschikbaar voordat Eigenschappen kon worden geopend. Er is niets gewijzigd."
+  refused_selection_changed: "De selectie is gewijzigd voordat Eigenschappen kon worden geopend. Er is niets gewijzigd. Selecteer de nummers opnieuw om ze te bewerken."
+  mixed_cleared: "Wordt bij alle nummers gewist"
+  musicbrainz_applied: "Ingevuld vanuit de MusicBrainz-uitgave ‘%{release}’. Controleer de velden voordat je opslaat."
+  musicbrainz_title_only: "Geen MusicBrainz-uitgave kwam overeen met het album, dus alleen de titel en artiest zijn ingevuld."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -261,6 +282,10 @@ smart_playlist:
   add_rule: "Regel toevoegen"
   remove_rule: "Regel verwijderen"
   limit_to: "Beperken tot"
+  rule_not_integer: "Voer een geheel getal in."
+  rule_reversed_range: "De eerste waarde mag niet groter zijn dan de tweede."
+  rule_not_positive: "Voer een geheel getal van 1 of meer in."
+  rule_invalid_date: "Voer een datum in als YYYY-MM-DD, bijvoorbeeld 2024-01-15."
 
 # ── Serverafspeellijsten ───────────────────────────────────────────
 server_playlists:
@@ -327,6 +352,11 @@ errors:
     heading: "Bibliotheek niet beschikbaar"
     open_failed: "Tributary kon de bibliotheekdatabase niet openen, waardoor uw bibliotheek en afspeellijsten niet kunnen worden weergegeven. Zie het logboek voor details."
     upgrade_failed: "Tributary kon de bibliotheekdatabase niet bijwerken voor deze versie, waardoor uw bibliotheek en afspeellijsten niet kunnen worden weergegeven. Zie het logboek voor details."
+    backup_saved: "Een kopie van uw bibliotheek van vóór de upgrade is opgeslagen in %{path}."
+    newer_version: "Deze bibliotheekdatabase is gemaakt door een nieuwere versie van Tributary en kan niet worden geopend door deze versie. Installeer de nieuwere versie opnieuw, of sluit Tributary af en vervang library.db door een eerdere kopie uit %{path}."
+  open_files:
+    unsupported_location: "Deze locatie kan niet worden geopend. Tributary kan alleen bestanden op deze computer openen."
+    closing: "Tributary wordt afgesloten. Open het opnieuw zodra het is afgesloten."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

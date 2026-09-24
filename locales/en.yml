@@ -20,6 +20,7 @@ header:
   main_menu: "Main Menu"
   playback_position: "Playback position"
   volume: "Volume"
+  rescan_library: "Rescan Library"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "Album"
   folder: "Folder"
   all: "All"
+  folder_root_unavailable: "%{name} (unavailable)"
+  folder_unavailable_notice: "This folder is currently unavailable"
   # Album-pane artwork toggle labels. The browser key set ships in
   # every locale at the `browser:` level; artwork controls live under
   # preferences to match the existing grouping-toggle placement.
@@ -122,6 +125,13 @@ preferences:
   browser_views: "Browser Views"
   visible_columns: "Visible Columns"
   reset_to_defaults: "Reset to Defaults"
+  privacy: "Privacy"
+  location_title: "Location for Stations Near Me"
+  location_subtitle: "Look up your approximate location from your IP address with ipapi.co, ipwho.is, or freeipapi.com."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "Could not read %{file}, so default settings are in use. The unreadable file was kept as %{copy}."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -139,6 +149,9 @@ dialogs:
   enter_password: "Enter the share password (leave blank if none)"
   username: "Username"
   password: "Password"
+  missing_server_url: "Enter a valid server address, such as https://music.example.com."
+  missing_username: "Enter a username."
+  missing_password: "Enter a password."
   # Playlist dialogs
   new_playlist_heading: "New Playlist"
   playlist_name: "Playlist name"
@@ -167,6 +180,8 @@ dialogs:
   output_exclusive_control_confirmation: "I confirm Tributary has exclusive control of this MPD playback partition."
   output_detection_warning: "With supervision enabled, Tributary keeps observing the partition while it plays: a foreign current song, a foreign option change, or a lost observation window revokes playback control and keeps any orphaned queue entry. Supervision can only revoke, never grant: after such evidence the output refuses commands until you re-select it to confirm again."
   output_detection_confirmation: "Supervise this exclusive output and revoke its control on evidence of another controller."
+  output_probe_failed: "Could not reach MPD at %{host}:%{port}. The output was not added."
+  output_save_failed: "Could not save the output “%{name}”."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -291,6 +306,12 @@ properties:
   save_conflict_all: "%{conflicts} of %{total} file(s) changed on disk since Properties opened. The competing files were left untouched — reopen Properties to edit the current files."
   save_conflict_mixed: "%{conflicts} of %{total} file(s) changed on disk and %{other} other file(s) could not be saved; all were left unchanged. Reopen Properties for the changed files."
   save_failure: "%{failed} of %{total} file(s) could not be saved and were left unchanged."
+  refused_heading: "Properties Couldn’t Open"
+  refused_unavailable: "A selected file changed or became unavailable before Properties could open. Nothing was changed."
+  refused_selection_changed: "The selection changed before Properties could open. Nothing was changed. Select the tracks again to edit them."
+  mixed_cleared: "Will be cleared on all tracks"
+  musicbrainz_applied: "Filled in from the MusicBrainz release “%{release}”. Check the fields before saving."
+  musicbrainz_title_only: "No MusicBrainz release matched the album, so only the title and artist were filled in."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -302,6 +323,10 @@ smart_playlist:
   add_rule: "Add rule"
   remove_rule: "Remove rule"
   limit_to: "Limit to"
+  rule_not_integer: "Enter a whole number."
+  rule_reversed_range: "The first value must not exceed the second."
+  rule_not_positive: "Enter a whole number of 1 or more."
+  rule_invalid_date: "Enter a date as YYYY-MM-DD, for example 2024-01-15."
 
 # ── Server playlists ───────────────────────────────────────────────
 server_playlists:
@@ -368,6 +393,11 @@ errors:
     heading: "Library Unavailable"
     open_failed: "Tributary could not open its library database, so your library and playlists cannot be shown. See the log for details."
     upgrade_failed: "Tributary could not upgrade its library database for this version, so your library and playlists cannot be shown. See the log for details."
+    backup_saved: "A copy of your library from before the upgrade was saved to %{path}."
+    newer_version: "This library database was created by a newer version of Tributary, which this version cannot open. Reinstall the newer version, or quit Tributary and replace library.db with an earlier copy from %{path}."
+  open_files:
+    unsupported_location: "Can’t open this location. Tributary can only open files on this computer."
+    closing: "Tributary is closing. Open it again once it has closed."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

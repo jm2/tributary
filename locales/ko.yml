@@ -20,6 +20,7 @@ header:
   main_menu: "메인 메뉴"
   playback_position: "재생 위치"
   volume: "음량"
+  rescan_library: "라이브러리 다시 검색"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "앨범"
   folder: "폴더"
   all: "전체"
+  folder_root_unavailable: "%{name} (사용할 수 없음)"
+  folder_unavailable_notice: "이 폴더는 현재 사용할 수 없습니다"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -115,6 +118,13 @@ preferences:
   browser_views: "브라우저 보기"
   visible_columns: "표시할 열"
   reset_to_defaults: "기본값으로 재설정"
+  privacy: "개인정보"
+  location_title: "내 주변 방송국 위치"
+  location_subtitle: "ipapi.co, ipwho.is 또는 freeipapi.com을 통해 IP 주소로 대략적인 위치를 확인합니다."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "%{file}을(를) 읽을 수 없어 기본 설정을 사용합니다. 읽을 수 없는 파일은 %{copy}(으)로 보관했습니다."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -130,6 +140,9 @@ dialogs:
   enter_password: "공유 비밀번호를 입력하세요 (없으면 비워두세요)"
   username: "사용자 이름"
   password: "비밀번호"
+  missing_server_url: "올바른 서버 주소를 입력하세요(예: https://music.example.com)."
+  missing_username: "사용자 이름을 입력하세요."
+  missing_password: "비밀번호를 입력하세요."
   new_playlist_heading: "새 재생목록"
   playlist_name: "재생목록 이름"
   rename_playlist_heading: "재생목록 이름 변경"
@@ -154,6 +167,8 @@ dialogs:
   output_exclusive_control_confirmation: "Tributary가 이 MPD 재생 파티션을 독점 제어함을 확인합니다."
   output_detection_warning: "감독을 활성화하면 Tributary는 재생 중에도 파티션을 계속 관찰합니다. 외부 현재 곡, 외부 옵션 변경 또는 관찰 공백이 감지되면 재생 제어 권한을 철회하고 고아 큐 항목을 유지합니다. 감독은 철회만 할 수 있으며 부여할 수는 없습니다. 이러한 증거가 감지되면 다시 선택하여 재확인할 때까지 이 출력은 명령을 거부합니다."
   output_detection_confirmation: "이 배타 출력을 감독하고 다른 컨트롤러의 증거가 감지되면 제어를 철회합니다."
+  output_probe_failed: "%{host}:%{port}의 MPD에 연결할 수 없습니다. 출력이 추가되지 않았습니다."
+  output_save_failed: "“%{name}” 출력을 저장할 수 없습니다."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -250,6 +265,12 @@ properties:
   save_conflict_all: "속성 창을 연 뒤 %{total}개 중 %{conflicts}개 파일이 디스크에서 변경되었습니다. 충돌한 파일은 그대로 보존되었습니다. 현재 파일을 편집하려면 속성을 다시 여십시오."
   save_conflict_mixed: "%{total}개 중 %{conflicts}개 파일이 디스크에서 변경되었고 나머지 %{other}개 파일은 저장할 수 없었습니다. 모두 변경되지 않고 남아 있습니다. 변경된 파일은 속성을 다시 여십시오."
   save_failure: "%{total}개 중 %{failed}개 파일을 저장할 수 없었으며 변경되지 않고 남아 있습니다."
+  refused_heading: "속성을 열 수 없음"
+  refused_unavailable: "속성을 열기 전에 선택한 파일이 변경되었거나 사용할 수 없게 되었습니다. 변경된 내용이 없습니다."
+  refused_selection_changed: "속성을 열기 전에 선택 항목이 변경되었습니다. 변경된 내용이 없습니다. 편집하려면 트랙을 다시 선택하세요."
+  mixed_cleared: "모든 트랙에서 지워집니다"
+  musicbrainz_applied: "MusicBrainz 릴리스 “%{release}”에서 채웠습니다. 저장하기 전에 필드를 확인하세요."
+  musicbrainz_title_only: "앨범과 일치하는 MusicBrainz 릴리스가 없어 제목과 아티스트만 채웠습니다."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -261,6 +282,10 @@ smart_playlist:
   add_rule: "규칙 추가"
   remove_rule: "규칙 제거"
   limit_to: "제한"
+  rule_not_integer: "정수를 입력하세요."
+  rule_reversed_range: "첫 번째 값은 두 번째 값보다 클 수 없습니다."
+  rule_not_positive: "1 이상의 정수를 입력하세요."
+  rule_invalid_date: "날짜를 YYYY-MM-DD 형식으로 입력하세요(예: 2024-01-15)."
 
 # ── 서버 재생목록 ──────────────────────────────────────────────────
 server_playlists:
@@ -327,6 +352,11 @@ errors:
     heading: "라이브러리를 사용할 수 없음"
     open_failed: "Tributary가 라이브러리 데이터베이스를 열 수 없어 라이브러리와 재생목록을 표시할 수 없습니다. 자세한 내용은 로그를 확인하세요."
     upgrade_failed: "Tributary가 이 버전에 맞게 라이브러리 데이터베이스를 업그레이드할 수 없어 라이브러리와 재생목록을 표시할 수 없습니다. 자세한 내용은 로그를 확인하세요."
+    backup_saved: "업그레이드 전 라이브러리의 사본을 %{path}에 저장했습니다."
+    newer_version: "이 라이브러리 데이터베이스는 최신 버전의 Tributary에서 만들어져 이 버전에서는 열 수 없습니다. 최신 버전을 다시 설치하거나, Tributary를 종료한 다음 library.db를 %{path}에 있는 이전 사본으로 바꾸세요."
+  open_files:
+    unsupported_location: "이 위치를 열 수 없습니다. Tributary는 이 컴퓨터에 있는 파일만 열 수 있습니다."
+    closing: "Tributary를 종료하는 중입니다. 종료된 후 다시 여세요."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

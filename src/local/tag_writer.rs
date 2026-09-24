@@ -992,6 +992,20 @@ pub fn preflight_tag_write_directory(path: &Path) -> Result<(), TagWritePrefligh
     drop(destination_file);
     destination_result.map_err(|_| TagWritePreflightError::Unavailable)?;
 
+    // Off Unix the commit publishes the staged copy with `std::fs::hard_link`,
+    // which FAT and exFAT volumes do not support. Rehearse it too, so such a
+    // volume reports tag editing unavailable instead of failing every save.
+    #[cfg(not(unix))]
+    {
+        let link = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(staged_sibling_name(path.as_os_str()));
+        std::fs::hard_link(replacement.path(), &link)
+            .map_err(|_| TagWritePreflightError::Unavailable)?;
+        std::fs::remove_file(&link).map_err(|_| TagWritePreflightError::Unavailable)?;
+    }
+
     replacement
         .persist_to(destination.path())
         .map_err(|_| TagWritePreflightError::Unavailable)?;
@@ -1294,29 +1308,6 @@ impl LocalMutationTarget {
     /// The exact native pathname the user selected.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Whether `admitted` names exactly the object this capture snapshotted.
-    ///
-    /// The context menu captures every pending local pathname the moment the
-    /// menu is built and admits the same pathnames again when Properties is
-    /// activated; the two captures are separated by the menu's whole visible
-    /// lifetime, during which a pathname can be replaced. An admission may
-    /// only proceed when it names the exact selected object: identical
-    /// selection evidence — file identity, containing-directory chain, and
-    /// content revision — or, when the selection carried no evidence either
-    /// time, the identical capture-failure category. Any evidence/category
-    /// mismatch, or a difference in any captured field, refuses the admission
-    /// instead of authorizing a write under the selection's metadata.
-    pub(crate) fn admits_same_selection(&self, admitted: &Self) -> bool {
-        match (&self.evidence, &admitted.evidence) {
-            (Some(captured), Some(admitted)) => captured == admitted,
-            // A selection that carried no evidence both times did not change
-            // in any way capture can see; the write path still refuses
-            // without evidence, so no blind write is authorized either way.
-            (None, None) => self.capture_failure == admitted.capture_failure,
-            (None, Some(_)) | (Some(_), None) => false,
-        }
     }
 
     /// Point-in-time write-capability probe for the properties dialog.
@@ -3408,144 +3399,6 @@ mod tests {
         );
     }
 
-    /// Menu-time admission comparison: the context menu captures a pending
-    /// local pathname when the menu is built and admits it again when
-    /// Properties is activated. Only the exact captured object — or an
-    /// equally uncapturable one — may pass.
-    #[test]
-    fn an_admission_of_the_unchanged_object_matches_the_menu_time_capture() {
-        let directory = TestDirectory::new("local-menu-time-unchanged");
-        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
-        let menu_time = LocalMutationTarget::capture(&track);
-        let admitted = LocalMutationTarget::capture(&track);
-
-        assert!(
-            menu_time.admits_same_selection(&admitted),
-            "the unchanged object must pass the menu-time comparison"
-        );
-    }
-
-    #[test]
-    fn a_file_replaced_after_the_menu_time_capture_refuses_admission() {
-        // Same pathname, different object: the lookalike must never be
-        // admitted under the selection's evidence, or a save would
-        // overwrite it with metadata read off the original.
-        let directory = TestDirectory::new("local-menu-time-replaced-file");
-        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
-        let menu_time = LocalMutationTarget::capture(&track);
-
-        // Rename the original aside instead of removing it: a rename keeps
-        // its inode allocated, so the replacement can never alias the
-        // captured identity through filesystem inode reuse (the same
-        // discipline the save-time tests follow).
-        let displaced = directory.path.join("silence-displaced.flac");
-        std::fs::rename(&track, &displaced).expect("move the selected file aside");
-        std::fs::write(&track, b"an impostor at the same pathname")
-            .expect("install the replacement");
-        let admitted = LocalMutationTarget::capture(&track);
-
-        assert!(
-            !menu_time.admits_same_selection(&admitted),
-            "a replaced object must fail the menu-time comparison"
-        );
-    }
-
-    #[test]
-    fn an_in_place_edit_after_the_menu_time_capture_refuses_admission() {
-        // Same pathname, same object, different content: the revision no
-        // longer matches, so the admission must refuse rather than
-        // overwrite the newer content.
-        let directory = TestDirectory::new("local-menu-time-edited-in-place");
-        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
-        let menu_time = LocalMutationTarget::capture(&track);
-
-        // A different length forces a revision difference on every
-        // filesystem, independent of timestamp granularity.
-        let mut edited = silence_fixture_bytes().to_vec();
-        edited.extend_from_slice(b" plus an in-place edit");
-        std::fs::write(&track, &edited).expect("rewrite the file in place");
-        let admitted = LocalMutationTarget::capture(&track);
-
-        assert!(
-            !menu_time.admits_same_selection(&admitted),
-            "an in-place edit must fail the menu-time comparison"
-        );
-    }
-
-    #[test]
-    fn a_replaced_containing_directory_after_the_menu_time_capture_refuses_admission() {
-        // The file object and content can be recreated faithfully, but a
-        // replaced containing directory is still a different parent: the
-        // captured parent identity must refuse the lookalike's admission.
-        let directory = TestDirectory::new("local-menu-time-replaced-parent");
-        let real = directory.path.join("real-music");
-        std::fs::create_dir(&real).expect("create the containing directory");
-        let track = real.join("silence.flac");
-        std::fs::write(&track, silence_fixture_bytes()).expect("write the fixture");
-        let menu_time = LocalMutationTarget::capture(&track);
-
-        let displaced = directory.path.join("real-music-displaced");
-        std::fs::rename(&real, &displaced).expect("move the containing directory aside");
-        std::fs::create_dir(&real).expect("install a replacement directory");
-        std::fs::write(&track, silence_fixture_bytes()).expect("install the lookalike");
-        let admitted = LocalMutationTarget::capture(&track);
-
-        assert!(
-            !menu_time.admits_same_selection(&admitted),
-            "a replaced containing directory must fail the menu-time comparison"
-        );
-    }
-
-    #[test]
-    fn a_missing_selection_captured_twice_with_the_same_failure_still_admits() {
-        // A selection that carried no evidence both times did not change in
-        // any way capture can see: the same failure category holds the
-        // comparison, and the write path refuses without evidence anyway.
-        let directory = TestDirectory::new("local-menu-time-missing-twice");
-        let missing = directory.path.join("never-there.flac");
-        let menu_time = LocalMutationTarget::capture(&missing);
-        let admitted = LocalMutationTarget::capture(&missing);
-
-        assert!(
-            menu_time.admits_same_selection(&admitted),
-            "the same missing selection must pass the menu-time comparison"
-        );
-    }
-
-    #[test]
-    fn a_selection_that_lost_its_evidence_between_captures_refuses_admission() {
-        // Evidence at menu time but none at admission means the object the
-        // user saw is gone: the mismatch refuses instead of admitting an
-        // unproven pathname under the selection's metadata.
-        let directory = TestDirectory::new("local-menu-time-evidence-lost");
-        let track = directory.audio_file("silence.flac", silence_fixture_bytes());
-        let menu_time = LocalMutationTarget::capture(&track);
-        std::fs::remove_file(&track).expect("remove the selected file");
-        let admitted = LocalMutationTarget::capture(&track);
-
-        assert!(
-            !menu_time.admits_same_selection(&admitted),
-            "a selection that lost its evidence must fail the menu-time comparison"
-        );
-    }
-
-    #[test]
-    fn a_selection_that_gained_evidence_between_captures_refuses_admission() {
-        // The mirror case: no evidence at menu time but evidence at
-        // admission means something appeared at the pathname — an object
-        // the menu never anchored, which must refuse.
-        let directory = TestDirectory::new("local-menu-time-evidence-gained");
-        let track = directory.path.join("appeared.flac");
-        let menu_time = LocalMutationTarget::capture(&track);
-        std::fs::write(&track, silence_fixture_bytes()).expect("create the late object");
-        let admitted = LocalMutationTarget::capture(&track);
-
-        assert!(
-            !menu_time.admits_same_selection(&admitted),
-            "a selection that gained evidence must fail the menu-time comparison"
-        );
-    }
-
     /// A selection named by a path that does not exist is an availability
     /// problem, not a changed-on-disk conflict: there is no prior selection
     /// state to conflict with.
@@ -4747,53 +4600,15 @@ mod tests {
         *stolen.lock().unwrap() = Some(stolen_leaf);
     }
 
-    /// A `tracing` layer capturing the message of every ERROR-level event
-    /// emitted under it, so a regression can require the loud signal the
-    /// contested-cleanup refusal must carry.
-    #[cfg(unix)]
-    struct ErrorEventSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    #[cfg(unix)]
-    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ErrorEventSink {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().level() != &tracing::Level::ERROR {
-                return;
-            }
-            event.record(&mut MessageVisitor(std::sync::Arc::clone(&self.0)));
-        }
-    }
-
-    /// A `tracing` field visitor extracting the `message` field of an
-    /// ERROR-level event into the sink.
-    #[cfg(unix)]
-    struct MessageVisitor(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    #[cfg(unix)]
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                self.0.lock().unwrap().push(format!("{value:?}"));
-            }
-        }
-    }
-
     /// Run `body` capturing the message of every ERROR-level tracing event
     /// it emits on this thread.
     #[cfg(unix)]
     fn capture_error_events(body: impl FnOnce()) -> Vec<String> {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(ErrorEventSink(std::sync::Arc::clone(&sink)));
-        // The default dispatcher is scoped to `body`; it is restored before
-        // this returns.
-        tracing::subscriber::with_default(subscriber, body);
-        let captured = sink.lock().unwrap().clone();
-        captured
+        crate::test_log_capture::capture_events(body)
+            .into_iter()
+            .filter(|event| event.level == tracing::Level::ERROR)
+            .filter_map(|event| event.message().map(str::to_owned))
+            .collect()
     }
 
     /// Drive the contested rehearsal under the armed verify→unlink window:

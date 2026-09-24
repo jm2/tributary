@@ -1449,7 +1449,7 @@ if ($Test) {
 
 if ($Run) {
     Write-Info "Building Tributary (release) for $RustTarget..."
-    cargo build --release --target $RustTarget
+    cargo build --release --locked --target $RustTarget
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed." }
     $runExePath = "target\$RustTarget\release\tributary.exe"
     if (-not (Test-Path $runExePath)) { Write-Err "Binary not found at $runExePath" }
@@ -1574,7 +1574,7 @@ Write-Info "All dependency checks passed."
 # ── Rust Build ───────────────────────────────────────────────────────────────
 if (-not $NoCargoBuild) {
     Write-Info "Building Tributary (release) for $RustTarget..."
-    cargo build --release --target $RustTarget
+    cargo build --release --locked --target $RustTarget
     if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed." }
 }
 else {

@@ -20,6 +20,7 @@ header:
   main_menu: "Menu principal"
   playback_position: "Position de lecture"
   volume: "Volume"
+  rescan_library: "Réanalyser la bibliothèque"
 
 # ── Sidebar ────────────────────────────────────────────────────────
 sidebar:
@@ -50,6 +51,8 @@ browser:
   album: "Album"
   folder: "Dossier"
   all: "Tous"
+  folder_root_unavailable: "%{name} (indisponible)"
+  folder_unavailable_notice: "Ce dossier est actuellement indisponible"
 
 # ── Tracklist columns ──────────────────────────────────────────────
 columns:
@@ -115,6 +118,13 @@ preferences:
   browser_views: "Volets du navigateur"
   visible_columns: "Colonnes visibles"
   reset_to_defaults: "Réinitialiser par défaut"
+  privacy: "Confidentialité"
+  location_title: "Localisation pour Stations à proximité"
+  location_subtitle: "Déterminer votre position approximative à partir de votre adresse IP via ipapi.co, ipwho.is ou freeipapi.com."
+
+# ── Settings files ─────────────────────────────────────────────────
+settings:
+  file_set_aside: "Impossible de lire %{file} : les paramètres par défaut sont utilisés. Le fichier illisible a été conservé sous le nom %{copy}."
 
 # ── Dialogs ────────────────────────────────────────────────────────
 dialogs:
@@ -130,6 +140,9 @@ dialogs:
   enter_password: "Saisissez le mot de passe du partage (laissez vide si aucun)"
   username: "Nom d'utilisateur"
   password: "Mot de passe"
+  missing_server_url: "Saisissez une adresse de serveur valide, par exemple https://music.example.com."
+  missing_username: "Saisissez un nom d’utilisateur."
+  missing_password: "Saisissez un mot de passe."
   new_playlist_heading: "Nouvelle liste de lecture"
   playlist_name: "Nom de la liste"
   rename_playlist_heading: "Renommer la liste de lecture"
@@ -154,6 +167,8 @@ dialogs:
   output_exclusive_control_confirmation: "Je confirme que Tributary contrôle exclusivement cette partition de lecture MPD."
   output_detection_warning: "Avec la supervision activée, Tributary continue d'observer la partition pendant la lecture : une chanson actuelle étrangère, un changement d'option étranger ou une fenêtre d'observation perdue révoque le contrôle de la lecture et conserve toute entrée de file orpheline. La supervision ne peut que révoquer, jamais accorder : après de telles preuves, la sortie refuse les commandes jusqu'à ce que vous la resélectionniez pour la confirmer à nouveau."
   output_detection_confirmation: "Superviser cette sortie exclusive et révoquer son contrôle en cas de preuve d'un autre contrôleur."
+  output_probe_failed: "Impossible de joindre MPD à l'adresse %{host}:%{port}. La sortie n'a pas été ajoutée."
+  output_save_failed: "Impossible d'enregistrer la sortie « %{name} »."
 
 # ── Playlist import and export ─────────────────────────────────────
 playlist_io:
@@ -250,6 +265,12 @@ properties:
   save_conflict_all: "%{conflicts} fichier(s) sur %{total} ont changé sur le disque depuis l’ouverture des Propriétés. Les fichiers concurrents ont été laissés intacts — rouvrez les Propriétés pour modifier les fichiers actuels."
   save_conflict_mixed: "%{conflicts} fichier(s) sur %{total} ont changé sur le disque et %{other} autre(s) fichier(s) n’ont pas pu être enregistrés ; tous ont été laissés inchangés. Rouvrez les Propriétés pour les fichiers modifiés."
   save_failure: "%{failed} fichier(s) sur %{total} n’ont pas pu être enregistrés et ont été laissés inchangés."
+  refused_heading: "Impossible d’ouvrir les Propriétés"
+  refused_unavailable: "Un fichier sélectionné a changé ou est devenu indisponible avant l’ouverture des Propriétés. Aucune modification n’a été effectuée."
+  refused_selection_changed: "La sélection a changé avant l’ouverture des Propriétés. Aucune modification n’a été effectuée. Sélectionnez de nouveau les pistes pour les modifier."
+  mixed_cleared: "Sera effacé sur toutes les pistes"
+  musicbrainz_applied: "Rempli à partir de la parution MusicBrainz « %{release} ». Vérifiez les champs avant d’enregistrer."
+  musicbrainz_title_only: "Aucune parution MusicBrainz ne correspond à l’album : seuls le titre et l’artiste ont été remplis."
 
 # ── Smart playlist editor ──────────────────────────────────────────
 smart_playlist:
@@ -261,6 +282,10 @@ smart_playlist:
   add_rule: "Ajouter une règle"
   remove_rule: "Supprimer la règle"
   limit_to: "Limiter à"
+  rule_not_integer: "Saisissez un nombre entier."
+  rule_reversed_range: "La première valeur ne doit pas dépasser la seconde."
+  rule_not_positive: "Saisissez un nombre entier supérieur ou égal à 1."
+  rule_invalid_date: "Saisissez une date au format YYYY-MM-DD, par exemple 2024-01-15."
 
 # ── Listes du serveur ──────────────────────────────────────────────
 server_playlists:
@@ -327,6 +352,11 @@ errors:
     heading: "Bibliothèque indisponible"
     open_failed: "Tributary n’a pas pu ouvrir la base de données de la bibliothèque ; votre bibliothèque et vos listes de lecture ne peuvent donc pas être affichées. Consultez le journal pour plus de détails."
     upgrade_failed: "Tributary n’a pas pu mettre à niveau la base de données de la bibliothèque pour cette version ; votre bibliothèque et vos listes de lecture ne peuvent donc pas être affichées. Consultez le journal pour plus de détails."
+    backup_saved: "Une copie de votre bibliothèque antérieure à la mise à niveau a été enregistrée dans %{path}."
+    newer_version: "Cette base de données de la bibliothèque a été créée par une version plus récente de Tributary, que cette version ne peut pas ouvrir. Réinstallez la version plus récente, ou quittez Tributary et remplacez library.db par une copie antérieure provenant de %{path}."
+  open_files:
+    unsupported_location: "Impossible d’ouvrir cet emplacement. Tributary ne peut ouvrir que des fichiers présents sur cet ordinateur."
+    closing: "Tributary est en cours de fermeture. Rouvrez-le une fois qu’il sera fermé."
 
 # ── About dialog ───────────────────────────────────────────────────
 about:

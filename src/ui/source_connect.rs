@@ -22,7 +22,7 @@ use super::playback::refresh_projected_library_uris;
 use super::playlist_projection::{project_playlist_rows, PlaylistRowContent, PlaylistRowSpec};
 use super::preferences;
 use super::radio::{apply_radio_columns, handle_radio_nearme, is_radio_backend, radio_view_origin};
-use super::server_dialogs::{show_auth_dialog, validate_remote_server_url};
+use super::server_dialogs::{show_auth_dialog, validate_remote_server_url, CredentialPolicy};
 use super::source_navigation::{
     CompletionDisposition, ConnectionIntentKind, PendingConnection, SourceNavigation, SourceRequest,
 };
@@ -1139,7 +1139,7 @@ pub fn setup_source_connect(state: &WindowState) {
             return;
         }
 
-        let password_only = backend_type == "daap";
+        let credential_policy = CredentialPolicy::for_backend(&backend_type);
 
         // Set the pending-connection guard *before* the auth dialog is
         // shown so a second sidebar click while the dialog is open is
@@ -1194,7 +1194,7 @@ pub fn setup_source_connect(state: &WindowState) {
             &win,
             &server_name,
             &server_url,
-            password_only,
+            credential_policy,
             move |user, pass| {
                 let server_url = url_for_closure.clone();
                 let server_name = name_for_closure.clone();

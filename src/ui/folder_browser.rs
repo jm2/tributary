@@ -17,28 +17,26 @@
 //! * **Lazy navigation.** Nothing is walked up front. Descending into a
 //!   directory derives only that level's subdirectories (from the indexed
 //!   track paths) at the moment it is asked for.
-//! * **Unavailable / renamed roots.** A root whose path is missing or unreadable
-//!   is listed as unavailable; a root whose recorded identity no longer matches
-//!   its path is listed as renamed. Both remain visible (with the reason) but
-//!   refuse navigation instead of silently disappearing or appearing empty.
+//! * **Unavailable roots.** Availability is the library engine's verdict — a
+//!   root that is missing, unmounted, replaced or not yet trusted backs no
+//!   playable tracks. Such a root stays listed but refuses navigation instead
+//!   of silently disappearing or appearing empty. The model never touches the
+//!   filesystem itself.
 //! * **Explicit omission policy.** Tracks from pathless sources (radio,
 //!   remotes without filesystem semantics) and local paths outside every
 //!   configured root are NOT shown; every omission is reported back so the
 //!   policy is a decision, never an accident.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Availability of one configured library root as folder browsing sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootAvailability {
-    /// The path exists and is a readable directory.
+    /// The engine established the root and its tracks are playable.
     Available,
-    /// The configured path does not exist or is not a directory.
-    Unavailable { reason: String },
-    /// The path exists, but the recorded root identity no longer matches it —
-    /// the directory was likely renamed or replaced after the library scan.
-    Renamed { previous_path: String },
+    /// The engine could not establish the root (or has not yet).
+    Unavailable,
 }
 
 /// One configured library root as folder browsing sees it.
@@ -50,52 +48,19 @@ pub struct BrowsableRoot {
     pub display_name: String,
     /// Absolute configured root path.
     pub root_path: PathBuf,
-    /// Availability observed at construction time.
+    /// The engine's latest verdict on this root.
     pub availability: RootAvailability,
 }
 
 impl BrowsableRoot {
-    /// Inspect one configured root path.
-    ///
-    /// `recorded_path` is the path the library scan last confirmed for this
-    /// root's identity, when one exists: if the configured path now names a
-    /// different directory than the recorded one, the root is reported as
-    /// [`RootAvailability::Renamed`] rather than silently browsed.
-    pub fn from_configured(path_text: &str, recorded_path: Option<&str>) -> Self {
+    /// One configured root path with the availability the engine reported
+    /// for it.
+    pub fn new(path_text: &str, availability: RootAvailability) -> Self {
         let root_path = PathBuf::from(path_text);
         let display_name = root_path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path_text.to_string());
-        let availability = match std::fs::metadata(&root_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                RootAvailability::Unavailable {
-                    reason: "folder is missing".to_string(),
-                }
-            }
-            Err(error) => RootAvailability::Unavailable {
-                reason: format!("folder is not readable: {error}"),
-            },
-            Ok(metadata) if !metadata.is_dir() => RootAvailability::Unavailable {
-                reason: "configured path is not a folder".to_string(),
-            },
-            Ok(_) => {
-                // The path exists. A recorded identity that points somewhere
-                // else means this path is (likely) a renamed or replaced
-                // library folder.
-                if let Some(recorded) = recorded_path {
-                    if recorded != path_text && Path::new(recorded).exists() {
-                        RootAvailability::Renamed {
-                            previous_path: recorded.to_string(),
-                        }
-                    } else {
-                        RootAvailability::Available
-                    }
-                } else {
-                    RootAvailability::Available
-                }
-            }
-        };
         Self {
             root_id: path_text.to_string(),
             display_name,
@@ -107,17 +72,6 @@ impl BrowsableRoot {
     /// Whether navigation into this root may proceed.
     pub fn browsable(&self) -> bool {
         self.availability == RootAvailability::Available
-    }
-
-    /// Suffix describing a non-available root, for display next to its name.
-    pub fn availability_suffix(&self) -> Option<String> {
-        match &self.availability {
-            RootAvailability::Available => None,
-            RootAvailability::Unavailable { reason } => Some(format!(" (unavailable: {reason})")),
-            RootAvailability::Renamed { previous_path } => {
-                Some(format!(" (renamed from {previous_path})"))
-            }
-        }
     }
 }
 
@@ -226,10 +180,9 @@ pub struct FolderChild {
 }
 
 /// Why navigation into a root cannot proceed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootBrowseError {
-    Unavailable { reason: String },
-    Renamed { previous_path: String },
+    Unavailable,
     UnknownRoot,
 }
 
@@ -294,18 +247,8 @@ impl FolderBrowser {
             .iter()
             .find(|root| root.root_id == root_id)
             .ok_or(RootBrowseError::UnknownRoot)?;
-        match &root.availability {
-            RootAvailability::Unavailable { reason } => {
-                return Err(RootBrowseError::Unavailable {
-                    reason: reason.clone(),
-                });
-            }
-            RootAvailability::Renamed { previous_path } => {
-                return Err(RootBrowseError::Renamed {
-                    previous_path: previous_path.clone(),
-                });
-            }
-            RootAvailability::Available => {}
+        if !root.browsable() {
+            return Err(RootBrowseError::Unavailable);
         }
         let normalized = normalize_dir(dir);
         let dir_path = portable_dir_path(&normalized);
@@ -357,6 +300,22 @@ impl FolderBrowser {
             .collect();
         children.sort_by_key(|child| child.name.to_lowercase());
         Ok(children)
+    }
+
+    /// Whether `dir` (portable, root-relative) still holds any placed track
+    /// under `root_id`. The root itself (`""`) always exists.
+    pub fn has_directory(&self, root_id: &str, dir: &str) -> bool {
+        let dir_path = portable_dir_path(&normalize_dir(dir));
+        if dir_path.as_os_str().is_empty() {
+            return true;
+        }
+        self.by_root.get(root_id).is_some_and(|paths| {
+            paths.iter().any(|relative| {
+                relative
+                    .strip_prefix(&dir_path)
+                    .is_ok_and(|rest| !rest.as_os_str().is_empty())
+            })
+        })
     }
 }
 
@@ -434,6 +393,7 @@ pub fn join_native(root: &str, dir: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn available_root(path_text: &str) -> BrowsableRoot {
         BrowsableRoot {
@@ -771,48 +731,28 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_and_renamed_roots_refuse_navigation_but_stay_listed() {
-        let mut roots = vec![available_root("/music")];
-        roots.push(BrowsableRoot {
-            root_id: "/mnt/gone".to_string(),
-            display_name: "gone".to_string(),
-            root_path: PathBuf::from("/mnt/gone"),
-            availability: RootAvailability::Unavailable {
-                reason: "folder is missing".to_string(),
-            },
-        });
-        roots.push(BrowsableRoot {
-            root_id: "/mnt/moved-old".to_string(),
-            display_name: "moved".to_string(),
-            root_path: PathBuf::from("/mnt/moved-old"),
-            availability: RootAvailability::Renamed {
-                previous_path: "/mnt/moved-old".to_string(),
-            },
-        });
-        let tracks = vec![input("local", "/music/x/1.flac")];
+    fn unavailable_roots_refuse_navigation_but_stay_listed() {
+        let roots = vec![
+            available_root("/music"),
+            BrowsableRoot::new("/mnt/gone", RootAvailability::Unavailable),
+        ];
+        let tracks = vec![
+            input("local", "/music/x/1.flac"),
+            input("local", "/mnt/gone/y/2.flac"),
+        ];
         let (placed, _) = place_tracks(&roots, &tracks);
         let browser = FolderBrowser::new(roots, placed.clone());
 
-        // All three roots stay listed.
-        assert_eq!(browser.roots().len(), 3);
-        assert_eq!(
-            browser.roots()[1].availability_suffix().as_deref(),
-            Some(" (unavailable: folder is missing)")
-        );
+        // Both roots stay listed.
+        assert_eq!(browser.roots().len(), 2);
+        assert_eq!(browser.roots()[1].display_name, "gone");
+        assert!(!browser.roots()[1].browsable());
 
-        // Navigation into them is refused with the recorded reason, even
-        // though placement would have put tracks under a matching prefix.
+        // Navigation into the unavailable root is refused even though its
+        // tracks are still in the catalogue.
         assert_eq!(
             browser.children("/mnt/gone", ""),
-            Err(RootBrowseError::Unavailable {
-                reason: "folder is missing".to_string(),
-            })
-        );
-        assert_eq!(
-            browser.children("/mnt/moved-old", ""),
-            Err(RootBrowseError::Renamed {
-                previous_path: "/mnt/moved-old".to_string(),
-            })
+            Err(RootBrowseError::Unavailable)
         );
         assert_eq!(
             browser.children("/does-not-exist", ""),
@@ -820,8 +760,26 @@ mod tests {
         );
 
         // Unavailable roots never capture placement.
-        assert_eq!(placed.clone().len(), 1);
+        assert_eq!(placed.len(), 1);
         assert_eq!(placed[0].root_id, "/music");
+    }
+
+    #[test]
+    fn has_directory_tracks_folders_that_still_hold_tracks() {
+        let roots = vec![available_root("/music")];
+        let tracks = vec![
+            input("local", "/music/rock/a/1.flac"),
+            input("local", "/music/jazz.flac"),
+        ];
+        let (placed, _) = place_tracks(&roots, &tracks);
+        let browser = FolderBrowser::new(roots, placed);
+
+        assert!(browser.has_directory("/music", ""));
+        assert!(browser.has_directory("/music", "rock"));
+        assert!(browser.has_directory("/music", "rock/a"));
+        assert!(!browser.has_directory("/music", "rock/b"));
+        assert!(!browser.has_directory("/music", "rock/a/1.flac"));
+        assert!(!browser.has_directory("/elsewhere", "rock"));
     }
 
     #[test]
@@ -845,6 +803,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_fixtures {
     use super::*;
+    use std::path::Path;
 
     fn windows_root(path_text: &str) -> BrowsableRoot {
         BrowsableRoot {

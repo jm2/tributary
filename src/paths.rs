@@ -33,3 +33,15 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
     }
     dirs::data_dir()
 }
+
+/// Resolve the user cache root (`<cache_dir>`).
+///
+/// In test builds a non-empty [`TEST_USER_STATE_DIR_ENV`] redirects it to a
+/// `cache` folder inside that sandbox, as it does for [`data_dir`].
+pub fn cache_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = std::env::var_os(TEST_USER_STATE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return Some(std::path::PathBuf::from(dir).join("cache"));
+    }
+    dirs::cache_dir()
+}

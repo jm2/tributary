@@ -10,6 +10,8 @@ const RUST_TOOLCHAIN_MANIFEST: &str = include_str!("../.github/rust-toolchain.to
 const DEPENDABOT_CONFIG: &str = include_str!("../.github/dependabot.yml");
 const DEPENDABOT_AUTOMERGE: &str = include_str!("../.github/workflows/dependabot-automerge.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
+const FUZZ_WORKFLOW: &str = include_str!("../.github/workflows/fuzz.yml");
+const PACKIT_CONFIG: &str = include_str!("../.packit.yaml");
 const REFINERY_CONFIG: &str = include_str!("../docs/refinery-config.md");
 const COVERAGE_BASELINE: &str = include_str!("../coverage-baseline.txt");
 const README: &str = include_str!("../README.md");
@@ -24,7 +26,32 @@ const MACOS_AUDIO: &str = include_str!("../src/audio/macos_audio.rs");
 const MACOS_AUDIO_NATIVE: &str = include_str!("../src/audio/macos_audio_native.rs");
 const MACOS_AUDIO_TESTS: &str = include_str!("../src/audio/macos_audio_tests.rs");
 const PLATFORM_RUNTIME: &str = include_str!("../src/platform_runtime.rs");
-const RUST_TOOLCHAIN_ACTION_SHA: &str = "6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
+/// The immutable `dtolnay/rust-toolchain` commit the release-pinned CI jobs
+/// use (`@<sha> # master`). Read from the workflow, where Dependabot updates
+/// it, and required to be one full commit SHA shared by every pinned use.
+fn rust_toolchain_action_sha() -> &'static str {
+    let prefix = "uses: dtolnay/rust-toolchain@";
+    let pins: Vec<&str> = CI_WORKFLOW
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(prefix))
+        .filter_map(|rest| rest.strip_suffix(" # master"))
+        .collect();
+    let sha = *pins
+        .first()
+        .expect("CI pins dtolnay/rust-toolchain to a commit for the declared release");
+    assert!(
+        sha.len() == 40
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "the rust-toolchain action must be pinned to a full commit SHA, got {sha}"
+    );
+    assert!(
+        pins.iter().all(|pin| *pin == sha),
+        "every pinned rust-toolchain use must share one commit: {pins:?}"
+    );
+    sha
+}
 const FLATPAK_BUILDER_ACTION_SHA: &str = "79327416609af08178ad73b352877e51450790b3";
 const FORBIDDEN_BUNDLED_COMPONENTS: &str =
     include_str!("../build-aux/packaging/forbidden-bundled-components.txt");
@@ -212,7 +239,7 @@ fn assert_flatpak_artifact_boundary(
     );
     assert_flatpak_builder_pin(source, job_name, label);
     assert_eq!(
-        job.matches("uses: actions/upload-artifact@v7").count(),
+        job.matches("uses: actions/upload-artifact@").count(),
         1,
         "{label} must upload the Flatpak exactly once"
     );
@@ -1113,6 +1140,11 @@ fn debian_runtime_floors_match_the_enabled_api_levels() {
 
     let gtk_expected = format!("libgtk-4-1 (>= {gtk_floor})");
     let adw_expected = format!("libadwaita-1-0 (>= {adw_floor})");
+    assert_eq!(
+        entries.first(),
+        Some(&"$auto"),
+        "cargo-deb must derive the linked-library floors, glibc included, from the binary"
+    );
     assert_exact_constraint(
         &entries,
         "libgtk-4-1",
@@ -1124,6 +1156,43 @@ fn debian_runtime_floors_match_the_enabled_api_levels() {
         "libadwaita-1-0",
         &adw_expected,
         "Cargo.toml package.metadata.deb.depends",
+    );
+}
+
+#[test]
+fn debian_description_is_short_text_rather_than_the_readme() {
+    let manifest = manifest();
+    let description = manifest["package"]["metadata"]["deb"]["extended-description"]
+        .as_str()
+        .expect(
+            "package.metadata.deb.extended-description must be set, or cargo-deb uses the README",
+        );
+    assert!(
+        !description.trim().is_empty()
+            && description.len() < 400
+            && !description.contains('#')
+            && !description.contains("]("),
+        "the .deb extended description must be a short plain paragraph: {description:?}"
+    );
+}
+
+#[test]
+fn copr_builds_carry_bare_release_versions() {
+    let packit: serde_yaml::Value =
+        serde_yaml::from_str(PACKIT_CONFIG).expect(".packit.yaml must parse");
+    assert_eq!(
+        packit["upstream_tag_template"].as_str(),
+        Some("v{version}"),
+        "Packit must strip the tag's v, or rpmvercmp ranks every COPR build below the release RPM"
+    );
+    let spec_version = RPM_SPEC
+        .lines()
+        .find_map(|line| line.strip_prefix("Version:"))
+        .map(str::trim)
+        .expect("the RPM spec must declare a Version");
+    assert!(
+        spec_version.starts_with(|character: char| character.is_ascii_digit()),
+        "the RPM spec Version must be a bare version, not a tag: {spec_version}"
     );
 }
 
@@ -1242,7 +1311,8 @@ fn ci_compile_proves_the_exact_declared_msrv() {
     assert!(
         toolchain_manifest["toolchain"]["channel"].as_str() == Some(&rust_release)
             && msrv_job.contains(&format!(
-                "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # master"
+                "uses: dtolnay/rust-toolchain@{} # master",
+                rust_toolchain_action_sha()
             ))
             && msrv_job.contains(&format!("toolchain: {rust_release}")),
         "the compiler manifest and CI must install the declared release through one immutable action commit"
@@ -1662,7 +1732,8 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
     );
     assert!(
         coverage_job.contains(&format!(
-            "uses: dtolnay/rust-toolchain@{RUST_TOOLCHAIN_ACTION_SHA} # master"
+            "uses: dtolnay/rust-toolchain@{} # master",
+            rust_toolchain_action_sha()
         )) && coverage_job.contains(&format!("toolchain: {rust_version}.0")),
         "coverage must use the declared Rust release through the immutable action commit"
     );
@@ -1724,7 +1795,10 @@ fn ci_security_audit_runs_only_the_advisory_audit() {
         .collect();
     assert_eq!(
         commands,
-        ["cargo install cargo-audit --locked", "cargo audit"],
+        [
+            "cargo install cargo-audit --locked --version 0.22.2",
+            "cargo audit"
+        ],
         "policy scripts belong in Repository Policy, not the required audit check"
     );
     assert_eq!(
@@ -1796,6 +1870,215 @@ fn workflow_checkouts_do_not_persist_the_token() {
             }
         }
     }
+}
+
+#[test]
+fn workflow_actions_are_pinned_to_full_commit_shas() {
+    let (workflows_dir, workflows) = repository_workflow_names();
+    let mut toolchain_installs = 0;
+    for workflow in &workflows {
+        let source = std::fs::read_to_string(workflows_dir.join(workflow))
+            .unwrap_or_else(|error| panic!("workflow {workflow} must be readable: {error}"));
+        for line in source.lines() {
+            let Some(action) = line
+                .trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("uses:")
+            else {
+                continue;
+            };
+            let reference = action.split('#').next().unwrap_or_default().trim();
+            let (name, revision) = reference
+                .rsplit_once('@')
+                .unwrap_or_else(|| panic!("{workflow}: `{reference}` must name a revision"));
+            assert!(
+                revision.len() == 40
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{workflow}: `{reference}` must pin a full commit SHA, not a movable tag or branch"
+            );
+            if name == "dtolnay/rust-toolchain" {
+                toolchain_installs += 1;
+                assert_eq!(
+                    revision,
+                    rust_toolchain_action_sha(),
+                    "{workflow}: every toolchain install must use the one reviewed action commit"
+                );
+            }
+        }
+    }
+    assert!(
+        toolchain_installs > 0,
+        "the action scan must see the toolchain installs"
+    );
+}
+
+fn release_workflow() -> serde_yaml::Value {
+    serde_yaml::from_str(RELEASE_WORKFLOW).expect("release.yml must parse")
+}
+
+fn workflow_steps(workflow: &serde_yaml::Value) -> impl Iterator<Item = &serde_yaml::Value> {
+    workflow["jobs"]
+        .as_mapping()
+        .expect("workflow jobs must be a mapping")
+        .values()
+        .flat_map(|job| job["steps"].as_sequence().into_iter().flatten())
+}
+
+#[test]
+fn release_builds_use_one_exact_stable_toolchain() {
+    let workflow = release_workflow();
+    let toolchain = workflow["env"]["RUST_RELEASE_TOOLCHAIN"]
+        .as_str()
+        .expect("release.yml must pin RUST_RELEASE_TOOLCHAIN as a string");
+    let release: Vec<u32> = toolchain
+        .split('.')
+        .map(|part| part.parse().expect("the release toolchain must be numeric"))
+        .collect();
+    let manifest = manifest();
+    let msrv: Vec<u32> = manifest["package"]["rust-version"]
+        .as_str()
+        .expect("package.rust-version must be a string")
+        .split('.')
+        .map(|part| part.parse().expect("rust-version must be numeric"))
+        .collect();
+    assert_eq!(
+        release.len(),
+        3,
+        "release builds must name one exact X.Y.Z stable release, not a channel: {toolchain}"
+    );
+    assert!(
+        release[..2] >= msrv[..],
+        "the release toolchain {toolchain} must not fall below the declared MSRV"
+    );
+
+    let installs: Vec<_> = workflow_steps(&workflow)
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("dtolnay/rust-toolchain@"))
+        })
+        .collect();
+    assert_eq!(
+        installs.len(),
+        4,
+        "the macOS, Windows, .deb, and .rpm builds each install the release toolchain"
+    );
+    for step in installs {
+        assert_eq!(
+            step["with"]["toolchain"].as_str(),
+            Some("${{ env.RUST_RELEASE_TOOLCHAIN }}"),
+            "every rustup-based release build must install the pinned toolchain"
+        );
+    }
+}
+
+#[test]
+fn cargo_installed_tools_are_exact_locked_releases() {
+    for (label, source) in [
+        ("ci.yml", CI_WORKFLOW),
+        ("release.yml", RELEASE_WORKFLOW),
+        ("fuzz.yml", FUZZ_WORKFLOW),
+        ("build-linux.sh", BUILD_LINUX),
+        ("build-macos.sh", BUILD_MACOS),
+        ("build-windows.ps1", BUILD_WINDOWS),
+    ] {
+        for line in source
+            .lines()
+            .filter(|line| line.contains("cargo install "))
+        {
+            assert!(
+                line.contains(" --locked") && line.contains(" --version "),
+                "{label}: `{}` must install an exact release with its own lockfile",
+                line.trim()
+            );
+        }
+    }
+}
+
+#[test]
+fn release_builds_require_the_committed_lockfile() {
+    for (label, source) in [
+        ("release.yml", RELEASE_WORKFLOW),
+        ("build-linux.sh", BUILD_LINUX),
+        ("build-macos.sh", BUILD_MACOS),
+        ("build-windows.ps1", BUILD_WINDOWS),
+        ("PKGBUILD", ARCH_PKGBUILD),
+        ("tributary.spec", RPM_SPEC),
+    ] {
+        let builds: Vec<_> = source
+            .lines()
+            .map(|line| {
+                let line = line.trim();
+                line.strip_prefix("run: ").unwrap_or(line)
+            })
+            .filter(|command| {
+                command.starts_with("cargo build") || command.starts_with("cargo deb")
+            })
+            .collect();
+        assert!(!builds.is_empty(), "{label} must contain its release build");
+        for command in builds {
+            assert!(
+                command.contains(" --locked"),
+                "{label}: `{command}` must build against the committed Cargo.lock"
+            );
+        }
+    }
+}
+
+#[test]
+fn release_assets_are_attested_before_publication() {
+    let workflow = release_workflow();
+    let jobs = workflow["jobs"]
+        .as_mapping()
+        .expect("release jobs must be a mapping");
+    let attest = &workflow["jobs"]["attest"];
+    assert_eq!(
+        attest["if"].as_str(),
+        Some("github.event_name == 'release'")
+    );
+    assert_eq!(
+        yaml_string_list(&workflow["jobs"]["publish"], "needs"),
+        ["prepare", "checksums", "attest"],
+        "assets must be attested before they are published"
+    );
+    let permissions = attest["permissions"]
+        .as_mapping()
+        .expect("the attestation job must scope its own permissions");
+    assert_eq!(permissions.len(), 3);
+    assert_eq!(attest["permissions"]["contents"].as_str(), Some("read"));
+    assert_eq!(attest["permissions"]["id-token"].as_str(), Some("write"));
+    assert_eq!(
+        attest["permissions"]["attestations"].as_str(),
+        Some("write")
+    );
+    for (id, job) in jobs {
+        assert!(
+            id.as_str() == Some("attest") || job["permissions"]["id-token"].is_null(),
+            "only the attestation job may mint an OIDC token; {id:?} requests one"
+        );
+    }
+    let attestations: Vec<_> = attest["steps"]
+        .as_sequence()
+        .expect("attestation steps")
+        .iter()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/attest-build-provenance@"))
+        })
+        .collect();
+    assert_eq!(attestations.len(), 1);
+    assert_eq!(
+        attestations[0]["with"]["subject-checksums"].as_str(),
+        Some("SHA256SUMS.txt"),
+        "the attestation subjects must be exactly the checksummed release assets"
+    );
+    assert!(
+        yaml_string_list(&workflow["jobs"]["checksums"], "needs").contains(&"prepare".to_owned()),
+        "the checksum job's dry-run guard reads prepare outputs, so it must need prepare"
+    );
 }
 
 #[test]
