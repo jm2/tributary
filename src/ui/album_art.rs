@@ -72,6 +72,118 @@ pub fn invalidate() {
     next_generation();
 }
 
+// ── Now-playing cover export ────────────────────────────────────────────
+//
+// The desktop's media controls load artwork from a file, so the header lanes
+// save the current item's original image into a private cache folder. Remote
+// artwork is saved as fetched; its request URL, which can carry credentials,
+// never leaves the worker.
+
+/// Where covers are exported. Unset (nothing is written) until the desktop
+/// media controls exist.
+static COVER_EXPORT_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The exported cover and the header generation it belongs to.
+static NOW_PLAYING_COVER: std::sync::Mutex<Option<(u64, std::path::PathBuf)>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes exports so an older generation's cleanup cannot remove a newer
+/// generation's file.
+static COVER_EXPORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Export each now-playing cover into `dir` from now on. The folder must be
+/// Tributary's own: each export removes every other file in it.
+pub fn enable_now_playing_cover_export(dir: std::path::PathBuf) {
+    let _ = COVER_EXPORT_DIR.set(dir);
+}
+
+/// The exported cover of the item the header currently shows, once its
+/// artwork has loaded.
+pub fn now_playing_cover() -> Option<std::path::PathBuf> {
+    let cover = NOW_PLAYING_COVER.lock().ok()?;
+    cover
+        .as_ref()
+        .filter(|(generation, _)| generation_is_current(*generation))
+        .map(|(_, path)| path.clone())
+}
+
+/// Save the header's encoded artwork for the desktop media controls.
+/// Blocking — runs on the art workers.
+fn export_now_playing_cover(generation: u64, data: &[u8]) {
+    let Some(dir) = COVER_EXPORT_DIR.get() else {
+        return;
+    };
+    let Ok(_export) = COVER_EXPORT_LOCK.lock() else {
+        return;
+    };
+    if !generation_is_current(generation) {
+        return;
+    }
+    match write_cover_file(dir, data) {
+        Ok(Some(path)) => {
+            if let Ok(mut cover) = NOW_PLAYING_COVER.lock() {
+                *cover = Some((generation, path));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::debug!(%error, "Could not export the now-playing cover"),
+    }
+}
+
+/// Write `data` into `dir` under a name derived from its content, then remove
+/// every other file there. A new name per image makes the desktop reload it.
+/// `None` when `data` is not an image format the desktop can be expected to
+/// load.
+fn write_cover_file(
+    dir: &std::path::Path,
+    data: &[u8],
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    use std::hash::{Hash, Hasher};
+
+    let Some(extension) = cover_image_extension(data) else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(dir)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    let name = format!("cover-{:016x}.{extension}", hasher.finish());
+    let path = dir.join(&name);
+    if !path.exists() {
+        // Readers never see a partly written file.
+        let partial = dir.join(format!("{name}.part"));
+        std::fs::write(&partial, data)?;
+        std::fs::rename(&partial, &path)?;
+    }
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if entry.file_name() != name.as_str() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(Some(path))
+}
+
+fn cover_image_extension(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\xFF\xD8\xFF") {
+        Some("jpg")
+    } else if data.starts_with(b"\x89PNG\r\n\x1A\n") {
+        Some("png")
+    } else if data.starts_with(b"GIF8") {
+        Some("gif")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// Decode now-playing header artwork on an art worker and export the
+/// original image for the desktop media controls.
+fn decode_header_art(generation: u64, data: &[u8]) -> Option<gtk::gdk::Texture> {
+    let texture = decode_art_thumbnail(data, HEADER_ART_SIDE)?;
+    export_now_playing_cover(generation, data);
+    Some(texture)
+}
+
 /// Liveness gate carried by one in-flight album-art request.
 ///
 /// Two scopes share the persistent worker:
@@ -374,6 +486,9 @@ fn send_and_deliver_art(request: reqwest::blocking::RequestBuilder, req: ArtRequ
             ) {
                 Ok(bytes) if !bytes.is_empty() && still_wanted(&req) => {
                     if let Some(texture) = decode_art_thumbnail(&bytes, req.max_side) {
+                        if let RequestLiveness::GlobalGeneration(generation) = &req.liveness {
+                            export_now_playing_cover(*generation, &bytes);
+                        }
                         if still_wanted(&req) {
                             let _ = req.reply_tx.send_blocking(texture);
                         }
@@ -412,10 +527,7 @@ pub fn update_direct_file_album_art(image: &gtk::Image, uri: &str) {
     image.set_icon_name(Some("audio-x-generic-symbolic"));
     let reply_rx =
         enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
-            decode_art_thumbnail(
-                &extract_direct_file_album_art_bytes(&path)?,
-                HEADER_ART_SIDE,
-            )
+            decode_header_art(generation, &extract_direct_file_album_art_bytes(&path)?)
         });
     display_local_album_art_reply(
         image,
@@ -518,10 +630,7 @@ pub fn update_resolved_file_album_art(
     image.set_icon_name(Some("audio-x-generic-symbolic"));
     let reply_rx =
         enqueue_local_art_job(RequestLiveness::GlobalGeneration(generation), move || {
-            decode_art_thumbnail(
-                &extract_resolved_file_album_art_bytes(&media)?,
-                HEADER_ART_SIDE,
-            )
+            decode_header_art(generation, &extract_resolved_file_album_art_bytes(&media)?)
         });
     display_local_album_art_reply(
         image,
@@ -1513,6 +1622,57 @@ mod tests {
                 .expect("write artwork response body");
         });
         (format!("http://{address}/art"), thread)
+    }
+
+    #[test]
+    fn cover_export_keeps_only_the_current_image() {
+        let dir = tempfile::tempdir().expect("cover export folder");
+        let png = b"\x89PNG\r\n\x1A\nfirst".to_vec();
+        let jpeg = b"\xFF\xD8\xFFsecond".to_vec();
+
+        let png_path = write_cover_file(dir.path(), &png)
+            .expect("write the first cover")
+            .expect("PNG is exported");
+        assert_eq!(png_path.extension(), Some("png".as_ref()));
+        assert_eq!(std::fs::read(&png_path).expect("read the cover"), png);
+        assert_eq!(
+            write_cover_file(dir.path(), &png).expect("rewrite the same cover"),
+            Some(png_path.clone()),
+            "the same image keeps its file, so the desktop need not reload it"
+        );
+
+        let jpeg_path = write_cover_file(dir.path(), &jpeg)
+            .expect("write the next cover")
+            .expect("JPEG is exported");
+        assert_eq!(jpeg_path.extension(), Some("jpg".as_ref()));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list the folder")
+            .map(|entry| entry.expect("folder entry").path())
+            .collect();
+        assert_eq!(names, std::slice::from_ref(&jpeg_path));
+
+        assert_eq!(
+            write_cover_file(dir.path(), b"<html>").expect("skip a non-image"),
+            None
+        );
+        assert!(jpeg_path.exists());
+    }
+
+    #[test]
+    fn exported_cover_belongs_to_its_generation() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = next_generation();
+        let cover = std::path::PathBuf::from("cover.png");
+        *NOW_PLAYING_COVER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((generation, cover.clone()));
+        assert_eq!(now_playing_cover(), Some(cover));
+
+        invalidate();
+
+        assert_eq!(now_playing_cover(), None);
     }
 
     #[test]

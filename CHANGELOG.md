@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   have Tributary watch the partition. If another client changes the song or the playback options,
   or Tributary loses contact with the partition, it stops controlling that output until you
   select it again.
+- **Seek bar and artwork in the system media controls** — The desktop's media controls (MPRIS on
+  Linux, the Windows media overlay, and macOS Now Playing) now show the track's length, position,
+  and cover art, and seeking there moves playback.
 - **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure and
   connecting or disconnecting an account. Current release builds don't include Last.fm
   application credentials, so the group shows the feature as unavailable.

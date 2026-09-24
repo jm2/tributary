@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use crate::audio::local_output::LocalOutput;
 use crate::audio::output::AudioOutput;
 use crate::audio::{PlayerEvent, PlayerEventGeneration, PlayerState};
-use crate::desktop_integration::MediaAction;
+use crate::desktop_integration::{relative_seek_target, MediaAction};
 use crate::local::engine::{
     LibraryEngine, LibraryEvent, RootReauthorizationOutcome, RootReauthorizationRequest,
 };
@@ -113,6 +113,48 @@ fn apply_current_seek_intent(
     observe_discontinuity(generation);
     seek_output(target_ms);
     true
+}
+
+/// Seek the current item for the user, recording the jump for play history
+/// and Last.fm. `generation` is the item the request was made for; a stale
+/// one is ignored.
+fn seek_current_item(
+    session: &RefCell<PlaybackSession>,
+    output: &RefCell<Box<dyn AudioOutput>>,
+    lastfm: &crate::lastfm::playback_coordinator::LastFmPlaybackCoordinatorBinding,
+    generation: PlayerEventGeneration,
+    target_ms: u64,
+) -> bool {
+    apply_current_seek_intent(
+        generation,
+        target_ms,
+        |generation| session.borrow().accepts_event_generation(generation),
+        || output.borrow().position_ms().unwrap_or(0),
+        |generation, actual_position_ms, target_ms| {
+            let _ = session.borrow_mut().observe_history_seek(
+                generation,
+                actual_position_ms,
+                target_ms,
+            );
+        },
+        |generation| {
+            let _ = lastfm.observe_discontinuity(generation);
+        },
+        |target_ms| output.borrow().seek_to(target_ms),
+    )
+}
+
+/// Seek the current item for the desktop's media controls.
+fn seek_from_desktop(ctx: &PlaybackContext, target_ms: u64) {
+    super::open_files::invalidate_admission();
+    let generation = ctx.session.borrow().current_event_generation();
+    let _ = seek_current_item(
+        &ctx.session,
+        &ctx.active_output,
+        &ctx.lastfm_playback,
+        generation,
+        target_ms,
+    );
 }
 
 /// Upper bound on the close drain. A tracked operation stuck in kernel I/O
@@ -2699,6 +2741,22 @@ pub(crate) fn build_window(
         Ok((ctrl, media_rx)) => {
             *media_ctrl.borrow_mut() = Some(ctrl);
 
+            // The overlay shows the header's artwork, exported to a file,
+            // whenever the header's artwork changes.
+            if let Some(cache_dir) = crate::paths::cache_dir() {
+                super::album_art::enable_now_playing_cover_export(
+                    cache_dir.join("tributary").join("now-playing"),
+                );
+            }
+            {
+                let media_ctrl = media_ctrl.clone();
+                hb.album_art.connect_paintable_notify(move |_| {
+                    if let Some(ctrl) = media_ctrl.borrow().as_ref() {
+                        ctrl.update_cover(super::album_art::now_playing_cover().as_deref());
+                    }
+                });
+            }
+
             let active_output = active_output.clone();
             let album_art = hb.album_art.clone();
             let title_label = hb.title_label.clone();
@@ -2790,6 +2848,37 @@ pub(crate) fn build_window(
                                 repeat_mode.get(),
                                 shuffle.is_active(),
                             );
+                        }
+                        // Only a track with a known length can be seeked. As
+                        // MPRIS specifies, an absolute position past the end
+                        // is ignored and a relative seek past it skips ahead.
+                        MediaAction::SetPosition(target_ms) => {
+                            let duration_ms = ctrl_for_ctx
+                                .borrow()
+                                .as_ref()
+                                .and_then(crate::desktop_integration::MediaController::duration_ms);
+                            if duration_ms.is_some_and(|duration_ms| target_ms <= duration_ms) {
+                                seek_from_desktop(&ctx, target_ms);
+                            }
+                        }
+                        MediaAction::SeekBy(offset_ms) => {
+                            let duration_ms = ctrl_for_ctx
+                                .borrow()
+                                .as_ref()
+                                .and_then(crate::desktop_integration::MediaController::duration_ms);
+                            if let Some(duration_ms) = duration_ms {
+                                let position_ms = active_output.borrow().position_ms().unwrap_or(0);
+                                match relative_seek_target(position_ms, offset_ms, duration_ms) {
+                                    Some(target_ms) => seek_from_desktop(&ctx, target_ms),
+                                    None => {
+                                        advance_track_from_user(
+                                            &ctx,
+                                            repeat_mode.get(),
+                                            shuffle.is_active(),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2963,26 +3052,12 @@ pub(crate) fn build_window(
                 let Some((generation, target_ms)) = intent else {
                     return;
                 };
-                let _ = apply_current_seek_intent(
+                let _ = seek_current_item(
+                    &playback_session,
+                    &active_output,
+                    &playback_lastfm,
                     generation,
                     target_ms,
-                    |generation| {
-                        playback_session
-                            .borrow()
-                            .accepts_event_generation(generation)
-                    },
-                    || active_output.borrow().position_ms().unwrap_or(0),
-                    |generation, actual_position_ms, target_ms| {
-                        let _ = playback_session.borrow_mut().observe_history_seek(
-                            generation,
-                            actual_position_ms,
-                            target_ms,
-                        );
-                    },
-                    |generation| {
-                        let _ = playback_lastfm.observe_discontinuity(generation);
-                    },
-                    |target_ms| active_output.borrow().seek_to(target_ms),
                 );
             });
         });
@@ -3316,8 +3391,11 @@ pub(crate) fn build_window(
                         // catalogue's duration then stands in, and only an
                         // item with neither is shown as live.
                         let catalogue_ms = playback_session.borrow().current_duration_ms();
-                        playback_progress
-                            .show(position_ms, display_duration_ms(duration_ms, catalogue_ms));
+                        let duration_ms = display_duration_ms(duration_ms, catalogue_ms);
+                        playback_progress.show(position_ms, duration_ms);
+                        if let Some(ctrl) = media_ctrl.borrow().as_ref() {
+                            ctrl.update_timeline(position_ms, duration_ms);
+                        }
                     }
 
                     PlayerEvent::TrackEnded { .. } => {
