@@ -1,6 +1,6 @@
 Name:           tributary
 # Packit replaces Version with the release tag minus its "v" (see .packit.yaml).
-Version:        0.6.2
+Version:        0.7.0
 Release:        1%{?dist}
 Summary:        A high-performance media manager with unified local and remote backends
 
@@ -76,6 +76,9 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/io.github.tributary.Tributary.png
 
 %changelog
+* Thu Sep 24 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.7.0-1
+- Update to 0.7.0.
+
 * Wed Sep 23 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.6.2-1
 - Version COPR builds without the release tag's "v" prefix.
 

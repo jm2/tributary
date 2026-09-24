@@ -5,7 +5,7 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] — Unreleased
 
 ### Added
 
@@ -101,10 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Server sign-in** — Jellyfin accounts without a password can now connect, and the Connect
   and Add Server dialogs stay open with a message about what's missing instead of silently
   discarding what you typed.
-- **Last.fm keeps queued scrobbles** — Scrobbles saved while offline are no longer deleted when
-  Last.fm rejects the app's key or signature or the daily scrobble limit is reached; they wait and
-  are sent later. Brief storage errors and web error pages are retried instead of stopping
-  delivery. Last.fm remains unavailable in current builds.
 - **Library folders that come and go** — A library folder on a drive or network share that
   connects after Tributary starts, or is remounted, is now watched and scanned within about
   half a minute, and the folder browser shows it as unavailable while it is away and keeps
@@ -153,12 +149,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **No full rescan after tag edits and syncs** — Saving a tag edit, or a sync tool such as rsync or
   Syncthing finishing a download into your music folder, now updates just that track.
 - **Responsiveness during scans** — Ratings, play counts, and other edits no longer wait for the
-  startup scan or for folder watching to be set up, and closing the window no longer waits for a
-  rescan to finish.
+  startup scan, for folder watching to be set up, or for a refresh that file changes started
+  (such as after syncing music into a library folder), and closing the window no longer waits
+  for a rescan to finish.
 - **Playlist edits during a scan** — Creating, renaming, deleting, importing, or editing playlists
   while a scan is running now waits briefly instead of failing with "database is locked".
-- **Edits during library refreshes** — Ratings and play counts no longer wait for a library refresh
-  that file changes started, such as after syncing music into a library folder.
 - **Upgrading libraries from 0.5.x** — A deleted song with a blank artist tag in an old playlist no
   longer stops the upgrade and leaves the library empty. If the library database can't be opened
   or upgraded, Tributary now shows an error instead of an empty library.
@@ -233,6 +228,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named by `SSLKEYLOGFILE`.
 - **TLS library update** — The TLS library was updated to fix a TLS 1.3 handshake-validation
   advisory (RUSTSEC-2026-0285).
+- **No advisory exceptions** — The build no longer includes the `rkyv` 0.7 crate
+  (RUSTSEC-2026-0235), so the dependency audit passes without any exceptions.
 - **Jellyfin discovery and account names in logs** — A device on the network can no longer flood
   the sidebar with fake Jellyfin servers or stop real ones from being marked as gone, and each
   reply is checked against the address it advertises. Server account names and IDs are no longer
