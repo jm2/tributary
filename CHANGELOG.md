@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apply to the playing track immediately and are remembered between sessions.
 - **Drag and drop onto playlists** — Drag selected tracks onto a playlist in the sidebar to add
   them in the order shown, and drag playlists to reorder the sidebar.
+- **Drag tracks to a file manager** — Drag tracks from your local library into a file manager to
+  copy their files there. A selection that includes server, radio, or removable-media tracks
+  offers no files but can still be dropped on a playlist.
 - **Chromecast over IPv6** — Chromecast receivers are discovered and can play over IPv6, and
   Tributary picks the network interface that reaches the selected receiver.
 - **Tag editing on removable drives** — Properties can now edit tracks on USB drives and other
