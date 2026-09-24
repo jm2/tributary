@@ -69,6 +69,7 @@ require_once()
 require_once "--socket=wayland"
 require_once "--socket=fallback-x11"
 require_once "--share=ipc"
+require_once "--device=dri"
 require_once "--socket=pulseaudio"
 require_once "--share=network"
 require_once "--filesystem=xdg-music:rw"
@@ -90,6 +91,7 @@ for entry in $finish_args; do
         "--socket=wayland" | \
         "--socket=fallback-x11" | \
         "--share=ipc" | \
+        "--device=dri" | \
         "--socket=pulseaudio" | \
         "--share=network" | \
         "--filesystem=xdg-music:rw" | \
@@ -109,6 +111,6 @@ for entry in $finish_args; do
     esac
 done
 
-[ "$entry_count" -eq 14 ] || fail "expected exactly 14 reviewed finish arguments (found $entry_count)"
+[ "$entry_count" -eq 15 ] || fail "expected exactly 15 reviewed finish arguments (found $entry_count)"
 
 echo "Flatpak permission policy is valid: $manifest"

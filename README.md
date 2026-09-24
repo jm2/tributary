@@ -331,7 +331,8 @@ flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo --i
 `./scripts/build-linux.sh --flatpak` uses the same generator, then builds and validates a
 single-file `tributary.flatpak` bundle instead of installing; no native build is required first.
 
-The sandbox does not expose the whole home directory:
+The sandbox has GPU access (`--device=dri`), so GTK renders with the host's graphics driver
+rather than in software. It does not expose the whole home directory:
 
 - **XDG Music** is available read/write.
 - A custom library folder chosen in **Preferences → Library Folders** goes through the GTK

@@ -10,6 +10,10 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --share=ipc
+  # GPU access (DRM render nodes) so GTK4 renders with the host's graphics
+  # driver instead of falling back to software rendering. This is the
+  # graphics-only device grant; broad `--device=all` stays unreviewed.
+  - --device=dri
   # Audio output
   - --socket=pulseaudio
   # Network (for remote backends: Subsonic, Jellyfin, DAAP)
