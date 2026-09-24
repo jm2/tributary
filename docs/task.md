@@ -1,6 +1,6 @@
 # Tributary backlog index
 
-Last reconciled: 2026-09-23 (main `76385d0f`).
+Last reconciled: 2026-09-24 (main `c2ac8630`, version 0.7.0 unreleased).
 
 **GitHub issues are the source of truth.** Each issue holds its own scope, acceptance criteria,
 discussion, and state. This file only maps the stable IDs used in older docs, commits, and PR
@@ -23,44 +23,44 @@ GitHub.
 
 | ID | Issue | Scope | State |
 | --- | --- | --- | --- |
-| R1 | [#248](https://github.com/jm2/tributary/issues/248) | Tag saves can modify a replacement file | #284 merged; confirm the remaining acceptance on the issue |
-| R6 | [#253](https://github.com/jm2/tributary/issues/253) | Folder entries and root status stay stale after library changes | Open |
-| R10 | [#257](https://github.com/jm2/tributary/issues/257) | Browser headings and idle metadata ignore translations | Open |
-| R11 | [#258](https://github.com/jm2/tributary/issues/258) | Lossless or explicitly refused native local paths | Design merged (#283, [native-path-authority-design.md](native-path-authority-design.md)); implementation open |
-| Q5 | [#299](https://github.com/jm2/tributary/issues/299) | Media-relay resource limits | Open, design first |
-| Q6 | [#300](https://github.com/jm2/tributary/issues/300) | Aggregate remote catalogue limits and partialness | Open, design first |
-| P2.1-B | [#50](https://github.com/jm2/tributary/issues/50) | Last.fm scrobbling | LF1 (#289), LF2 (#305), LF3 (#308) merged; LF4 (packaged credentials, live acceptance) and #335–#337 open |
-| P2.2-B | [#46](https://github.com/jm2/tributary/issues/46) | Remaining drag-and-drop targets | File-manager export next, as a small PR under #46; remote-row drops stay unavailable; device copy follows #8 |
-| P2.3-A | [#14](https://github.com/jm2/tributary/issues/14) | Folder browsing | Shipped in `455e786`; R3–R5 done; R6 and R10 remain |
+| R11 | [#258](https://github.com/jm2/tributary/issues/258) | Non-UTF-8 local file names | Safe refusal shipped (#410): such files are skipped with a notice. Quarantining rows stored by older versions and a lossless path key remain |
+| Q5 | [#299](https://github.com/jm2/tributary/issues/299) | Media-relay resource limits | Open; the issue's design awaits an owner decision |
+| Q6 | [#300](https://github.com/jm2/tributary/issues/300) | Remote catalogue limits and partialness | Open; the issue's design awaits an owner decision. A truncated catalogue loses no stored data (checked 2026-09-24) |
+| P2.1-B | [#50](https://github.com/jm2/tributary/issues/50) | Last.fm scrobbling | LF1 (#289), LF2 (#305), LF3 (#308) merged; #335 and #337 fixed (#391). LF4 (packaged credentials, live acceptance) and [#336](https://github.com/jm2/tributary/issues/336) (local-library attribution, after LF4) open |
+| P2.2-B | [#46](https://github.com/jm2/tributary/issues/46) | Remaining drag-and-drop targets | Drag to a file manager shipped (#405); dragging remote tracks stays unavailable. Close with the 0.7.0 release |
 | P2.3-C | [#29](https://github.com/jm2/tributary/issues/29) | Separator, count-opacity, and alignment refinements | Merged (#179); visual and accessibility sign-off per [acceptance-p2.3-c.md](acceptance-p2.3-c.md) pending |
 | P2.4-F | — | Chromecast IPv6 media | Merged (#174, #278); a check against a real IPv6 receiver is pending |
-| P3.1 | [#11](https://github.com/jm2/tributary/issues/11) | Offline downloads | Replaced by a simple Download action into a library folder (plan on #11) |
-| P3.2 | [#8](https://github.com/jm2/tributary/issues/8) | Copy to devices | Replaced by a Copy to Device… action (plan on #8) |
+| P3.2 | [#8](https://github.com/jm2/tributary/issues/8) | Copy to devices | Copy to Device shipped (#404) for mounted storage; Android sync over MTP is not supported and keeps #8 open |
 | P3.3-B | — | Queue every file from a multi-file OS open | Blocked on a product decision |
-| P3.4-B | — | Re-review the `paste` and `rkyv` advisory exceptions | Due by 2026-12-01 or the next release |
 | P3.4-C | — | Remove the macOS channel-cap workaround | Blocked on an upstream GStreamer fix and multichannel hardware tests |
 
 ## Done
 
 | ID | Issue | Merged work |
 | --- | --- | --- |
+| R1 | [#248](https://github.com/jm2/tributary/issues/248) | #284; remaining acceptance and residual races stated in #410 |
 | R2 | [#249](https://github.com/jm2/tributary/issues/249) | #272 |
 | R3 | [#250](https://github.com/jm2/tributary/issues/250) | #298; full-sync view preservation in #380 |
 | R4 | [#251](https://github.com/jm2/tributary/issues/251) | #310 |
 | R5 | [#252](https://github.com/jm2/tributary/issues/252) | #297 |
+| R6 | [#253](https://github.com/jm2/tributary/issues/253) | #390 |
 | R7 | [#254](https://github.com/jm2/tributary/issues/254) | #287 |
 | R8 | [#255](https://github.com/jm2/tributary/issues/255) | #295 (a real-receiver check is still useful) |
-| R9 | [#256](https://github.com/jm2/tributary/issues/256) | #286, #376 |
+| R9 | [#256](https://github.com/jm2/tributary/issues/256) | #286, #376, #407 |
+| R10 | [#257](https://github.com/jm2/tributary/issues/257) | #398 |
 | Q1 | [#274](https://github.com/jm2/tributary/issues/274) | #277 |
 | Q2 | [#279](https://github.com/jm2/tributary/issues/279) | #282; superseded by the single workspace lockfile (#365) |
 | Q3 | [#301](https://github.com/jm2/tributary/issues/301) | #304 |
 | Q4 | [#275](https://github.com/jm2/tributary/issues/275) | #285, #291, #306 |
 | Q7 | [#276](https://github.com/jm2/tributary/issues/276) | #280; the checker was retired on 2026-09-23 along with the counters it checked |
 | P2.2-A | [#46](https://github.com/jm2/tributary/issues/46) | Drops onto local playlists: #182, #242, #290 |
+| P2.3-A | [#14](https://github.com/jm2/tributary/issues/14) | Folder browsing: `455e786`, with R3–R6 and R10 |
 | P2.3-B | [#39](https://github.com/jm2/tributary/issues/39) | Album artwork in the browser: #171 |
 | P2.4-A, P2.4-B | [#49](https://github.com/jm2/tributary/issues/49) | Equalizer design #183; implementation #368 (replaced #220) |
 | P2.4-C | — | AirPlay sender design #170; the sender itself (P2.4-D/E) was dropped, see below |
 | P2.4-G | — | Optional MPD supervision: #173, with fixes in #375 |
+| P3.1 | [#11](https://github.com/jm2/tributary/issues/11) | Download action: #403, with refusal notices in #415 |
+| P3.4-B | — | Advisory exceptions re-reviewed before 0.7.0: `rkyv` left the lockfile with `rust_decimal` 1.43.0, so none remain; `paste` is only an unmaintained-crate warning |
 | P1.x, P2.1-A, P3.3-A, P3.4-A, P3.4-D | — | Completed before 2026-09-09; see the history file |
 
 ## Closed on 2026-09-23 in favour of simpler plans
@@ -82,7 +82,9 @@ GitHub.
 These need a person, a live service, or real hardware; CI can't produce them. Record the date,
 the exact commit or artifact, the environment, and the result on the linked issue or release PR.
 
-- **O1 — Merge gate policy.** Settled in #339: eleven required checks including Coverage, strict mode off, admin bypass through pull requests only. See "Merge gate" in `docs/refinery-config.md`.
+- **O1 — Merge gate policy.** Done (#339, #414): eleven required checks including Coverage at an
+  80.3% floor, strict mode off, admin bypass through pull requests only. See "Merge gate" in
+  `docs/refinery-config.md`.
 - **O2 — Live CI timeout and check names.** Done (#288).
 - **V1 — Removable media.** Browse, play, and detach/reconnect on real removable hardware.
 - **V2 — Flatpak.** Portal, custom-root, and USB permissions in an installed Flatpak.
@@ -90,3 +92,9 @@ the exact commit or artifact, the environment, and the result on the linked issu
   servers.
 - **V4 — macOS package.** Protected playback and output-device switching (including unplug and
   replug) in a bundle without Homebrew.
+- **V5 — 0.7.0 release checks.** Before tagging 0.7.0, check against real servers and hardware:
+  Jellyfin 12 sign-in; Plex discovery and sign-in; Chromecast track changes, volume, and seeking;
+  the equalizer by ear; Download for offline, including a Subsonic account without download
+  permission; Copy to Device onto a FAT-formatted drive; dragging tracks into Nautilus or Dolphin,
+  Explorer, and Finder; seek and artwork in MPRIS, the Windows media overlay, and macOS Now
+  Playing; the Windows on ARM package; and one walkthrough in a language other than English.

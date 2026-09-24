@@ -657,8 +657,8 @@ right-click, and choose **Download**. Each track is saved as
 folder; choose another folder under **Downloads** in Preferences. Two tracks download at a time,
 a notification shows progress with a **Cancel** button, and a summary reports how many tracks were
 downloaded, skipped because the file already exists, or failed. Subsonic downloads use the
-server's original-file download, so the account needs download permission there; Jellyfin, Plex,
-and DAAP tracks are fetched as the original file.
+server's original-file download, so the account needs download permission there; when a server
+refuses, a second notice says so. Jellyfin, Plex, and DAAP tracks are fetched as the original file.
 
 The download folder is part of your library. When a library folder already contains it (the
 default when your library is your music folder), finished files appear right away. Otherwise
