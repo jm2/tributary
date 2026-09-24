@@ -6281,29 +6281,43 @@ mod identity_tests {
     /// that stay queued for later.
     #[test]
     fn queued_row_events_coalesce_until_another_event() {
+        // Row identity is the file URI, so the fixture paths must be absolute
+        // on the host platform (`/music/…` has no drive and no URI on Windows).
+        let path = |name: &str| {
+            if cfg!(windows) {
+                format!(r"C:\music\{name}")
+            } else {
+                format!("/music/{name}")
+            }
+        };
+        let uri = |name: &str| {
+            url::Url::from_file_path(path(name))
+                .expect("absolute fixture path")
+                .to_string()
+        };
         let (tx, rx) = async_channel::unbounded();
         for event in [
-            LibraryEvent::TrackRemoved("/music/b.flac".to_string()),
-            LibraryEvent::TrackUpserted(Box::new(library_track("/music/c.flac"))),
+            LibraryEvent::TrackRemoved(path("b.flac")),
+            LibraryEvent::TrackUpserted(Box::new(library_track(&path("c.flac")))),
             LibraryEvent::ScanComplete,
-            LibraryEvent::TrackRemoved("/music/d.flac".to_string()),
+            LibraryEvent::TrackRemoved(path("d.flac")),
         ] {
             tx.try_send(event).unwrap();
         }
-        let first = LibraryEvent::TrackUpserted(Box::new(library_track("/music/a.flac")));
+        let first = LibraryEvent::TrackUpserted(Box::new(library_track(&path("a.flac"))));
 
         let (batch, next) = coalesce_local_row_events(first, &rx);
 
         assert_eq!(batch.len(), 3);
         assert!(matches!(next, Some(LibraryEvent::ScanComplete)));
         assert!(
-            matches!(rx.try_recv(), Ok(LibraryEvent::TrackRemoved(path)) if path == "/music/d.flac")
+            matches!(rx.try_recv(), Ok(LibraryEvent::TrackRemoved(removed)) if removed == path("d.flac"))
         );
 
-        let mut rows = vec![arch_track_to_object(&library_track("/music/b.flac"))];
+        let mut rows = vec![arch_track_to_object(&library_track(&path("b.flac")))];
         batch.apply_to_rows(&mut rows);
         let uris: Vec<_> = rows.iter().map(TrackObject::uri).collect();
-        assert_eq!(uris, ["file:///music/a.flac", "file:///music/c.flac"]);
+        assert_eq!(uris, [uri("a.flac"), uri("c.flac")]);
     }
 
     fn disconnected_visible_snapshot(
