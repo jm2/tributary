@@ -12,8 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **License notices in Windows and macOS downloads** — Each download now includes a
   `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
   offer of their source code.
-  distinct identities for multiple roots, lazy navigation, and a visible notice when a
-  root is unavailable.
 - **Album artwork in the browser** — The Album pane can show cover art for local and server
   albums. Turn it on under Preferences → Browser Views and choose Small, Medium, or Large.
 - **Folder browsing** — A Folder pane browses the local library by library folder and
