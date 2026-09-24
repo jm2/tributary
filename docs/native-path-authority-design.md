@@ -6,7 +6,7 @@ representation plus an explicit unsupported-input boundary, for review before
 any behavior changes. It authorizes follow-up implementation beads; it does not
 ship them.
 
-Implemented: safe refusal (PR #PENDING); lossless representation remains future
+Implemented: safe refusal (PR #410); lossless representation remains future
 work. The local library now admits only paths that are valid UTF-8, so a stored
 `file_path` is always the exact native path. The scanner and the watcher refuse
 an audio file whose name is not valid UTF-8 instead of storing a lossy
