@@ -262,17 +262,6 @@ jobs:
           toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
 
-      - name: Cache Cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: release-macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-macos-${{ matrix.arch }}-cargo-
-
       - name: Build and create .dmg
         run: bash scripts/build-macos.sh --dmg
 
@@ -353,17 +342,6 @@ jobs:
         with:
           toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
-
-      - name: Cache Cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: release-windows-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-windows-${{ matrix.arch }}-cargo-
 
       - name: Build (release)
         run: |
@@ -461,17 +439,6 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked --version 3.8.0
 
-      - name: Cache Cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: release-deb-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-deb-${{ matrix.arch }}-cargo-
-
       - name: Build .deb package
         run: |
           cargo deb --locked -o "target/debian/tributary-${{ matrix.deb_arch }}.deb"
@@ -530,17 +497,6 @@ jobs:
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm --locked --version 0.21.0
 
-      - name: Cache Cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: release-rpm-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-rpm-${{ matrix.arch }}-cargo-
-
       - name: Build release binary
         run: cargo build --release --locked
 
@@ -577,16 +533,6 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.build_ref }}
           persist-credentials: false
-
-      - name: Cache Cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: release-arch-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-arch-x86_64-cargo-
 
       - name: Build Arch package
         run: |
