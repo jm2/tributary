@@ -93,16 +93,79 @@ struct PlaylistDragPayload {
     candidates: Vec<PlaylistAddCandidate>,
 }
 
-impl PlaylistDragPayload {
-    fn from_selection(sm: &gtk::SortListModel, selection: &gtk::MultiSelection) -> Option<Self> {
-        let selected = selection.selection();
-        let snapshot = SelectionSnapshot::from_positions(
-            (0..sm.n_items()).filter(|position| selected.contains(*position)),
-        )?;
-        Some(Self {
-            candidates: collect_selected_add_candidates(sm, &snapshot)?,
-        })
+/// Everything one tracklist drag offers, snapshotted as the drag starts.
+///
+/// The in-app playlist payload always carries the whole selection in
+/// displayed order. The same rows are also offered to file managers as a
+/// file list, which GTK serializes as `text/uri-list`, but only when
+/// [`exportable_file_paths`] accepts every one of them.
+fn track_drag_content(
+    sm: &gtk::SortListModel,
+    selection: &gtk::MultiSelection,
+) -> Option<gtk::gdk::ContentProvider> {
+    let selected = selection.selection();
+    let snapshot = SelectionSnapshot::from_positions(
+        (0..sm.n_items()).filter(|position| selected.contains(*position)),
+    )?;
+    let tracks = selected_tracks(sm, &snapshot)?;
+    let payload = PlaylistDragPayload {
+        candidates: tracks
+            .iter()
+            .map(playlist_add_candidate)
+            .collect::<Option<_>>()?,
+    };
+    Some(track_drag_provider(
+        &payload,
+        exportable_file_paths(&tracks).as_deref(),
+    ))
+}
+
+/// The content provider for `payload`, joined by `files` as a
+/// [`gtk::gdk::FileList`] when there are files to export.
+fn track_drag_provider(
+    payload: &PlaylistDragPayload,
+    files: Option<&[std::path::PathBuf]>,
+) -> gtk::gdk::ContentProvider {
+    use gtk::glib::prelude::ToValue;
+
+    let in_app = gtk::gdk::ContentProvider::for_value(&payload.to_value());
+    let Some(paths) = files else {
+        return in_app;
+    };
+    let files = paths
+        .iter()
+        .map(gtk::gio::File::for_path)
+        .collect::<Vec<_>>();
+    let export =
+        gtk::gdk::ContentProvider::for_value(&gtk::gdk::FileList::from_array(&files).to_value());
+    gtk::gdk::ContentProvider::new_union(&[in_app, export])
+}
+
+/// The local files a tracklist drag may hand to a file manager, in dragged
+/// order.
+///
+/// All or nothing: every row must be a local-library row whose URI names a
+/// local file, or no file is offered. A file manager copies everything a
+/// drag offers, so a partial list would silently copy less than the user
+/// dragged. Remote, removable-device, radio, unavailable playlist, and
+/// opened-from-the-OS rows hold no library path, so any one of them
+/// withholds the list; the in-app payload is unaffected.
+///
+/// Only the path each row already holds is read. This runs on the UI thread
+/// as the drag starts, so it never touches the filesystem: a file removed
+/// since the library last saw it fails in the file manager's own copy.
+fn exportable_file_paths(tracks: &[TrackObject]) -> Option<Vec<std::path::PathBuf>> {
+    if tracks.is_empty() {
+        return None;
     }
+    tracks
+        .iter()
+        .map(|track| {
+            super::playback::shows_local_library_track(track)
+                .then(|| track.with_uri(local_file_path))
+                .flatten()
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -881,19 +944,38 @@ fn setup_playlist_transfer(
     state: &WindowState,
     playlist_row_drop: Rc<RefCell<Option<PlaylistRowDropContext>>>,
 ) {
-    use gtk::glib::prelude::ToValue;
-
     // Publish the per-row drop context so any sidebar row that is realized
     // after this point gets a `DropTarget` resolving to its own `position()`.
     // Rows already realized will not retroactively gain a target, so the
     // sidebar factory must consult this slot lazily on every row setup.
     *playlist_row_drop.borrow_mut() = Some(PlaylistRowDropContext::from_window(state));
 
+    state.column_view.add_controller(track_drag_source(
+        state.sort_model.clone(),
+        state.column_view.clone(),
+    ));
+    state.column_view.update_property(&[
+        gtk::accessible::Property::Description(
+            rust_i18n::t!("context.playlist_drag_description").as_ref(),
+        ),
+        gtk::accessible::Property::KeyShortcuts("Shift+F10 ContextMenu"),
+    ]);
+}
+
+/// The tracklist's one drag source, serving both in-app playlist drops and
+/// file-manager export through [`track_drag_content`].
+///
+/// It offers COPY alone. A playlist drop adds entries without removing
+/// anything, and a file manager must copy exported files: Tributary never
+/// learns when a foreign copy finishes, so it could never honor a MOVE, and
+/// a LINK would leave a pointer into the library outside its control.
+fn track_drag_source(
+    sort_model: gtk::SortListModel,
+    column_view: gtk::ColumnView,
+) -> gtk::DragSource {
     let drag_source = gtk::DragSource::builder()
         .actions(gtk::gdk::DragAction::COPY)
         .build();
-    let sort_model = state.sort_model.clone();
-    let column_view = state.column_view.clone();
     drag_source.connect_prepare(move |_, x, y| {
         // The source is installed on the whole `ColumnView`, whose header
         // owns GTK's column reorder and resize gestures. Only a press inside
@@ -906,16 +988,9 @@ fn setup_playlist_transfer(
             .model()?
             .downcast::<gtk::MultiSelection>()
             .ok()?;
-        let payload = PlaylistDragPayload::from_selection(&sort_model, &selection)?;
-        Some(gtk::gdk::ContentProvider::for_value(&payload.to_value()))
+        track_drag_content(&sort_model, &selection)
     });
-    state.column_view.add_controller(drag_source);
-    state.column_view.update_property(&[
-        gtk::accessible::Property::Description(
-            rust_i18n::t!("context.playlist_drag_description").as_ref(),
-        ),
-        gtk::accessible::Property::KeyShortcuts("Shift+F10 ContextMenu"),
-    ]);
+    drag_source
 }
 
 /// Whether a drag starting at `picked`, the widget under the pointer as
@@ -1138,13 +1213,21 @@ fn collect_selected_add_candidates(
     sm: &gtk::SortListModel,
     selection: &SelectionSnapshot,
 ) -> Option<Vec<PlaylistAddCandidate>> {
+    selected_tracks(sm, selection)?
+        .iter()
+        .map(playlist_add_candidate)
+        .collect()
+}
+
+/// The rows at `selection`'s positions, or `None` if any is not a track.
+fn selected_tracks(
+    sm: &gtk::SortListModel,
+    selection: &SelectionSnapshot,
+) -> Option<Vec<TrackObject>> {
     selection
         .positions
         .iter()
-        .map(|position| {
-            let track = sm.item(*position)?.downcast::<TrackObject>().ok()?;
-            playlist_add_candidate(&track)
-        })
+        .map(|position| sm.item(*position).and_downcast::<TrackObject>())
         .collect()
 }
 
@@ -2997,6 +3080,130 @@ pub mod tests {
         ));
     }
 
+    fn export_fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tributary export {name}.flac"))
+    }
+
+    fn file_uri(path: &std::path::Path) -> String {
+        url::Url::from_file_path(path)
+            .expect("absolute fixture path")
+            .to_string()
+    }
+
+    /// A catalogue row owned by `source_id` under an adopted session.
+    fn session_bound_track(id: &str, source_id: SourceId, uri: &str) -> TrackObject {
+        let track = TrackObject::new(
+            1, "Session", 60, "Artist", "Album", "", "", 0, "", 0, 0, 0, "", uri,
+        );
+        track.set_track_id(id);
+        assert!(track.set_source_id(source_id));
+        track.set_source_session_epoch(3);
+        track.set_source_catalogue_generation(5);
+        track
+    }
+
+    fn subsonic_source() -> SourceId {
+        SourceId::remote(
+            "subsonic",
+            &url::Url::parse("http://mini.local:4533").expect("server URL"),
+        )
+        .expect("remote source")
+    }
+
+    #[test]
+    fn file_export_needs_every_dragged_row_to_be_a_local_library_file() {
+        use crate::ui::objects::{PlaylistOccurrenceBinding, PlaylistRowUnavailableReason};
+
+        let first = export_fixture_path("first");
+        let second = export_fixture_path("second");
+        let local = local_ctx_track("local-1", &file_uri(&first));
+        let listed = local_ctx_track("local-2", &file_uri(&second));
+        listed.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::available_local(
+                "entry-2",
+                TrackId::new("local-2").expect("local track id"),
+            )
+            .expect("available local occurrence"),
+        );
+
+        assert_eq!(
+            exportable_file_paths(&[listed.clone(), local.clone()]),
+            Some(vec![second, first.clone()]),
+            "an all-local selection exports every file in dragged order"
+        );
+
+        // Any one of these rows withholds the whole list. The remote,
+        // removable, unowned, and missing rows carry a real file URI: row
+        // ownership decides, not the URI.
+        let first_uri = file_uri(&first);
+        let remote = session_bound_track("remote-1", subsonic_source(), &first_uri);
+        let removable = session_bound_track(
+            "device-1",
+            SourceId::removable("device:key").expect("removable source"),
+            &first_uri,
+        );
+        let streamed = local_ctx_track("streamed", "https://example.test/song.flac");
+        let pathless = local_ctx_track("pathless", "");
+        let unowned = TrackObject::new(
+            1, "Unowned", 60, "", "", "", "", 0, "", 0, 0, 0, "", &first_uri,
+        );
+        let missing = local_ctx_track("missing", &first_uri);
+        missing.set_playlist_occurrence_binding(
+            PlaylistOccurrenceBinding::unavailable(
+                "entry-missing",
+                SourceId::local(),
+                Some(TrackId::new("missing").expect("local track id")),
+                PlaylistRowUnavailableReason::LocalTrackMissing,
+            )
+            .expect("missing local occurrence"),
+        );
+        for other in [remote, removable, streamed, pathless, unowned, missing] {
+            assert_eq!(exportable_file_paths(&[local.clone(), other.clone()]), None);
+            assert_eq!(exportable_file_paths(&[other]), None);
+        }
+        assert_eq!(exportable_file_paths(&[]), None);
+    }
+
+    #[test]
+    fn drag_content_adds_a_file_list_only_when_files_are_exportable() {
+        use gtk::gdk::FileList;
+
+        let payload = PlaylistDragPayload {
+            candidates: vec![PlaylistAddCandidate::Local(MediaKey::new(
+                SourceId::local(),
+                TrackId::new("local-1").expect("local track id"),
+            ))],
+        };
+        let path = export_fixture_path("offered");
+
+        let in_app_only = track_drag_provider(&payload, None).formats();
+        assert!(in_app_only.contains_type(PlaylistDragPayload::static_type()));
+        assert!(!in_app_only.contains_type(FileList::static_type()));
+
+        let content = track_drag_provider(&payload, Some(std::slice::from_ref(&path)));
+        let formats = content.formats();
+        assert!(formats.contains_type(PlaylistDragPayload::static_type()));
+        assert!(formats.contains_type(FileList::static_type()));
+
+        // In-app drop targets decode the same payload out of the union.
+        let decoded = content
+            .value(PlaylistDragPayload::static_type())
+            .expect("the union keeps the in-app payload")
+            .get::<PlaylistDragPayload>()
+            .expect("typed payload");
+        assert_eq!(decoded, payload);
+        let files = content
+            .value(FileList::static_type())
+            .expect("the union offers the file list")
+            .get::<FileList>()
+            .expect("typed file list")
+            .files();
+        assert_eq!(
+            files.iter().map(gtk::gio::File::path).collect::<Vec<_>>(),
+            [Some(path)]
+        );
+    }
+
     #[test]
     fn playlist_views_offer_add_destinations_alongside_removal() {
         let source = include_str!("context_menu.rs");
@@ -3617,8 +3824,7 @@ pub mod tests {
     pub fn drag_payload_preserves_displayed_selection_order() {
         let (sort_model, selection) = sorted_track_selection_models();
 
-        let payload = PlaylistDragPayload::from_selection(&sort_model, &selection)
-            .expect("a non-empty selection must produce a drag payload");
+        let payload = dragged_payload(&sort_model, &selection);
         assert_eq!(
             payload
                 .candidates
@@ -3628,6 +3834,79 @@ pub mod tests {
             ["a-track", "c-track"],
             "candidates must follow displayed position order"
         );
+    }
+
+    /// The in-app payload the production drag content carries for
+    /// `selection`.
+    #[cfg(not(target_os = "macos"))]
+    fn dragged_payload(
+        sort_model: &gtk::SortListModel,
+        selection: &gtk::MultiSelection,
+    ) -> PlaylistDragPayload {
+        track_drag_content(sort_model, selection)
+            .expect("a non-empty selection must produce drag content")
+            .value(PlaylistDragPayload::static_type())
+            .expect("every track drag carries the in-app payload")
+            .get::<PlaylistDragPayload>()
+            .expect("typed payload")
+    }
+
+    /// The production drag content over a real selection model: an
+    /// all-local selection is advertised to file managers as
+    /// `text/uri-list` with its files in displayed order, one remote row
+    /// withholds the files while the in-app payload keeps the whole
+    /// selection, and the drag offers COPY alone.
+    #[cfg(not(target_os = "macos"))]
+    pub fn track_drag_offers_files_only_for_all_local_selections() {
+        let first = export_fixture_path("first");
+        let second = export_fixture_path("second");
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        store.append(&local_ctx_track("local-1", &file_uri(&first)));
+        store.append(&local_ctx_track("local-2", &file_uri(&second)));
+        store.append(&session_bound_track("remote-1", subsonic_source(), ""));
+        let sort_model = gtk::SortListModel::new(Some(store), None::<gtk::Sorter>);
+        let selection = gtk::MultiSelection::new(Some(sort_model.clone()));
+
+        let drag_source = track_drag_source(
+            sort_model.clone(),
+            gtk::ColumnView::new(Some(selection.clone())),
+        );
+        assert_eq!(drag_source.actions(), gtk::gdk::DragAction::COPY);
+
+        selection.select_item(1, true);
+        selection.select_item(0, false);
+        let content = track_drag_content(&sort_model, &selection).expect("local rows drag");
+        assert!(content
+            .formats()
+            .union_serialize_mime_types()
+            .contain_mime_type("text/uri-list"));
+        assert_eq!(
+            offered_paths(&content),
+            [Some(first), Some(second)],
+            "file managers receive the files in displayed order"
+        );
+
+        selection.select_item(2, false);
+        let content = track_drag_content(&sort_model, &selection).expect("mixed rows drag");
+        assert!(!content
+            .formats()
+            .union_serialize_mime_types()
+            .contain_mime_type("text/uri-list"));
+        assert_eq!(dragged_payload(&sort_model, &selection).candidates.len(), 3);
+    }
+
+    /// The local paths of the file list `content` offers to file managers.
+    #[cfg(not(target_os = "macos"))]
+    fn offered_paths(content: &gtk::gdk::ContentProvider) -> Vec<Option<PathBuf>> {
+        content
+            .value(gtk::gdk::FileList::static_type())
+            .expect("the drag offers a file list")
+            .get::<gtk::gdk::FileList>()
+            .expect("typed file list")
+            .files()
+            .iter()
+            .map(gtk::gio::File::path)
+            .collect()
     }
 
     /// Store order (c, a, b) displayed sorted (a, b, c), first and last
@@ -3683,7 +3962,7 @@ pub mod tests {
     /// behave identically to the per-row drop. The action builder collects
     /// its candidates with `collect_selected_add_candidates` over the popup
     /// selection snapshot and the drag source collects them through
-    /// `PlaylistDragPayload::from_selection`; both must carry the identical
+    /// `track_drag_content`; both must carry the identical
     /// candidates in displayed position order, and the keyboard destination
     /// guard `playlist_is_editable_regular` must accept exactly the editable
     /// regular playlists the drop target's `position_source` check accepts.
@@ -3850,8 +4129,7 @@ pub mod tests {
                 .collect()
         }
 
-        let drag = PlaylistDragPayload::from_selection(sort_model, selection)
-            .expect("a non-empty selection must produce a drag payload");
+        let drag = dragged_payload(sort_model, selection);
         let keyboard = collect_selected_add_candidates(sort_model, &keyboard_selection)
             .expect("selected rows must resolve to add candidates");
 
