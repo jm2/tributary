@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend} 傳回了無效回應"
     authentication_method_unsupported: "%{backend} 的身分驗證方式不受支援"
     source_failed: "%{backend} 資料來源發生錯誤"
+    catalogue_incomplete: "無法載入 %{server} 中的部分音樂。請重新連線後再試一次。"
     removable_backend: "卸除式媒體"
     generic_backend: "遠端伺服器"
   playback:

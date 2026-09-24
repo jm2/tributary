@@ -67,6 +67,9 @@ struct LibraryCache {
     /// Exact Plex rating key → Last.fm attribution profile derived from the
     /// raw accepted protocol row before display fallbacks were substituted.
     attribution_profiles: HashMap<TrackId, PlaybackAttributionProfile>,
+    /// A section failed to load or stopped at the page cap, so the server
+    /// has music this cache lacks.
+    incomplete: bool,
 }
 
 impl LibraryCache {
@@ -76,6 +79,7 @@ impl LibraryCache {
             stream_source_by_track_id: HashMap::new(),
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
+            incomplete: false,
         }
     }
 }
@@ -184,6 +188,7 @@ impl PlexBackend {
         let mut stream_source_by_track_id = HashMap::new();
         let mut track_artwork_locator_by_track_id = HashMap::new();
         let mut attribution_profiles = HashMap::new();
+        let mut incomplete = false;
 
         for lib in &self.music_libraries {
             let section_endpoint = format!("library/sections/{}/all", lib.key);
@@ -193,6 +198,7 @@ impl PlexBackend {
             // the items returned per request). A failure is logged and skips
             // ONLY this section, so other music libraries still load, and a
             // section is accumulated only after its whole listing arrived.
+            // Either a failure or the page cap marks the load incomplete.
             let tracks: Vec<PlexTrack> = match self
                 .fetch_all_pages::<PlexTracksResponse, _>(&section_endpoint, "10", &lib.name, |r| {
                     let c = r.media_container;
@@ -200,13 +206,17 @@ impl PlexBackend {
                 })
                 .await
             {
-                Ok(items) => items,
+                Ok((items, truncated)) => {
+                    incomplete |= truncated;
+                    items
+                }
                 Err(e) => {
                     tracing::warn!(
                         section = %lib.name,
                         error = %e,
                         "Failed to fetch Plex tracks, skipping section"
                     );
+                    incomplete = true;
                     continue;
                 }
             };
@@ -232,7 +242,7 @@ impl PlexBackend {
 
         info!(
             tracks = all_tracks.len(),
-            skipped_unplayable_tracks, "Plex library loaded"
+            skipped_unplayable_tracks, incomplete, "Plex library loaded"
         );
 
         let mut cache = self.cache.write().await;
@@ -241,6 +251,7 @@ impl PlexBackend {
             stream_source_by_track_id,
             track_artwork_locator_by_track_id,
             attribution_profiles,
+            incomplete,
         };
 
         Ok(())
@@ -256,19 +267,21 @@ impl PlexBackend {
     /// everything has been retrieved, bounded by [`PLEX_MAX_PAGES`].
     ///
     /// A request failure propagates as `Err`, letting the caller keep the
-    /// existing per-section log-and-continue behaviour.
+    /// existing per-section log-and-continue behaviour. The returned flag is
+    /// `true` when the page cap stopped paging before the listing ended.
     async fn fetch_all_pages<R, T>(
         &self,
         endpoint: &str,
         item_type: &str,
         section_name: &str,
         into_page: impl Fn(R) -> (Vec<T>, Option<u32>),
-    ) -> BackendResult<Vec<T>>
+    ) -> BackendResult<(Vec<T>, bool)>
     where
         R: serde::de::DeserializeOwned,
     {
         let mut items: Vec<T> = Vec::new();
         let mut start: u32 = 0;
+        let mut truncated = false;
 
         for page in 0..PLEX_MAX_PAGES {
             let start_str = start.to_string();
@@ -309,13 +322,21 @@ impl PlexBackend {
                     total = ?total_size,
                     "Plex pagination hit the MAX_PAGES cap; some items may be missing"
                 );
+                truncated = true;
                 break;
             }
 
             start += page_len;
         }
 
-        Ok(items)
+        Ok((items, truncated))
+    }
+
+    /// Whether the loaded library is known to be missing music the server
+    /// has. The registry asks right after the load finished, when no refresh
+    /// holds the cache, so the non-blocking read always sees the result.
+    pub(crate) fn catalogue_incomplete(&self) -> bool {
+        self.cache.try_read().is_ok_and(|cache| cache.incomplete)
     }
 
     /// Return the exact Last.fm attribution profile retained for one accepted
@@ -731,6 +752,7 @@ mod tests {
             .await
             .expect("connect Plex fixture");
 
+        assert!(!backend.catalogue_incomplete());
         assert_eq!(backend.rating_capability(), RatingCapability::ReadOnly);
         let published = crate::architecture::load_track_catalog(&backend)
             .await
@@ -1037,6 +1059,7 @@ mod tests {
         .await
         .expect("the healthy section must survive another section's failure");
 
+        assert!(backend.catalogue_incomplete());
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), (PLEX_PAGE_SIZE + 1) as usize);
         let first_id = cache.tracks[0]

@@ -493,6 +493,7 @@ errors:
     invalid_response: "%{backend} returned an invalid response"
     authentication_method_unsupported: "%{backend} authentication method is unsupported"
     source_failed: "%{backend} source failed"
+    catalogue_incomplete: "Some music from %{server} couldn’t be loaded. Reconnect to try again."
     removable_backend: "Removable media"
     generic_backend: "Remote"
   playback:

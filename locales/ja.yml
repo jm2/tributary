@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend} から無効な応答が返されました"
     authentication_method_unsupported: "%{backend} の認証方式はサポートされていません"
     source_failed: "%{backend} ソースでエラーが発生しました"
+    catalogue_incomplete: "%{server} の音楽の一部を読み込めませんでした。再接続して、もう一度お試しください。"
     removable_backend: "リムーバブルメディア"
     generic_backend: "リモートサーバー"
   playback:

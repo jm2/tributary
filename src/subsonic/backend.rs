@@ -55,6 +55,9 @@ struct LibraryCache {
     /// Exact Subsonic song ID → validated stream representation. Tracks whose
     /// suffix is absent or outside the allowlist map to the explicit unknown.
     representation_by_track_id: HashMap<TrackId, MediaRepresentation>,
+    /// An artist or album failed to load, so the server has music this cache
+    /// lacks.
+    incomplete: bool,
 }
 
 impl LibraryCache {
@@ -65,6 +68,7 @@ impl LibraryCache {
             track_artwork_locator_by_track_id: HashMap::new(),
             attribution_profiles: HashMap::new(),
             representation_by_track_id: HashMap::new(),
+            incomplete: false,
         }
     }
 }
@@ -286,7 +290,7 @@ impl SubsonicBackend {
         // so the resulting cache is identical to the old sequential walk.
         // Per-item failures keep the original log-and-skip semantics: a
         // failed `getArtist` drops that artist entirely, a failed `getAlbum`
-        // drops just that album.
+        // drops just that album, and either marks the load incomplete.
         //
         // An album with several album artists is listed by `getArtist` under
         // each of them. It is fetched once and assembled under the first
@@ -372,6 +376,9 @@ impl SubsonicBackend {
             .collect()
             .await;
 
+        let incomplete = artist_albums.iter().any(|(_, albums)| albums.is_none())
+            || album_songs.iter().any(|(_, songs)| songs.is_none());
+
         // Index the fetched songs by album ID. Albums whose `getAlbum` failed
         // are absent here and so are skipped during assembly below.
         let mut songs_by_album: HashMap<String, Vec<SongEntry>> = album_songs
@@ -455,7 +462,10 @@ impl SubsonicBackend {
 
         info!(
             tracks = all_tracks.len(),
-            skipped_invalid_track_ids, skipped_duplicate_track_ids, "Subsonic library loaded"
+            skipped_invalid_track_ids,
+            skipped_duplicate_track_ids,
+            incomplete,
+            "Subsonic library loaded"
         );
 
         let mut cache = self.cache.write().await;
@@ -465,6 +475,7 @@ impl SubsonicBackend {
             track_artwork_locator_by_track_id,
             attribution_profiles,
             representation_by_track_id,
+            incomplete,
         };
 
         Ok(())
@@ -485,6 +496,13 @@ impl SubsonicBackend {
     ) -> Option<PlaybackAttributionProfile> {
         let cache = self.cache.try_read().ok()?;
         cache.attribution_profiles.get(track_id).cloned()
+    }
+
+    /// Whether the loaded library is known to be missing music the server
+    /// has. The registry asks right after the load finished, when no refresh
+    /// holds the cache, so the non-blocking read always sees the result.
+    pub(crate) fn catalogue_incomplete(&self) -> bool {
+        self.cache.try_read().is_ok_and(|cache| cache.incomplete)
     }
 
     /// The native song ID and validated representation of one accepted track.
@@ -922,6 +940,7 @@ mod tests {
         .await
         .expect("partial failures must retain the healthy catalogue subset");
 
+        assert!(backend.catalogue_incomplete());
         let cache = backend.cache.read().await;
         assert_eq!(cache.tracks.len(), 1);
         assert_eq!(cache.tracks[0].title, "Healthy Track");
@@ -1013,6 +1032,7 @@ mod tests {
             .await
             .expect("connect to fixture");
 
+        assert!(!backend.catalogue_incomplete());
         let cache = backend.cache.read().await;
         let track_ids: Vec<_> = cache
             .tracks
@@ -1033,6 +1053,51 @@ mod tests {
         assert_eq!(album_ids, [Some(duet), Some(duet), Some(solo)]);
         drop(cache);
         service.finish().await;
+    }
+
+    #[tokio::test]
+    async fn one_failed_artist_or_album_fetch_reports_an_incomplete_load() {
+        let artist_index = |artists: serde_json::Value| {
+            MockRoute::get("/rest/getArtists.view").reply(MockResponse::json(serde_json::json!({
+                "subsonic-response": {
+                    "status": "ok",
+                    "artists": {"index": [{"artist": artists}]}
+                }
+            })))
+        };
+        let failed_artist = vec![
+            artist_index(serde_json::json!([
+                {"id": "healthy", "name": "Healthy"},
+                {"id": "failed", "name": "Failed"}
+            ])),
+            artist_listing("healthy", "Healthy", &["healthy-album"]),
+            MockRoute::get("/rest/getArtist.view")
+                .with_query("id", "failed")
+                .reply(MockResponse::status(StatusCode::SERVICE_UNAVAILABLE)),
+            album_listing("healthy-album", &["healthy-song"]),
+        ];
+        let failed_album = vec![
+            artist_index(serde_json::json!([{"id": "healthy", "name": "Healthy"}])),
+            artist_listing("healthy", "Healthy", &["healthy-album", "failed-album"]),
+            album_listing("healthy-album", &["healthy-song"]),
+            MockRoute::get("/rest/getAlbum.view")
+                .with_query("id", "failed-album")
+                .reply(MockResponse::status(StatusCode::BAD_GATEWAY)),
+        ];
+
+        for mut routes in [failed_artist, failed_album] {
+            routes.push(MockRoute::get("/rest/ping.view").reply(MockResponse::json(
+                serde_json::json!({"subsonic-response": {"status": "ok"}}),
+            )));
+            let service = MockHttpService::start(routes).await;
+            let backend = SubsonicBackend::connect(&service.base_url(), "user", "pw")
+                .await
+                .expect("a failed fetch keeps the rest of the library");
+
+            assert!(backend.catalogue_incomplete());
+            assert_eq!(backend.cache.read().await.tracks.len(), 1);
+            service.finish().await;
+        }
     }
 
     fn raw_row_album_songs() -> Vec<serde_json::Value> {

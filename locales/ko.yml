@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend}에서 잘못된 응답을 받았습니다"
     authentication_method_unsupported: "%{backend}의 인증 방식은 지원되지 않습니다"
     source_failed: "%{backend} 소스에 오류가 발생했습니다"
+    catalogue_incomplete: "%{server}의 음악 중 일부를 불러오지 못했습니다. 다시 연결해 다시 시도하세요."
     removable_backend: "이동식 미디어"
     generic_backend: "원격 서버"
   playback:

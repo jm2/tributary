@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend} 返回了无效响应"
     authentication_method_unsupported: "%{backend} 的身份验证方式不受支持"
     source_failed: "%{backend} 数据源发生错误"
+    catalogue_incomplete: "无法加载 %{server} 中的部分音乐。请重新连接后重试。"
     removable_backend: "可移动介质"
     generic_backend: "远程服务器"
   playback:

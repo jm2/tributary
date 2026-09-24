@@ -208,6 +208,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the download summary now says so instead of counting them only as failed. For Subsonic
   servers such as Navidrome, it suggests asking the server's administrator to allow downloads for
   your account.
+- **Server libraries that load only partly** — When part of a Jellyfin, Plex, or Subsonic library
+  can't be loaded on connecting, Tributary now says so and suggests reconnecting, instead of
+  silently showing fewer songs. A Jellyfin server that keeps sending the same page of songs no
+  longer makes Tributary ask for it thousands of times.
 
 ### Security
 

@@ -484,6 +484,7 @@ errors:
     invalid_response: "%{backend} heeft een ongeldig antwoord geretourneerd"
     authentication_method_unsupported: "De authenticatiemethode van %{backend} wordt niet ondersteund"
     source_failed: "De %{backend}-bron is mislukt"
+    catalogue_incomplete: "Een deel van de muziek van %{server} kon niet worden geladen. Maak opnieuw verbinding om het nogmaals te proberen."
     removable_backend: "Verwisselbaar medium"
     generic_backend: "Externe server"
   playback:
