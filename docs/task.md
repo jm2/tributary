@@ -24,8 +24,6 @@ GitHub.
 | ID | Issue | Scope | State |
 | --- | --- | --- | --- |
 | R11 | [#258](https://github.com/jm2/tributary/issues/258) | Non-UTF-8 local file names | Safe refusal shipped (#410): such files are skipped with a notice. Quarantining rows stored by older versions and a lossless path key remain |
-| Q5 | [#299](https://github.com/jm2/tributary/issues/299) | Media-relay resource limits | Open; the issue's design awaits an owner decision |
-| Q6 | [#300](https://github.com/jm2/tributary/issues/300) | Remote catalogue limits and partialness | Open; the issue's design awaits an owner decision. A truncated catalogue loses no stored data (checked 2026-09-24) |
 | P2.1-B | [#50](https://github.com/jm2/tributary/issues/50) | Last.fm scrobbling | LF1 (#289), LF2 (#305), LF3 (#308) merged; #335 and #337 fixed (#391). LF4 (packaged credentials, live acceptance) and [#336](https://github.com/jm2/tributary/issues/336) (local-library attribution, after LF4) open |
 | P2.2-B | [#46](https://github.com/jm2/tributary/issues/46) | Remaining drag-and-drop targets | Drag to a file manager shipped (#405); dragging remote tracks stays unavailable. Close with the 0.7.0 release |
 | P2.3-C | [#29](https://github.com/jm2/tributary/issues/29) | Separator, count-opacity, and alignment refinements | Merged (#179); visual and accessibility sign-off per [acceptance-p2.3-c.md](acceptance-p2.3-c.md) pending |
@@ -52,6 +50,8 @@ GitHub.
 | Q2 | [#279](https://github.com/jm2/tributary/issues/279) | #282; superseded by the single workspace lockfile (#365) |
 | Q3 | [#301](https://github.com/jm2/tributary/issues/301) | #304 |
 | Q4 | [#275](https://github.com/jm2/tributary/issues/275) | #285, #291, #306 |
+| Q5 | [#299](https://github.com/jm2/tributary/issues/299) | Reduced scope chosen by the owner: a per-server cap on concurrent relay responses, #419 |
+| Q6 | [#300](https://github.com/jm2/tributary/issues/300) | Reduced scope chosen by the owner: an incomplete-library notice and a Jellyfin repeated-page guard, #418 |
 | Q7 | [#276](https://github.com/jm2/tributary/issues/276) | #280; the checker was retired on 2026-09-23 along with the counters it checked |
 | P2.2-A | [#46](https://github.com/jm2/tributary/issues/46) | Drops onto local playlists: #182, #242, #290 |
 | P2.3-A | [#14](https://github.com/jm2/tributary/issues/14) | Folder browsing: `455e786`, with R3–R6 and R10 |

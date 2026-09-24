@@ -41,9 +41,6 @@ produce that evidence. After the release, close [#46] and publish the AppStream 
 
 ## Waiting for a decision
 
-- **Media-relay limits ([#299]) and remote catalogue limits ([#300]).** Both issues propose large
-  designs. A truncated remote catalogue loses no stored data, and the relay only serves Cast
-  receivers holding valid tickets on the local network, so smaller fixes may be enough.
 - **Non-UTF-8 file names ([#258]).** Such files are refused with a notice. Keeping tracks stored
   by older versions (instead of removing them at the next scan) and indexing these files
   losslessly would need a schema change.
@@ -94,6 +91,4 @@ Superseded, kept for background: [offline media](offline-media.md) and the
 [#50]: https://github.com/jm2/tributary/issues/50
 [#258]: https://github.com/jm2/tributary/issues/258
 [#266]: https://github.com/jm2/tributary/issues/266
-[#299]: https://github.com/jm2/tributary/issues/299
-[#300]: https://github.com/jm2/tributary/issues/300
 [#336]: https://github.com/jm2/tributary/issues/336
