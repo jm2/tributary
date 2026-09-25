@@ -70,15 +70,15 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Local playback history (play counts and last-played times) | ✅ |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
 | Track ratings | ✅ Editable for local tracks; Subsonic, Jellyfin, and Plex ratings are read-only |
-| Last.fm scrobbling | 🚧 Settings exist, but release builds can't connect yet |
+| Last.fm scrobbling | 🚧 Not available yet |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
-Last.fm scrobbling is not usable yet. Preferences has a Last.fm group, but release builds don't
-include Last.fm application credentials, so it shows the feature as unavailable and Tributary never
+Last.fm scrobbling isn't available yet. Release builds don't include Last.fm application
+credentials, so Preferences doesn't show Last.fm settings until they do, and Tributary never
 contacts Last.fm. The [Last.fm design](docs/lastfm-scrobbling.md) records what exists and what
 remains. Planned work is tracked in [GitHub issues](https://github.com/jm2/tributary/issues); the
 [roadmap](docs/roadmap.md) summarizes product direction and current limitations.
@@ -344,10 +344,11 @@ rather than in software. It does not expose the whole home directory:
   the host.
 - Media mounted under `/media`, `/run/media`, and `/mnt` is exposed read/write for the automatic
   **Devices** entries, playback, tag editing, and **Copy to Device**.
-- A custom path saved by an older Flatpak build may become unavailable under this policy. Use that
-  root's **Reauthorize…** action in Preferences to reselect the same folder through the portal,
-  confirm the move, and restart Tributary so the relocation completes before scanning. Removing and
-  re-adding the folder instead would lose track IDs, history, and playlist links.
+- A custom path saved by an older Flatpak build may become unavailable under this policy. Use the
+  folder button (**Reauthorize…**) on that root's row in Preferences to reselect the same folder
+  through the portal, confirm the move, and restart Tributary so the relocation completes before
+  scanning. Removing and re-adding the folder instead would lose track IDs, history, and playlist
+  links.
 
 #### Moving Flatpak data to the new app ID
 
@@ -607,9 +608,9 @@ local library offer files: if the selection includes a server, radio, or removab
 the drag can still add to a playlist but hands no files to the file manager. Tributary offers a
 copy only, never a move, so the originals stay in your library.
 
-To show cover art in the Album pane, turn on **Album pane artwork** under Preferences → Browser
-Views and choose Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for
-server libraries, from the server.
+To show cover art in the Album pane, set **Album artwork** under Preferences → Browser Views to
+Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for server libraries,
+from the server.
 
 ### Library Folders
 
@@ -781,7 +782,7 @@ of video IDs or watch URLs is not enough to match a local library.
 
 ### Importing from Rhythmbox
 
-Open **Preferences → Library** and choose **Import from Rhythmbox…**, then select the Rhythmbox
+Open **Preferences → Import** and choose **Import from Rhythmbox…**, then select the Rhythmbox
 profile folder containing `rhythmdb.xml` (and `playlists.xml` when present). The preview shows
 what will be imported before anything is written. Ratings and play counts are enabled by default;
 last-played timestamps and overwriting an existing Tributary rating are explicit choices, and an
@@ -844,12 +845,14 @@ Open **Preferences** from the hamburger menu (☰) to:
   folder may be a symbolic link to another location; its tracks keep the path you added. Symbolic
   links inside a library folder are not followed. Removing a folder forgets its tracks, with their
   play counts and ratings, at the next start; playlists keep those entries as unmatched items.
-- Reauthorize a library folder or import from Rhythmbox
+- Reauthorize a library folder
 - Choose the folder that downloaded tracks are saved to (see [Downloading Remote Tracks](#downloading-remote-tracks))
-- Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
+- Toggle browser panes (Genre, Artist, Album, Folder) and choose the Album pane's artwork size
 - Show/hide tracklist columns
 - Set up the equalizer for playback on this computer
 - Turn the location lookup for Stations Near Me on or off (see [Internet Radio](#internet-radio))
+- Import ratings, play counts, and playlists from Rhythmbox (see
+  [Importing from Rhythmbox](#importing-from-rhythmbox))
 
 ---
 

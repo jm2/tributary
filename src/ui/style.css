@@ -76,3 +76,12 @@ searchentry {
 }
 
 
+
+/* Equalizer sliders in Preferences — Adwaita pads every scale by 12px on
+ * each side, which makes the preamp and ten vertical bands 540px wide at
+ * minimum. Trimming the horizontal padding lets the row shrink with the
+ * Preferences dialog; the columns still spread out when there is room. */
+.equalizer-slider.vertical {
+    padding-left: 6px;
+    padding-right: 6px;
+}

@@ -1,8 +1,9 @@
 //! Preferences window — unified settings for library location, browser
 //! views, and column visibility.
 //!
-//! Uses `adw::PreferencesDialog` with a single page containing four
-//! groups: Library Location, Browser Views, Visible Columns, and Equalizer.
+//! Uses `adw::PreferencesDialog` with a single page: Library Location,
+//! Downloads, Browser Views, Visible Columns, Equalizer, Privacy, any
+//! integration groups the window supplies (Last.fm), and Import last.
 
 use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -881,12 +882,12 @@ impl LayoutTargets {
 /// * `layout` — the tracklist, browser, and active source the toggles restyle
 /// * `config` — current configuration, mutated on changes
 /// * `saves` — coalesces the resulting `config.json` writes
-/// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
-/// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
-/// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
+/// * `on_album_artist_changed` — invoked when the artist grouping switch flips
+/// * `on_album_pane_artwork_changed` — invoked when album artwork turns on or off
+/// * `on_album_pane_artwork_size_changed` — invoked when the artwork size changes
 /// * `active_output` — the output the equalizer group applies its settings to
-///
-/// Returns the page so the caller can append integration groups (Last.fm).
+/// * `integration_groups` — groups for optional integrations (Last.fm), placed
+///   after the app's own settings and before the Import group
 #[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
@@ -897,7 +898,8 @@ pub fn show_preferences(
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
     active_output: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::audio::output::AudioOutput>>>,
-) -> adw::PreferencesPage {
+    integration_groups: &[adw::PreferencesGroup],
+) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
@@ -908,354 +910,32 @@ pub fn show_preferences(
     }
 
     let page = adw::PreferencesPage::new();
+    page.add(&library_group(parent, config));
+    page.add(&downloads_group(parent, config, saves));
+    for group in browser_views_groups(
+        config,
+        saves,
+        layout,
+        on_album_artist_changed,
+        on_album_pane_artwork_changed,
+        on_album_pane_artwork_size_changed,
+    ) {
+        page.add(&group);
+    }
+
     let cfg = config.borrow();
 
-    // ── Library Location group (supports multiple folders) ──────────
-    let library_group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.library_location").as_ref())
-        .build();
-
-    // The "+" (add) and the per-row "−" (remove) buttons all live inside this
-    // one content box, so they share its trailing edge and line up by
-    // construction — no DPI-fragile fixed margins. (A header-suffix "+" can't
-    // be made to align with the rows, because adw lays the group header and
-    // the row list out in separate containers with different insets.)
-    let library_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .build();
-
-    // "+" at the bottom-right of the group body, after the folder rows.
-    let add_folder_btn = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .halign(gtk::Align::End)
-        .css_classes(["flat", "circular"])
-        .tooltip_text(rust_i18n::t!("preferences.add_folder").as_ref())
-        .build();
-
-    // Hint shown once the user adds or removes a folder. The running
-    // library engine only reads the configured paths at startup, so a
-    // restart is required before a newly-added folder is scanned/watched
-    // (and a removed folder stops being watched). Hidden until a change.
-    let restart_hint_text = if cfg.pending_root_reauthorizations.is_empty() {
-        rust_i18n::t!("preferences.library_restart_hint")
-    } else {
-        rust_i18n::t!("preferences.reauthorization_restart_hint")
-    };
-    let restart_hint = gtk::Label::builder()
-        .label(restart_hint_text.as_ref())
-        .css_classes(["dim-label", "caption"])
-        .halign(gtk::Align::Start)
-        .wrap(true)
-        .visible(!cfg.pending_root_reauthorizations.is_empty())
-        .margin_top(2)
-        .build();
-
-    // One row per folder: path on the left, "−" flush to the right edge.
-    let paths_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .build();
-    for lib_path in &cfg.library_paths {
-        paths_box.append(&build_library_path_row(
-            lib_path,
-            config.clone(),
-            paths_box.clone(),
-            restart_hint.clone(),
-            parent.clone(),
-        ));
-    }
-    library_box.append(&paths_box);
-    library_box.append(&add_folder_btn);
-    library_box.append(&restart_hint);
-
-    // Add a folder via the file chooser.
-    {
-        let config = config.clone();
-        let paths_box = paths_box.clone();
-        let parent = parent.clone();
-        let restart_hint = restart_hint.clone();
-        add_folder_btn.connect_clicked(move |_| {
-            let config = config.clone();
-            let paths_box = paths_box.clone();
-            let restart_hint = restart_hint.clone();
-            let dialog = gtk::FileDialog::builder()
-                .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
-                .modal(true)
-                .build();
-            let parent_for_result = parent.clone();
-
-            dialog.select_folder(
-                Some(&parent),
-                None::<&gtk::gio::Cancellable>,
-                move |result| {
-                    if let Ok(folder) = result {
-                        if let Some(path) = folder.path() {
-                            let Some(path_str) = path.to_str().map(str::to_string) else {
-                                warn!("Ignoring a selected library folder with a non-Unicode path");
-                                return;
-                            };
-                            if !add_library_path(&config, &path_str) {
-                                return;
-                            }
-
-                            let row = build_library_path_row(
-                                &path_str,
-                                config.clone(),
-                                paths_box.clone(),
-                                restart_hint.clone(),
-                                parent_for_result.clone(),
-                            );
-                            paths_box.append(&row);
-                            // The engine won't pick up the new folder until
-                            // the next launch — tell the user a restart is
-                            // needed instead of leaving them with an empty
-                            // library.
-                            restart_hint.set_label(
-                                rust_i18n::t!("preferences.library_restart_hint").as_ref(),
-                            );
-                            restart_hint.set_visible(true);
-                        }
-                    }
-                },
-            );
-        });
-    }
-
-    let import_rhythmbox_btn = adw::ButtonRow::builder()
-        .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
-        .start_icon_name("document-open-symbolic")
-        // Reuse the window action so the Preferences entry follows the same
-        // admission, shutdown, and migration-dialog path as the former menu
-        // item.
-        .action_name("win.migrate-rhythmbox")
-        .build();
-
-    library_group.add(&library_box);
-    library_group.add(&import_rhythmbox_btn);
-    page.add(&library_group);
-    page.add(&downloads_group(parent, config, saves));
-
-    // ── Browser Views group (dense horizontal checkboxes) ───────────
-    let browser_group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.browser_views").as_ref())
-        .build();
-
-    // Same homogeneous 3-column grid as Visible Columns, so the two groups'
-    // checkboxes line up column-to-column.
-    let browser_grid = gtk::Grid::builder()
-        .column_homogeneous(true)
-        .row_spacing(4)
-        .column_spacing(8)
-        .hexpand(true)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-
-    let genre_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.genre").as_ref())
-        .active(cfg.browser_views.genre)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let artist_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.artist").as_ref())
-        .active(cfg.browser_views.artist)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let album_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album").as_ref())
-        .active(cfg.browser_views.album)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-
-    let album_artist_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
-        .active(cfg.group_by_album_artist)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-
-    let folder_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.folder").as_ref())
-        .active(cfg.browser_views.folder)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let album_art_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork").as_ref())
-        .active(cfg.album_pane_artwork)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-
-    // Three radio options matching the `AlbumArtSize` tokens.
-    let album_art_size_small = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork_size_small").as_ref())
-        .active(cfg.album_pane_artwork_size == AlbumArtSize::Small)
-        .build();
-    let album_art_size_medium = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork_size_medium").as_ref())
-        .group(&album_art_size_small)
-        .active(cfg.album_pane_artwork_size == AlbumArtSize::Medium)
-        .build();
-    let album_art_size_large = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork_size_large").as_ref())
-        .group(&album_art_size_small)
-        .active(cfg.album_pane_artwork_size == AlbumArtSize::Large)
-        .build();
-
-    // Row 0: the three browser panes (one per grid column).
-    browser_grid.attach(&genre_check, 0, 0, 1, 1);
-    browser_grid.attach(&artist_check, 1, 0, 1, 1);
-    browser_grid.attach(&album_check, 2, 0, 1, 1);
-    // Row 1: the folder pane toggle (fourth browser pane) and the
-    // album pane artwork toggle share the row.
-    browser_grid.attach(&folder_check, 0, 1, 1, 1);
-    browser_grid.attach(&album_art_check, 1, 1, 2, 1);
-    // Row 2: the grouping toggle spans the full width (its label is longer).
-    browser_grid.attach(&album_artist_check, 0, 2, 3, 1);
-    // Row 3: size triplet (one per grid column). Grouped radios so only
-    // one can be active at a time.
-    browser_grid.attach(&album_art_size_small, 0, 3, 1, 1);
-    browser_grid.attach(&album_art_size_medium, 1, 3, 1, 1);
-    browser_grid.attach(&album_art_size_large, 2, 3, 1, 1);
-
-    // Wire album artist toggle
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let on_change = on_album_artist_changed.clone();
-        album_artist_check.connect_toggled(move |btn| {
-            let active = btn.is_active();
-            config.borrow_mut().group_by_album_artist = active;
-            saves.schedule();
-            on_change(active);
-        });
-    }
-
-    // Wire browser view toggles
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        genre_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.genre = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        artist_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.artist = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        album_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.album = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        folder_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.folder = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-
-    // Wire album pane artwork toggle. The pane rebuild is performed by
-    // the on-change callback so the browser owns the swap.
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let on_change = on_album_pane_artwork_changed.clone();
-        album_art_check.connect_toggled(move |btn| {
-            let active = btn.is_active();
-            config.borrow_mut().album_pane_artwork = active;
-            saves.schedule();
-            on_change(active);
-        });
-    }
-
-    // Wire album-pane artwork size radios. Same pattern as the toggle.
-    for (button, size) in [
-        (&album_art_size_small, AlbumArtSize::Small),
-        (&album_art_size_medium, AlbumArtSize::Medium),
-        (&album_art_size_large, AlbumArtSize::Large),
-    ] {
-        let config = config.clone();
-        let saves = saves.clone();
-        let on_change = on_album_pane_artwork_size_changed.clone();
-        button.connect_toggled(move |btn| {
-            if !btn.is_active() {
-                return;
-            }
-            config.borrow_mut().album_pane_artwork_size = size;
-            saves.schedule();
-            on_change(size);
-        });
-    }
-
-    browser_group.add(&browser_grid);
-    page.add(&browser_group);
-
-    // ── Visible Columns group (dense grid with FlowBox) ─────────────
+    // ── Visible Columns group (dense checkbox grid) ─────────────────
     let columns_group = adw::PreferencesGroup::builder()
         .title(rust_i18n::t!("preferences.visible_columns").as_ref())
         .build();
 
-    // A homogeneous Grid (rather than a FlowBox) so every column is equal
-    // width and the grid fills the group's clamped width: the leftmost column
-    // is flush with the left edge and the rightmost with the right edge, and
-    // the checkboxes line up column-to-column on every row.
-    let columns_grid = gtk::Grid::builder()
-        .column_homogeneous(true)
-        .row_spacing(4)
-        .column_spacing(8)
-        .hexpand(true)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-
-    const COLUMNS_PER_ROW: usize = 4;
-
     let locale = rust_i18n::locale();
     let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
         .iter()
-        .enumerate()
-        .map(|(i, &col_id)| {
+        .map(|&col_id| {
             let is_visible = cfg.visible_columns.iter().any(|c| c == col_id);
-            let check = gtk::CheckButton::builder()
-                .label(column_title(col_id, &locale))
-                .active(is_visible)
-                // Fill the homogeneous cell, but keep the label left-aligned
-                // so column text aligns down each grid column.
-                .hexpand(true)
-                .halign(gtk::Align::Start)
-                .build();
+            let check = grid_check(&column_title(col_id, &locale), is_visible);
 
             // Wire each column toggle
             let config = config.clone();
@@ -1274,13 +954,10 @@ pub fn show_preferences(
                 layout.show_columns(&cfg.visible_columns);
                 saves.schedule();
             });
-
-            let col = (i % COLUMNS_PER_ROW) as i32;
-            let row = (i / COLUMNS_PER_ROW) as i32;
-            columns_grid.attach(&check, col, row, 1, 1);
             (col_id, check)
         })
         .collect();
+    let columns_grid = check_grid(column_checks.iter().map(|(_, check)| check));
 
     // Reset to Defaults button
     let reset_btn = gtk::Button::builder()
@@ -1332,12 +1009,331 @@ pub fn show_preferences(
         active_output,
     ));
     page.add(&privacy_group(config, saves));
+    for group in integration_groups {
+        page.add(group);
+    }
+    page.add(&import_group());
 
     prefs_dialog.add(&page);
     drop(cfg);
 
     prefs_dialog.present(Some(parent));
-    page
+}
+
+/// The Library Location group: one row per library folder, laid out like
+/// the Downloads row, and an Add Folder… row closing the list.
+///
+/// The running library engine reads the configured folders only at startup,
+/// so adding or removing a folder shows a restart hint as the group
+/// description, and a pending reauthorization shows its own hint from the
+/// start.
+fn library_group(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.library_location").as_ref())
+        .build();
+    if !config.borrow().pending_root_reauthorizations.is_empty() {
+        group.set_description(Some(
+            rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref(),
+        ));
+    }
+    for lib_path in &config.borrow().library_paths {
+        group.add(&library_folder_row(lib_path, config, &group, parent));
+    }
+
+    let add_row = adw::ButtonRow::builder()
+        .title(rust_i18n::t!("preferences.add_folder").as_ref())
+        .start_icon_name("list-add-symbolic")
+        .build();
+    group.add(&add_row);
+
+    // Add a folder via the file chooser.
+    let (parent, config, group_ref) = (parent.clone(), config.clone(), group.downgrade());
+    add_row.connect_activated(move |add_row| {
+        let Some(group) = group_ref.upgrade() else {
+            return;
+        };
+        choose_library_folder(&parent, &config, &group, add_row);
+    });
+    group
+}
+
+/// Ask for a folder to add to the library, then list it in `group` above
+/// the Add Folder… row.
+fn choose_library_folder(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    group: &adw::PreferencesGroup,
+    add_row: &adw::ButtonRow,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
+        .modal(true)
+        .build();
+    let (config, group, add_row) = (config.clone(), group.clone(), add_row.clone());
+    let parent_for_result = parent.clone();
+    dialog.select_folder(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let Some(path) = result.ok().and_then(|folder| folder.path()) else {
+                return;
+            };
+            let Some(path) = path.to_str() else {
+                warn!("Ignoring a selected library folder with a non-Unicode path");
+                return;
+            };
+            if !add_library_path(&config, path) {
+                return;
+            }
+            // A group only appends rows, so Add Folder… moves back below
+            // the new folder, keeping the focus it had.
+            group.remove(&add_row);
+            group.add(&library_folder_row(
+                path,
+                &config,
+                &group,
+                &parent_for_result,
+            ));
+            group.add(&add_row);
+            add_row.grab_focus();
+            // The engine won't pick up the new folder until the next
+            // launch — tell the user a restart is needed instead of
+            // leaving them with an empty library.
+            group.set_description(Some(
+                rust_i18n::t!("preferences.library_restart_hint").as_ref(),
+            ));
+        },
+    );
+}
+
+/// Checkbox columns per row in the Browser Views and Visible Columns grids.
+const CHECK_GRID_COLUMNS: usize = 4;
+
+/// A checkbox that fills its grid cell but keeps its label left-aligned, so
+/// the labels line up down each grid column.
+fn grid_check(label: &str, active: bool) -> gtk::CheckButton {
+    gtk::CheckButton::builder()
+        .label(label)
+        .active(active)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build()
+}
+
+/// Lay checkboxes out row by row in a homogeneous grid.
+///
+/// Browser Views and Visible Columns both use this grid, so their checkbox
+/// columns line up across the two groups: every column is equal width and
+/// the grid fills the group's clamped width, the leftmost column flush with
+/// the left edge and the rightmost with the right edge.
+fn check_grid<'a>(checks: impl IntoIterator<Item = &'a gtk::CheckButton>) -> gtk::Grid {
+    let grid = gtk::Grid::builder()
+        .column_homogeneous(true)
+        .row_spacing(4)
+        .column_spacing(8)
+        .hexpand(true)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    for (index, check) in checks.into_iter().enumerate() {
+        let column = (index % CHECK_GRID_COLUMNS) as i32;
+        let row = (index / CHECK_GRID_COLUMNS) as i32;
+        grid.attach(check, column, row, 1, 1);
+    }
+    grid
+}
+
+/// Album artwork sizes in the order the Album artwork dropdown lists them,
+/// after Off.
+const ALBUM_ARTWORK_SIZES: [AlbumArtSize; 3] = [
+    AlbumArtSize::Small,
+    AlbumArtSize::Medium,
+    AlbumArtSize::Large,
+];
+
+/// The Album artwork dropdown position for the saved settings: Off, or the
+/// size the artwork is shown at.
+fn album_artwork_position(enabled: bool, size: AlbumArtSize) -> u32 {
+    ALBUM_ARTWORK_SIZES
+        .iter()
+        .position(|choice| enabled && *choice == size)
+        .map_or(0, |index| index as u32 + 1)
+}
+
+/// The size an Album artwork dropdown position selects, or `None` for Off.
+fn album_artwork_size_at(position: u32) -> Option<AlbumArtSize> {
+    let index = usize::try_from(position.checked_sub(1)?).ok()?;
+    ALBUM_ARTWORK_SIZES.get(index).copied()
+}
+
+/// One browser pane's visibility flag in the config.
+type PaneFlag = fn(&mut BrowserViewsConfig) -> &mut bool;
+
+/// The Browser Views groups: the pane checkboxes, then an untitled group
+/// directly below with the Group by Album Artist switch and the Album
+/// artwork dropdown.
+///
+/// A preferences group lists its rows before any other child, so the grid
+/// and the rows need a group each for the grid to come first.
+fn browser_views_groups(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    layout: &LayoutTargets,
+    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+) -> [adw::PreferencesGroup; 2] {
+    let panes_group = browser_panes_group(config, saves, layout);
+    let album_artist = album_artist_row(config, saves, on_album_artist_changed);
+    let artwork = album_artwork_row(
+        config,
+        saves,
+        on_album_pane_artwork_changed,
+        on_album_pane_artwork_size_changed,
+    );
+    let rows_group = adw::PreferencesGroup::new();
+    rows_group.add(&album_artist);
+    rows_group.add(&artwork);
+    [panes_group, rows_group]
+}
+
+/// The titled Browser Views group: one checkbox per browser pane, each
+/// showing or hiding its pane.
+fn browser_panes_group(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    layout: &LayoutTargets,
+) -> adw::PreferencesGroup {
+    let mut saved_views = config.borrow().browser_views.clone();
+    let panes: [(&str, PaneFlag); 4] = [
+        ("browser.genre", |views| &mut views.genre),
+        ("browser.artist", |views| &mut views.artist),
+        ("browser.album", |views| &mut views.album),
+        ("browser.folder", |views| &mut views.folder),
+    ];
+    let pane_checks = panes.map(|(key, flag)| {
+        let check = grid_check(rust_i18n::t!(key).as_ref(), *flag(&mut saved_views));
+        let (config, saves, layout) = (config.clone(), saves.clone(), layout.clone());
+        check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            *flag(&mut cfg.browser_views) = btn.is_active();
+            layout.show_browser(&cfg.browser_views);
+            saves.schedule();
+        });
+        check
+    });
+    let panes_group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.browser_views").as_ref())
+        .build();
+    panes_group.add(&check_grid(&pane_checks));
+    panes_group
+}
+
+/// The Group by Album Artist switch.
+fn album_artist_row(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+) -> adw::SwitchRow {
+    let album_artist = adw::SwitchRow::builder()
+        .title(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
+        .active(config.borrow().group_by_album_artist)
+        .build();
+    let (config, saves) = (config.clone(), saves.clone());
+    album_artist.connect_active_notify(move |row| {
+        let active = row.is_active();
+        config.borrow_mut().group_by_album_artist = active;
+        saves.schedule();
+        on_album_artist_changed(active);
+    });
+    album_artist
+}
+
+/// The Album artwork dropdown: Off, or the size the album pane shows its
+/// artwork at.
+fn album_artwork_row(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+) -> adw::ComboRow {
+    let cfg = config.borrow();
+    let choices = [
+        rust_i18n::t!("browser.album_artwork_off"),
+        rust_i18n::t!("browser.album_artwork_size_small"),
+        rust_i18n::t!("browser.album_artwork_size_medium"),
+        rust_i18n::t!("browser.album_artwork_size_large"),
+    ];
+    let artwork = adw::ComboRow::builder()
+        .title(rust_i18n::t!("browser.album_artwork").as_ref())
+        .model(&gtk::StringList::new(
+            &choices.each_ref().map(AsRef::as_ref),
+        ))
+        .selected(album_artwork_position(
+            cfg.album_pane_artwork,
+            cfg.album_pane_artwork_size,
+        ))
+        .build();
+    {
+        // The browser owns the pane rebuild, so each change goes through its
+        // callback.
+        let (config, saves) = (config.clone(), saves.clone());
+        artwork.connect_selected_notify(move |row| {
+            if row.selected() == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            let size = album_artwork_size_at(row.selected());
+            let (size_changed, enabled_changed) = set_album_artwork(&mut config.borrow_mut(), size);
+            saves.schedule();
+            // The size goes first, so turning the artwork on decodes
+            // thumbnails only at the chosen size.
+            if let Some(size) = size.filter(|_| size_changed) {
+                on_album_pane_artwork_size_changed(size);
+            }
+            if enabled_changed {
+                on_album_pane_artwork_changed(size.is_some());
+            }
+        });
+    }
+    artwork
+}
+
+/// Record an Album artwork choice in `cfg`. Off (`None`) turns the artwork
+/// off and keeps the size for next time; a size turns the artwork on at that
+/// size. Returns whether the size changed and whether the artwork turned on
+/// or off.
+fn set_album_artwork(cfg: &mut AppConfig, size: Option<AlbumArtSize>) -> (bool, bool) {
+    let size_changed = size.is_some_and(|size| size != cfg.album_pane_artwork_size);
+    if let Some(size) = size {
+        cfg.album_pane_artwork_size = size;
+    }
+    let enabled_changed = cfg.album_pane_artwork != size.is_some();
+    cfg.album_pane_artwork = size.is_some();
+    (size_changed, enabled_changed)
+}
+
+/// The Import group, last on the page: bringing in another player's library
+/// is a one-time step rather than a setting.
+fn import_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.import").as_ref())
+        .build();
+    group.add(
+        &adw::ButtonRow::builder()
+            .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
+            .start_icon_name("document-open-symbolic")
+            // Reuse the window action so the Preferences entry follows the
+            // same admission, shutdown, and migration-dialog path as the
+            // former menu item.
+            .action_name("win.migrate-rhythmbox")
+            .build(),
+    );
+    group
 }
 
 /// The Downloads group: where downloaded remote tracks are saved.
@@ -1555,43 +1551,79 @@ fn settle_pending_separators(pending_separators: &mut Vec<gtk::Widget>, gutter_v
     }
 }
 
-/// Build a library-folder row: the path (left, ellipsized) and its own "−"
-/// remove button flush to the right edge, so it lines up under the group's
-/// "+". A plain `Label` is used (no Pango markup), so no escaping is needed.
+/// One library folder as a row laid out like the Downloads one: the folder's
+/// name over its full path, with flat Reauthorize… and remove buttons.
 ///
 /// An empty list is valid (for example on first launch), but a root with an
 /// in-flight reauthorization is locked until its exact intent settles.
-fn build_library_path_row(
+fn library_folder_row(
     path: &str,
-    config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
-    paths_box: gtk::Box,
-    restart_hint: gtk::Label,
-    parent: adw::ApplicationWindow,
-) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    group: &adw::PreferencesGroup,
+    parent: &adw::ApplicationWindow,
+) -> adw::ActionRow {
+    let name = std::path::Path::new(path).file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    // Folder names are plain text, never Pango markup. The labels only take
+    // `use-markup` once construction ends, so the text is set afterwards.
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .subtitle_selectable(true)
         .build();
+    row.set_title(&name);
+    row.set_subtitle(path);
 
-    let label = gtk::Label::builder()
-        .label(path)
-        .hexpand(true)
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
+    let (reauthorize_btn, remove_btn) = library_folder_buttons(path, config);
+    row.add_suffix(&reauthorize_btn);
+    row.add_suffix(&remove_btn);
+
+    let old_path = path.to_string();
+    {
+        let config = config.clone();
+        let parent = parent.clone();
+        let group = group.downgrade();
+        let buttons = [reauthorize_btn.downgrade(), remove_btn.downgrade()];
+        reauthorize_btn.connect_clicked(move |_| {
+            choose_reauthorization_folder(&parent, &config, &old_path, &group, &buttons);
+        });
+    }
+
+    let config = config.clone();
+    let path_owned = path.to_string();
+    let group = group.downgrade();
+    let row_ref = row.downgrade();
+    remove_btn.connect_clicked(move |_| {
+        remove_library_folder(&config, &path_owned, &group, &row_ref);
+    });
+
+    row
+}
+
+/// A library folder row's flat Reauthorize… and remove buttons, locked while
+/// the folder has a reauthorization pending.
+fn library_folder_buttons(
+    path: &str,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+) -> (gtk::Button, gtk::Button) {
+    let reauthorize_label = rust_i18n::t!("preferences.reauthorize_folder");
+    let reauthorize_btn = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text(reauthorize_label.as_ref())
         .build();
+    reauthorize_btn.update_property(&[gtk::accessible::Property::Label(&reauthorize_label)]);
 
+    let remove_label = rust_i18n::t!("preferences.remove_folder");
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
         .valign(gtk::Align::Center)
-        .css_classes(["flat", "circular"])
-        .tooltip_text(rust_i18n::t!("preferences.remove_folder").as_ref())
-        .build();
-
-    let reauthorize_btn = gtk::Button::builder()
-        .label(rust_i18n::t!("preferences.reauthorize_folder").as_ref())
-        .valign(gtk::Align::Center)
         .css_classes(["flat"])
+        .tooltip_text(remove_label.as_ref())
         .build();
+    remove_btn.update_property(&[gtk::accessible::Property::Label(&remove_label)]);
 
     let has_pending_request = config
         .borrow()
@@ -1600,182 +1632,213 @@ fn build_library_path_row(
         .any(|pending| pending.old_path == path);
     reauthorize_btn.set_sensitive(!has_pending_request);
     remove_btn.set_sensitive(!has_pending_request);
+    (reauthorize_btn, remove_btn)
+}
 
-    row.append(&label);
-    row.append(&reauthorize_btn);
-    row.append(&remove_btn);
-
-    let old_path = path.to_string();
-    {
-        let config = config.clone();
-        let parent = parent.clone();
-        let restart_hint = restart_hint.clone();
-        let reauthorize_btn_for_state = reauthorize_btn.clone();
-        let remove_btn_for_state = remove_btn.clone();
-        reauthorize_btn.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder()
-                .title(
-                    rust_i18n::t!("preferences.select_reauthorization_folder").as_ref(),
-                )
-                .modal(true)
-                .build();
-            let config = config.clone();
-            let parent = parent.clone();
-            let old_path = old_path.clone();
-            let restart_hint = restart_hint.clone();
-            let reauthorize_btn = reauthorize_btn_for_state.clone();
-            let remove_btn = remove_btn_for_state.clone();
-            let parent_for_result = parent.clone();
-            dialog.select_folder(
-                Some(&parent),
-                None::<&gtk::gio::Cancellable>,
-                move |result| {
-                    let Ok(folder) = result else {
-                        // Closing the chooser is not an error and needs no
-                        // additional prompt.
-                        return;
-                    };
-                    let Some(path) = folder.path() else {
-                        present_reauthorization_error(
-                            &parent_for_result,
-                            None,
-                            &old_path,
-                            None,
-                        );
-                        return;
-                    };
-                    let Some(new_path) = path.to_str().map(str::to_string) else {
-                        present_reauthorization_error(
-                            &parent_for_result,
-                            Some(RootReauthorizationError::UnsupportedPathEncoding),
-                            &old_path,
-                            None,
-                        );
-                        return;
-                    };
-                    if let Err(error) = validate_root_reauthorization(
-                        &config.borrow(),
-                        &old_path,
-                        &new_path,
-                    ) {
-                        present_reauthorization_error(
-                            &parent_for_result,
-                            Some(error),
-                            &old_path,
-                            Some(&new_path),
-                        );
-                        return;
-                    }
-
-                    let body = rust_i18n::t!(
-                        "preferences.reauthorization_confirmation_body",
-                        old_path = old_path.clone(),
-                        new_path = new_path.clone()
-                    );
-                    let confirmation = adw::AlertDialog::builder()
-                        .heading(
-                            rust_i18n::t!("preferences.reauthorization_confirmation_heading")
-                                .as_ref(),
-                        )
-                        .body(body.as_ref())
-                        .close_response("cancel")
-                        .default_response("cancel")
-                        .build();
-                    confirmation.add_response(
-                        "cancel",
-                        rust_i18n::t!("dialogs.cancel").as_ref(),
-                    );
-                    confirmation.add_response(
-                        "reauthorize",
-                        rust_i18n::t!("preferences.confirm_reauthorization").as_ref(),
-                    );
-                    confirmation.set_response_appearance(
-                        "reauthorize",
-                        adw::ResponseAppearance::Suggested,
-                    );
-
-                    let config = config.clone();
-                    let parent = parent_for_result.clone();
-                    let parent_for_response = parent.clone();
-                    let restart_hint = restart_hint.clone();
-                    let reauthorize_btn = reauthorize_btn.clone();
-                    let remove_btn = remove_btn.clone();
-                    confirmation.connect_response(None, move |_dialog, response| {
-                        if response != "reauthorize" {
-                            return;
-                        }
-
-                        let request_id = uuid::Uuid::new_v4().to_string();
-                        let result = {
-                            let mut cfg = config.borrow_mut();
-                            let mut candidate = cfg.clone();
-                            let result = schedule_root_reauthorization(
-                                &mut candidate,
-                                &old_path,
-                                &new_path,
-                                &request_id,
-                            );
-                            if result.is_ok() && save_config(&candidate) {
-                                *cfg = candidate;
-                                result
-                            } else if result.is_ok() {
-                                Err(RootReauthorizationError::ConfigSaveFailed)
-                            } else {
-                                result
-                            }
-                        };
-                        match result {
-                            Ok(RootReauthorizationSchedule::Scheduled { request_id }) => {
-                                info!(%request_id, old_path = %old_path, new_path = %new_path, "Library root reauthorization scheduled");
-                                restart_hint.set_label(
-                                    rust_i18n::t!(
-                                        "preferences.reauthorization_restart_hint"
-                                    )
-                                    .as_ref(),
-                                );
-                                restart_hint.set_visible(true);
-                                reauthorize_btn.set_sensitive(false);
-                                remove_btn.set_sensitive(false);
-                            }
-                            Err(error) => present_reauthorization_error(
-                                &parent_for_response,
-                                Some(error),
-                                &old_path,
-                                Some(&new_path),
-                            ),
-                        }
-                    });
-                    confirmation.present(Some(&parent));
-                },
+/// Ask for the folder that replaces the library folder at `old_path`, then
+/// confirm the reauthorization.
+///
+/// Once a request is scheduled, `group` shows the restart hint and `buttons`
+/// — the row's Reauthorize… and remove buttons — lock.
+fn choose_reauthorization_folder(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: &str,
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    buttons: &[gtk::glib::WeakRef<gtk::Button>; 2],
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title(rust_i18n::t!("preferences.select_reauthorization_folder").as_ref())
+        .modal(true)
+        .build();
+    let config = config.clone();
+    let old_path = old_path.to_string();
+    let group = group.clone();
+    let buttons = buttons.clone();
+    let parent_for_result = parent.clone();
+    dialog.select_folder(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let Ok(folder) = result else {
+                // Closing the chooser is not an error and needs no
+                // additional prompt.
+                return;
+            };
+            let Some(new_path) =
+                reauthorization_destination(&parent_for_result, &config, &old_path, &folder)
+            else {
+                return;
+            };
+            confirm_reauthorization(
+                &parent_for_result,
+                &config,
+                old_path,
+                new_path,
+                &group,
+                &buttons,
             );
-        });
-    }
+        },
+    );
+}
 
-    let path_owned = path.to_string();
-    let row_clone = row.clone();
-    remove_btn.connect_clicked(move |_| {
-        let removed = {
-            let mut cfg = config.borrow_mut();
-            let mut candidate = cfg.clone();
-            if remove_library_path(&mut candidate, &path_owned) && save_config(&candidate) {
-                *cfg = candidate;
-                true
-            } else {
-                false
-            }
-        };
-        if !removed {
+/// The path of the chosen `folder` when it can replace `old_path`. Otherwise
+/// the user is told why it can't, and there is none.
+fn reauthorization_destination(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: &str,
+    folder: &gtk::gio::File,
+) -> Option<String> {
+    let Some(path) = folder.path() else {
+        present_reauthorization_error(parent, None, old_path, None);
+        return None;
+    };
+    let Some(new_path) = path.to_str().map(str::to_string) else {
+        present_reauthorization_error(
+            parent,
+            Some(RootReauthorizationError::UnsupportedPathEncoding),
+            old_path,
+            None,
+        );
+        return None;
+    };
+    if let Err(error) = validate_root_reauthorization(&config.borrow(), old_path, &new_path) {
+        present_reauthorization_error(parent, Some(error), old_path, Some(&new_path));
+        return None;
+    }
+    Some(new_path)
+}
+
+/// Ask the user to confirm reauthorizing `old_path` as `new_path`, and
+/// schedule the request once they do.
+fn confirm_reauthorization(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: String,
+    new_path: String,
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    buttons: &[gtk::glib::WeakRef<gtk::Button>; 2],
+) {
+    let confirmation = reauthorization_confirmation(&old_path, &new_path);
+    let config = config.clone();
+    let parent_for_response = parent.clone();
+    let group = group.clone();
+    let buttons = buttons.clone();
+    confirmation.connect_response(None, move |_dialog, response| {
+        if response != "reauthorize" {
             return;
         }
-        paths_box.remove(&row_clone);
-        // The engine keeps watching the removed folder until the next
-        // launch — surface a restart hint so the stale tracks aren't
-        // mistaken for a bug.
-        restart_hint.set_label(rust_i18n::t!("preferences.library_restart_hint").as_ref());
-        restart_hint.set_visible(true);
-    });
 
-    row
+        match schedule_saved_reauthorization(&config, &old_path, &new_path) {
+            Ok(RootReauthorizationSchedule::Scheduled { request_id }) => {
+                info!(%request_id, old_path = %old_path, new_path = %new_path, "Library root reauthorization scheduled");
+                lock_reauthorized_folder_row(&group, &buttons);
+            }
+            Err(error) => present_reauthorization_error(
+                &parent_for_response,
+                Some(error),
+                &old_path,
+                Some(&new_path),
+            ),
+        }
+    });
+    confirmation.present(Some(parent));
+}
+
+/// The dialog asking to confirm reauthorizing `old_path` as `new_path`, with
+/// Cancel as its default and close response.
+fn reauthorization_confirmation(old_path: &str, new_path: &str) -> adw::AlertDialog {
+    let body = rust_i18n::t!(
+        "preferences.reauthorization_confirmation_body",
+        old_path = old_path,
+        new_path = new_path
+    );
+    let confirmation = adw::AlertDialog::builder()
+        .heading(rust_i18n::t!("preferences.reauthorization_confirmation_heading").as_ref())
+        .body(body.as_ref())
+        .close_response("cancel")
+        .default_response("cancel")
+        .build();
+    confirmation.add_response("cancel", rust_i18n::t!("dialogs.cancel").as_ref());
+    confirmation.add_response(
+        "reauthorize",
+        rust_i18n::t!("preferences.confirm_reauthorization").as_ref(),
+    );
+    confirmation.set_response_appearance("reauthorize", adw::ResponseAppearance::Suggested);
+    confirmation
+}
+
+/// Schedule reauthorizing `old_path` as `new_path` under a fresh request ID.
+/// The config takes the request only once a copy holding it is saved.
+fn schedule_saved_reauthorization(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: &str,
+    new_path: &str,
+) -> Result<RootReauthorizationSchedule, RootReauthorizationError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut cfg = config.borrow_mut();
+    let mut candidate = cfg.clone();
+    let result = schedule_root_reauthorization(&mut candidate, old_path, new_path, &request_id);
+    if result.is_ok() && save_config(&candidate) {
+        *cfg = candidate;
+        result
+    } else if result.is_ok() {
+        Err(RootReauthorizationError::ConfigSaveFailed)
+    } else {
+        result
+    }
+}
+
+/// Show the restart hint on `group` and lock the folder row's `buttons` once
+/// its reauthorization is scheduled.
+fn lock_reauthorized_folder_row(
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    buttons: &[gtk::glib::WeakRef<gtk::Button>; 2],
+) {
+    if let Some(group) = group.upgrade() {
+        group.set_description(Some(
+            rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref(),
+        ));
+    }
+    for button in buttons {
+        if let Some(button) = button.upgrade() {
+            button.set_sensitive(false);
+        }
+    }
+}
+
+/// Remove the library folder at `path` once the config without it is saved,
+/// and take its row out of `group`.
+fn remove_library_folder(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    path: &str,
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    row: &gtk::glib::WeakRef<adw::ActionRow>,
+) {
+    let removed = {
+        let mut cfg = config.borrow_mut();
+        let mut candidate = cfg.clone();
+        if remove_library_path(&mut candidate, path) && save_config(&candidate) {
+            *cfg = candidate;
+            true
+        } else {
+            false
+        }
+    };
+    if !removed {
+        return;
+    }
+    let (Some(group), Some(row)) = (group.upgrade(), row.upgrade()) else {
+        return;
+    };
+    group.remove(&row);
+    // The engine keeps watching the removed folder until the next
+    // launch — surface a restart hint so the stale tracks aren't
+    // mistaken for a bug.
+    group.set_description(Some(
+        rust_i18n::t!("preferences.library_restart_hint").as_ref(),
+    ));
 }
 
 fn present_reauthorization_error(
@@ -2327,6 +2390,28 @@ mod tests {
     }
 
     #[test]
+    fn album_artwork_dropdown_positions_map_onto_the_saved_settings() {
+        for size in ALBUM_ARTWORK_SIZES {
+            assert_eq!(
+                album_artwork_position(false, size),
+                0,
+                "off whatever the size"
+            );
+        }
+        for (position, size) in [
+            (1, AlbumArtSize::Small),
+            (2, AlbumArtSize::Medium),
+            (3, AlbumArtSize::Large),
+        ] {
+            assert_eq!(album_artwork_position(true, size), position);
+            assert_eq!(album_artwork_size_at(position), Some(size));
+        }
+        assert_eq!(album_artwork_size_at(0), None, "Off selects no size");
+        assert_eq!(album_artwork_size_at(4), None);
+        assert_eq!(album_artwork_size_at(gtk::INVALID_LIST_POSITION), None);
+    }
+
+    #[test]
     fn persisted_localized_titles_map_to_stable_ids_and_unknown_keys_drop() {
         let mut config = AppConfig {
             visible_columns: vec!["Bewertung".to_string(), "Title".to_string()],
@@ -2369,9 +2454,13 @@ pub mod widget_tests {
     use super::BrowserViewsConfig;
     use super::{
         apply_column_order, apply_column_visibility, column_title, identified_columns,
-        read_column_order, AppConfig, ALL_COLUMNS,
+        read_column_order, AlbumArtSize, AppConfig, ConfigSaveQueue, PendingRootReauthorization,
+        ALL_COLUMNS,
     };
+    use adw::prelude::*;
     use gtk::prelude::{BoxExt, CastNone, ListModelExt, WidgetExt};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     /// Mirror of `build_browser`'s pane row: SearchEntry stand-in, then
     /// the horizontal panes_box alternating genre, gutter, artist,
@@ -2702,5 +2791,214 @@ pub mod widget_tests {
                 Some(column_title(&id, &locale).as_str())
             );
         }
+    }
+
+    /// Every descendant of `root` of type `T`, in tree order.
+    fn descendants<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Vec<T> {
+        let mut found = Vec::new();
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(typed) = widget.downcast_ref::<T>() {
+                found.push(typed.clone());
+            }
+            found.extend(descendants::<T>(&widget));
+            child = widget.next_sibling();
+        }
+        found
+    }
+
+    /// Library folders are rows like the Downloads one — name, full path,
+    /// and flat suffix buttons — closed by the Add Folder… row, and a folder
+    /// with a pending reauthorization stays locked.
+    pub fn library_folders_are_listed_like_the_downloads_row() {
+        let pending = "/media/usb & co/Rock";
+        let config = Rc::new(RefCell::new(AppConfig {
+            library_paths: vec!["/music/Main".to_string(), pending.to_string()],
+            pending_root_reauthorizations: vec![PendingRootReauthorization {
+                request_id: "21c020ca-57df-4fd9-a950-e34fb40a6c1b".to_string(),
+                old_path: pending.to_string(),
+                new_path: "/media/usb/Rock".to_string(),
+            }],
+            ..AppConfig::default()
+        }));
+        let parent = adw::ApplicationWindow::builder().build();
+        let group = super::library_group(&parent, &config);
+
+        let rows = descendants::<gtk::ListBoxRow>(group.upcast_ref());
+        assert_eq!(rows.len(), 3, "two folders and Add Folder…");
+        let folders: Vec<adw::ActionRow> = rows[..2]
+            .iter()
+            .map(|row| row.clone().downcast().expect("folder rows are action rows"))
+            .collect();
+        let shown: Vec<(String, String)> = folders
+            .iter()
+            .map(|row| {
+                (
+                    row.title().into(),
+                    row.subtitle().unwrap_or_default().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Main".to_string(), "/music/Main".to_string()),
+                ("Rock".to_string(), pending.to_string()),
+            ]
+        );
+        for (row, locked) in folders.iter().zip([false, true]) {
+            assert!(!row.uses_markup(), "paths are plain text");
+            assert!(row.is_subtitle_selectable());
+            let buttons = descendants::<gtk::Button>(row.upcast_ref());
+            assert_eq!(buttons.len(), 2, "Reauthorize… and remove");
+            for button in &buttons {
+                assert!(button.has_css_class("flat"));
+                assert_eq!(button.valign(), gtk::Align::Center);
+                assert_eq!(button.is_sensitive(), !locked);
+            }
+        }
+        let add = rows[2]
+            .clone()
+            .downcast::<adw::ButtonRow>()
+            .expect("the list ends with Add Folder…");
+        assert_eq!(
+            add.title().as_str(),
+            rust_i18n::t!("preferences.add_folder").as_ref()
+        );
+        assert_eq!(
+            group.description().as_deref(),
+            Some(rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref()),
+            "a pending reauthorization asks for a restart from the start"
+        );
+        parent.destroy();
+    }
+
+    /// Browser Views puts exactly the four pane checkboxes on one grid row,
+    /// then the grouping switch and the artwork dropdown in an untitled group
+    /// below, and each control updates the config and calls the browser the
+    /// way the checkboxes and size radios did.
+    #[allow(clippy::too_many_lines)] // one walk through every control in the group
+    pub fn browser_views_rows_drive_the_saved_settings() {
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let writes = Rc::new(Cell::new(0));
+        let counter = writes.clone();
+        let saves = ConfigSaveQueue::with_writer(
+            config.clone(),
+            Rc::new(move |_: &AppConfig| {
+                counter.set(counter.get() + 1);
+                true
+            }),
+        );
+        // Keep one save armed so the edits below never start a save timer.
+        assert!(saves.request());
+        let panes = PaneRow::build();
+        let layout = super::LayoutTargets {
+            column_view: german_tracklist(),
+            browser_box: panes.browser_box.clone(),
+            active_source_key: Rc::new(RefCell::new("local".to_string())),
+        };
+        let calls: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (grouping, artwork, size) = (calls.clone(), calls.clone(), calls.clone());
+        let [panes_group, rows_group] = super::browser_views_groups(
+            &config,
+            &saves,
+            &layout,
+            Rc::new(move |on| grouping.borrow_mut().push(format!("grouping {on}"))),
+            Rc::new(move |on| artwork.borrow_mut().push(format!("artwork {on}"))),
+            Rc::new(move |chosen: AlbumArtSize| size.borrow_mut().push(format!("size {chosen:?}"))),
+        );
+
+        let grids = descendants::<gtk::Grid>(panes_group.upcast_ref());
+        assert_eq!(grids.len(), 1);
+        let checks = descendants::<gtk::CheckButton>(grids[0].upcast_ref());
+        let placed: Vec<(i32, i32, String)> = checks
+            .iter()
+            .map(|check| {
+                let (column, row, _, _) = grids[0].query_child(check);
+                (column, row, check.label().unwrap_or_default().into())
+            })
+            .collect();
+        let expected: Vec<(i32, i32, String)> = [
+            "browser.genre",
+            "browser.artist",
+            "browser.album",
+            "browser.folder",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(column, key)| (column as i32, 0, rust_i18n::t!(key).into_owned()))
+        .collect();
+        assert_eq!(placed, expected, "one row of pane checkboxes");
+        assert!(
+            rows_group.title().is_empty(),
+            "the rows continue Browser Views"
+        );
+
+        checks[3].set_active(false);
+        assert!(!config.borrow().browser_views.folder);
+        assert!(
+            !panes.panes[3].is_visible(),
+            "unticking Folder hides its pane"
+        );
+
+        let switch = descendants::<adw::SwitchRow>(rows_group.upcast_ref());
+        let combo = descendants::<adw::ComboRow>(rows_group.upcast_ref());
+        let (switch, combo) = (&switch[0], &combo[0]);
+        switch.set_active(true);
+        assert!(config.borrow().group_by_album_artist);
+
+        let choices = combo.model().expect("artwork choices");
+        let labels: Vec<String> = (0..choices.n_items())
+            .map(|position| {
+                choices
+                    .item(position)
+                    .and_downcast::<gtk::StringObject>()
+                    .expect("string choice")
+                    .string()
+                    .into()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "browser.album_artwork_off",
+                "browser.album_artwork_size_small",
+                "browser.album_artwork_size_medium",
+                "browser.album_artwork_size_large",
+            ]
+            .map(|key| rust_i18n::t!(key).into_owned())
+        );
+        assert_eq!(combo.selected(), 0, "artwork starts off");
+
+        let artwork_state = || {
+            let cfg = config.borrow();
+            (cfg.album_pane_artwork, cfg.album_pane_artwork_size)
+        };
+        combo.set_selected(3);
+        assert_eq!(artwork_state(), (true, AlbumArtSize::Large));
+        combo.set_selected(0);
+        assert_eq!(
+            artwork_state(),
+            (false, AlbumArtSize::Large),
+            "Off keeps the size for next time"
+        );
+        combo.set_selected(3);
+        combo.set_selected(1);
+        assert_eq!(artwork_state(), (true, AlbumArtSize::Small));
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                "grouping true",
+                "size Large",
+                "artwork true",
+                "artwork false",
+                "artwork true",
+                "size Small",
+            ]
+        );
+
+        assert_eq!(writes.get(), 0);
+        saves.flush();
+        assert_eq!(writes.get(), 1, "every edit shares one pending save");
     }
 }

@@ -20,13 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `THIRD-PARTY-NOTICES.txt` file and the license texts of the libraries it bundles, with an
   offer of their source code.
 - **Album artwork in the browser** — The Album pane can show cover art for local and server
-  albums. Turn it on under Preferences → Browser Views and choose Small, Medium, or Large.
+  albums. Set Album artwork under Preferences → Browser Views to Small, Medium, or Large.
 - **Folder browsing** — A Folder pane browses the local library by library folder and
   subfolder, on Windows as well as Linux and macOS. Double-click a folder or press Enter to open
   it, and use the `…` row to go back up.
-- **Equalizer** — A ten-band equalizer in Preferences for playback on this computer, with Flat,
-  Pop, Rock, Jazz, and Classical presets, a preamp, and optional soft clip protection. Changes
-  apply to the playing track immediately and are remembered between sessions.
+- **Equalizer** — A ten-band graphic equalizer in Preferences for playback on this computer, with
+  bands from 32 Hz to 16 kHz, ±12 dB of gain, Winamp's classic presets, a preamp, and optional
+  soft clip protection. Changes apply to the playing track immediately and are remembered
+  between sessions.
 - **Drag and drop onto playlists** — Drag selected tracks onto a playlist in the sidebar to add
   them in the order shown, and drag playlists to reorder the sidebar.
 - **Drag tracks to a file manager** — Drag tracks from your local library into a file manager to
@@ -44,9 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Seek bar and artwork in the system media controls** — The desktop's media controls (MPRIS on
   Linux, the Windows media overlay, and macOS Now Playing) now show the track's length, position,
   and cover art, and seeking there moves playback.
-- **Last.fm settings** — Preferences has a Last.fm group for accepting the privacy disclosure and
-  connecting or disconnecting an account. Current release builds don't include Last.fm
-  application credentials, so the group shows the feature as unavailable.
 
 ### Changed
 
@@ -68,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail on play. The README explains how to reach AirPlay speakers through your operating system.
 - **Browser and track list look** — The track list drops its grid lines, browser panes have lighter
   dividers and dimmed item counts, and screen readers announce each browser row once.
+- **Preferences layout** — Library folders are listed like the other settings, Import from
+  Rhythmbox… has its own group at the bottom, the browser pane checkboxes line up with the column
+  checkboxes, and the album artwork size is chosen from a dropdown.
 - **Confirm before deleting** — Deleting a playlist or removing a saved server from the sidebar now
   asks for confirmation first, with Cancel as the default.
 - **GPU rendering in the Flatpak** — The Flatpak can now use the graphics card, so the interface

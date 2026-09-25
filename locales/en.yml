@@ -61,10 +61,11 @@ browser:
   unknown_genre: "Unknown"
   folder_no_sources: "Folder browsing follows the local library sources"
   folder_no_roots: "No library folders configured"
-  # Album-pane artwork toggle labels. The browser key set ships in
-  # every locale at the `browser:` level; artwork controls live under
-  # preferences to match the existing grouping-toggle placement.
-  album_artwork: "Album pane artwork"
+  # Album pane artwork dropdown: its title and choices. The browser key set
+  # ships in every locale at the `browser:` level; the dropdown lives in
+  # Preferences → Browser Views next to the grouping switch.
+  album_artwork: "Album artwork"
+  album_artwork_off: "Off"
   album_artwork_size_small: "Small"
   album_artwork_size_medium: "Medium"
   album_artwork_size_large: "Large"
@@ -137,9 +138,10 @@ preferences:
   privacy: "Privacy"
   location_title: "Location for Stations Near Me"
   location_subtitle: "Look up your approximate location from your IP address with ipapi.co, ipwho.is, or freeipapi.com."
-  add_folder: "Add folder"
+  add_folder: "Add Folder…"
   remove_folder: "Remove folder"
   group_by_album_artist: "Group by Album Artist"
+  import: "Import"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
@@ -666,10 +668,23 @@ equalizer:
   enabled: "Enable equalizer"
   preset: "Preset"
   preset_flat: "Flat"
-  preset_pop: "Pop"
-  preset_rock: "Rock"
-  preset_jazz: "Jazz"
   preset_classical: "Classical"
+  preset_club: "Club"
+  preset_dance: "Dance"
+  preset_full_bass: "Full Bass"
+  preset_full_bass_treble: "Full Bass & Treble"
+  preset_full_treble: "Full Treble"
+  preset_headphones: "Headphones"
+  preset_large_hall: "Large Hall"
+  preset_live: "Live"
+  preset_party: "Party"
+  preset_pop: "Pop"
+  preset_reggae: "Reggae"
+  preset_rock: "Rock"
+  preset_ska: "Ska"
+  preset_soft: "Soft"
+  preset_soft_rock: "Soft Rock"
+  preset_techno: "Techno"
   preset_custom: "Custom"
   preamp: "Preamp"
   clip_protection: "Clip protection"

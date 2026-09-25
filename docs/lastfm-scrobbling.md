@@ -2,8 +2,8 @@
 
 - Status: accepted P2.1 design; the internal foundation, the application owner with its account
   controls, and the LF3 consent/account settings group are implemented. Shipped builds carry no
-  application credentials, so they report Last.fm as unavailable and do no Last.fm work until LF4
-  injects them. Local-library attribution is still closed
+  application credentials, so Preferences leaves the settings group out and they do no Last.fm
+  work until LF4 injects them. Local-library attribution is still closed
   ([#336](https://github.com/jm2/tributary/issues/336))
 - Decision date: 2026-07-20
 - Implementation status date: 2026-09-23

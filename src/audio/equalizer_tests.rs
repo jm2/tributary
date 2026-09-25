@@ -12,7 +12,7 @@ use crate::ui::preferences::AppConfig;
 const TONE_RMS_DB: f64 = -15.05;
 
 /// Centre of band 5, the band the tone tests boost.
-const TONE_HZ: f64 = 947.0;
+const TONE_HZ: f64 = 1000.0;
 
 #[allow(clippy::float_cmp)] // preset tables and snapped gains are exact half-dB steps
 #[test]
@@ -24,7 +24,7 @@ fn presets_load_their_gains_and_custom_keeps_the_current_ones() {
 
     settings.select_preset(Preset::Rock);
     assert_eq!(settings.bands_db, Preset::Rock.band_gains_db().unwrap());
-    assert_eq!(settings.preamp_db, -1.0);
+    assert_eq!(settings.preamp_db, -6.5);
 
     settings.bands_db[0] = 4.5;
     settings.select_preset(Preset::Custom);
@@ -33,7 +33,7 @@ fn presets_load_their_gains_and_custom_keeps_the_current_ones() {
         settings.bands_db[0], 4.5,
         "Custom must keep the edited gains"
     );
-    assert_eq!(settings.preamp_db, -1.0);
+    assert_eq!(settings.preamp_db, -6.5);
 
     for preset in Preset::ALL {
         let mut selected = EqualizerSettings::default();
@@ -46,19 +46,100 @@ fn presets_load_their_gains_and_custom_keeps_the_current_ones() {
     }
 }
 
+#[allow(clippy::float_cmp)] // the range is exact
+#[test]
+fn the_bands_are_iso_octaves_with_twelve_db_either_way() {
+    assert_eq!(
+        BAND_CENTERS_HZ,
+        [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    );
+    assert_eq!(
+        std::array::from_fn::<u32, 10, _>(band_width_hz),
+        [32, 32, 61, 125, 250, 500, 1000, 2000, 4000, 8000]
+    );
+    assert_eq!((MIN_GAIN_DB, MAX_GAIN_DB), (-12.0, 12.0));
+}
+
+#[allow(clippy::float_cmp)] // preset tables are exact half-dB steps
+#[test]
+fn the_presets_are_winamps_classic_presets_within_twelve_db() {
+    let named: Vec<Preset> = Preset::ALL
+        .into_iter()
+        .filter(|preset| *preset != Preset::Custom)
+        .collect();
+    assert_eq!(named.len(), 18, "Flat and Winamp's seventeen presets");
+    for preset in named {
+        let bands = preset.band_gains_db().unwrap();
+        for gain in bands {
+            assert_eq!(snap_gain_db(gain), gain, "{preset:?} {gain} is on the grid");
+        }
+        let boost = bands.iter().copied().fold(0.0, f64::max);
+        assert_eq!(
+            preset.preamp_db(),
+            -boost,
+            "{preset:?} preamp cancels its boost"
+        );
+        assert!(preset.preamp_db().is_sign_positive() || boost > 0.0);
+    }
+    assert_eq!(Preset::Custom.band_gains_db(), None);
+    assert_eq!(Preset::Custom.preamp_db(), 0.0);
+
+    // Spot checks against Winamp's values at 0.12 dB per unit: Full Treble's
+    // 85 at 16 kHz, Full Bass's 70 held flat below 60 Hz, Classical's -50.
+    assert_eq!(Preset::FullTreble.band_gains_db().unwrap()[9], 10.0);
+    assert_eq!(Preset::FullTreble.preamp_db(), -10.0);
+    assert_eq!(Preset::FullBass.band_gains_db().unwrap()[0], 8.5);
+    assert_eq!(Preset::Classical.band_gains_db().unwrap()[9], -6.0);
+    assert_eq!(Preset::Classical.preamp_db(), 0.0);
+}
+
+#[test]
+fn preset_names_are_saved_in_snake_case() {
+    let names: Vec<String> = Preset::ALL
+        .iter()
+        .map(|preset| serde_json::to_string(preset).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "\"flat\"",
+            "\"classical\"",
+            "\"club\"",
+            "\"dance\"",
+            "\"full_bass\"",
+            "\"full_bass_treble\"",
+            "\"full_treble\"",
+            "\"headphones\"",
+            "\"large_hall\"",
+            "\"live\"",
+            "\"party\"",
+            "\"pop\"",
+            "\"reggae\"",
+            "\"rock\"",
+            "\"ska\"",
+            "\"soft\"",
+            "\"soft_rock\"",
+            "\"techno\"",
+            "\"custom\"",
+        ]
+    );
+}
+
 #[allow(clippy::float_cmp)] // snapped gains are exact half-dB steps
 #[test]
 fn validation_clamps_snaps_and_relabels_edited_presets() {
     assert_eq!(snap_gain_db(1.26), 1.5);
     assert_eq!(snap_gain_db(1.24), 1.0);
     assert_eq!(snap_gain_db(-0.2), 0.0);
+    assert_eq!(snap_gain_db(12.2), MAX_GAIN_DB);
+    assert_eq!(snap_gain_db(-24.0), MIN_GAIN_DB);
     assert_eq!(snap_gain_db(40.0), MAX_GAIN_DB);
     assert_eq!(snap_gain_db(-40.0), MIN_GAIN_DB);
     assert_eq!(snap_gain_db(f64::NAN), 0.0);
 
     let mut rock = EqualizerSettings::default();
     rock.select_preset(Preset::Rock);
-    rock.bands_db[0] = 3.1; // snaps back onto the preset value
+    rock.bands_db[0] = 5.1; // snaps back onto the preset value
     assert_eq!(rock.validated().preset, Preset::Rock);
 
     let mut edited = rock;
@@ -79,12 +160,13 @@ fn the_config_field_round_trips_and_a_malformed_block_resets_only_the_equalizer(
         clip_protection: ClipProtection::Soft,
         ..EqualizerSettings::default()
     };
-    settings.select_preset(Preset::Jazz);
+    settings.select_preset(Preset::FullBassTreble);
     let config = AppConfig {
         equalizer: settings,
         ..AppConfig::default()
     };
     let json = serde_json::to_string(&config).expect("serialize config");
+    assert!(json.contains(r#""preset":"full_bass_treble""#), "{json}");
     let reloaded: AppConfig = serde_json::from_str(&json).expect("reload config");
     assert_eq!(reloaded.equalizer, settings);
 
@@ -93,7 +175,7 @@ fn the_config_field_round_trips_and_a_malformed_block_resets_only_the_equalizer(
 
     for malformed in [
         r#""loud""#,
-        r#"{"preset":"disco"}"#,
+        r#"{"preset":7}"#,
         r#"{"bands_db":[1.0,2.0]}"#,
         r#"{"enabled":"yes"}"#,
     ] {
@@ -112,6 +194,59 @@ fn the_config_field_round_trips_and_a_malformed_block_resets_only_the_equalizer(
     assert!(partial.equalizer.enabled);
     assert!((partial.equalizer.preamp_db - MAX_GAIN_DB).abs() < f64::EPSILON);
     assert_eq!(partial.equalizer.preset, Preset::Custom);
+}
+
+/// Load `equalizer` as the `equalizer` field of an otherwise ordinary config.
+fn load(equalizer: &str) -> EqualizerSettings {
+    let json = format!(r#"{{"library_paths":["/music"],"equalizer":{equalizer}}}"#);
+    let config: AppConfig = serde_json::from_str(&json).expect("config still loads");
+    assert_eq!(config.library_paths, ["/music"], "{equalizer}");
+    config.equalizer
+}
+
+#[allow(clippy::float_cmp)] // saved and snapped gains are exact half-dB steps
+#[test]
+fn earlier_configs_load_with_their_gains_clamped_to_twelve_db() {
+    // An earlier version's Jazz preset no longer exists: it loads as Custom
+    // with its gains, as does any other unknown name.
+    let jazz = load(
+        r#"{"enabled":true,"preset":"jazz","preamp_db":-1.0,
+            "bands_db":[2.0,1.0,0.0,1.0,1.0,0.0,1.0,2.0,2.0,1.0],"clip_protection":"soft"}"#,
+    );
+    assert_eq!(jazz.preset, Preset::Custom);
+    assert!(jazz.enabled);
+    assert_eq!(jazz.preamp_db, -1.0);
+    assert_eq!(
+        jazz.bands_db,
+        [2.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 2.0, 2.0, 1.0]
+    );
+    assert_eq!(jazz.clip_protection, ClipProtection::Soft);
+    assert_eq!(load(r#"{"preset":"disco"}"#).preset, Preset::Custom);
+
+    // Pop still exists, but the saved gains are the earlier version's Pop.
+    let old_pop = load(
+        r#"{"preset":"pop","preamp_db":-2.0,
+            "bands_db":[1.0,2.0,3.0,2.0,0.0,-1.0,-1.0,0.0,1.0,2.0]}"#,
+    );
+    assert_eq!(old_pop.preset, Preset::Custom);
+    assert_eq!(
+        old_pop.bands_db,
+        [1.0, 2.0, 3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 1.0, 2.0]
+    );
+
+    // The earlier range reached -24 dB; those gains clamp to -12 dB.
+    let deep = load(
+        r#"{"preset":"custom","preamp_db":-24.0,
+            "bands_db":[-24.0,-18.0,-12.5,0.0,0.0,0.0,0.0,0.0,12.0,30.0]}"#,
+    );
+    assert_eq!(deep.preamp_db, -12.0);
+    assert_eq!(
+        deep.bands_db,
+        [-12.0, -12.0, -12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0, 12.0]
+    );
+
+    let flat = load(r#"{"preset":"flat","bands_db":[0,0,0,0,0,0,0,0,0,0]}"#);
+    assert_eq!(flat.preset, Preset::Flat);
 }
 
 // ── Real pipelines ──────────────────────────────────────────────────────
@@ -156,11 +291,12 @@ fn tone_caps(rate: i32, channels: i32) -> gst::Caps {
         .build()
 }
 
-/// `audiotestsrc ! capsfilter ! <equalizer> ! level ! fakesink`.
-fn tone_pipeline(equalizer: &EqualizerBin, amplitude: f64) -> gst::Pipeline {
+/// `audiotestsrc ! capsfilter ! <equalizer> ! level ! fakesink`, playing a
+/// `hz` tone.
+fn tone_pipeline(equalizer: &EqualizerBin, amplitude: f64, hz: f64) -> gst::Pipeline {
     let source = gst::ElementFactory::make("audiotestsrc")
         .name("source")
-        .property("freq", TONE_HZ)
+        .property("freq", hz)
         .property("volume", amplitude)
         .property("num-buffers", 60)
         .build()
@@ -234,10 +370,14 @@ fn peak(levels: &[(f64, f64)]) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
-fn measure(settings: &EqualizerSettings, amplitude: f64) -> Vec<(f64, f64)> {
+fn measure_at(settings: &EqualizerSettings, amplitude: f64, hz: f64) -> Vec<(f64, f64)> {
     let equalizer = EqualizerBin::new().unwrap();
     equalizer.apply(settings);
-    run(&tone_pipeline(&equalizer, amplitude))
+    run(&tone_pipeline(&equalizer, amplitude, hz))
+}
+
+fn measure(settings: &EqualizerSettings, amplitude: f64) -> Vec<(f64, f64)> {
+    measure_at(settings, amplitude, TONE_HZ)
 }
 
 fn assert_near(actual: f64, expected: f64, tolerance: f64, what: &str) {
@@ -269,13 +409,61 @@ fn preamp_and_band_gains_change_the_measured_level() {
 
     let mut boosted = enabled();
     boosted.bands_db[5] = 6.0;
-    assert_near(rms(&boosted), TONE_RMS_DB + 6.0, 0.5, "947 Hz band +6 dB");
+    assert_near(rms(&boosted), TONE_RMS_DB + 6.0, 0.5, "1 kHz band +6 dB");
 
     let bypassed = EqualizerSettings {
         enabled: false,
         ..boosted
     };
     assert_near(rms(&bypassed), TONE_RMS_DB, 0.1, "disabled with gains set");
+}
+
+#[allow(clippy::float_cmp)] // the bands read back the exact values written
+#[test]
+fn the_bands_are_peak_filters_on_the_iso_centres() {
+    if !plugins_available() {
+        return;
+    }
+    let equalizer = EqualizerBin::new().unwrap();
+    let element = equalizer.bin.by_name("bands").unwrap();
+    assert_eq!(element.factory().unwrap().name(), "equalizer-nbands");
+    assert_eq!(element.property::<u32>("num-bands"), 10);
+    assert_eq!(equalizer.bands.len(), 10);
+    for (index, (band, hz)) in equalizer.bands.iter().zip(BAND_CENTERS_HZ).enumerate() {
+        assert_eq!(band.property::<f64>("freq"), f64::from(hz), "band {index}");
+        assert_eq!(
+            band.property::<f64>("bandwidth"),
+            f64::from(band_width_hz(index)),
+            "band {index}"
+        );
+        let kind = band.property_value("type");
+        let (_, kind) = glib::EnumValue::from_value(&kind).expect("band type is an enum");
+        assert_eq!(kind.nick(), "peak", "band {index}");
+    }
+}
+
+#[test]
+fn every_band_reaches_its_gain_at_its_own_centre() {
+    if !plugins_available() {
+        return;
+    }
+    for (index, hz) in BAND_CENTERS_HZ.iter().enumerate() {
+        let hz = f64::from(*hz);
+        let neutral = settled_rms(&measure_at(&enabled(), 0.25, hz));
+        let mut boosted = enabled();
+        boosted.bands_db[index] = 6.0;
+        let lifted = settled_rms(&measure_at(&boosted, 0.25, hz));
+        // A shelf would reach only half its gain here.
+        assert_near(lifted - neutral, 6.0, 0.5, &format!("{hz} Hz band +6 dB"));
+        boosted.bands_db[index] = MIN_GAIN_DB;
+        let cut = settled_rms(&measure_at(&boosted, 0.25, hz));
+        assert_near(
+            cut - neutral,
+            MIN_GAIN_DB,
+            0.5,
+            &format!("{hz} Hz band cut"),
+        );
+    }
 }
 
 #[test]
@@ -307,7 +495,7 @@ fn settings_written_mid_stream_take_effect() {
         return;
     }
     let equalizer = Arc::new(EqualizerBin::new().unwrap());
-    let pipeline = tone_pipeline(&equalizer, 0.25);
+    let pipeline = tone_pipeline(&equalizer, 0.25, TONE_HZ);
     let source_pad = pipeline
         .by_name("source")
         .unwrap()
@@ -409,7 +597,14 @@ fn the_installed_bin_follows_rate_and_channel_changes_between_loads() {
 /// Make the band filter fail part-way through the stream, as a broken
 /// element would: post an error and return a flow error upstream.
 fn fail_bands_after(equalizer: &PlayerEqualizer, buffers: usize) {
-    let bands = equalizer.bin.borrow().as_ref().unwrap().bands.clone();
+    let bands = equalizer
+        .bin
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .bin
+        .by_name("bands")
+        .unwrap();
     let seen = AtomicUsize::new(0);
     bands
         .static_pad("src")
