@@ -97,4 +97,6 @@ the exact commit or artifact, the environment, and the result on the linked issu
   the equalizer by ear; Download for offline, including a Subsonic account without download
   permission; Copy to Device onto a FAT-formatted drive; dragging tracks into Nautilus or Dolphin,
   Explorer, and Finder; seek and artwork in MPRIS, the Windows media overlay, and macOS Now
-  Playing; the Windows on ARM package; and one walkthrough in a language other than English.
+  Playing; the Windows on ARM package; one walkthrough in a language other than English; and,
+  for the new app ID, moving an existing Flatpak's data as the changelog describes, including
+  re-granting a library folder outside Music.
