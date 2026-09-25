@@ -148,6 +148,8 @@ fn gain_slider(title: &str, db: f64) -> gtk::Scale {
     scale.set_height_request(SLIDER_HEIGHT);
     scale.set_hexpand(true);
     scale.set_halign(gtk::Align::Center);
+    // The stylesheet trims the padding Adwaita gives every scale.
+    scale.add_css_class("equalizer-slider");
     scale.add_mark(0.0, gtk::PositionType::Right, None);
     scale.update_property(&[gtk::accessible::Property::Label(title)]);
     scale.set_value(db);
@@ -698,12 +700,17 @@ pub mod widget_tests {
             .into()
     }
 
-    #[allow(clippy::float_cmp)] // slider bounds and snapped gains are exact half-dB steps
-    pub fn equalizer_sliders_stand_like_a_graphic_equalizer() {
+    /// A panel showing the Full Treble preset, and its slider grid.
+    fn full_treble_sliders() -> (adw::PreferencesGroup, Rc<Panel>, gtk::Grid) {
         let mut saved = EqualizerSettings::default();
         saved.select_preset(Preset::FullTreble);
-        let (_group, panel, _changes) = panel(saved);
-        let grid = &sliders(&panel);
+        let (group, panel, _changes) = panel(saved);
+        let grid = sliders(&panel);
+        (group, panel, grid)
+    }
+
+    pub fn equalizer_sliders_stand_like_a_graphic_equalizer() {
+        let (_group, panel, grid) = full_treble_sliders();
 
         // Preamp first, then a separator, then the ten bands left to right,
         // each above its short frequency caption.
@@ -711,12 +718,12 @@ pub mod widget_tests {
             grid.child_at(1, 0).as_ref(),
             Some(panel.preamp.upcast_ref())
         );
-        assert_eq!(caption_at(grid, 1, 1), "Preamp");
+        assert_eq!(caption_at(&grid, 1, 1), "Preamp");
         assert!(grid
             .child_at(2, 0)
             .and_downcast::<gtk::Separator>()
             .is_some());
-        let captions: Vec<String> = (3..13).map(|column| caption_at(grid, column, 1)).collect();
+        let captions: Vec<String> = (3..13).map(|column| caption_at(&grid, column, 1)).collect();
         assert_eq!(
             captions,
             ["32", "64", "125", "250", "500", "1K", "2K", "4K", "8K", "16K"]
@@ -734,7 +741,16 @@ pub mod widget_tests {
             .collect();
         assert_eq!(marks, ["+12 dB", "0 dB", "-12 dB"]);
         assert_eq!(axis.accessible_role(), gtk::AccessibleRole::Presentation);
+        assert_eq!(
+            grid.child_at(5, 1).unwrap().accessible_role(),
+            gtk::AccessibleRole::Presentation,
+            "screen readers read each slider's own name, not the caption"
+        );
+    }
 
+    #[allow(clippy::float_cmp)] // slider bounds and snapped gains are exact half-dB steps
+    pub fn equalizer_sliders_boost_at_the_top_and_report_their_gain() {
+        let (_group, panel, _grid) = full_treble_sliders();
         for scale in std::iter::once(&panel.preamp).chain(&panel.bands) {
             assert_eq!(scale.orientation(), gtk::Orientation::Vertical);
             assert!(scale.is_inverted(), "boost is at the top");
@@ -753,11 +769,6 @@ pub mod widget_tests {
         assert_eq!(panel.bands[9].value(), 10.0);
         assert_eq!(panel.bands[9].tooltip_text().as_deref(), Some("+10.0 dB"));
         assert_eq!(panel.preamp.tooltip_text().as_deref(), Some("-10.0 dB"));
-        assert_eq!(
-            grid.child_at(5, 1).unwrap().accessible_role(),
-            gtk::AccessibleRole::Presentation,
-            "screen readers read each slider's own name, not the caption"
-        );
     }
 
     #[allow(clippy::float_cmp)] // snapped gains are exact half-dB steps

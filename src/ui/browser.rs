@@ -3938,6 +3938,7 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_edits_report_consistent_settings();
                 crate::ui::equalizer_panel::widget_tests::equalizer_panel_is_disabled_for_unsupported_outputs();
                 crate::ui::equalizer_panel::widget_tests::equalizer_sliders_stand_like_a_graphic_equalizer();
+                crate::ui::equalizer_panel::widget_tests::equalizer_sliders_boost_at_the_top_and_report_their_gain();
                 crate::ui::equalizer_panel::widget_tests::equalizer_sliders_follow_the_keyboard();
                 crate::ui::equalizer_panel::widget_tests::the_wheel_over_the_sliders_scrolls_the_page_not_a_slider();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();

@@ -1055,47 +1055,58 @@ fn library_group(
         let Some(group) = group_ref.upgrade() else {
             return;
         };
-        let dialog = gtk::FileDialog::builder()
-            .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
-            .modal(true)
-            .build();
-        let (config, parent_for_result, add_row) =
-            (config.clone(), parent.clone(), add_row.clone());
-        dialog.select_folder(
-            Some(&parent),
-            None::<&gtk::gio::Cancellable>,
-            move |result| {
-                let Some(path) = result.ok().and_then(|folder| folder.path()) else {
-                    return;
-                };
-                let Some(path) = path.to_str() else {
-                    warn!("Ignoring a selected library folder with a non-Unicode path");
-                    return;
-                };
-                if !add_library_path(&config, path) {
-                    return;
-                }
-                // A group only appends rows, so Add Folder… moves back below
-                // the new folder, keeping the focus it had.
-                group.remove(&add_row);
-                group.add(&library_folder_row(
-                    path,
-                    &config,
-                    &group,
-                    &parent_for_result,
-                ));
-                group.add(&add_row);
-                add_row.grab_focus();
-                // The engine won't pick up the new folder until the next
-                // launch — tell the user a restart is needed instead of
-                // leaving them with an empty library.
-                group.set_description(Some(
-                    rust_i18n::t!("preferences.library_restart_hint").as_ref(),
-                ));
-            },
-        );
+        choose_library_folder(&parent, &config, &group, add_row);
     });
     group
+}
+
+/// Ask for a folder to add to the library, then list it in `group` above
+/// the Add Folder… row.
+fn choose_library_folder(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    group: &adw::PreferencesGroup,
+    add_row: &adw::ButtonRow,
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
+        .modal(true)
+        .build();
+    let (config, group, add_row) = (config.clone(), group.clone(), add_row.clone());
+    let parent_for_result = parent.clone();
+    dialog.select_folder(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let Some(path) = result.ok().and_then(|folder| folder.path()) else {
+                return;
+            };
+            let Some(path) = path.to_str() else {
+                warn!("Ignoring a selected library folder with a non-Unicode path");
+                return;
+            };
+            if !add_library_path(&config, path) {
+                return;
+            }
+            // A group only appends rows, so Add Folder… moves back below
+            // the new folder, keeping the focus it had.
+            group.remove(&add_row);
+            group.add(&library_folder_row(
+                path,
+                &config,
+                &group,
+                &parent_for_result,
+            ));
+            group.add(&add_row);
+            add_row.grab_focus();
+            // The engine won't pick up the new folder until the next
+            // launch — tell the user a restart is needed instead of
+            // leaving them with an empty library.
+            group.set_description(Some(
+                rust_i18n::t!("preferences.library_restart_hint").as_ref(),
+            ));
+        },
+    );
 }
 
 /// Checkbox columns per row in the Browser Views and Visible Columns grids.
@@ -1177,8 +1188,28 @@ fn browser_views_groups(
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
 ) -> [adw::PreferencesGroup; 2] {
-    let cfg = config.borrow();
-    let mut saved_views = cfg.browser_views.clone();
+    let panes_group = browser_panes_group(config, saves, layout);
+    let album_artist = album_artist_row(config, saves, on_album_artist_changed);
+    let artwork = album_artwork_row(
+        config,
+        saves,
+        on_album_pane_artwork_changed,
+        on_album_pane_artwork_size_changed,
+    );
+    let rows_group = adw::PreferencesGroup::new();
+    rows_group.add(&album_artist);
+    rows_group.add(&artwork);
+    [panes_group, rows_group]
+}
+
+/// The titled Browser Views group: one checkbox per browser pane, each
+/// showing or hiding its pane.
+fn browser_panes_group(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    layout: &LayoutTargets,
+) -> adw::PreferencesGroup {
+    let mut saved_views = config.borrow().browser_views.clone();
     let panes: [(&str, PaneFlag); 4] = [
         ("browser.genre", |views| &mut views.genre),
         ("browser.artist", |views| &mut views.artist),
@@ -1200,21 +1231,38 @@ fn browser_views_groups(
         .title(rust_i18n::t!("preferences.browser_views").as_ref())
         .build();
     panes_group.add(&check_grid(&pane_checks));
+    panes_group
+}
 
+/// The Group by Album Artist switch.
+fn album_artist_row(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+) -> adw::SwitchRow {
     let album_artist = adw::SwitchRow::builder()
         .title(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
-        .active(cfg.group_by_album_artist)
+        .active(config.borrow().group_by_album_artist)
         .build();
-    {
-        let (config, saves) = (config.clone(), saves.clone());
-        album_artist.connect_active_notify(move |row| {
-            let active = row.is_active();
-            config.borrow_mut().group_by_album_artist = active;
-            saves.schedule();
-            on_album_artist_changed(active);
-        });
-    }
+    let (config, saves) = (config.clone(), saves.clone());
+    album_artist.connect_active_notify(move |row| {
+        let active = row.is_active();
+        config.borrow_mut().group_by_album_artist = active;
+        saves.schedule();
+        on_album_artist_changed(active);
+    });
+    album_artist
+}
 
+/// The Album artwork dropdown: Off, or the size the album pane shows its
+/// artwork at.
+fn album_artwork_row(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+) -> adw::ComboRow {
+    let cfg = config.borrow();
     let choices = [
         rust_i18n::t!("browser.album_artwork_off"),
         rust_i18n::t!("browser.album_artwork_size_small"),
@@ -1232,25 +1280,15 @@ fn browser_views_groups(
         ))
         .build();
     {
-        // Off turns the artwork off and keeps the size for next time; a size
-        // turns the artwork on at that size. The browser owns the pane
-        // rebuild, so each change goes through its callback.
+        // The browser owns the pane rebuild, so each change goes through its
+        // callback.
         let (config, saves) = (config.clone(), saves.clone());
         artwork.connect_selected_notify(move |row| {
             if row.selected() == gtk::INVALID_LIST_POSITION {
                 return;
             }
             let size = album_artwork_size_at(row.selected());
-            let (size_changed, enabled_changed) = {
-                let mut cfg = config.borrow_mut();
-                let size_changed = size.is_some_and(|size| size != cfg.album_pane_artwork_size);
-                if let Some(size) = size {
-                    cfg.album_pane_artwork_size = size;
-                }
-                let enabled_changed = cfg.album_pane_artwork != size.is_some();
-                cfg.album_pane_artwork = size.is_some();
-                (size_changed, enabled_changed)
-            };
+            let (size_changed, enabled_changed) = set_album_artwork(&mut config.borrow_mut(), size);
             saves.schedule();
             // The size goes first, so turning the artwork on decodes
             // thumbnails only at the chosen size.
@@ -1262,10 +1300,21 @@ fn browser_views_groups(
             }
         });
     }
-    let rows_group = adw::PreferencesGroup::new();
-    rows_group.add(&album_artist);
-    rows_group.add(&artwork);
-    [panes_group, rows_group]
+    artwork
+}
+
+/// Record an Album artwork choice in `cfg`. Off (`None`) turns the artwork
+/// off and keeps the size for next time; a size turns the artwork on at that
+/// size. Returns whether the size changed and whether the artwork turned on
+/// or off.
+fn set_album_artwork(cfg: &mut AppConfig, size: Option<AlbumArtSize>) -> (bool, bool) {
+    let size_changed = size.is_some_and(|size| size != cfg.album_pane_artwork_size);
+    if let Some(size) = size {
+        cfg.album_pane_artwork_size = size;
+    }
+    let enabled_changed = cfg.album_pane_artwork != size.is_some();
+    cfg.album_pane_artwork = size.is_some();
+    (size_changed, enabled_changed)
 }
 
 /// The Import group, last on the page: bringing in another player's library
@@ -1526,6 +1575,38 @@ fn library_folder_row(
     row.set_title(&name);
     row.set_subtitle(path);
 
+    let (reauthorize_btn, remove_btn) = library_folder_buttons(path, config);
+    row.add_suffix(&reauthorize_btn);
+    row.add_suffix(&remove_btn);
+
+    let old_path = path.to_string();
+    {
+        let config = config.clone();
+        let parent = parent.clone();
+        let group = group.downgrade();
+        let buttons = [reauthorize_btn.downgrade(), remove_btn.downgrade()];
+        reauthorize_btn.connect_clicked(move |_| {
+            choose_reauthorization_folder(&parent, &config, &old_path, &group, &buttons);
+        });
+    }
+
+    let config = config.clone();
+    let path_owned = path.to_string();
+    let group = group.downgrade();
+    let row_ref = row.downgrade();
+    remove_btn.connect_clicked(move |_| {
+        remove_library_folder(&config, &path_owned, &group, &row_ref);
+    });
+
+    row
+}
+
+/// A library folder row's flat Reauthorize… and remove buttons, locked while
+/// the folder has a reauthorization pending.
+fn library_folder_buttons(
+    path: &str,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+) -> (gtk::Button, gtk::Button) {
     let reauthorize_label = rust_i18n::t!("preferences.reauthorize_folder");
     let reauthorize_btn = gtk::Button::builder()
         .icon_name("folder-open-symbolic")
@@ -1551,191 +1632,213 @@ fn library_folder_row(
         .any(|pending| pending.old_path == path);
     reauthorize_btn.set_sensitive(!has_pending_request);
     remove_btn.set_sensitive(!has_pending_request);
+    (reauthorize_btn, remove_btn)
+}
 
-    row.add_suffix(&reauthorize_btn);
-    row.add_suffix(&remove_btn);
-
-    let old_path = path.to_string();
-    {
-        let config = config.clone();
-        let parent = parent.clone();
-        let group = group.downgrade();
-        let reauthorize_btn_for_state = reauthorize_btn.downgrade();
-        let remove_btn_for_state = remove_btn.downgrade();
-        reauthorize_btn.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder()
-                .title(
-                    rust_i18n::t!("preferences.select_reauthorization_folder").as_ref(),
-                )
-                .modal(true)
-                .build();
-            let config = config.clone();
-            let parent = parent.clone();
-            let old_path = old_path.clone();
-            let group = group.clone();
-            let reauthorize_btn = reauthorize_btn_for_state.clone();
-            let remove_btn = remove_btn_for_state.clone();
-            let parent_for_result = parent.clone();
-            dialog.select_folder(
-                Some(&parent),
-                None::<&gtk::gio::Cancellable>,
-                move |result| {
-                    let Ok(folder) = result else {
-                        // Closing the chooser is not an error and needs no
-                        // additional prompt.
-                        return;
-                    };
-                    let Some(path) = folder.path() else {
-                        present_reauthorization_error(
-                            &parent_for_result,
-                            None,
-                            &old_path,
-                            None,
-                        );
-                        return;
-                    };
-                    let Some(new_path) = path.to_str().map(str::to_string) else {
-                        present_reauthorization_error(
-                            &parent_for_result,
-                            Some(RootReauthorizationError::UnsupportedPathEncoding),
-                            &old_path,
-                            None,
-                        );
-                        return;
-                    };
-                    if let Err(error) = validate_root_reauthorization(
-                        &config.borrow(),
-                        &old_path,
-                        &new_path,
-                    ) {
-                        present_reauthorization_error(
-                            &parent_for_result,
-                            Some(error),
-                            &old_path,
-                            Some(&new_path),
-                        );
-                        return;
-                    }
-
-                    let body = rust_i18n::t!(
-                        "preferences.reauthorization_confirmation_body",
-                        old_path = old_path.clone(),
-                        new_path = new_path.clone()
-                    );
-                    let confirmation = adw::AlertDialog::builder()
-                        .heading(
-                            rust_i18n::t!("preferences.reauthorization_confirmation_heading")
-                                .as_ref(),
-                        )
-                        .body(body.as_ref())
-                        .close_response("cancel")
-                        .default_response("cancel")
-                        .build();
-                    confirmation.add_response(
-                        "cancel",
-                        rust_i18n::t!("dialogs.cancel").as_ref(),
-                    );
-                    confirmation.add_response(
-                        "reauthorize",
-                        rust_i18n::t!("preferences.confirm_reauthorization").as_ref(),
-                    );
-                    confirmation.set_response_appearance(
-                        "reauthorize",
-                        adw::ResponseAppearance::Suggested,
-                    );
-
-                    let config = config.clone();
-                    let parent = parent_for_result.clone();
-                    let parent_for_response = parent.clone();
-                    let group = group.clone();
-                    let reauthorize_btn = reauthorize_btn.clone();
-                    let remove_btn = remove_btn.clone();
-                    confirmation.connect_response(None, move |_dialog, response| {
-                        if response != "reauthorize" {
-                            return;
-                        }
-
-                        let request_id = uuid::Uuid::new_v4().to_string();
-                        let result = {
-                            let mut cfg = config.borrow_mut();
-                            let mut candidate = cfg.clone();
-                            let result = schedule_root_reauthorization(
-                                &mut candidate,
-                                &old_path,
-                                &new_path,
-                                &request_id,
-                            );
-                            if result.is_ok() && save_config(&candidate) {
-                                *cfg = candidate;
-                                result
-                            } else if result.is_ok() {
-                                Err(RootReauthorizationError::ConfigSaveFailed)
-                            } else {
-                                result
-                            }
-                        };
-                        match result {
-                            Ok(RootReauthorizationSchedule::Scheduled { request_id }) => {
-                                info!(%request_id, old_path = %old_path, new_path = %new_path, "Library root reauthorization scheduled");
-                                if let Some(group) = group.upgrade() {
-                                    group.set_description(Some(
-                                        rust_i18n::t!(
-                                            "preferences.reauthorization_restart_hint"
-                                        )
-                                        .as_ref(),
-                                    ));
-                                }
-                                for button in [&reauthorize_btn, &remove_btn] {
-                                    if let Some(button) = button.upgrade() {
-                                        button.set_sensitive(false);
-                                    }
-                                }
-                            }
-                            Err(error) => present_reauthorization_error(
-                                &parent_for_response,
-                                Some(error),
-                                &old_path,
-                                Some(&new_path),
-                            ),
-                        }
-                    });
-                    confirmation.present(Some(&parent));
-                },
-            );
-        });
-    }
-
+/// Ask for the folder that replaces the library folder at `old_path`, then
+/// confirm the reauthorization.
+///
+/// Once a request is scheduled, `group` shows the restart hint and `buttons`
+/// — the row's Reauthorize… and remove buttons — lock.
+fn choose_reauthorization_folder(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: &str,
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    buttons: &[gtk::glib::WeakRef<gtk::Button>; 2],
+) {
+    let dialog = gtk::FileDialog::builder()
+        .title(rust_i18n::t!("preferences.select_reauthorization_folder").as_ref())
+        .modal(true)
+        .build();
     let config = config.clone();
-    let path_owned = path.to_string();
-    let group = group.downgrade();
-    let row_ref = row.downgrade();
-    remove_btn.connect_clicked(move |_| {
-        let removed = {
-            let mut cfg = config.borrow_mut();
-            let mut candidate = cfg.clone();
-            if remove_library_path(&mut candidate, &path_owned) && save_config(&candidate) {
-                *cfg = candidate;
-                true
-            } else {
-                false
-            }
-        };
-        if !removed {
+    let old_path = old_path.to_string();
+    let group = group.clone();
+    let buttons = buttons.clone();
+    let parent_for_result = parent.clone();
+    dialog.select_folder(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |result| {
+            let Ok(folder) = result else {
+                // Closing the chooser is not an error and needs no
+                // additional prompt.
+                return;
+            };
+            let Some(new_path) =
+                reauthorization_destination(&parent_for_result, &config, &old_path, &folder)
+            else {
+                return;
+            };
+            confirm_reauthorization(
+                &parent_for_result,
+                &config,
+                old_path,
+                new_path,
+                &group,
+                &buttons,
+            );
+        },
+    );
+}
+
+/// The path of the chosen `folder` when it can replace `old_path`. Otherwise
+/// the user is told why it can't, and there is none.
+fn reauthorization_destination(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: &str,
+    folder: &gtk::gio::File,
+) -> Option<String> {
+    let Some(path) = folder.path() else {
+        present_reauthorization_error(parent, None, old_path, None);
+        return None;
+    };
+    let Some(new_path) = path.to_str().map(str::to_string) else {
+        present_reauthorization_error(
+            parent,
+            Some(RootReauthorizationError::UnsupportedPathEncoding),
+            old_path,
+            None,
+        );
+        return None;
+    };
+    if let Err(error) = validate_root_reauthorization(&config.borrow(), old_path, &new_path) {
+        present_reauthorization_error(parent, Some(error), old_path, Some(&new_path));
+        return None;
+    }
+    Some(new_path)
+}
+
+/// Ask the user to confirm reauthorizing `old_path` as `new_path`, and
+/// schedule the request once they do.
+fn confirm_reauthorization(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: String,
+    new_path: String,
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    buttons: &[gtk::glib::WeakRef<gtk::Button>; 2],
+) {
+    let confirmation = reauthorization_confirmation(&old_path, &new_path);
+    let config = config.clone();
+    let parent_for_response = parent.clone();
+    let group = group.clone();
+    let buttons = buttons.clone();
+    confirmation.connect_response(None, move |_dialog, response| {
+        if response != "reauthorize" {
             return;
         }
-        let (Some(group), Some(row)) = (group.upgrade(), row_ref.upgrade()) else {
-            return;
-        };
-        group.remove(&row);
-        // The engine keeps watching the removed folder until the next
-        // launch — surface a restart hint so the stale tracks aren't
-        // mistaken for a bug.
-        group.set_description(Some(
-            rust_i18n::t!("preferences.library_restart_hint").as_ref(),
-        ));
-    });
 
-    row
+        match schedule_saved_reauthorization(&config, &old_path, &new_path) {
+            Ok(RootReauthorizationSchedule::Scheduled { request_id }) => {
+                info!(%request_id, old_path = %old_path, new_path = %new_path, "Library root reauthorization scheduled");
+                lock_reauthorized_folder_row(&group, &buttons);
+            }
+            Err(error) => present_reauthorization_error(
+                &parent_for_response,
+                Some(error),
+                &old_path,
+                Some(&new_path),
+            ),
+        }
+    });
+    confirmation.present(Some(parent));
+}
+
+/// The dialog asking to confirm reauthorizing `old_path` as `new_path`, with
+/// Cancel as its default and close response.
+fn reauthorization_confirmation(old_path: &str, new_path: &str) -> adw::AlertDialog {
+    let body = rust_i18n::t!(
+        "preferences.reauthorization_confirmation_body",
+        old_path = old_path,
+        new_path = new_path
+    );
+    let confirmation = adw::AlertDialog::builder()
+        .heading(rust_i18n::t!("preferences.reauthorization_confirmation_heading").as_ref())
+        .body(body.as_ref())
+        .close_response("cancel")
+        .default_response("cancel")
+        .build();
+    confirmation.add_response("cancel", rust_i18n::t!("dialogs.cancel").as_ref());
+    confirmation.add_response(
+        "reauthorize",
+        rust_i18n::t!("preferences.confirm_reauthorization").as_ref(),
+    );
+    confirmation.set_response_appearance("reauthorize", adw::ResponseAppearance::Suggested);
+    confirmation
+}
+
+/// Schedule reauthorizing `old_path` as `new_path` under a fresh request ID.
+/// The config takes the request only once a copy holding it is saved.
+fn schedule_saved_reauthorization(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    old_path: &str,
+    new_path: &str,
+) -> Result<RootReauthorizationSchedule, RootReauthorizationError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut cfg = config.borrow_mut();
+    let mut candidate = cfg.clone();
+    let result = schedule_root_reauthorization(&mut candidate, old_path, new_path, &request_id);
+    if result.is_ok() && save_config(&candidate) {
+        *cfg = candidate;
+        result
+    } else if result.is_ok() {
+        Err(RootReauthorizationError::ConfigSaveFailed)
+    } else {
+        result
+    }
+}
+
+/// Show the restart hint on `group` and lock the folder row's `buttons` once
+/// its reauthorization is scheduled.
+fn lock_reauthorized_folder_row(
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    buttons: &[gtk::glib::WeakRef<gtk::Button>; 2],
+) {
+    if let Some(group) = group.upgrade() {
+        group.set_description(Some(
+            rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref(),
+        ));
+    }
+    for button in buttons {
+        if let Some(button) = button.upgrade() {
+            button.set_sensitive(false);
+        }
+    }
+}
+
+/// Remove the library folder at `path` once the config without it is saved,
+/// and take its row out of `group`.
+fn remove_library_folder(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    path: &str,
+    group: &gtk::glib::WeakRef<adw::PreferencesGroup>,
+    row: &gtk::glib::WeakRef<adw::ActionRow>,
+) {
+    let removed = {
+        let mut cfg = config.borrow_mut();
+        let mut candidate = cfg.clone();
+        if remove_library_path(&mut candidate, path) && save_config(&candidate) {
+            *cfg = candidate;
+            true
+        } else {
+            false
+        }
+    };
+    if !removed {
+        return;
+    }
+    let (Some(group), Some(row)) = (group.upgrade(), row.upgrade()) else {
+        return;
+    };
+    group.remove(&row);
+    // The engine keeps watching the removed folder until the next
+    // launch — surface a restart hint so the stale tracks aren't
+    // mistaken for a bug.
+    group.set_description(Some(
+        rust_i18n::t!("preferences.library_restart_hint").as_ref(),
+    ));
 }
 
 fn present_reauthorization_error(
