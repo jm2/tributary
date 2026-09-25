@@ -24,10 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Folder browsing** — A Folder pane browses the local library by library folder and
   subfolder, on Windows as well as Linux and macOS. Double-click a folder or press Enter to open
   it, and use the `…` row to go back up.
-- **Equalizer** — A ten-band graphic equalizer in Preferences for playback on this computer, with
-  bands from 32 Hz to 16 kHz, ±12 dB of gain, Winamp's classic presets, a preamp, and optional
-  soft clip protection. Changes apply to the playing track immediately and are remembered
-  between sessions.
+- **Equalizer** — A ten-band graphic equalizer for playback on this computer, in its own window
+  opened from the EQ button in the header bar or the main menu, with bands from 32 Hz to 16 kHz,
+  ±12 dB of gain, Winamp's classic presets, a preamp, and optional soft clip protection. The EQ
+  button is highlighted while the equalizer is on. Changes apply to the playing track immediately
+  and are remembered between sessions.
 - **Drag and drop onto playlists** — Drag selected tracks onto a playlist in the sidebar to add
   them in the order shown, and drag playlists to reorder the sidebar.
 - **Drag tracks to a file manager** — Drag tracks from your local library into a file manager to

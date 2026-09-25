@@ -2,7 +2,7 @@
 //! views, and column visibility.
 //!
 //! Uses `adw::PreferencesDialog` with a single page: Library Location,
-//! Downloads, Browser Views, Visible Columns, Equalizer, Privacy, any
+//! Downloads, Browser Views, Visible Columns, Privacy, any
 //! integration groups the window supplies (Last.fm), and Import last.
 
 use adw::prelude::*;
@@ -885,7 +885,6 @@ impl LayoutTargets {
 /// * `on_album_artist_changed` — invoked when the artist grouping switch flips
 /// * `on_album_pane_artwork_changed` — invoked when album artwork turns on or off
 /// * `on_album_pane_artwork_size_changed` — invoked when the artwork size changes
-/// * `active_output` — the output the equalizer group applies its settings to
 /// * `integration_groups` — groups for optional integrations (Last.fm), placed
 ///   after the app's own settings and before the Import group
 #[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
@@ -897,7 +896,6 @@ pub fn show_preferences(
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
-    active_output: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::audio::output::AudioOutput>>>,
     integration_groups: &[adw::PreferencesGroup],
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
@@ -1003,11 +1001,6 @@ pub fn show_preferences(
     columns_group.add(&columns_grid);
     columns_group.add(&reset_btn);
     page.add(&columns_group);
-    page.add(&super::equalizer_panel::preferences_group(
-        config,
-        saves,
-        active_output,
-    ));
     page.add(&privacy_group(config, saves));
     for group in integration_groups {
         page.add(group);

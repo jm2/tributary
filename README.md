@@ -541,6 +541,7 @@ src/
     ├── window.rs           # Main window orchestration (GTK lifecycle + event wiring)
     ├── window_state.rs     # Shared WindowState struct
     ├── header_bar.rs       # Playback controls, now-playing, progress, volume
+    ├── equalizer_panel.rs  # Equalizer window
     ├── sidebar.rs          # Source list (local + remote + discovered + playlists)
     ├── browser.rs          # Search bar + Genre → Artist → Album filter panes
     ├── folder_browser.rs   # Folder pane over the local library
@@ -820,6 +821,9 @@ volume. Packaged Windows and macOS builds follow changes to the system default a
   mode Previous walks back through the tracks actually played, and Next then retraces that history
   before continuing
 - **Repeat** — cycles through Off → All → One
+- **Equalizer** — the EQ button after Shuffle, or **Equalizer** in the main menu, opens the
+  ten-band equalizer for playback on this computer in its own window. The button's icon is
+  highlighted while the equalizer is on. See the [equalizer design](docs/equalizer.md)
 - **Seek** — drag the progress scrubber
 - **Volume** — drag the volume slider (cubic perceptual curve)
 
@@ -849,7 +853,6 @@ Open **Preferences** from the hamburger menu (☰) to:
 - Choose the folder that downloaded tracks are saved to (see [Downloading Remote Tracks](#downloading-remote-tracks))
 - Toggle browser panes (Genre, Artist, Album, Folder) and choose the Album pane's artwork size
 - Show/hide tracklist columns
-- Set up the equalizer for playback on this computer
 - Turn the location lookup for Stations Near Me on or off (see [Internet Radio](#internet-radio))
 - Import ratings, play counts, and playlists from Rhythmbox (see
   [Importing from Rhythmbox](#importing-from-rhythmbox))

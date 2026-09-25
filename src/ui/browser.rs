@@ -3941,7 +3941,12 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::equalizer_sliders_boost_at_the_top_and_report_their_gain();
                 crate::ui::equalizer_panel::widget_tests::equalizer_sliders_follow_the_keyboard();
                 crate::ui::equalizer_panel::widget_tests::the_wheel_over_the_sliders_scrolls_the_page_not_a_slider();
+                crate::ui::equalizer_panel::widget_tests::the_equalizer_window_opens_once_and_escape_closes_it();
+                crate::ui::equalizer_panel::widget_tests::the_equalizer_window_follows_the_selected_output();
+                crate::ui::equalizer_panel::widget_tests::the_eq_button_shows_whether_the_equalizer_is_on();
+                crate::ui::equalizer_panel::widget_tests::the_wheel_in_the_equalizer_window_moves_nothing();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
+                crate::ui::header_bar::widget_tests::equalizer_button_follows_shuffle();
                 crate::ui::playlist_editor::widget_tests::number_and_date_rows_gate_ok();
                 crate::ui::playlist_editor::widget_tests::rows_are_labelled_for_the_locale_they_are_built_for();
                 crate::ui::server_dialogs::widget_tests::connect_waits_for_required_credentials();

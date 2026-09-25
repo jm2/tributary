@@ -4,6 +4,7 @@ const MANIFEST: &str = include_str!("../Cargo.toml");
 const ROOT_LOCK: &str = include_str!("../Cargo.lock");
 const RPM_SPEC: &str = include_str!("../build-aux/rpm/tributary.spec");
 const ARCH_PKGBUILD: &str = include_str!("../build-aux/arch/PKGBUILD");
+const FLATPAK_MANIFEST: &str = include_str!("../build-aux/flatpak/io.github.jm2.tributary.yml");
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.jm2.tributary.desktop");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const RUST_TOOLCHAIN_MANIFEST: &str = include_str!("../.github/rust-toolchain.toml");
@@ -2482,4 +2483,88 @@ fn developer_coverage_commands_do_not_hide_source_areas() {
             && README.contains("measurement-definition change"),
         "the threshold enforcement and separate review ratchet must be documented accurately"
     );
+}
+
+/// The header bar's EQ button icon, which GNOME's icon theme lacks.
+const EQUALIZER_ICON: &str = "io.github.jm2.tributary-equalizer-symbolic.svg";
+
+/// The icon's path in the source tree, and under an install prefix.
+fn equalizer_icon_paths() -> (String, String) {
+    (
+        format!("data/icons/hicolor/scalable/actions/{EQUALIZER_ICON}"),
+        format!("icons/hicolor/scalable/actions/{EQUALIZER_ICON}"),
+    )
+}
+
+#[test]
+fn cargo_deb_and_rpm_assets_install_the_equalizer_icon() {
+    let (source, installed) = equalizer_icon_paths();
+    assert!(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(&source)
+            .is_file(),
+        "{source} is missing"
+    );
+    let manifest = manifest();
+    let deb = manifest["package"]["metadata"]["deb"]["assets"]
+        .as_array()
+        .expect("package.metadata.deb.assets must be an array");
+    assert!(
+        deb.iter().any(|asset| {
+            asset[0].as_str() == Some(source.as_str())
+                && asset[1].as_str() == Some("usr/share/icons/hicolor/scalable/actions/")
+        }),
+        "the .deb does not install {source}"
+    );
+    let rpm = manifest["package"]["metadata"]["generate-rpm"]["assets"]
+        .as_array()
+        .expect("package.metadata.generate-rpm.assets must be an array");
+    let destination = format!("/usr/share/{installed}");
+    assert!(
+        rpm.iter().any(|asset| {
+            asset["source"].as_str() == Some(source.as_str())
+                && asset["dest"].as_str() == Some(destination.as_str())
+        }),
+        "the generated .rpm does not install {source}"
+    );
+}
+
+#[test]
+fn distribution_packages_and_bundles_install_the_equalizer_icon() {
+    let (source, installed) = equalizer_icon_paths();
+    for (package, text, destination) in [
+        (
+            "tributary.spec",
+            RPM_SPEC,
+            format!("%{{buildroot}}%{{_datadir}}/{installed}"),
+        ),
+        (
+            "PKGBUILD",
+            ARCH_PKGBUILD,
+            format!("$pkgdir/usr/share/{installed}"),
+        ),
+        (
+            "Flatpak manifest",
+            FLATPAK_MANIFEST,
+            format!("/app/share/{installed}"),
+        ),
+    ] {
+        assert!(
+            text.contains(&source) && text.contains(&destination),
+            "{package} does not install {source} to {destination}"
+        );
+    }
+    let spec_files = RPM_SPEC
+        .split("%files")
+        .nth(1)
+        .expect("tributary.spec has a %files section");
+    assert!(
+        spec_files.contains(&format!("%{{_datadir}}/{installed}")),
+        "tributary.spec does not list the icon under %files"
+    );
+
+    // The Windows and macOS bundles copy the whole icon tree.
+    assert!(BUILD_WINDOWS.contains(r#"$appIconsSrc = "data\icons\hicolor""#));
+    assert!(BUILD_MACOS
+        .contains(r#"cp -R "${APP_ICONS_SRC}/." "${RESOURCES_DIR}/share/icons/hicolor/""#));
 }

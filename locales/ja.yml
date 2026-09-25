@@ -23,6 +23,7 @@ header:
   playback_position: "再生位置"
   volume: "音量"
   rescan_library: "ライブラリを再スキャン"
+  equalizer_menu: "イコライザー(_E)"
   my_computer: "このコンピューター"
   preferences_menu: "設定(_P)"
   about_menu: "Tributary について(_A)"

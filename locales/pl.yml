@@ -25,6 +25,7 @@ header:
   playback_position: "Pozycja odtwarzania"
   volume: "Głośność"
   rescan_library: "Przeskanuj bibliotekę ponownie"
+  equalizer_menu: "_Korektor"
   my_computer: "Mój komputer"
   preferences_menu: "_Ustawienia"
   about_menu: "_O programie Tributary"

@@ -179,6 +179,7 @@ assets = [
     ["data/icons/hicolor/128x128/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["data/icons/hicolor/256x256/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["data/icons/hicolor/512x512/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["data/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg", "usr/share/icons/hicolor/scalable/actions/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -194,6 +195,7 @@ assets = [
     { source = "data/icons/hicolor/128x128/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.jm2.tributary.png", mode = "0644" },
     { source = "data/icons/hicolor/256x256/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.jm2.tributary.png", mode = "0644" },
     { source = "data/icons/hicolor/512x512/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg", dest = "/usr/share/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg", mode = "0644" },
 ]
 
 [package.metadata.generate-rpm.requires]

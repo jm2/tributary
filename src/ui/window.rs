@@ -3736,7 +3736,6 @@ pub(crate) fn build_window(
         let saves = config_saves.clone();
         let bs = browser_state.clone();
         let master_for_pref = master_tracks.clone();
-        let output_for_prefs = active_output.clone();
         let lastfm_settings = lastfm_settings.clone();
         let prefs_action = gtk::gio::SimpleAction::new("show-preferences", None);
         prefs_action.connect_activate(move |_, _| {
@@ -3787,11 +3786,32 @@ pub(crate) fn build_window(
                 on_aa_change,
                 on_art_change,
                 on_art_size_change,
-                &output_for_prefs,
                 lastfm_group.as_slice(),
             );
         });
         window.add_action(&prefs_action);
+    }
+
+    // ── Equalizer window: the header's EQ button and the main menu ───
+    {
+        let equalizer = Rc::new(super::equalizer_panel::EqualizerWindow::new(
+            &window,
+            &app_config,
+            &config_saves,
+            &active_output,
+            &hb.equalizer_button,
+        ));
+        let opener = equalizer.clone();
+        let equalizer_action = gtk::gio::SimpleAction::new("show-equalizer", None);
+        equalizer_action.connect_activate(move |_, _| opener.present());
+        window.add_action(&equalizer_action);
+        // Connected to run after the output selector's own handler, once the
+        // selected output has changed.
+        hb.output_list
+            .connect_local("row-activated", true, move |_| {
+                equalizer.output_changed();
+                None
+            });
     }
 
     // ── Rescan the local library on request ──────────────────────────
