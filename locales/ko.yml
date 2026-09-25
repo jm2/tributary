@@ -23,6 +23,7 @@ header:
   playback_position: "재생 위치"
   volume: "음량"
   rescan_library: "라이브러리 다시 검색"
+  equalizer_menu: "이퀄라이저(_E)"
   my_computer: "내 컴퓨터"
   preferences_menu: "환경설정(_P)"
   about_menu: "Tributary 정보(_A)"

@@ -57,6 +57,8 @@ for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
     install -D -p -m 0644 data/icons/hicolor/${size}/apps/io.github.jm2.tributary.png \
         %{buildroot}%{_datadir}/icons/hicolor/${size}/apps/io.github.jm2.tributary.png
 done
+install -D -p -m 0644 data/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg \
+    %{buildroot}%{_datadir}/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg
 
 # Validate the installed tree even when a build service skips its test phase.
 build-aux/linux/validate-package-compliance.sh --tree "%{buildroot}"
@@ -74,6 +76,7 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %{_datadir}/applications/io.github.jm2.tributary.desktop
 %{_metainfodir}/io.github.jm2.tributary.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/io.github.jm2.tributary.png
+%{_datadir}/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg
 
 %changelog
 * Thu Sep 24 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.7.0-1

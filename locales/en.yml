@@ -23,6 +23,7 @@ header:
   playback_position: "Playback position"
   volume: "Volume"
   rescan_library: "Rescan Library"
+  equalizer_menu: "_Equalizer"
   my_computer: "My Computer"
   preferences_menu: "_Preferences"
   about_menu: "_About Tributary"

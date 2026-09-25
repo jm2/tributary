@@ -25,6 +25,7 @@ header:
   playback_position: "Позиция воспроизведения"
   volume: "Громкость"
   rescan_library: "Пересканировать библиотеку"
+  equalizer_menu: "_Эквалайзер"
   my_computer: "Мой компьютер"
   preferences_menu: "_Настройки"
   about_menu: "_О программе Tributary"

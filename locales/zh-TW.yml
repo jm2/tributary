@@ -23,6 +23,7 @@ header:
   playback_position: "播放位置"
   volume: "音量"
   rescan_library: "重新掃描音樂庫"
+  equalizer_menu: "等化器(_E)"
   my_computer: "我的電腦"
   preferences_menu: "偏好設定(_P)"
   about_menu: "關於 Tributary(_A)"

@@ -3,7 +3,7 @@
 - Status: implemented for the local output
 - Tracking issue: [#49](https://github.com/jm2/tributary/issues/49)
 - Code: `src/audio/equalizer.rs` (settings and the GStreamer bin),
-  `src/ui/equalizer_panel.rs` (the Preferences group)
+  `src/ui/equalizer_panel.rs` (the Equalizer window)
 
 Tributary has a ten-band graphic equalizer with Winamp's classic presets, a preamp, and optional
 clip protection. Its bands, range, and layout follow iTunes and Winamp: ten octave bands from
@@ -12,7 +12,12 @@ loudness normalization, and per-track or per-source profiles are out of scope.
 
 ## Controls
 
-The **Equalizer** group sits at the bottom of Preferences:
+The **EQ** button in the header bar, after Shuffle, opens the **Equalizer** window, and so does
+**Equalizer** in the main menu. The window is not modal, so it can stay open beside the main
+window. Clicking the button again raises it instead of opening a second one, and Escape or its
+close button closes it. The button's icon takes the accent colour while the equalizer is on.
+
+The window holds these controls:
 
 | Control | Values |
 | ------- | ------ |
@@ -32,7 +37,7 @@ name ("Preamp", "1 kHz") and reports its value as dB text ("+3.0 dB"); the capti
 are presentational.
 
 Drag a slider, or focus it and use the arrow, Page Up, and Page Down keys. The mouse wheel and
-touchpad scrolling over the sliders scroll the Preferences page and never move a slider.
+touchpad scrolling over the sliders never move a slider.
 
 Choosing a named preset loads its band gains and preamp. Moving any slider by hand switches the
 preset to Custom. Choosing Custom keeps the current gains. Changes apply to the playing track
@@ -81,9 +86,9 @@ Winamp's "Laptop speakers/headphones" preset is called Headphones.
 Only the local output runs the equalizer. AirPlay, Chromecast, and MPD receivers decode and play
 the audio themselves, so Tributary's pipeline never processes what they play.
 `AudioOutput::supports_equalizer` is `false` by default. Only the local output returns `true`,
-and only while its equalizer is available. When it is `false`, the group shows the controls
-disabled, with the reason as the group description. The settings stay saved and apply again when
-you switch back to the local output.
+and only while its equalizer is available. When it is `false`, the window shows the controls
+disabled, with the reason above them. Selecting another output while the window is open updates
+it. The settings stay saved and apply again when you switch back to the local output.
 
 ## Filter graph
 
@@ -131,12 +136,13 @@ audioresample ! audioconvert ! capsfilter(format=F32LE, layout=interleaved)
 ## Failures
 
 - If an element cannot be created, for example because gst-plugins-good is missing, the player
-  runs without an `audio-filter`. Playback is unchanged, and the Preferences group says the
+  runs without an `audio-filter`. Playback is unchanged, and the Equalizer window says the
   equalizer is unavailable.
 - If an element inside the bin posts an error during playback, the bus watch removes the bin
   and restarts the current stream without it. Once the stream prerolls, the watch seeks back to
-  where the failure happened. The track keeps playing without the equalizer, and the group
-  reports the equalizer unavailable for the rest of the session. Errors from anywhere else in
+  where the failure happened. The track keeps playing without the equalizer, and from the next
+  time the Equalizer window opens it reports the equalizer unavailable for the rest of the
+  session. Errors from anywhere else in
   the pipeline are handled as before.
 
 ## Persistence
@@ -168,9 +174,9 @@ Preset names are saved in snake case: `flat`, `classical`, `club`, `dance`, `ful
   gains also becomes `custom`, because the gains no longer match the preset.
 - A malformed `equalizer` value, such as a preset that is not a string or the wrong number of
   bands, resets only this field to its defaults. The rest of `config.json` still loads.
-- The group saves through the shared atomic `save_config`. Slider drags are grouped into one
+- The window saves through the shared atomic `save_config`. Slider drags are grouped into one
   write 750 ms after the first change, the same delay the volume slider uses. A write still
-  pending when the Preferences dialog closes is saved then.
+  pending when Tributary closes is saved then.
 
 ## Tests
 
@@ -187,5 +193,9 @@ Preset names are saved in snake case: `flat`, `classical`, `club`, `dance`, `ful
   GStreamer elements are not installed.
 - `src/ui/equalizer_panel.rs` covers label formatting, preset names, and key parity across all 13
   locale catalogs. Its GTK widget contracts run in the shared widget-test session. They check the
-  slider layout and accessibility, keyboard steps, and that a scroll over the sliders moves the
-  enclosing scrolled window, is stopped before the sliders, and edits nothing.
+  slider layout and accessibility, keyboard steps, and that a scroll over the sliders is stopped
+  before them and edits nothing, moving an enclosing scrolled window if there is one; in the
+  Equalizer window there is none. They also check that the window opens once over the main
+  window and closes on Escape, that it follows the selected output, and that the EQ button's
+  accent colour follows the switch. `src/ui/header_bar.rs` checks the button's place after
+  Shuffle, its action, name, and icon.

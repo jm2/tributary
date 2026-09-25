@@ -23,6 +23,7 @@ header:
   playback_position: "Posição da reprodução"
   volume: "Volume"
   rescan_library: "Reexaminar a biblioteca"
+  equalizer_menu: "_Equalizador"
   my_computer: "Meu computador"
   preferences_menu: "_Preferências"
   about_menu: "_Sobre o Tributary"

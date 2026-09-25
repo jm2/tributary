@@ -23,6 +23,7 @@ header:
   playback_position: "Afspeelpositie"
   volume: "Volume"
   rescan_library: "Bibliotheek opnieuw scannen"
+  equalizer_menu: "_Equalizer"
   my_computer: "Mijn computer"
   preferences_menu: "_Voorkeuren"
   about_menu: "_Over Tributary"

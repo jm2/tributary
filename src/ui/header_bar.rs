@@ -1,4 +1,5 @@
-//! Header bar — playback controls, now-playing widget, progress, volume, menu.
+//! Header bar — playback controls, the EQ button, now-playing widget,
+//! progress, volume, menu.
 //!
 //! Follows modern GNOME app patterns (Ptyxis-style): a primary `MenuButton`
 //! with a `gio::Menu` popover on the right, rather than a legacy hamburger.
@@ -26,6 +27,7 @@ pub struct HeaderBarWidgets {
     pub repeat_button: gtk::ToggleButton,
     pub repeat_mode: Rc<Cell<RepeatMode>>,
     pub shuffle_button: gtk::ToggleButton,
+    pub equalizer_button: gtk::Button,
     pub album_art: gtk::Image,
     pub title_label: gtk::Label,
     pub artist_label: gtk::Label,
@@ -95,6 +97,20 @@ pub fn show_play_button_state(button: &gtk::Button, playing: bool) {
     button.update_property(&[gtk::accessible::Property::Label(&name)]);
 }
 
+/// The EQ button's icon, installed with the app's other icons: GNOME's icon
+/// theme has no equalizer icon.
+pub const EQUALIZER_ICON: &str = "io.github.jm2.tributary-equalizer-symbolic";
+
+/// Show on the EQ button whether the equalizer is on: its icon takes the
+/// accent colour, as a toggled button's background would.
+pub fn show_equalizer_state(button: &gtk::Button, enabled: bool) {
+    if enabled {
+        button.add_css_class("accent");
+    } else {
+        button.remove_css_class("accent");
+    }
+}
+
 /// Build the full header bar and return all interactive widgets.
 pub fn build_header_bar() -> HeaderBarWidgets {
     // ── Left: Playback Controls ──────────────────────────────────────
@@ -141,6 +157,16 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .tooltip_text(rust_i18n::t!("header.shuffle").as_ref())
         .build();
 
+    // Opens the Equalizer window, which keeps the button's accent colour in
+    // step with its switch.
+    let equalizer_title = rust_i18n::t!("equalizer.title");
+    let btn_equalizer = gtk::Button::builder()
+        .icon_name(EQUALIZER_ICON)
+        .tooltip_text(equalizer_title.as_ref())
+        .action_name("win.show-equalizer")
+        .build();
+    btn_equalizer.update_property(&[gtk::accessible::Property::Label(&equalizer_title)]);
+
     let playback_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(2)
@@ -151,6 +177,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
     playback_box.append(&btn_next);
     playback_box.append(&btn_repeat);
     playback_box.append(&btn_shuffle);
+    playback_box.append(&btn_equalizer);
 
     // ── Center: Now Playing ──────────────────────────────────────────
     let album_art = gtk::Image::builder()
@@ -330,6 +357,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         repeat_button: btn_repeat,
         repeat_mode,
         shuffle_button: btn_shuffle,
+        equalizer_button: btn_equalizer,
         album_art,
         title_label,
         artist_label,
@@ -350,6 +378,7 @@ fn primary_menu(locale: &str) -> gtk::gio::Menu {
     let section = gtk::gio::Menu::new();
     for (key, action) in [
         ("header.rescan_library", "win.rescan-library"),
+        ("header.equalizer_menu", "win.show-equalizer"),
         ("header.preferences_menu", "win.show-preferences"),
         ("header.about_menu", "app.about"),
     ] {
@@ -444,6 +473,37 @@ pub mod widget_tests {
             );
         }
     }
+
+    /// The EQ button follows Shuffle, opens the Equalizer window, is named
+    /// for assistive technology, and its icon is found in the app's icons.
+    pub fn equalizer_button_follows_shuffle() {
+        let widgets = build_header_bar();
+        let button = &widgets.equalizer_button;
+        assert_eq!(
+            widgets.shuffle_button.next_sibling().as_ref(),
+            Some(button.upcast_ref::<gtk::Widget>())
+        );
+        assert!(button.next_sibling().is_none(), "the last playback button");
+        assert_eq!(button.action_name().as_deref(), Some("win.show-equalizer"));
+        assert_eq!(button.icon_name().as_deref(), Some(EQUALIZER_ICON));
+        assert_eq!(button.tooltip_text().as_deref(), Some("Equalizer"));
+        assert!(gtk::test_accessible_has_property(
+            button,
+            gtk::AccessibleProperty::Label
+        ));
+        assert!(!button.has_css_class("accent"));
+        show_equalizer_state(button, true);
+        assert!(button.has_css_class("accent"));
+        show_equalizer_state(button, false);
+        assert!(!button.has_css_class("accent"));
+
+        // Only the app's icon folder, as a development build adds it.
+        let theme = gtk::IconTheme::new();
+        let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons");
+        theme.set_search_path(&[icons.as_path()]);
+        theme.set_theme_name(Some("hicolor"));
+        assert!(theme.has_icon(EQUALIZER_ICON));
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +532,7 @@ mod tests {
             labels,
             [
                 "Bibliothek neu einlesen",
+                "E_qualizer",
                 "_Einstellungen",
                 "_Über Tributary",
                 "_Beenden"

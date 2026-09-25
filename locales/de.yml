@@ -23,6 +23,7 @@ header:
   playback_position: "Wiedergabeposition"
   volume: "Lautstärke"
   rescan_library: "Bibliothek neu einlesen"
+  equalizer_menu: "E_qualizer"
   my_computer: "Mein Computer"
   preferences_menu: "_Einstellungen"
   about_menu: "_Über Tributary"

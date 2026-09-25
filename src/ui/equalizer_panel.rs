@@ -1,15 +1,17 @@
-//! The Preferences "Equalizer" group.
+//! The Equalizer window.
 //!
-//! The group edits `AppConfig::equalizer`. Every change applies to the
-//! active output at once and is saved to `config.json` through the
-//! Preferences save queue, after a short pause or when the dialog closes.
-//! Outputs that cannot run the equalizer get the same controls, disabled,
-//! with the reason as the group description.
+//! The header bar's EQ button and the main menu open it over the main
+//! window, one at a time. It edits `AppConfig::equalizer`. Every change
+//! applies to the active output at once and is saved to `config.json`
+//! through the shared save queue after a short pause. Outputs that cannot
+//! run the equalizer get the same controls, disabled, with the reason as
+//! the group description; selecting another output while the window is
+//! open updates them.
 //!
 //! The gains are a graphic equalizer, as in iTunes and Winamp: a row of
 //! vertical sliders, the preamp first and then the ten bands, boost at the
-//! top. The mouse wheel over the sliders scrolls the page instead of moving
-//! a slider; dragging and the keyboard still move them.
+//! top. The mouse wheel over the sliders never moves a slider; dragging and
+//! the keyboard still move them.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -17,6 +19,7 @@ use std::rc::{Rc, Weak};
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
+use super::header_bar::show_equalizer_state;
 use super::preferences::{AppConfig, ConfigSaveQueue};
 use crate::audio::equalizer::{
     snap_gain_db, ClipProtection, EqualizerSettings, Preset, BAND_CENTERS_HZ, GAIN_STEP_DB,
@@ -27,25 +30,148 @@ use crate::audio::output::{AudioOutput, OutputType};
 /// Height of the slider troughs, in pixels.
 const SLIDER_HEIGHT: i32 = 160;
 
-/// Build the group editing `config` and driving `output`.
-pub fn preferences_group(
-    config: &Rc<RefCell<AppConfig>>,
-    saves: &ConfigSaveQueue,
-    output: &Rc<RefCell<Box<dyn AudioOutput>>>,
-) -> adw::PreferencesGroup {
-    let on_change = {
+/// The widest the window's content grows, in pixels: English's description
+/// fits on one line.
+const WINDOW_CONTENT_WIDTH: i32 = 500;
+
+/// Opens the Equalizer window over the main window, at most one at a time.
+pub struct EqualizerWindow {
+    parent: gtk::Window,
+    /// The saved settings a new window starts from.
+    settings: Box<dyn Fn() -> EqualizerSettings>,
+    /// Why the selected output cannot run the equalizer, or `None` when it can.
+    unavailable: Box<dyn Fn() -> Option<String>>,
+    /// Applies an edit and shows on the EQ button whether the equalizer is on.
+    on_change: Rc<dyn Fn(&EqualizerSettings)>,
+    window: glib::WeakRef<adw::Window>,
+    panel: RefCell<Weak<Panel>>,
+}
+
+impl EqualizerWindow {
+    /// Windows editing `config` and driving the selected `output`. `button`,
+    /// the header bar's EQ button, shows whether the equalizer is on.
+    pub fn new(
+        parent: &impl IsA<gtk::Window>,
+        config: &Rc<RefCell<AppConfig>>,
+        saves: &ConfigSaveQueue,
+        output: &Rc<RefCell<Box<dyn AudioOutput>>>,
+        button: &gtk::Button,
+    ) -> Self {
+        let apply = {
+            let config = config.clone();
+            let saves = saves.clone();
+            let output = output.clone();
+            move |settings: &EqualizerSettings| {
+                output.borrow().set_equalizer(settings);
+                config.borrow_mut().equalizer = *settings;
+                saves.schedule();
+            }
+        };
         let config = config.clone();
-        let saves = saves.clone();
         let output = output.clone();
-        Rc::new(move |settings: &EqualizerSettings| {
-            output.borrow().set_equalizer(settings);
-            config.borrow_mut().equalizer = *settings;
-            saves.schedule();
-        })
-    };
-    let unavailable = unavailable_reason(output.borrow().as_ref());
-    let settings = config.borrow().equalizer;
-    build(settings, unavailable.as_deref(), on_change).0
+        Self::with(
+            parent.upcast_ref(),
+            button,
+            move || config.borrow().equalizer,
+            move || unavailable_reason(output.borrow().as_ref()),
+            apply,
+        )
+    }
+
+    /// Windows starting from `settings()`, disabled while `unavailable()`
+    /// gives a reason, that `apply` each edit and keep `button` in step with
+    /// the switch.
+    fn with(
+        parent: &gtk::Window,
+        button: &gtk::Button,
+        settings: impl Fn() -> EqualizerSettings + 'static,
+        unavailable: impl Fn() -> Option<String> + 'static,
+        apply: impl Fn(&EqualizerSettings) + 'static,
+    ) -> Self {
+        show_equalizer_state(button, settings().enabled);
+        let button = button.clone();
+        Self {
+            parent: parent.clone(),
+            settings: Box::new(settings),
+            unavailable: Box::new(unavailable),
+            on_change: Rc::new(move |settings: &EqualizerSettings| {
+                apply(settings);
+                show_equalizer_state(&button, settings.enabled);
+            }),
+            window: glib::WeakRef::new(),
+            panel: RefCell::default(),
+        }
+    }
+
+    /// Open the window, or raise the one already open.
+    pub fn present(&self) {
+        // A closed window is hidden before it is freed.
+        if let Some(window) = self.window.upgrade().filter(WidgetExt::is_visible) {
+            window.present();
+            return;
+        }
+        let unavailable = (self.unavailable)();
+        let (group, panel) = build(
+            (self.settings)(),
+            unavailable.as_deref(),
+            self.on_change.clone(),
+        );
+        let window = build_window(&self.parent, &group);
+        self.window.set(Some(&window));
+        self.panel.replace(Rc::downgrade(&panel));
+        window.present();
+    }
+
+    /// Enable or disable the open window's controls for the output selected
+    /// now.
+    pub fn output_changed(&self) {
+        if let Some(panel) = self.panel.borrow().upgrade() {
+            panel.show_availability((self.unavailable)().as_deref());
+        }
+    }
+}
+
+/// The window holding `group`: a non-modal toplevel over `parent`, sized to
+/// its content, that Escape closes.
+fn build_window(parent: &gtk::Window, group: &adw::PreferencesGroup) -> adw::Window {
+    // A longer description, such as another output's reason, wraps instead
+    // of widening the window.
+    let content = adw::Clamp::builder()
+        .maximum_size(WINDOW_CONTENT_WIDTH)
+        .tightening_threshold(WINDOW_CONTENT_WIDTH)
+        .margin_top(6)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .child(group)
+        .build();
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&content));
+    let window = adw::Window::builder()
+        .title(rust_i18n::t!("equalizer.title").as_ref())
+        .transient_for(parent)
+        .destroy_with_parent(true)
+        .modal(false)
+        .resizable(false)
+        .content(&view)
+        .build();
+    let escape = gtk::ShortcutController::new();
+    escape.add_shortcut(gtk::Shortcut::new(
+        Some(gtk::KeyvalTrigger::new(
+            gdk::Key::Escape,
+            gdk::ModifierType::empty(),
+        )),
+        Some(gtk::NamedAction::new("window.close")),
+    ));
+    window.add_controller(escape);
+    // The main window turns inert while its close drain runs; so does this
+    // one, until it closes with it.
+    parent
+        .bind_property("sensitive", &window, "sensitive")
+        .sync_create()
+        .build();
+    window
 }
 
 /// Why `output` cannot run the equalizer, or `None` when it can.
@@ -216,6 +342,9 @@ fn slider_grid(settings: &EqualizerSettings) -> (gtk::Grid, gtk::Scale, Vec<gtk:
     preamp_caption.set_wrap(true);
     preamp_caption.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     preamp_caption.set_max_width_chars(8);
+    // Never narrower than it wraps at, so the window it sizes measures and
+    // lays out the caption on the same number of lines.
+    preamp_caption.set_width_chars(8);
     grid.attach(&preamp_caption, 1, 1, 1, 1);
 
     let separator = gtk::Separator::builder()
@@ -236,14 +365,15 @@ fn slider_grid(settings: &EqualizerSettings) -> (gtk::Grid, gtk::Scale, Vec<gtk:
     (grid, preamp, bands)
 }
 
-/// Make the mouse wheel over `sliders` scroll the enclosing page instead of
-/// moving a slider.
+/// Keep the mouse wheel over `sliders` from moving a slider.
 ///
 /// A capture-phase controller on the container sees every scroll before the
-/// sliders do. It moves the nearest [`gtk::ScrolledWindow`] ancestor as that
-/// window would scroll itself, then stops the event, so the sliders never
-/// receive wheel or touchpad scrolling. Drags and keys are not scroll events
-/// and still reach them.
+/// sliders do. It moves the nearest [`gtk::ScrolledWindow`] ancestor, if
+/// there is one, as that window would scroll itself, and stops the event
+/// either way, so the sliders never receive wheel or touchpad scrolling. The
+/// Equalizer window has no scrolled ancestor, so there the wheel does
+/// nothing. Drags and keys are not scroll events and still reach the
+/// sliders.
 fn route_wheel_to_page(sliders: &impl IsA<gtk::Widget>) {
     let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -279,6 +409,10 @@ pub struct Panel {
     /// Set while [`Panel::show`] moves widgets, so their handlers ignore it.
     syncing: Cell<bool>,
     on_change: Rc<dyn Fn(&EqualizerSettings)>,
+    /// Weak: the group owns the panel.
+    group: glib::WeakRef<adw::PreferencesGroup>,
+    /// The group's rows, the slider row among them.
+    controls: [gtk::Widget; 5],
     pub enabled: adw::SwitchRow,
     pub preset: adw::ComboRow,
     pub preamp: gtk::Scale,
@@ -311,6 +445,21 @@ impl Panel {
         self.syncing.set(false);
     }
 
+    /// Enable every control, or, when the equalizer is `unavailable`,
+    /// disable them all and give the reason as the group description.
+    fn show_availability(&self, unavailable: Option<&str>) {
+        if let Some(group) = self.group.upgrade() {
+            let description = unavailable.map_or_else(
+                || rust_i18n::t!("equalizer.description").into_owned(),
+                str::to_owned,
+            );
+            group.set_description(Some(&description));
+        }
+        for control in &self.controls {
+            control.set_sensitive(unavailable.is_none());
+        }
+    }
+
     /// Hand-edit one gain; the preset becomes Custom.
     fn edit_gain(&self, scale: &gtk::Scale, band: Option<usize>) {
         let db = snap_gain_db(scale.value());
@@ -333,24 +482,6 @@ fn combo_row(title: &str, labels: &[String], selected: u32) -> adw::ComboRow {
         .build()
 }
 
-/// The group holding `controls`, all disabled with the reason as the
-/// description when the equalizer is `unavailable`.
-fn group(controls: &[gtk::Widget], unavailable: Option<&str>) -> adw::PreferencesGroup {
-    let description = unavailable.map_or_else(
-        || rust_i18n::t!("equalizer.description").into_owned(),
-        str::to_owned,
-    );
-    let group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("equalizer.title").as_ref())
-        .description(description)
-        .build();
-    for control in controls {
-        group.add(control);
-        control.set_sensitive(unavailable.is_none());
-    }
-    group
-}
-
 /// The boxed-list row holding the slider grid. It is not activatable, so
 /// clicks go to the sliders.
 fn slider_row(grid: &gtk::Grid) -> adw::PreferencesRow {
@@ -361,6 +492,15 @@ fn slider_row(grid: &gtk::Grid) -> adw::PreferencesRow {
         .focusable(false)
         .child(grid)
         .build()
+}
+
+/// The group holding `controls`, untitled: the window's title names it.
+fn group(controls: &[gtk::Widget]) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    for control in controls {
+        group.add(control);
+    }
+    group
 }
 
 fn clip_protection_row(protection: ClipProtection) -> adw::ComboRow {
@@ -410,11 +550,13 @@ pub fn build(
         clip_protection.clone().upcast(),
         reset.clone().upcast(),
     ];
-    let group = group(&controls, unavailable);
+    let group = group(&controls);
     let panel = Rc::new(Panel {
         settings: Cell::new(settings),
         syncing: Cell::new(false),
         on_change,
+        group: group.downgrade(),
+        controls,
         enabled,
         preset,
         preamp,
@@ -422,9 +564,10 @@ pub fn build(
         clip_protection,
         reset,
     });
+    panel.show_availability(unavailable);
     connect(&panel, &Rc::downgrade(&panel));
     // The handlers reach the panel weakly and the group owns it, so the panel
-    // and its widgets are freed with the dialog instead of keeping each
+    // and its widgets are freed with the window instead of keeping each
     // other alive. Once the group is torn down, widget notifications are
     // no longer edits.
     let owner = panel.clone();
@@ -867,5 +1010,209 @@ pub mod widget_tests {
         drop(panel);
         drop(group);
         assert!(weak.upgrade().is_none(), "the panel outlived its group");
+    }
+
+    /// Opens windows over a fresh parent from `saved`, recording edits. The
+    /// output cannot run the equalizer while `unavailable` holds a reason.
+    fn opener(
+        saved: EqualizerSettings,
+        unavailable: &Rc<RefCell<Option<String>>>,
+    ) -> (EqualizerWindow, gtk::Window, gtk::Button, Changes) {
+        let parent = gtk::Window::new();
+        let button = gtk::Button::new();
+        let changes: Changes = Rc::default();
+        let recorded = changes.clone();
+        let reason = unavailable.clone();
+        let opener = EqualizerWindow::with(
+            &parent,
+            &button,
+            move || saved,
+            move || reason.borrow().clone(),
+            move |settings: &EqualizerSettings| recorded.borrow_mut().push(*settings),
+        );
+        (opener, parent, button, changes)
+    }
+
+    /// The open window and its panel.
+    fn opened(opener: &EqualizerWindow) -> (adw::Window, Rc<Panel>) {
+        let window = opener
+            .window
+            .upgrade()
+            .filter(WidgetExt::is_visible)
+            .expect("an open window");
+        let panel = opener
+            .panel
+            .borrow()
+            .upgrade()
+            .expect("the open window's panel");
+        (window, panel)
+    }
+
+    /// The action `window` runs for a bare `key`.
+    fn shortcut_action(window: &adw::Window, key: gdk::Key) -> Option<String> {
+        let controllers = window.observe_controllers();
+        (0..controllers.n_items())
+            .filter_map(|index| {
+                controllers
+                    .item(index)
+                    .and_downcast::<gtk::ShortcutController>()
+            })
+            .flat_map(|controller| {
+                (0..controller.n_items())
+                    .filter_map(move |index| controller.item(index).and_downcast::<gtk::Shortcut>())
+            })
+            .find(|shortcut| {
+                shortcut
+                    .trigger()
+                    .and_downcast::<gtk::KeyvalTrigger>()
+                    .is_some_and(|trigger| {
+                        trigger.keyval() == key && trigger.modifiers().is_empty()
+                    })
+            })
+            .and_then(|shortcut| shortcut.action().and_downcast::<gtk::NamedAction>())
+            .map(|action| action.action_name().into())
+    }
+
+    /// How many windows are open over `parent`.
+    fn open_over(parent: &gtk::Window) -> usize {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|toplevel| toplevel.downcast::<gtk::Window>().ok())
+            .filter(|window| window.is_visible() && window.transient_for().as_ref() == Some(parent))
+            .count()
+    }
+
+    pub fn the_equalizer_window_opens_once_and_escape_closes_it() {
+        let (opener, parent, _button, _changes) =
+            opener(EqualizerSettings::default(), &Rc::default());
+        opener.present();
+        let (window, panel) = opened(&opener);
+        assert_eq!(window.title().as_deref(), Some("Equalizer"));
+        assert_eq!(window.transient_for().as_ref(), Some(&parent));
+        assert!(!window.is_modal());
+        assert!(!window.is_resizable(), "the window is sized to its content");
+        assert!(window.must_destroy_with_parent());
+        assert!(
+            panel.enabled.is_ancestor(&window) && panel.bands[9].is_ancestor(&window),
+            "the window holds the equalizer's controls"
+        );
+        let clamp = panel
+            .enabled
+            .ancestor(adw::Clamp::static_type())
+            .and_downcast::<adw::Clamp>()
+            .expect("a longer description wraps instead of widening the window");
+        assert_eq!(clamp.maximum_size(), WINDOW_CONTENT_WIDTH);
+
+        opener.present();
+        assert_eq!(opened(&opener).0, window, "a second click raises it");
+        assert_eq!(open_over(&parent), 1);
+
+        assert_eq!(
+            shortcut_action(&window, gdk::Key::Escape).as_deref(),
+            Some("window.close")
+        );
+        window
+            .activate_action("window.close", None)
+            .expect("GTK's window.close action");
+        assert!(!window.is_visible(), "Escape's action closes the window");
+        assert_eq!(open_over(&parent), 0);
+
+        opener.present();
+        let (reopened, _) = opened(&opener);
+        assert_ne!(reopened, window, "the next click opens a new window");
+        assert_eq!(open_over(&parent), 1);
+        reopened.close();
+        parent.destroy();
+    }
+
+    pub fn the_equalizer_window_follows_the_selected_output() {
+        let unavailable = Rc::new(RefCell::new(None));
+        let (opener, parent, _button, _changes) =
+            opener(EqualizerSettings::default(), &unavailable);
+        opener.output_changed();
+        opener.present();
+        let (window, panel) = opened(&opener);
+        let group = panel.group.upgrade().expect("the window holds the group");
+        let enabled = |panel: &Panel| {
+            let controls = [
+                panel.enabled.upcast_ref::<gtk::Widget>(),
+                panel.preset.upcast_ref(),
+                panel.preamp.upcast_ref(),
+                panel.clip_protection.upcast_ref(),
+                panel.reset.upcast_ref(),
+            ];
+            controls
+                .into_iter()
+                .chain(panel.bands.iter().map(|band| band.upcast_ref()))
+                .map(WidgetExt::is_sensitive)
+                .collect::<Vec<_>>()
+        };
+        assert!(enabled(&panel).into_iter().all(|sensitive| sensitive));
+        let description = rust_i18n::t!("equalizer.description");
+        assert_eq!(group.description().as_deref(), Some(description.as_ref()));
+
+        let mpd = "MPD renders audio on the server.";
+        unavailable.replace(Some(mpd.to_owned()));
+        opener.output_changed();
+        assert_eq!(group.description().as_deref(), Some(mpd));
+        assert!(enabled(&panel).into_iter().all(|sensitive| !sensitive));
+
+        unavailable.replace(None);
+        opener.output_changed();
+        assert_eq!(group.description().as_deref(), Some(description.as_ref()));
+        assert!(enabled(&panel).into_iter().all(|sensitive| sensitive));
+        window.close();
+        parent.destroy();
+    }
+
+    pub fn the_eq_button_shows_whether_the_equalizer_is_on() {
+        let saved = EqualizerSettings {
+            enabled: true,
+            ..EqualizerSettings::default()
+        };
+        let (opener, parent, button, changes) = opener(saved, &Rc::default());
+        assert!(button.has_css_class("accent"), "on from the saved settings");
+        opener.present();
+        let (window, panel) = opened(&opener);
+
+        panel.enabled.set_active(false);
+        assert!(!last(&changes).enabled);
+        assert!(!button.has_css_class("accent"));
+        panel.bands[0].set_value(3.0);
+        assert!(!button.has_css_class("accent"), "gains leave it alone");
+        panel.enabled.set_active(true);
+        assert!(button.has_css_class("accent"));
+        window.close();
+        parent.destroy();
+    }
+
+    pub fn the_wheel_in_the_equalizer_window_moves_nothing() {
+        let mut saved = EqualizerSettings::default();
+        saved.select_preset(Preset::Rock);
+        let (opener, parent, _button, changes) = opener(saved, &Rc::default());
+        opener.present();
+        let (window, panel) = opened(&opener);
+        let grid = sliders(&panel);
+        assert!(
+            grid.ancestor(gtk::ScrolledWindow::static_type()).is_none(),
+            "nothing in the window scrolls"
+        );
+
+        let controller = wheel_controller(&grid);
+        for (dx, dy) in [(0.0_f64, 2.0_f64), (0.0, -5.0), (3.0, 0.0)] {
+            let handled: bool = controller.emit_by_name("scroll", &[&dx, &dy]);
+            assert!(handled, "the wheel event stops before the sliders");
+        }
+        assert!(changes.borrow().is_empty(), "no slider moved");
+        assert_eq!(
+            panel
+                .bands
+                .iter()
+                .map(gtk::Scale::value)
+                .collect::<Vec<_>>(),
+            Preset::Rock.band_gains_db().unwrap()
+        );
+        window.close();
+        parent.destroy();
     }
 }
