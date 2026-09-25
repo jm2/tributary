@@ -608,9 +608,9 @@ local library offer files: if the selection includes a server, radio, or removab
 the drag can still add to a playlist but hands no files to the file manager. Tributary offers a
 copy only, never a move, so the originals stay in your library.
 
-To show cover art in the Album pane, turn on **Album pane artwork** under Preferences → Browser
-Views and choose Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for
-server libraries, from the server.
+To show cover art in the Album pane, set **Album artwork** under Preferences → Browser Views to
+Small, Medium, or Large. Artwork comes from the tracks' embedded tags or, for server libraries,
+from the server.
 
 ### Library Folders
 
@@ -847,7 +847,7 @@ Open **Preferences** from the hamburger menu (☰) to:
   play counts and ratings, at the next start; playlists keep those entries as unmatched items.
 - Reauthorize a library folder
 - Choose the folder that downloaded tracks are saved to (see [Downloading Remote Tracks](#downloading-remote-tracks))
-- Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
+- Toggle browser panes (Genre, Artist, Album, Folder) and choose the Album pane's artwork size
 - Show/hide tracklist columns
 - Set up the equalizer for playback on this computer
 - Turn the location lookup for Stations Near Me on or off (see [Internet Radio](#internet-radio))

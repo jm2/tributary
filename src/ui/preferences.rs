@@ -882,9 +882,9 @@ impl LayoutTargets {
 /// * `layout` — the tracklist, browser, and active source the toggles restyle
 /// * `config` — current configuration, mutated on changes
 /// * `saves` — coalesces the resulting `config.json` writes
-/// * `on_album_artist_changed` — invoked when the artist grouping toggle flips
-/// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
-/// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
+/// * `on_album_artist_changed` — invoked when the artist grouping switch flips
+/// * `on_album_pane_artwork_changed` — invoked when album artwork turns on or off
+/// * `on_album_pane_artwork_size_changed` — invoked when the artwork size changes
 /// * `active_output` — the output the equalizer group applies its settings to
 /// * `integration_groups` — groups for optional integrations (Last.fm), placed
 ///   after the app's own settings and before the Import group
@@ -912,228 +912,30 @@ pub fn show_preferences(
     let page = adw::PreferencesPage::new();
     page.add(&library_group(parent, config));
     page.add(&downloads_group(parent, config, saves));
+    for group in browser_views_groups(
+        config,
+        saves,
+        layout,
+        on_album_artist_changed,
+        on_album_pane_artwork_changed,
+        on_album_pane_artwork_size_changed,
+    ) {
+        page.add(&group);
+    }
+
     let cfg = config.borrow();
 
-    // ── Browser Views group (dense horizontal checkboxes) ───────────
-    let browser_group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.browser_views").as_ref())
-        .build();
-
-    // Same homogeneous 3-column grid as Visible Columns, so the two groups'
-    // checkboxes line up column-to-column.
-    let browser_grid = gtk::Grid::builder()
-        .column_homogeneous(true)
-        .row_spacing(4)
-        .column_spacing(8)
-        .hexpand(true)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-
-    let genre_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.genre").as_ref())
-        .active(cfg.browser_views.genre)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let artist_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.artist").as_ref())
-        .active(cfg.browser_views.artist)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let album_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album").as_ref())
-        .active(cfg.browser_views.album)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-
-    let album_artist_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
-        .active(cfg.group_by_album_artist)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-
-    let folder_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.folder").as_ref())
-        .active(cfg.browser_views.folder)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    let album_art_check = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork").as_ref())
-        .active(cfg.album_pane_artwork)
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-
-    // Three radio options matching the `AlbumArtSize` tokens.
-    let album_art_size_small = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork_size_small").as_ref())
-        .active(cfg.album_pane_artwork_size == AlbumArtSize::Small)
-        .build();
-    let album_art_size_medium = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork_size_medium").as_ref())
-        .group(&album_art_size_small)
-        .active(cfg.album_pane_artwork_size == AlbumArtSize::Medium)
-        .build();
-    let album_art_size_large = gtk::CheckButton::builder()
-        .label(rust_i18n::t!("browser.album_artwork_size_large").as_ref())
-        .group(&album_art_size_small)
-        .active(cfg.album_pane_artwork_size == AlbumArtSize::Large)
-        .build();
-
-    // Row 0: the three browser panes (one per grid column).
-    browser_grid.attach(&genre_check, 0, 0, 1, 1);
-    browser_grid.attach(&artist_check, 1, 0, 1, 1);
-    browser_grid.attach(&album_check, 2, 0, 1, 1);
-    // Row 1: the folder pane toggle (fourth browser pane) and the
-    // album pane artwork toggle share the row.
-    browser_grid.attach(&folder_check, 0, 1, 1, 1);
-    browser_grid.attach(&album_art_check, 1, 1, 2, 1);
-    // Row 2: the grouping toggle spans the full width (its label is longer).
-    browser_grid.attach(&album_artist_check, 0, 2, 3, 1);
-    // Row 3: size triplet (one per grid column). Grouped radios so only
-    // one can be active at a time.
-    browser_grid.attach(&album_art_size_small, 0, 3, 1, 1);
-    browser_grid.attach(&album_art_size_medium, 1, 3, 1, 1);
-    browser_grid.attach(&album_art_size_large, 2, 3, 1, 1);
-
-    // Wire album artist toggle
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let on_change = on_album_artist_changed.clone();
-        album_artist_check.connect_toggled(move |btn| {
-            let active = btn.is_active();
-            config.borrow_mut().group_by_album_artist = active;
-            saves.schedule();
-            on_change(active);
-        });
-    }
-
-    // Wire browser view toggles
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        genre_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.genre = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        artist_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.artist = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        album_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.album = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        folder_check.connect_toggled(move |btn| {
-            let mut cfg = config.borrow_mut();
-            cfg.browser_views.folder = btn.is_active();
-            layout.show_browser(&cfg.browser_views);
-            saves.schedule();
-        });
-    }
-
-    // Wire album pane artwork toggle. The pane rebuild is performed by
-    // the on-change callback so the browser owns the swap.
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let on_change = on_album_pane_artwork_changed.clone();
-        album_art_check.connect_toggled(move |btn| {
-            let active = btn.is_active();
-            config.borrow_mut().album_pane_artwork = active;
-            saves.schedule();
-            on_change(active);
-        });
-    }
-
-    // Wire album-pane artwork size radios. Same pattern as the toggle.
-    for (button, size) in [
-        (&album_art_size_small, AlbumArtSize::Small),
-        (&album_art_size_medium, AlbumArtSize::Medium),
-        (&album_art_size_large, AlbumArtSize::Large),
-    ] {
-        let config = config.clone();
-        let saves = saves.clone();
-        let on_change = on_album_pane_artwork_size_changed.clone();
-        button.connect_toggled(move |btn| {
-            if !btn.is_active() {
-                return;
-            }
-            config.borrow_mut().album_pane_artwork_size = size;
-            saves.schedule();
-            on_change(size);
-        });
-    }
-
-    browser_group.add(&browser_grid);
-    page.add(&browser_group);
-
-    // ── Visible Columns group (dense grid with FlowBox) ─────────────
+    // ── Visible Columns group (dense checkbox grid) ─────────────────
     let columns_group = adw::PreferencesGroup::builder()
         .title(rust_i18n::t!("preferences.visible_columns").as_ref())
         .build();
 
-    // A homogeneous Grid (rather than a FlowBox) so every column is equal
-    // width and the grid fills the group's clamped width: the leftmost column
-    // is flush with the left edge and the rightmost with the right edge, and
-    // the checkboxes line up column-to-column on every row.
-    let columns_grid = gtk::Grid::builder()
-        .column_homogeneous(true)
-        .row_spacing(4)
-        .column_spacing(8)
-        .hexpand(true)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-
-    const COLUMNS_PER_ROW: usize = 4;
-
     let locale = rust_i18n::locale();
     let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
         .iter()
-        .enumerate()
-        .map(|(i, &col_id)| {
+        .map(|&col_id| {
             let is_visible = cfg.visible_columns.iter().any(|c| c == col_id);
-            let check = gtk::CheckButton::builder()
-                .label(column_title(col_id, &locale))
-                .active(is_visible)
-                // Fill the homogeneous cell, but keep the label left-aligned
-                // so column text aligns down each grid column.
-                .hexpand(true)
-                .halign(gtk::Align::Start)
-                .build();
+            let check = grid_check(&column_title(col_id, &locale), is_visible);
 
             // Wire each column toggle
             let config = config.clone();
@@ -1152,13 +954,10 @@ pub fn show_preferences(
                 layout.show_columns(&cfg.visible_columns);
                 saves.schedule();
             });
-
-            let col = (i % COLUMNS_PER_ROW) as i32;
-            let row = (i / COLUMNS_PER_ROW) as i32;
-            columns_grid.attach(&check, col, row, 1, 1);
             (col_id, check)
         })
         .collect();
+    let columns_grid = check_grid(column_checks.iter().map(|(_, check)| check));
 
     // Reset to Defaults button
     let reset_btn = gtk::Button::builder()
@@ -1210,7 +1009,6 @@ pub fn show_preferences(
         active_output,
     ));
     page.add(&privacy_group(config, saves));
-
     for group in integration_groups {
         page.add(group);
     }
@@ -1298,6 +1096,176 @@ fn library_group(
         );
     });
     group
+}
+
+/// Checkbox columns per row in the Browser Views and Visible Columns grids.
+const CHECK_GRID_COLUMNS: usize = 4;
+
+/// A checkbox that fills its grid cell but keeps its label left-aligned, so
+/// the labels line up down each grid column.
+fn grid_check(label: &str, active: bool) -> gtk::CheckButton {
+    gtk::CheckButton::builder()
+        .label(label)
+        .active(active)
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build()
+}
+
+/// Lay checkboxes out row by row in a homogeneous grid.
+///
+/// Browser Views and Visible Columns both use this grid, so their checkbox
+/// columns line up across the two groups: every column is equal width and
+/// the grid fills the group's clamped width, the leftmost column flush with
+/// the left edge and the rightmost with the right edge.
+fn check_grid<'a>(checks: impl IntoIterator<Item = &'a gtk::CheckButton>) -> gtk::Grid {
+    let grid = gtk::Grid::builder()
+        .column_homogeneous(true)
+        .row_spacing(4)
+        .column_spacing(8)
+        .hexpand(true)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    for (index, check) in checks.into_iter().enumerate() {
+        let column = (index % CHECK_GRID_COLUMNS) as i32;
+        let row = (index / CHECK_GRID_COLUMNS) as i32;
+        grid.attach(check, column, row, 1, 1);
+    }
+    grid
+}
+
+/// Album artwork sizes in the order the Album artwork dropdown lists them,
+/// after Off.
+const ALBUM_ARTWORK_SIZES: [AlbumArtSize; 3] = [
+    AlbumArtSize::Small,
+    AlbumArtSize::Medium,
+    AlbumArtSize::Large,
+];
+
+/// The Album artwork dropdown position for the saved settings: Off, or the
+/// size the artwork is shown at.
+fn album_artwork_position(enabled: bool, size: AlbumArtSize) -> u32 {
+    ALBUM_ARTWORK_SIZES
+        .iter()
+        .position(|choice| enabled && *choice == size)
+        .map_or(0, |index| index as u32 + 1)
+}
+
+/// The size an Album artwork dropdown position selects, or `None` for Off.
+fn album_artwork_size_at(position: u32) -> Option<AlbumArtSize> {
+    let index = usize::try_from(position.checked_sub(1)?).ok()?;
+    ALBUM_ARTWORK_SIZES.get(index).copied()
+}
+
+/// One browser pane's visibility flag in the config.
+type PaneFlag = fn(&mut BrowserViewsConfig) -> &mut bool;
+
+/// The Browser Views groups: the pane checkboxes, then an untitled group
+/// directly below with the Group by Album Artist switch and the Album
+/// artwork dropdown.
+///
+/// A preferences group lists its rows before any other child, so the grid
+/// and the rows need a group each for the grid to come first.
+fn browser_views_groups(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    layout: &LayoutTargets,
+    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+) -> [adw::PreferencesGroup; 2] {
+    let cfg = config.borrow();
+    let mut saved_views = cfg.browser_views.clone();
+    let panes: [(&str, PaneFlag); 4] = [
+        ("browser.genre", |views| &mut views.genre),
+        ("browser.artist", |views| &mut views.artist),
+        ("browser.album", |views| &mut views.album),
+        ("browser.folder", |views| &mut views.folder),
+    ];
+    let pane_checks = panes.map(|(key, flag)| {
+        let check = grid_check(rust_i18n::t!(key).as_ref(), *flag(&mut saved_views));
+        let (config, saves, layout) = (config.clone(), saves.clone(), layout.clone());
+        check.connect_toggled(move |btn| {
+            let mut cfg = config.borrow_mut();
+            *flag(&mut cfg.browser_views) = btn.is_active();
+            layout.show_browser(&cfg.browser_views);
+            saves.schedule();
+        });
+        check
+    });
+    let panes_group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.browser_views").as_ref())
+        .build();
+    panes_group.add(&check_grid(&pane_checks));
+
+    let album_artist = adw::SwitchRow::builder()
+        .title(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
+        .active(cfg.group_by_album_artist)
+        .build();
+    {
+        let (config, saves) = (config.clone(), saves.clone());
+        album_artist.connect_active_notify(move |row| {
+            let active = row.is_active();
+            config.borrow_mut().group_by_album_artist = active;
+            saves.schedule();
+            on_album_artist_changed(active);
+        });
+    }
+
+    let choices = [
+        rust_i18n::t!("browser.album_artwork_off"),
+        rust_i18n::t!("browser.album_artwork_size_small"),
+        rust_i18n::t!("browser.album_artwork_size_medium"),
+        rust_i18n::t!("browser.album_artwork_size_large"),
+    ];
+    let artwork = adw::ComboRow::builder()
+        .title(rust_i18n::t!("browser.album_artwork").as_ref())
+        .model(&gtk::StringList::new(
+            &choices.each_ref().map(AsRef::as_ref),
+        ))
+        .selected(album_artwork_position(
+            cfg.album_pane_artwork,
+            cfg.album_pane_artwork_size,
+        ))
+        .build();
+    {
+        // Off turns the artwork off and keeps the size for next time; a size
+        // turns the artwork on at that size. The browser owns the pane
+        // rebuild, so each change goes through its callback.
+        let (config, saves) = (config.clone(), saves.clone());
+        artwork.connect_selected_notify(move |row| {
+            if row.selected() == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            let size = album_artwork_size_at(row.selected());
+            let (size_changed, enabled_changed) = {
+                let mut cfg = config.borrow_mut();
+                let size_changed = size.is_some_and(|size| size != cfg.album_pane_artwork_size);
+                if let Some(size) = size {
+                    cfg.album_pane_artwork_size = size;
+                }
+                let enabled_changed = cfg.album_pane_artwork != size.is_some();
+                cfg.album_pane_artwork = size.is_some();
+                (size_changed, enabled_changed)
+            };
+            saves.schedule();
+            // The size goes first, so turning the artwork on decodes
+            // thumbnails only at the chosen size.
+            if let Some(size) = size.filter(|_| size_changed) {
+                on_album_pane_artwork_size_changed(size);
+            }
+            if enabled_changed {
+                on_album_pane_artwork_changed(size.is_some());
+            }
+        });
+    }
+    let rows_group = adw::PreferencesGroup::new();
+    rows_group.add(&album_artist);
+    rows_group.add(&artwork);
+    [panes_group, rows_group]
 }
 
 /// The Import group, last on the page: bringing in another player's library
@@ -2319,6 +2287,28 @@ mod tests {
     }
 
     #[test]
+    fn album_artwork_dropdown_positions_map_onto_the_saved_settings() {
+        for size in ALBUM_ARTWORK_SIZES {
+            assert_eq!(
+                album_artwork_position(false, size),
+                0,
+                "off whatever the size"
+            );
+        }
+        for (position, size) in [
+            (1, AlbumArtSize::Small),
+            (2, AlbumArtSize::Medium),
+            (3, AlbumArtSize::Large),
+        ] {
+            assert_eq!(album_artwork_position(true, size), position);
+            assert_eq!(album_artwork_size_at(position), Some(size));
+        }
+        assert_eq!(album_artwork_size_at(0), None, "Off selects no size");
+        assert_eq!(album_artwork_size_at(4), None);
+        assert_eq!(album_artwork_size_at(gtk::INVALID_LIST_POSITION), None);
+    }
+
+    #[test]
     fn persisted_localized_titles_map_to_stable_ids_and_unknown_keys_drop() {
         let mut config = AppConfig {
             visible_columns: vec!["Bewertung".to_string(), "Title".to_string()],
@@ -2361,11 +2351,12 @@ pub mod widget_tests {
     use super::BrowserViewsConfig;
     use super::{
         apply_column_order, apply_column_visibility, column_title, identified_columns,
-        read_column_order, AppConfig, PendingRootReauthorization, ALL_COLUMNS,
+        read_column_order, AlbumArtSize, AppConfig, ConfigSaveQueue, PendingRootReauthorization,
+        ALL_COLUMNS,
     };
     use adw::prelude::*;
     use gtk::prelude::{BoxExt, CastNone, ListModelExt, WidgetExt};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     /// Mirror of `build_browser`'s pane row: SearchEntry stand-in, then
@@ -2777,5 +2768,134 @@ pub mod widget_tests {
             "a pending reauthorization asks for a restart from the start"
         );
         parent.destroy();
+    }
+
+    /// Browser Views puts exactly the four pane checkboxes on one grid row,
+    /// then the grouping switch and the artwork dropdown in an untitled group
+    /// below, and each control updates the config and calls the browser the
+    /// way the checkboxes and size radios did.
+    #[allow(clippy::too_many_lines)] // one walk through every control in the group
+    pub fn browser_views_rows_drive_the_saved_settings() {
+        let config = Rc::new(RefCell::new(AppConfig::default()));
+        let writes = Rc::new(Cell::new(0));
+        let counter = writes.clone();
+        let saves = ConfigSaveQueue::with_writer(
+            config.clone(),
+            Rc::new(move |_: &AppConfig| {
+                counter.set(counter.get() + 1);
+                true
+            }),
+        );
+        // Keep one save armed so the edits below never start a save timer.
+        assert!(saves.request());
+        let panes = PaneRow::build();
+        let layout = super::LayoutTargets {
+            column_view: german_tracklist(),
+            browser_box: panes.browser_box.clone(),
+            active_source_key: Rc::new(RefCell::new("local".to_string())),
+        };
+        let calls: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (grouping, artwork, size) = (calls.clone(), calls.clone(), calls.clone());
+        let [panes_group, rows_group] = super::browser_views_groups(
+            &config,
+            &saves,
+            &layout,
+            Rc::new(move |on| grouping.borrow_mut().push(format!("grouping {on}"))),
+            Rc::new(move |on| artwork.borrow_mut().push(format!("artwork {on}"))),
+            Rc::new(move |chosen: AlbumArtSize| size.borrow_mut().push(format!("size {chosen:?}"))),
+        );
+
+        let grids = descendants::<gtk::Grid>(panes_group.upcast_ref());
+        assert_eq!(grids.len(), 1);
+        let checks = descendants::<gtk::CheckButton>(grids[0].upcast_ref());
+        let placed: Vec<(i32, i32, String)> = checks
+            .iter()
+            .map(|check| {
+                let (column, row, _, _) = grids[0].query_child(check);
+                (column, row, check.label().unwrap_or_default().into())
+            })
+            .collect();
+        let expected: Vec<(i32, i32, String)> = [
+            "browser.genre",
+            "browser.artist",
+            "browser.album",
+            "browser.folder",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(column, key)| (column as i32, 0, rust_i18n::t!(key).into_owned()))
+        .collect();
+        assert_eq!(placed, expected, "one row of pane checkboxes");
+        assert!(
+            rows_group.title().is_empty(),
+            "the rows continue Browser Views"
+        );
+
+        checks[3].set_active(false);
+        assert!(!config.borrow().browser_views.folder);
+        assert!(
+            !panes.panes[3].is_visible(),
+            "unticking Folder hides its pane"
+        );
+
+        let switch = descendants::<adw::SwitchRow>(rows_group.upcast_ref());
+        let combo = descendants::<adw::ComboRow>(rows_group.upcast_ref());
+        let (switch, combo) = (&switch[0], &combo[0]);
+        switch.set_active(true);
+        assert!(config.borrow().group_by_album_artist);
+
+        let choices = combo.model().expect("artwork choices");
+        let labels: Vec<String> = (0..choices.n_items())
+            .map(|position| {
+                choices
+                    .item(position)
+                    .and_downcast::<gtk::StringObject>()
+                    .expect("string choice")
+                    .string()
+                    .into()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "browser.album_artwork_off",
+                "browser.album_artwork_size_small",
+                "browser.album_artwork_size_medium",
+                "browser.album_artwork_size_large",
+            ]
+            .map(|key| rust_i18n::t!(key).into_owned())
+        );
+        assert_eq!(combo.selected(), 0, "artwork starts off");
+
+        let artwork_state = || {
+            let cfg = config.borrow();
+            (cfg.album_pane_artwork, cfg.album_pane_artwork_size)
+        };
+        combo.set_selected(3);
+        assert_eq!(artwork_state(), (true, AlbumArtSize::Large));
+        combo.set_selected(0);
+        assert_eq!(
+            artwork_state(),
+            (false, AlbumArtSize::Large),
+            "Off keeps the size for next time"
+        );
+        combo.set_selected(3);
+        combo.set_selected(1);
+        assert_eq!(artwork_state(), (true, AlbumArtSize::Small));
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                "grouping true",
+                "size Large",
+                "artwork true",
+                "artwork false",
+                "artwork true",
+                "size Small",
+            ]
+        );
+
+        assert_eq!(writes.get(), 0);
+        saves.flush();
+        assert_eq!(writes.get(), 1, "every edit shares one pending save");
     }
 }

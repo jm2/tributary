@@ -3924,6 +3924,7 @@ mod tests {
                 crate::ui::preferences::widget_tests::radio_columns_keep_their_ids();
                 crate::ui::preferences::widget_tests::preference_toggles_leave_the_radio_layout_alone();
                 crate::ui::preferences::widget_tests::library_folders_are_listed_like_the_downloads_row();
+                crate::ui::preferences::widget_tests::browser_views_rows_drive_the_saved_settings();
                 crate::ui::lastfm_settings::widget_tests::render_shows_only_the_offered_actions();
                 crate::ui::confirm_dialog::widget_tests::nothing_is_removed_until_the_destructive_response();
                 crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
