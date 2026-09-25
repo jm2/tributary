@@ -69,6 +69,12 @@ impl LastFmSettingsContext {
     pub fn attach_database(&self, database: DatabaseConnection) {
         let _ = self.database.set(database);
     }
+
+    /// Whether this build carries Last.fm application credentials.
+    /// Preferences shows the Last.fm group only when it does.
+    pub fn available_in_build(&self) -> bool {
+        self.application.build_available()
+    }
 }
 
 /// The vault account as the surface may display it.

@@ -508,6 +508,17 @@ impl LastFmApplicationHandle {
         self.inner.authorization.clone()
     }
 
+    /// Whether this build carries Last.fm application credentials. Fixed for
+    /// the process, unlike the phase: an unavailable build reports
+    /// `UnavailableBuild` only until shutdown moves it on.
+    pub(crate) fn build_available(&self) -> bool {
+        self.inner
+            .ingress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .build_available
+    }
+
     fn lock_ingress(&self) -> Result<MutexGuard<'_, IngressGate>, LastFmApplicationAdmissionError> {
         match self.inner.ingress.lock() {
             Ok(ingress) if ingress.open => Ok(ingress),
@@ -2102,6 +2113,7 @@ mod tests {
             handle.subscribe_status().borrow().phase,
             LastFmApplicationPhase::UnavailableBuild
         );
+        assert!(!handle.build_available());
         let database = Database::connect("sqlite::memory:")
             .await
             .expect("in-memory database");
@@ -2116,6 +2128,15 @@ mod tests {
         );
         assert_eq!(barrier.wait().await, Ok(()));
         assert_eq!(barrier.state(), LastFmApplicationDrainState::Drained);
+        assert_ne!(
+            handle.subscribe_status().borrow().phase,
+            LastFmApplicationPhase::UnavailableBuild,
+            "shutdown moves the phase on"
+        );
+        assert!(
+            !handle.build_available(),
+            "the build's availability outlives the phase"
+        );
     }
 
     #[tokio::test]
@@ -2129,6 +2150,7 @@ mod tests {
             Arc::new(FixedClock),
             live_policy_for_test(),
         );
+        assert!(handle.build_available());
         let database = Database::connect("sqlite::memory:")
             .await
             .expect("in-memory database");

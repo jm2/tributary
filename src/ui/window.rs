@@ -3775,8 +3775,10 @@ pub(crate) fn build_window(
                         size.pixel_size(),
                     );
                 });
-            let lastfm_group =
-                crate::ui::lastfm_settings::build_lastfm_group(&win, &lastfm_settings);
+            // A build without Last.fm credentials leaves the group out.
+            let lastfm_group = lastfm_settings
+                .available_in_build()
+                .then(|| crate::ui::lastfm_settings::build_lastfm_group(&win, &lastfm_settings));
             preferences::show_preferences(
                 &win,
                 &layout,
@@ -3786,7 +3788,7 @@ pub(crate) fn build_window(
                 on_art_change,
                 on_art_size_change,
                 &output_for_prefs,
-                std::slice::from_ref(&lastfm_group),
+                lastfm_group.as_slice(),
             );
         });
         window.add_action(&prefs_action);

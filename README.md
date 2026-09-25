@@ -70,15 +70,15 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Local playback history (play counts and last-played times) | ✅ |
 | Default smart playlists (Recently Added, Recently Played, Top 25) | ✅ |
 | Track ratings | ✅ Editable for local tracks; Subsonic, Jellyfin, and Plex ratings are read-only |
-| Last.fm scrobbling | 🚧 Settings exist, but release builds can't connect yet |
+| Last.fm scrobbling | 🚧 Not available yet |
 | Window position persistence | ✅ |
 | Windows 11 Snap Layout support | ✅ |
 | Linux and macOS file associations | ✅ |
 | Cross-platform: Linux, macOS, Windows | ✅ |
 | Light & dark mode | ✅ Automatic (libadwaita) |
 
-Last.fm scrobbling is not usable yet. Preferences has a Last.fm group, but release builds don't
-include Last.fm application credentials, so it shows the feature as unavailable and Tributary never
+Last.fm scrobbling isn't available yet. Release builds don't include Last.fm application
+credentials, so Preferences doesn't show Last.fm settings until they do, and Tributary never
 contacts Last.fm. The [Last.fm design](docs/lastfm-scrobbling.md) records what exists and what
 remains. Planned work is tracked in [GitHub issues](https://github.com/jm2/tributary/issues); the
 [roadmap](docs/roadmap.md) summarizes product direction and current limitations.
