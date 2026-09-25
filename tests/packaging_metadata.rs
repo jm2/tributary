@@ -2097,6 +2097,12 @@ fn ci_coverage_is_pinned_comprehensive_and_threshold_gated() {
         "the HTML upload must run after failure and reject a missing report"
     );
     assert!(
+        coverage_job.contains("xorg-x11-server-Xvfb")
+            && coverage_job.contains("TRIBUTARY_GTK_GATE: require")
+            && coverage_job.contains("xvfb-run -a"),
+        "coverage must run the GTK widget tests on a virtual display instead of skipping them"
+    );
+    assert!(
         !CI_WORKFLOW.contains("--ignore-filename-regex"),
         "the only CI coverage report must not hide source areas"
     );

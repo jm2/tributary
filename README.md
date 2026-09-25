@@ -460,7 +460,9 @@ cargo +1.94.0 llvm-cov --all-targets --all-features --locked --html \
 
 CI's coverage number comes from one Linux x86_64 run pinned to Rust 1.94.0 and cargo-llvm-cov
 0.8.7 over every host target and feature; the other platforms' `--coverage` helpers are
-informational only. [`coverage-baseline.txt`](coverage-baseline.txt) is the minimum accepted line
+informational only. The GTK widget tests count too: CI runs them on a virtual display with
+`TRIBUTARY_GTK_GATE=require`, so run the commands above from a desktop session (or under
+`xvfb-run -a` with `GDK_BACKEND=x11`) to get the same number. [`coverage-baseline.txt`](coverage-baseline.txt) is the minimum accepted line
 percentage. CI enforces the checked-in value but does not compare it with the base branch; the
 repository review policy treats the floor as a ratchet: ordinary changes keep or raise it, while
 lowering it requires a dedicated measurement-definition change that explains why. To raise it,
