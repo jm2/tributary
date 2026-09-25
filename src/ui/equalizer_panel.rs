@@ -5,11 +5,17 @@
 //! Preferences save queue, after a short pause or when the dialog closes.
 //! Outputs that cannot run the equalizer get the same controls, disabled,
 //! with the reason as the group description.
+//!
+//! The gains are a graphic equalizer, as in iTunes and Winamp: a row of
+//! vertical sliders, the preamp first and then the ten bands, boost at the
+//! top. The mouse wheel over the sliders scrolls the page instead of moving
+//! a slider; dragging and the keyboard still move them.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
+use gtk::{gdk, glib};
 
 use super::preferences::{AppConfig, ConfigSaveQueue};
 use crate::audio::equalizer::{
@@ -17,6 +23,9 @@ use crate::audio::equalizer::{
     MAX_GAIN_DB, MIN_GAIN_DB,
 };
 use crate::audio::output::{AudioOutput, OutputType};
+
+/// Height of the slider troughs, in pixels.
+const SLIDER_HEIGHT: i32 = 160;
 
 /// Build the group editing `config` and driving `output`.
 pub fn preferences_group(
@@ -56,16 +65,30 @@ fn unavailable_reason(output: &dyn AudioOutput) -> Option<String> {
 fn preset_label(preset: Preset) -> String {
     match preset {
         Preset::Flat => rust_i18n::t!("equalizer.preset_flat"),
-        Preset::Pop => rust_i18n::t!("equalizer.preset_pop"),
-        Preset::Rock => rust_i18n::t!("equalizer.preset_rock"),
-        Preset::Jazz => rust_i18n::t!("equalizer.preset_jazz"),
         Preset::Classical => rust_i18n::t!("equalizer.preset_classical"),
+        Preset::Club => rust_i18n::t!("equalizer.preset_club"),
+        Preset::Dance => rust_i18n::t!("equalizer.preset_dance"),
+        Preset::FullBass => rust_i18n::t!("equalizer.preset_full_bass"),
+        Preset::FullBassTreble => rust_i18n::t!("equalizer.preset_full_bass_treble"),
+        Preset::FullTreble => rust_i18n::t!("equalizer.preset_full_treble"),
+        Preset::Headphones => rust_i18n::t!("equalizer.preset_headphones"),
+        Preset::LargeHall => rust_i18n::t!("equalizer.preset_large_hall"),
+        Preset::Live => rust_i18n::t!("equalizer.preset_live"),
+        Preset::Party => rust_i18n::t!("equalizer.preset_party"),
+        Preset::Pop => rust_i18n::t!("equalizer.preset_pop"),
+        Preset::Reggae => rust_i18n::t!("equalizer.preset_reggae"),
+        Preset::Rock => rust_i18n::t!("equalizer.preset_rock"),
+        Preset::Ska => rust_i18n::t!("equalizer.preset_ska"),
+        Preset::Soft => rust_i18n::t!("equalizer.preset_soft"),
+        Preset::SoftRock => rust_i18n::t!("equalizer.preset_soft_rock"),
+        Preset::Techno => rust_i18n::t!("equalizer.preset_techno"),
         Preset::Custom => rust_i18n::t!("equalizer.preset_custom"),
     }
     .into_owned()
 }
 
-/// "29 Hz" below 1 kHz, otherwise kilohertz to one decimal: "1.9 kHz", "15 kHz".
+/// "32 Hz" below 1 kHz, otherwise kilohertz to one decimal: "1 kHz", "16 kHz".
+/// Names a band slider for assistive technology.
 fn frequency_label(hz: u32) -> String {
     if hz < 1000 {
         return rust_i18n::t!("equalizer.hz", value = hz).into_owned();
@@ -75,8 +98,29 @@ fn frequency_label(hz: u32) -> String {
     rust_i18n::t!("equalizer.khz", value = khz).into_owned()
 }
 
+/// The short caption under a band slider, as iTunes and Winamp print it:
+/// "32", "125", "1K", "16K".
+fn short_frequency_label(hz: u32) -> String {
+    if hz < 1000 {
+        hz.to_string()
+    } else {
+        format!("{}K", hz / 1000)
+    }
+}
+
+/// A slider value: "+3.0 dB", "-1.5 dB".
 fn gain_label(db: f64) -> String {
     rust_i18n::t!("equalizer.gain_db", value = format!("{db:+.1}")).into_owned()
+}
+
+/// A whole-dB scale mark: "+12 dB", "0 dB", "-12 dB".
+fn scale_label(db: f64) -> String {
+    let value = if db.abs() < GAIN_STEP_DB / 2.0 {
+        "0".to_owned()
+    } else {
+        format!("{db:+.0}")
+    };
+    rust_i18n::t!("equalizer.gain_db", value = value).into_owned()
 }
 
 fn position(preset: Preset) -> u32 {
@@ -87,25 +131,144 @@ fn position(preset: Preset) -> u32 {
         .unwrap_or(0)
 }
 
-/// A gain slider row. The slider is labelled with the row title for
-/// assistive technology and draws its value as localized dB text.
-fn gain_row(title: &str, db: f64) -> (adw::ActionRow, gtk::Scale) {
+/// A vertical gain slider, boost at the top, with a mark at 0 dB. It is
+/// named `title` for assistive technology and reports its value as dB text,
+/// which its tooltip also shows.
+fn gain_slider(title: &str, db: f64) -> gtk::Scale {
     let scale = gtk::Scale::with_range(
-        gtk::Orientation::Horizontal,
+        gtk::Orientation::Vertical,
         MIN_GAIN_DB,
         MAX_GAIN_DB,
         GAIN_STEP_DB,
     );
-    scale.set_value(db);
-    scale.set_draw_value(true);
-    scale.set_value_pos(gtk::PositionType::Left);
-    scale.set_width_request(240);
-    scale.add_mark(0.0, gtk::PositionType::Bottom, None);
-    scale.set_format_value_func(|_, value| gain_label(value));
+    scale.set_inverted(true);
+    scale.set_draw_value(false);
+    // No fill from the bottom: 0 dB, not -12 dB, is the neutral position.
+    scale.set_has_origin(false);
+    scale.set_height_request(SLIDER_HEIGHT);
+    scale.set_hexpand(true);
+    scale.set_halign(gtk::Align::Center);
+    scale.add_mark(0.0, gtk::PositionType::Right, None);
     scale.update_property(&[gtk::accessible::Property::Label(title)]);
-    let row = adw::ActionRow::builder().title(title).build();
-    row.add_suffix(&scale);
-    (row, scale)
+    scale.set_value(db);
+    show_gain(&scale);
+    scale.connect_value_changed(show_gain);
+    scale
+}
+
+/// Show `scale`'s value in its tooltip and accessible value text.
+fn show_gain(scale: &gtk::Scale) {
+    let text = gain_label(scale.value());
+    scale.set_tooltip_text(Some(&text));
+    scale.update_property(&[gtk::accessible::Property::ValueText(&text)]);
+}
+
+/// A small caption for the slider row, hidden from assistive technology,
+/// which reads each slider's own name and value instead.
+fn caption(text: &str) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .label(text)
+        .css_classes(["caption", "dim-label"])
+        .justify(gtk::Justification::Center)
+        .build();
+    label.set_accessible_role(gtk::AccessibleRole::Presentation);
+    label
+}
+
+/// The "+12 dB / 0 dB / -12 dB" axis beside the sliders.
+fn gain_axis() -> gtk::CenterBox {
+    let axis = gtk::CenterBox::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .height_request(SLIDER_HEIGHT)
+        .build();
+    let mark = |db: f64| {
+        let label = caption(&scale_label(db));
+        label.set_xalign(1.0);
+        label
+    };
+    axis.set_start_widget(Some(&mark(MAX_GAIN_DB)));
+    axis.set_center_widget(Some(&mark(0.0)));
+    axis.set_end_widget(Some(&mark(MIN_GAIN_DB)));
+    axis.set_accessible_role(gtk::AccessibleRole::Presentation);
+    axis
+}
+
+/// The graphic equalizer: a gain axis, the preamp slider, a separator, and
+/// the ten band sliders, each above its caption.
+fn slider_grid(settings: &EqualizerSettings) -> (gtk::Grid, gtk::Scale, Vec<gtk::Scale>) {
+    let grid = gtk::Grid::builder()
+        .css_classes(["equalizer-sliders"])
+        .column_spacing(2)
+        .row_spacing(6)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    grid.attach(&gain_axis(), 0, 0, 1, 1);
+
+    let preamp_title = rust_i18n::t!("equalizer.preamp");
+    let preamp = gain_slider(&preamp_title, settings.preamp_db);
+    grid.attach(&preamp, 1, 0, 1, 1);
+    let preamp_caption = caption(&preamp_title);
+    preamp_caption.set_wrap(true);
+    preamp_caption.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    preamp_caption.set_max_width_chars(8);
+    grid.attach(&preamp_caption, 1, 1, 1, 1);
+
+    let separator = gtk::Separator::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    grid.attach(&separator, 2, 0, 1, 2);
+
+    let mut bands = Vec::with_capacity(BAND_CENTERS_HZ.len());
+    for (column, (hz, db)) in (3..).zip(BAND_CENTERS_HZ.iter().zip(settings.bands_db)) {
+        let band = gain_slider(&frequency_label(*hz), db);
+        grid.attach(&band, column, 0, 1, 1);
+        grid.attach(&caption(&short_frequency_label(*hz)), column, 1, 1, 1);
+        bands.push(band);
+    }
+    route_wheel_to_page(&grid);
+    (grid, preamp, bands)
+}
+
+/// Make the mouse wheel over `sliders` scroll the enclosing page instead of
+/// moving a slider.
+///
+/// A capture-phase controller on the container sees every scroll before the
+/// sliders do. It moves the nearest [`gtk::ScrolledWindow`] ancestor as that
+/// window would scroll itself, then stops the event, so the sliders never
+/// receive wheel or touchpad scrolling. Drags and keys are not scroll events
+/// and still reach them.
+fn route_wheel_to_page(sliders: &impl IsA<gtk::Widget>) {
+    let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.connect_scroll(|controller, _, dy| {
+        let window = controller
+            .widget()
+            .and_then(|widget| widget.ancestor(gtk::ScrolledWindow::static_type()))
+            .and_downcast::<gtk::ScrolledWindow>();
+        if let Some(window) = window {
+            scroll_by(&window.vadjustment(), dy, controller.unit());
+        }
+        glib::Propagation::Stop
+    });
+    sliders.add_controller(controller);
+}
+
+/// Move `adjustment` by a scroll of `delta` in `unit`, the distance GTK
+/// 4.22's `GtkScrolledWindow` uses for the same scroll: a wheel notch moves
+/// the 2/3 power of the page size, and touchpad (surface) deltas are scaled
+/// by 2.5.
+fn scroll_by(adjustment: &gtk::Adjustment, delta: f64, unit: gdk::ScrollUnit) {
+    let distance = if unit == gdk::ScrollUnit::Wheel {
+        delta * adjustment.page_size().powf(2.0 / 3.0)
+    } else {
+        delta * 2.5
+    };
+    adjustment.set_value(adjustment.value() + distance);
 }
 
 /// The group's controls and the settings they show.
@@ -186,19 +349,16 @@ fn group(controls: &[gtk::Widget], unavailable: Option<&str>) -> adw::Preference
     group
 }
 
-/// The preamp row followed by the band rows, with their sliders.
-fn gain_rows(settings: &EqualizerSettings) -> (Vec<gtk::Widget>, gtk::Scale, Vec<gtk::Scale>) {
-    let (preamp_row, preamp) = gain_row(&rust_i18n::t!("equalizer.preamp"), settings.preamp_db);
-    let (band_rows, bands): (Vec<_>, Vec<_>) = BAND_CENTERS_HZ
-        .iter()
-        .zip(settings.bands_db)
-        .map(|(hz, db)| gain_row(&frequency_label(*hz), db))
-        .unzip();
-    let rows = std::iter::once(preamp_row)
-        .chain(band_rows)
-        .map(Cast::upcast)
-        .collect();
-    (rows, preamp, bands)
+/// The boxed-list row holding the slider grid. It is not activatable, so
+/// clicks go to the sliders.
+fn slider_row(grid: &gtk::Grid) -> adw::PreferencesRow {
+    adw::PreferencesRow::builder()
+        .title(rust_i18n::t!("equalizer.title").as_ref())
+        .activatable(false)
+        .selectable(false)
+        .focusable(false)
+        .child(grid)
+        .build()
 }
 
 fn clip_protection_row(protection: ClipProtection) -> adw::ComboRow {
@@ -237,13 +397,17 @@ pub fn build(
         &Preset::ALL.map(preset_label),
         position(settings.preset),
     );
-    let (gain_rows, preamp, bands) = gain_rows(&settings);
+    let (sliders, preamp, bands) = slider_grid(&settings);
     let clip_protection = clip_protection_row(settings.clip_protection);
     let reset = reset_button();
 
-    let mut controls: Vec<gtk::Widget> = vec![enabled.clone().upcast(), preset.clone().upcast()];
-    controls.extend(gain_rows);
-    controls.extend([clip_protection.clone().upcast(), reset.clone().upcast()]);
+    let controls: [gtk::Widget; 5] = [
+        enabled.clone().upcast(),
+        preset.clone().upcast(),
+        slider_row(&sliders).upcast(),
+        clip_protection.clone().upcast(),
+        reset.clone().upcast(),
+    ];
     let group = group(&controls, unavailable);
     let panel = Rc::new(Panel {
         settings: Cell::new(settings),
@@ -331,12 +495,54 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "29 Hz", "59 Hz", "119 Hz", "237 Hz", "474 Hz", "947 Hz", "1.9 kHz", "3.8 kHz",
-                "7.5 kHz", "15 kHz"
+                "32 Hz", "64 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz",
+                "16 kHz"
             ]
+        );
+        assert_eq!(frequency_label(1500), "1.5 kHz");
+        let captions: Vec<String> = BAND_CENTERS_HZ
+            .iter()
+            .map(|hz| short_frequency_label(*hz))
+            .collect();
+        assert_eq!(
+            captions,
+            ["32", "64", "125", "250", "500", "1K", "2K", "4K", "8K", "16K"]
         );
         assert_eq!(gain_label(-1.5), "-1.5 dB");
         assert_eq!(gain_label(3.0), "+3.0 dB");
+        assert_eq!(
+            [MAX_GAIN_DB, 0.0, MIN_GAIN_DB].map(scale_label),
+            ["+12 dB", "0 dB", "-12 dB"]
+        );
+    }
+
+    #[test]
+    fn every_preset_has_its_own_name() {
+        let names: Vec<String> = Preset::ALL.into_iter().map(preset_label).collect();
+        assert_eq!(
+            names,
+            [
+                "Flat",
+                "Classical",
+                "Club",
+                "Dance",
+                "Full Bass",
+                "Full Bass & Treble",
+                "Full Treble",
+                "Headphones",
+                "Large Hall",
+                "Live",
+                "Party",
+                "Pop",
+                "Reggae",
+                "Rock",
+                "Ska",
+                "Soft",
+                "Soft Rock",
+                "Techno",
+                "Custom",
+            ]
+        );
     }
 
     #[test]
@@ -432,15 +638,16 @@ pub mod widget_tests {
         let (_group, panel, changes) = panel(saved);
         assert!(panel.enabled.is_active());
         assert_eq!(panel.preset.selected(), position(Preset::Pop));
-        assert_eq!(panel.bands[2].value(), 3.0);
+        assert_eq!(panel.bands[3].value(), 4.0);
+        assert_eq!(panel.preamp.value(), -4.5);
         assert!(panel.preamp.is_sensitive());
 
         panel.preset.set_selected(position(Preset::Rock));
         let rock = last(&changes);
         assert_eq!(rock.preset, Preset::Rock);
         assert_eq!(rock.bands_db, Preset::Rock.band_gains_db().unwrap());
-        assert_eq!(panel.bands[0].value(), 3.0, "sliders follow the preset");
-        assert_eq!(panel.preamp.value(), -1.0);
+        assert_eq!(panel.bands[0].value(), 5.0, "sliders follow the preset");
+        assert_eq!(panel.preamp.value(), -6.5);
         assert_eq!(
             changes.borrow().len(),
             1,
@@ -471,6 +678,161 @@ pub mod widget_tests {
         );
         assert!(!flat.enabled, "reset keeps the switch");
         assert!(panel.bands.iter().all(|scale| scale.value() == 0.0));
+    }
+
+    /// The grid holding the sliders, which carries the wheel controller.
+    fn sliders(panel: &Panel) -> gtk::Grid {
+        panel
+            .preamp
+            .parent()
+            .and_downcast::<gtk::Grid>()
+            .expect("the sliders share one grid")
+    }
+
+    /// The text of the caption at `column`, `row` of the slider grid.
+    fn caption_at(grid: &gtk::Grid, column: i32, row: i32) -> String {
+        grid.child_at(column, row)
+            .and_downcast::<gtk::Label>()
+            .unwrap_or_else(|| panic!("no caption at {column}, {row}"))
+            .label()
+            .into()
+    }
+
+    #[allow(clippy::float_cmp)] // slider bounds and snapped gains are exact half-dB steps
+    pub fn equalizer_sliders_stand_like_a_graphic_equalizer() {
+        let mut saved = EqualizerSettings::default();
+        saved.select_preset(Preset::FullTreble);
+        let (_group, panel, _changes) = panel(saved);
+        let grid = &sliders(&panel);
+
+        // Preamp first, then a separator, then the ten bands left to right,
+        // each above its short frequency caption.
+        assert_eq!(
+            grid.child_at(1, 0).as_ref(),
+            Some(panel.preamp.upcast_ref())
+        );
+        assert_eq!(caption_at(grid, 1, 1), "Preamp");
+        assert!(grid
+            .child_at(2, 0)
+            .and_downcast::<gtk::Separator>()
+            .is_some());
+        let captions: Vec<String> = (3..13).map(|column| caption_at(grid, column, 1)).collect();
+        assert_eq!(
+            captions,
+            ["32", "64", "125", "250", "500", "1K", "2K", "4K", "8K", "16K"]
+        );
+        for (column, band) in (3..).zip(&panel.bands) {
+            assert_eq!(grid.child_at(column, 0).as_ref(), Some(band.upcast_ref()));
+        }
+        let axis = grid
+            .child_at(0, 0)
+            .and_downcast::<gtk::CenterBox>()
+            .unwrap();
+        let marks: Vec<String> = [axis.start_widget(), axis.center_widget(), axis.end_widget()]
+            .into_iter()
+            .map(|mark| mark.and_downcast::<gtk::Label>().unwrap().label().into())
+            .collect();
+        assert_eq!(marks, ["+12 dB", "0 dB", "-12 dB"]);
+        assert_eq!(axis.accessible_role(), gtk::AccessibleRole::Presentation);
+
+        for scale in std::iter::once(&panel.preamp).chain(&panel.bands) {
+            assert_eq!(scale.orientation(), gtk::Orientation::Vertical);
+            assert!(scale.is_inverted(), "boost is at the top");
+            assert!(!scale.draws_value());
+            let range = scale.adjustment();
+            assert_eq!((range.lower(), range.upper()), (-12.0, 12.0));
+            assert!(gtk::test_accessible_has_property(
+                scale,
+                gtk::AccessibleProperty::Label
+            ));
+            assert!(gtk::test_accessible_has_property(
+                scale,
+                gtk::AccessibleProperty::ValueText
+            ));
+        }
+        assert_eq!(panel.bands[9].value(), 10.0);
+        assert_eq!(panel.bands[9].tooltip_text().as_deref(), Some("+10.0 dB"));
+        assert_eq!(panel.preamp.tooltip_text().as_deref(), Some("-10.0 dB"));
+        assert_eq!(
+            grid.child_at(5, 1).unwrap().accessible_role(),
+            gtk::AccessibleRole::Presentation,
+            "screen readers read each slider's own name, not the caption"
+        );
+    }
+
+    #[allow(clippy::float_cmp)] // snapped gains are exact half-dB steps
+    pub fn equalizer_sliders_follow_the_keyboard() {
+        let (_group, panel, changes) = panel(EqualizerSettings::default());
+        panel.bands[3].emit_by_name::<()>("move-slider", &[&gtk::ScrollType::StepUp]);
+        let raised = last(&changes);
+        assert_eq!(raised.bands_db[3], GAIN_STEP_DB, "Up raises the band");
+        assert_eq!(raised.preset, Preset::Custom);
+        assert_eq!(
+            panel.bands[3].tooltip_text().as_deref(),
+            Some("+0.5 dB"),
+            "the tooltip follows the value"
+        );
+        panel
+            .preamp
+            .emit_by_name::<()>("move-slider", &[&gtk::ScrollType::StepDown]);
+        assert_eq!(
+            last(&changes).preamp_db,
+            -GAIN_STEP_DB,
+            "Down lowers the preamp"
+        );
+    }
+
+    /// The capture-phase scroll controller on the slider grid.
+    fn wheel_controller(sliders: &gtk::Grid) -> gtk::EventControllerScroll {
+        let controllers = sliders.observe_controllers();
+        let mut found = (0..controllers.n_items())
+            .filter_map(|index| {
+                controllers
+                    .item(index)
+                    .and_downcast::<gtk::EventControllerScroll>()
+            })
+            .filter(|controller| controller.propagation_phase() == gtk::PropagationPhase::Capture);
+        let controller = found.next().expect("a capture-phase scroll controller");
+        assert!(found.next().is_none(), "one wheel controller");
+        controller
+    }
+
+    #[allow(clippy::float_cmp)] // the page offsets are computed the same way on both sides
+    pub fn the_wheel_over_the_sliders_scrolls_the_page_not_a_slider() {
+        let mut saved = EqualizerSettings::default();
+        saved.select_preset(Preset::Rock);
+        let (group, panel, changes) = panel(saved);
+        let page = gtk::ScrolledWindow::new();
+        page.set_child(Some(&group));
+        let adjustment = page.vadjustment();
+        adjustment.configure(0.0, 0.0, 1000.0, 10.0, 90.0, 100.0);
+        let controller = wheel_controller(&sliders(&panel));
+        let notch = 100.0_f64.powf(2.0 / 3.0);
+
+        let handled: bool = controller.emit_by_name("scroll", &[&0.0_f64, &2.0_f64]);
+        assert!(handled, "the wheel event stops before the sliders");
+        assert_eq!(adjustment.value(), 2.0 * notch, "two notches down the page");
+        let handled: bool = controller.emit_by_name("scroll", &[&0.0_f64, &-5.0_f64]);
+        assert!(handled);
+        assert_eq!(adjustment.value(), 0.0, "scrolling up stops at the top");
+        let handled: bool = controller.emit_by_name("scroll", &[&3.0_f64, &0.0_f64]);
+        assert!(handled, "sideways scrolling never reaches a slider either");
+
+        assert!(changes.borrow().is_empty(), "no slider moved");
+        assert_eq!(
+            panel
+                .bands
+                .iter()
+                .map(gtk::Scale::value)
+                .collect::<Vec<_>>(),
+            Preset::Rock.band_gains_db().unwrap()
+        );
+
+        // Outside a scrolled window the wheel still never moves a slider.
+        page.set_child(None::<&gtk::Widget>);
+        let handled: bool = controller.emit_by_name("scroll", &[&0.0_f64, &1.0_f64]);
+        assert!(handled);
+        assert!(changes.borrow().is_empty());
     }
 
     pub fn equalizer_panel_is_disabled_for_unsupported_outputs() {
