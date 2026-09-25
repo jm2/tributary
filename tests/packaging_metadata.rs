@@ -747,7 +747,7 @@ fn release_plugin_allowlist_is_well_formed_and_ships_what_the_code_creates() {
         ),
         ("volume", EQUALIZER, "volume", &["windows", "macos"]),
         (
-            "equalizer-10bands",
+            "equalizer-nbands",
             EQUALIZER,
             "equalizer",
             &["windows", "macos"],

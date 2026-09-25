@@ -65,7 +65,7 @@ fn preset_label(preset: Preset) -> String {
     .into_owned()
 }
 
-/// "29 Hz" below 1 kHz, otherwise kilohertz to one decimal: "1.9 kHz", "15 kHz".
+/// "32 Hz" below 1 kHz, otherwise kilohertz to one decimal: "1 kHz", "16 kHz".
 fn frequency_label(hz: u32) -> String {
     if hz < 1000 {
         return rust_i18n::t!("equalizer.hz", value = hz).into_owned();
@@ -331,10 +331,11 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "29 Hz", "59 Hz", "119 Hz", "237 Hz", "474 Hz", "947 Hz", "1.9 kHz", "3.8 kHz",
-                "7.5 kHz", "15 kHz"
+                "32 Hz", "64 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz",
+                "16 kHz"
             ]
         );
+        assert_eq!(frequency_label(1500), "1.5 kHz");
         assert_eq!(gain_label(-1.5), "-1.5 dB");
         assert_eq!(gain_label(3.0), "+3.0 dB");
     }

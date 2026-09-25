@@ -6,8 +6,11 @@
 //!
 //! ```text
 //! audioresample ! audioconvert ! capsfilter(F32LE) ! volume (preamp)
-//!   ! equalizer-10bands ! rglimiter ! audioconvert ! audioresample
+//!   ! equalizer-nbands ! rglimiter ! audioconvert ! audioresample
 //! ```
+//!
+//! `equalizer-nbands` runs ten peak filters on the ISO octave centres, the
+//! bands iTunes shows, with ±12 dB of gain and a ±12 dB preamp.
 //!
 //! Every element stays in the bin for the life of the player, and every
 //! setting is a plain property write that the elements accept while
@@ -24,17 +27,30 @@ use gtk::glib;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::warn;
 
-/// Centre frequencies of the `equalizer-10bands` bands, in hertz.
-pub const BAND_CENTERS_HZ: [u32; 10] = [29, 59, 119, 237, 474, 947, 1889, 3770, 7523, 15011];
+/// Centre frequencies of the ten bands, in hertz: the ISO octave centres
+/// that iTunes' equalizer uses.
+pub const BAND_CENTERS_HZ: [u32; 10] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
-/// Lowest band or preamp gain, in dB (the `equalizer-10bands` range).
-pub const MIN_GAIN_DB: f64 = -24.0;
+/// Lowest band or preamp gain, in dB.
+pub const MIN_GAIN_DB: f64 = -12.0;
 
 /// Highest band or preamp gain, in dB.
 pub const MAX_GAIN_DB: f64 = 12.0;
 
 /// Gain resolution of the settings and the sliders, in dB.
 pub const GAIN_STEP_DB: f64 = 0.5;
+
+/// Width of each band's filter, in hertz: the distance from the previous
+/// band's centre, and the first band's own centre frequency. This is the
+/// spacing Strawberry gives its GStreamer equalizer bands; on octave
+/// centres it gives every band above the first a Q of 2.
+pub const fn band_width_hz(index: usize) -> u32 {
+    if index == 0 {
+        BAND_CENTERS_HZ[0]
+    } else {
+        BAND_CENTERS_HZ[index] - BAND_CENTERS_HZ[index - 1]
+    }
+}
 
 /// A named set of band gains and a matching preamp.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,31 +186,29 @@ fn db_to_factor(db: f64) -> f64 {
 struct EqualizerBin {
     bin: gst::Bin,
     preamp: gst::Element,
-    bands: gst::Element,
+    /// The bands of the `equalizer-nbands` element, in [`BAND_CENTERS_HZ`]
+    /// order.
+    bands: Vec<gst::Object>,
     limiter: gst::Element,
 }
 
 impl EqualizerBin {
     const CHAIN: &'static str = "audioresample ! audioconvert \
         ! capsfilter caps=audio/x-raw,format=F32LE,layout=interleaved \
-        ! volume name=preamp ! equalizer-10bands name=bands ! rglimiter name=limiter \
-        ! audioconvert ! audioresample";
+        ! volume name=preamp ! equalizer-nbands name=bands num-bands=10 \
+        ! rglimiter name=limiter ! audioconvert ! audioresample";
 
     /// Build the bin with neutral settings.
     ///
     /// # Errors
-    /// Fails when an element is not installed (`equalizer-10bands` and
+    /// Fails when an element is not installed (`equalizer-nbands` and
     /// `rglimiter` ship in gst-plugins-good) or the chain cannot be linked.
     fn new() -> Result<Self, glib::Error> {
         let bin = gst::parse::bin_from_description_with_name(Self::CHAIN, true, "equalizer")?;
-        let element = |name: &str| {
-            bin.by_name(name).ok_or_else(|| {
-                glib::Error::new(gst::CoreError::Failed, "equalizer element missing")
-            })
-        };
+        let element = |name: &str| bin.by_name(name).ok_or_else(missing_element);
         let equalizer = Self {
             preamp: element("preamp")?,
-            bands: element("bands")?,
+            bands: place_bands(&element("bands")?)?,
             limiter: element("limiter")?,
             bin,
         };
@@ -215,8 +229,8 @@ impl EqualizerBin {
             (0.0, [0.0; 10])
         };
         self.preamp.set_property("volume", db_to_factor(preamp_db));
-        for (index, gain) in bands_db.iter().enumerate() {
-            self.bands.set_property(&format!("band{index}"), gain);
+        for (band, gain) in self.bands.iter().zip(bands_db) {
+            band.set_property("gain", gain);
         }
         self.limiter.set_property(
             "enabled",
@@ -230,6 +244,41 @@ impl EqualizerBin {
             .src()
             .is_some_and(|source| source.has_as_ancestor(&self.bin))
     }
+}
+
+fn missing_element() -> glib::Error {
+    glib::Error::new(gst::CoreError::Failed, "equalizer element missing")
+}
+
+/// Put each band of the `equalizer-nbands` element `bands` on its
+/// [`BAND_CENTERS_HZ`] centre, [`band_width_hz`] wide, as a peak filter, and
+/// return the band objects.
+///
+/// `equalizer-nbands` makes its first band a low shelf and its last a high
+/// shelf. A shelf reaches only half its gain at its own frequency: a +12 dB
+/// shelf on the 16 kHz band lifts 16 kHz by 6 dB. Strawberry keeps its ten
+/// bands off the shelves too (its comment blames them for an "inverted
+/// slider" bug). Every band here is a peak filter, which reaches the
+/// slider's gain at the frequency under the slider.
+fn place_bands(bands: &gst::Element) -> Result<Vec<gst::Object>, glib::Error> {
+    let proxy = bands
+        .dynamic_cast_ref::<gst::ChildProxy>()
+        .ok_or_else(missing_element)?;
+    BAND_CENTERS_HZ
+        .iter()
+        .enumerate()
+        .map(|(index, hz)| {
+            let band = u32::try_from(index)
+                .ok()
+                .and_then(|index| proxy.child_by_index(index))
+                .and_downcast::<gst::Object>()
+                .ok_or_else(missing_element)?;
+            band.set_property("freq", f64::from(*hz));
+            band.set_property("bandwidth", f64::from(band_width_hz(index)));
+            band.set_property_from_str("type", "peak");
+            Ok(band)
+        })
+        .collect()
 }
 
 /// The local player's equalizer, shared with its bus watch.

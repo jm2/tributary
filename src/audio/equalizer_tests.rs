@@ -12,7 +12,7 @@ use crate::ui::preferences::AppConfig;
 const TONE_RMS_DB: f64 = -15.05;
 
 /// Centre of band 5, the band the tone tests boost.
-const TONE_HZ: f64 = 947.0;
+const TONE_HZ: f64 = 1000.0;
 
 #[allow(clippy::float_cmp)] // preset tables and snapped gains are exact half-dB steps
 #[test]
@@ -46,12 +46,28 @@ fn presets_load_their_gains_and_custom_keeps_the_current_ones() {
     }
 }
 
+#[allow(clippy::float_cmp)] // the range is exact
+#[test]
+fn the_bands_are_iso_octaves_with_twelve_db_either_way() {
+    assert_eq!(
+        BAND_CENTERS_HZ,
+        [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    );
+    assert_eq!(
+        std::array::from_fn::<u32, 10, _>(band_width_hz),
+        [32, 32, 61, 125, 250, 500, 1000, 2000, 4000, 8000]
+    );
+    assert_eq!((MIN_GAIN_DB, MAX_GAIN_DB), (-12.0, 12.0));
+}
+
 #[allow(clippy::float_cmp)] // snapped gains are exact half-dB steps
 #[test]
 fn validation_clamps_snaps_and_relabels_edited_presets() {
     assert_eq!(snap_gain_db(1.26), 1.5);
     assert_eq!(snap_gain_db(1.24), 1.0);
     assert_eq!(snap_gain_db(-0.2), 0.0);
+    assert_eq!(snap_gain_db(12.2), MAX_GAIN_DB);
+    assert_eq!(snap_gain_db(-24.0), MIN_GAIN_DB);
     assert_eq!(snap_gain_db(40.0), MAX_GAIN_DB);
     assert_eq!(snap_gain_db(-40.0), MIN_GAIN_DB);
     assert_eq!(snap_gain_db(f64::NAN), 0.0);
@@ -156,11 +172,12 @@ fn tone_caps(rate: i32, channels: i32) -> gst::Caps {
         .build()
 }
 
-/// `audiotestsrc ! capsfilter ! <equalizer> ! level ! fakesink`.
-fn tone_pipeline(equalizer: &EqualizerBin, amplitude: f64) -> gst::Pipeline {
+/// `audiotestsrc ! capsfilter ! <equalizer> ! level ! fakesink`, playing a
+/// `hz` tone.
+fn tone_pipeline(equalizer: &EqualizerBin, amplitude: f64, hz: f64) -> gst::Pipeline {
     let source = gst::ElementFactory::make("audiotestsrc")
         .name("source")
-        .property("freq", TONE_HZ)
+        .property("freq", hz)
         .property("volume", amplitude)
         .property("num-buffers", 60)
         .build()
@@ -234,10 +251,14 @@ fn peak(levels: &[(f64, f64)]) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
-fn measure(settings: &EqualizerSettings, amplitude: f64) -> Vec<(f64, f64)> {
+fn measure_at(settings: &EqualizerSettings, amplitude: f64, hz: f64) -> Vec<(f64, f64)> {
     let equalizer = EqualizerBin::new().unwrap();
     equalizer.apply(settings);
-    run(&tone_pipeline(&equalizer, amplitude))
+    run(&tone_pipeline(&equalizer, amplitude, hz))
+}
+
+fn measure(settings: &EqualizerSettings, amplitude: f64) -> Vec<(f64, f64)> {
+    measure_at(settings, amplitude, TONE_HZ)
 }
 
 fn assert_near(actual: f64, expected: f64, tolerance: f64, what: &str) {
@@ -269,13 +290,61 @@ fn preamp_and_band_gains_change_the_measured_level() {
 
     let mut boosted = enabled();
     boosted.bands_db[5] = 6.0;
-    assert_near(rms(&boosted), TONE_RMS_DB + 6.0, 0.5, "947 Hz band +6 dB");
+    assert_near(rms(&boosted), TONE_RMS_DB + 6.0, 0.5, "1 kHz band +6 dB");
 
     let bypassed = EqualizerSettings {
         enabled: false,
         ..boosted
     };
     assert_near(rms(&bypassed), TONE_RMS_DB, 0.1, "disabled with gains set");
+}
+
+#[allow(clippy::float_cmp)] // the bands read back the exact values written
+#[test]
+fn the_bands_are_peak_filters_on_the_iso_centres() {
+    if !plugins_available() {
+        return;
+    }
+    let equalizer = EqualizerBin::new().unwrap();
+    let element = equalizer.bin.by_name("bands").unwrap();
+    assert_eq!(element.factory().unwrap().name(), "equalizer-nbands");
+    assert_eq!(element.property::<u32>("num-bands"), 10);
+    assert_eq!(equalizer.bands.len(), 10);
+    for (index, (band, hz)) in equalizer.bands.iter().zip(BAND_CENTERS_HZ).enumerate() {
+        assert_eq!(band.property::<f64>("freq"), f64::from(hz), "band {index}");
+        assert_eq!(
+            band.property::<f64>("bandwidth"),
+            f64::from(band_width_hz(index)),
+            "band {index}"
+        );
+        let kind = band.property_value("type");
+        let (_, kind) = glib::EnumValue::from_value(&kind).expect("band type is an enum");
+        assert_eq!(kind.nick(), "peak", "band {index}");
+    }
+}
+
+#[test]
+fn every_band_reaches_its_gain_at_its_own_centre() {
+    if !plugins_available() {
+        return;
+    }
+    for (index, hz) in BAND_CENTERS_HZ.iter().enumerate() {
+        let hz = f64::from(*hz);
+        let neutral = settled_rms(&measure_at(&enabled(), 0.25, hz));
+        let mut boosted = enabled();
+        boosted.bands_db[index] = 6.0;
+        let lifted = settled_rms(&measure_at(&boosted, 0.25, hz));
+        // A shelf would reach only half its gain here.
+        assert_near(lifted - neutral, 6.0, 0.5, &format!("{hz} Hz band +6 dB"));
+        boosted.bands_db[index] = MIN_GAIN_DB;
+        let cut = settled_rms(&measure_at(&boosted, 0.25, hz));
+        assert_near(
+            cut - neutral,
+            MIN_GAIN_DB,
+            0.5,
+            &format!("{hz} Hz band cut"),
+        );
+    }
 }
 
 #[test]
@@ -307,7 +376,7 @@ fn settings_written_mid_stream_take_effect() {
         return;
     }
     let equalizer = Arc::new(EqualizerBin::new().unwrap());
-    let pipeline = tone_pipeline(&equalizer, 0.25);
+    let pipeline = tone_pipeline(&equalizer, 0.25, TONE_HZ);
     let source_pad = pipeline
         .by_name("source")
         .unwrap()
@@ -409,7 +478,14 @@ fn the_installed_bin_follows_rate_and_channel_changes_between_loads() {
 /// Make the band filter fail part-way through the stream, as a broken
 /// element would: post an error and return a flow error upstream.
 fn fail_bands_after(equalizer: &PlayerEqualizer, buffers: usize) {
-    let bands = equalizer.bin.borrow().as_ref().unwrap().bands.clone();
+    let bands = equalizer
+        .bin
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .bin
+        .by_name("bands")
+        .unwrap();
     let seen = AtomicUsize::new(0);
     bands
         .static_pad("src")
