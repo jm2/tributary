@@ -384,7 +384,7 @@ jobs:
             dbus-devel \
             gstreamer1-devel gstreamer1-plugins-base-devel \
             gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav \
-            pkgconf-pkg-config git curl
+            pkgconf-pkg-config git curl xorg-x11-server-Xvfb
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -409,12 +409,27 @@ jobs:
       - name: Install pinned cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
 
+      # The GTK widget tests run on a virtual display, as in the GTK Display
+      # Gate, so the interface code they exercise counts toward the floor.
+      # Without a display they skip, and every interface change reads as
+      # untested. TRIBUTARY_GTK_GATE=require turns a missing display into a
+      # failure instead of a silent skip.
       - name: Run comprehensive coverage gate
+        env:
+          TRIBUTARY_GTK_GATE: require
+          GDK_BACKEND: x11
+          # Xvfb has no GPU, and GL/Vulkan probing is slow and flaky here.
+          GSK_RENDERER: cairo
         run: |
+          runtime="${RUNNER_TEMP:-${TMPDIR:-/var/tmp}}/gtk-runtime"
+          mkdir -p "$runtime"
+          chmod 700 "$runtime"
+          export XDG_RUNTIME_DIR="$runtime"
           minimum="$(tr -d '[:space:]' < coverage-baseline.txt)"
           cargo llvm-cov clean --workspace
           coverage_status=0
-          cargo llvm-cov --all-targets --all-features --locked --html --output-dir coverage --fail-under-lines "$minimum" || coverage_status=$?
+          xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+            cargo llvm-cov --all-targets --all-features --locked --html --output-dir coverage --fail-under-lines "$minimum" || coverage_status=$?
           cargo llvm-cov report --summary-only
           exit "$coverage_status"
 
