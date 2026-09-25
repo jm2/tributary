@@ -181,7 +181,7 @@ jobs:
 
       - name: Validate desktop entry
         run: |
-          if ! diagnostics="$(desktop-file-validate data/io.github.tributary.Tributary.desktop 2>&1)"; then
+          if ! diagnostics="$(desktop-file-validate data/io.github.jm2.tributary.desktop 2>&1)"; then
             printf '%s\n' "$diagnostics"
             exit 1
           fi
@@ -191,7 +191,7 @@ jobs:
           fi
 
       - name: Validate AppStream metainfo
-        run: appstreamcli validate --no-net data/io.github.tributary.Tributary.metainfo.xml
+        run: appstreamcli validate --no-net data/io.github.jm2.tributary.metainfo.xml
 
   # ── Linux (native binary + test) ──────────────────────────────────────────
   build-linux:
@@ -703,7 +703,7 @@ jobs:
         uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
           bundle: tributary.flatpak
-          manifest-path: build-aux/flatpak/io.github.tributary.Tributary.yml
+          manifest-path: build-aux/flatpak/io.github.jm2.tributary.yml
           cache-key: flatpak-${{ hashFiles('**/Cargo.lock') }}
           upload-artifact: false
 

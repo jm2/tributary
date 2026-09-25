@@ -120,7 +120,7 @@ readonly MACOS_ICONUTIL_COMMAND="/usr/bin/iconutil"
 readonly MACOS_SIPS_COMMAND="/usr/bin/sips"
 
 APP_NAME="Tributary"
-BUNDLE_ID="io.github.tributary.Tributary"
+BUNDLE_ID="io.github.jm2.tributary"
 BINARY="target/release/tributary"
 APP_BUNDLE="dist/${APP_NAME}.app"
 

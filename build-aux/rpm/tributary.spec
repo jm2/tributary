@@ -47,15 +47,15 @@ cargo build --release --locked
 install -D -p -m 0755 target/release/tributary %{buildroot}%{_bindir}/tributary
 
 # Install desktop file
-install -D -p -m 0644 data/io.github.tributary.Tributary.desktop %{buildroot}%{_datadir}/applications/io.github.tributary.Tributary.desktop
+install -D -p -m 0644 data/io.github.jm2.tributary.desktop %{buildroot}%{_datadir}/applications/io.github.jm2.tributary.desktop
 
 # Install metainfo
-install -D -p -m 0644 data/io.github.tributary.Tributary.metainfo.xml %{buildroot}%{_metainfodir}/io.github.tributary.Tributary.metainfo.xml
+install -D -p -m 0644 data/io.github.jm2.tributary.metainfo.xml %{buildroot}%{_metainfodir}/io.github.jm2.tributary.metainfo.xml
 
 # Install icons
 for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
-    install -D -p -m 0644 data/icons/hicolor/${size}/apps/io.github.tributary.Tributary.png \
-        %{buildroot}%{_datadir}/icons/hicolor/${size}/apps/io.github.tributary.Tributary.png
+    install -D -p -m 0644 data/icons/hicolor/${size}/apps/io.github.jm2.tributary.png \
+        %{buildroot}%{_datadir}/icons/hicolor/${size}/apps/io.github.jm2.tributary.png
 done
 
 # Validate the installed tree even when a build service skips its test phase.
@@ -71,9 +71,9 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %license LICENSE
 %doc README.md
 %{_bindir}/tributary
-%{_datadir}/applications/io.github.tributary.Tributary.desktop
-%{_metainfodir}/io.github.tributary.Tributary.metainfo.xml
-%{_datadir}/icons/hicolor/*/apps/io.github.tributary.Tributary.png
+%{_datadir}/applications/io.github.jm2.tributary.desktop
+%{_metainfodir}/io.github.jm2.tributary.metainfo.xml
+%{_datadir}/icons/hicolor/*/apps/io.github.jm2.tributary.png
 
 %changelog
 * Thu Sep 24 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.7.0-1

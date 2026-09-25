@@ -12,7 +12,7 @@ validator="$script_dir/validate-package-compliance.sh"
 "$validator" --metadata \
     "$repository_root/Cargo.toml" \
     "$repository_root/Cargo.lock" \
-    "$repository_root/build-aux/flatpak/io.github.tributary.Tributary.yml" \
+    "$repository_root/build-aux/flatpak/io.github.jm2.tributary.yml" \
     "$repository_root/build-aux/arch/PKGBUILD" \
     "$repository_root/build-aux/rpm/tributary.spec"
 

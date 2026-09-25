@@ -2378,7 +2378,7 @@ if (Test-Path $appIconsSrc) {
 
     # Rebuild the hicolor icon-theme.cache so it includes the app icon.
     # The cache from MSYS2 only indexes system icons; without a rebuild
-    # GTK cannot find io.github.tributary.Tributary via the icon theme.
+    # GTK cannot find io.github.jm2.tributary via the icon theme.
     $iconCacheUpdater = Join-Path $MsysPath "bin\gtk4-update-icon-cache.exe"
     if (Test-Path $iconCacheUpdater) {
         & $iconCacheUpdater -f -t $appIconsDest 2>$null

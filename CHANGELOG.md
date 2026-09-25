@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **New application ID** — Tributary is now `io.github.jm2.tributary` instead of
+  `io.github.tributary.Tributary`, matching its GitHub home so it can be published on Flathub.
+  The Flatpak keeps its library and settings under the old ID, so quit Tributary and, before
+  starting 0.7.0 for the first time, run
+  `mv ~/.var/app/io.github.tributary.Tributary ~/.var/app/io.github.jm2.tributary` and then
+  `flatpak uninstall io.github.tributary.Tributary`. If 0.7.0 has already been started, quit it
+  and delete `~/.var/app/io.github.jm2.tributary` first. The `.deb`, `.rpm`, Arch, Windows, and
+  macOS builds keep their library and settings. On Linux, a launcher pinned to a dock or a
+  default-app choice for audio files may need setting again, and macOS may ask again for
+  permissions such as access to the Music folder.
 - **Smaller Windows and macOS downloads** — The downloads now contain only the audio plugins
   Tributary uses, leaving out video, streaming, and encoder plugins and the FDK AAC library,
   whose license does not allow it to ship with Tributary.

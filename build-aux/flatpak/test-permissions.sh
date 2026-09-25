@@ -5,7 +5,7 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-manifest="$script_dir/io.github.tributary.Tributary.yml"
+manifest="$script_dir/io.github.jm2.tributary.yml"
 validator="$script_dir/validate-permissions.sh"
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM

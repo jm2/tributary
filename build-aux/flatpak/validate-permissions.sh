@@ -6,7 +6,7 @@ set -eu
 set -f
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-manifest=${1:-"$script_dir/io.github.tributary.Tributary.yml"}
+manifest=${1:-"$script_dir/io.github.jm2.tributary.yml"}
 
 if [ ! -f "$manifest" ]; then
     echo "Flatpak manifest not found: $manifest" >&2

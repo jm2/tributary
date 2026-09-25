@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.tributary.Tributary</id>
+  <id>io.github.jm2.tributary</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
@@ -25,12 +25,17 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">io.github.tributary.Tributary.desktop</launchable>
+  <launchable type="desktop-id">io.github.jm2.tributary.desktop</launchable>
+
+  <!-- Releases up to 0.6.2 used this ID. -->
+  <replaces>
+    <id>io.github.tributary.Tributary</id>
+  </replaces>
 
   <url type="homepage">https://github.com/jm2/tributary</url>
   <url type="bugtracker">https://github.com/jm2/tributary/issues</url>
 
-  <developer id="io.github.tributary">
+  <developer id="io.github.jm2">
     <name>Tributary Contributors</name>
   </developer>
 

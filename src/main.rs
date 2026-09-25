@@ -105,7 +105,7 @@ use gtk::{gio, glib};
 use tracing::{error, info};
 
 /// Reverse-DNS application identifier.
-const APP_ID: &str = "io.github.tributary.Tributary";
+const APP_ID: &str = "io.github.jm2.tributary";
 
 /// Route an application-level quit request through the active window so its
 /// `close-request` handler can finish lifecycle-owned remote teardown first.
@@ -359,7 +359,7 @@ fn main() {
         .activate(|app: &adw::Application, _, _| {
             let about = adw::AboutDialog::builder()
                 .application_name("Tributary")
-                .application_icon("io.github.tributary.Tributary")
+                .application_icon("io.github.jm2.tributary")
                 .developer_name("John-Michael Mulesa")
                 .version(env!("CARGO_PKG_VERSION"))
                 .website("https://github.com/jm2/tributary")

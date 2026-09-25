@@ -11,7 +11,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-const SERVICE: &str = "io.github.tributary.Tributary.lastfm";
+const SERVICE: &str = "io.github.jm2.tributary.lastfm";
 const ACCOUNT: &str = "session";
 const ENCODING_VERSION: u8 = 1;
 const ACCOUNT_BINDING_DOMAIN: &[u8] = b"tributary:lastfm-account-binding:v1\0";
