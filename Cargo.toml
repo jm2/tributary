@@ -169,31 +169,31 @@ depends = "$auto, libgtk-4-1 (>= 4.16), libadwaita-1-0 (>= 1.6), gstreamer1.0-pl
 section = "sound"
 assets = [
     ["target/release/tributary", "usr/bin/", "755"],
-    ["data/io.github.tributary.Tributary.desktop", "usr/share/applications/", "644"],
-    ["data/io.github.tributary.Tributary.metainfo.xml", "usr/share/metainfo/", "644"],
-    ["data/icons/hicolor/16x16/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
-    ["data/icons/hicolor/24x24/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
-    ["data/icons/hicolor/32x32/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
-    ["data/icons/hicolor/48x48/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
-    ["data/icons/hicolor/64x64/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
-    ["data/icons/hicolor/128x128/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
-    ["data/icons/hicolor/256x256/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
-    ["data/icons/hicolor/512x512/apps/io.github.tributary.Tributary.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+    ["data/io.github.jm2.tributary.desktop", "usr/share/applications/", "644"],
+    ["data/io.github.jm2.tributary.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["data/icons/hicolor/16x16/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["data/icons/hicolor/24x24/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["data/icons/hicolor/32x32/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["data/icons/hicolor/48x48/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["data/icons/hicolor/64x64/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["data/icons/hicolor/128x128/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["data/icons/hicolor/256x256/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["data/icons/hicolor/512x512/apps/io.github.jm2.tributary.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/tributary", dest = "/usr/bin/tributary", mode = "0755" },
-    { source = "data/io.github.tributary.Tributary.desktop", dest = "/usr/share/applications/io.github.tributary.Tributary.desktop", mode = "0644" },
-    { source = "data/io.github.tributary.Tributary.metainfo.xml", dest = "/usr/share/metainfo/io.github.tributary.Tributary.metainfo.xml", mode = "0644" },
-    { source = "data/icons/hicolor/16x16/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/24x24/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/32x32/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/48x48/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/64x64/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/128x128/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/256x256/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.tributary.Tributary.png", mode = "0644" },
-    { source = "data/icons/hicolor/512x512/apps/io.github.tributary.Tributary.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.tributary.Tributary.png", mode = "0644" },
+    { source = "data/io.github.jm2.tributary.desktop", dest = "/usr/share/applications/io.github.jm2.tributary.desktop", mode = "0644" },
+    { source = "data/io.github.jm2.tributary.metainfo.xml", dest = "/usr/share/metainfo/io.github.jm2.tributary.metainfo.xml", mode = "0644" },
+    { source = "data/icons/hicolor/16x16/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/16x16/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/24x24/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/24x24/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/32x32/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/32x32/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/48x48/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/64x64/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/64x64/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/128x128/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/256x256/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.jm2.tributary.png", mode = "0644" },
+    { source = "data/icons/hicolor/512x512/apps/io.github.jm2.tributary.png", dest = "/usr/share/icons/hicolor/512x512/apps/io.github.jm2.tributary.png", mode = "0644" },
 ]
 
 [package.metadata.generate-rpm.requires]

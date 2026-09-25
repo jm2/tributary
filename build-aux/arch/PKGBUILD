@@ -48,18 +48,18 @@ package() {
   install -Dm755 "target/release/tributary" "$pkgdir/usr/bin/tributary"
 
   # Desktop entry
-  install -Dm644 "data/io.github.tributary.Tributary.desktop" \
-    "$pkgdir/usr/share/applications/io.github.tributary.Tributary.desktop"
+  install -Dm644 "data/io.github.jm2.tributary.desktop" \
+    "$pkgdir/usr/share/applications/io.github.jm2.tributary.desktop"
 
   # AppStream metainfo
-  install -Dm644 "data/io.github.tributary.Tributary.metainfo.xml" \
-    "$pkgdir/usr/share/metainfo/io.github.tributary.Tributary.metainfo.xml"
+  install -Dm644 "data/io.github.jm2.tributary.metainfo.xml" \
+    "$pkgdir/usr/share/metainfo/io.github.jm2.tributary.metainfo.xml"
 
   # Icons
   for size in 16 24 32 48 64 128 256 512; do
     install -Dm644 \
-      "data/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png"
+      "data/icons/hicolor/${size}x${size}/apps/io.github.jm2.tributary.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/io.github.jm2.tributary.png"
   done
 
   # License

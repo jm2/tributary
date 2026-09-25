@@ -176,7 +176,8 @@ Pre-built packages for Linux (Flatpak, .deb, .rpm), macOS (.dmg), and Windows (.
 The `.deb` and `.rpm` packages need GTK 4.16+ and libadwaita 1.6+; the `.deb` is built on Debian
 unstable and declares the glibc version it needs. Release assets published after 0.6.2 carry a
 GitHub build-provenance attestation, which `gh attestation verify <file> --repo jm2/tributary`
-checks.
+checks. Flatpak users upgrading from 0.6.2 or earlier should first
+[move their data to the new app ID](#moving-flatpak-data-to-the-new-app-id).
 
 > **macOS note:** The macOS `.dmg` is ad-hoc signed but not notarized, so macOS Gatekeeper will block it on first launch. After mounting the DMG and dragging Tributary to Applications, run:
 > ```bash
@@ -327,7 +328,7 @@ bash build-aux/flatpak/generate-cargo-sources.sh
 
 # Build and install locally:
 flatpak-builder --user --install-deps-from=flathub --force-clean --repo=repo --install \
-  build-dir build-aux/flatpak/io.github.tributary.Tributary.yml
+  build-dir build-aux/flatpak/io.github.jm2.tributary.yml
 ```
 
 `./scripts/build-linux.sh --flatpak` uses the same generator, then builds and validates a
@@ -347,6 +348,26 @@ rather than in software. It does not expose the whole home directory:
   root's **Reauthorize…** action in Preferences to reselect the same folder through the portal,
   confirm the move, and restart Tributary so the relocation completes before scanning. Removing and
   re-adding the folder instead would lose track IDs, history, and playlist links.
+
+#### Moving Flatpak data to the new app ID
+
+Tributary 0.7.0 changed its application ID from `io.github.tributary.Tributary` to
+`io.github.jm2.tributary`. Flatpak keeps an app's library and settings in `~/.var/app/<app ID>`,
+and the sandbox can't read another app's folder, so the new Flatpak starts with an empty library
+and default settings unless you move the old folder yourself. Quit Tributary, then, before
+starting 0.7.0 for the first time, run:
+
+```bash
+mv ~/.var/app/io.github.tributary.Tributary ~/.var/app/io.github.jm2.tributary
+flatpak uninstall io.github.tributary.Tributary
+```
+
+If you have already started 0.7.0, quit it and delete the folder it created first
+(`rm -r ~/.var/app/io.github.jm2.tributary`); otherwise `mv` puts the old folder inside it.
+Folder access granted through the file chooser belongs to the old ID, so a library folder outside
+Music may show as unavailable afterwards; select it again with its **Reauthorize…** action as
+described above. A launcher pinned to a dock, or a default-app choice for audio files, may need
+setting again.
 
 ---
 

@@ -162,7 +162,7 @@ build_flatpak() {
     error "Flathub user remote not found. Run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
   fi
 
-  local manifest="build-aux/flatpak/io.github.tributary.Tributary.yml"
+  local manifest="build-aux/flatpak/io.github.jm2.tributary.yml"
   "$PACKAGE_METADATA_VALIDATOR"
   info "Generating cargo-sources.json..."
   bash build-aux/flatpak/generate-cargo-sources.sh
@@ -170,7 +170,7 @@ build_flatpak() {
   info "Building Flatpak bundle..."
   flatpak-builder --user --install-deps-from=flathub --force-clean \
     --repo=repo build-dir "$manifest"
-  flatpak build-bundle repo tributary.flatpak io.github.tributary.Tributary \
+  flatpak build-bundle repo tributary.flatpak io.github.jm2.tributary \
     --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
   "$FLATPAK_BUNDLE_VALIDATOR" tributary.flatpak
   info "Flatpak bundle: $(pwd)/tributary.flatpak"

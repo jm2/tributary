@@ -1,4 +1,4 @@
-app-id: io.github.tributary.Tributary
+app-id: io.github.jm2.tributary
 runtime: org.gnome.Platform
 runtime-version: "50"
 sdk: org.gnome.Sdk
@@ -55,14 +55,14 @@ modules:
     build-commands:
       - cargo build --offline --release
       - install -Dm0755 target/release/tributary /app/bin/tributary
-      - install -Dm0644 data/io.github.tributary.Tributary.desktop
-          /app/share/applications/io.github.tributary.Tributary.desktop
-      - install -Dm0644 data/io.github.tributary.Tributary.metainfo.xml
-          /app/share/metainfo/io.github.tributary.Tributary.metainfo.xml
+      - install -Dm0644 data/io.github.jm2.tributary.desktop
+          /app/share/applications/io.github.jm2.tributary.desktop
+      - install -Dm0644 data/io.github.jm2.tributary.metainfo.xml
+          /app/share/metainfo/io.github.jm2.tributary.metainfo.xml
       - for size in 16 24 32 48 64 128 256 512; do
           install -Dm0644
-            "data/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png"
-            "/app/share/icons/hicolor/${size}x${size}/apps/io.github.tributary.Tributary.png";
+            "data/icons/hicolor/${size}x${size}/apps/io.github.jm2.tributary.png"
+            "/app/share/icons/hicolor/${size}x${size}/apps/io.github.jm2.tributary.png";
         done
       # Inspect only the app-owned /app payload. The referenced GNOME runtime
       # remains outside the bundle and continues to provide ordinary codecs.

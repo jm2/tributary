@@ -41,7 +41,7 @@ ref_count=0
 while IFS= read -r ref || [ -n "$ref" ]; do
     [ -n "$ref" ] || continue
     case "$ref" in
-        app/io.github.tributary.Tributary/*/*)
+        app/io.github.jm2.tributary/*/*)
             ref_count=$((ref_count + 1))
             app_ref=$ref
             ;;

@@ -311,13 +311,13 @@ printf '%s\n' \
     '    if [ "${TEST_BUNDLE_MODE:-allowed}" = unexpected-ref ]; then' \
     '      echo runtime/org.example.Unexpected/x86_64/master' \
     '    else' \
-    '      echo app/io.github.tributary.Tributary/x86_64/master' \
+    '      echo app/io.github.jm2.tributary/x86_64/master' \
     '    fi' \
     '    ;;' \
     '  checkout)' \
     '    mkdir -p "$last/files" "$last/export/share/applications"' \
     '    touch "$last/files/libgstlibav.so"' \
-    '    touch "$last/export/share/applications/io.github.tributary.Tributary.desktop"' \
+    '    touch "$last/export/share/applications/io.github.jm2.tributary.desktop"' \
     '    printf "[Application]\\nruntime=org.gnome.Platform/x86_64/49\\n" > "$last/metadata"' \
     '    case "${TEST_BUNDLE_MODE:-allowed}" in' \
     '      forbidden-export)' \
@@ -396,7 +396,7 @@ assert_before()
 }
 
 build_linux="$repository_root/scripts/build-linux.sh"
-flatpak_manifest="$repository_root/build-aux/flatpak/io.github.tributary.Tributary.yml"
+flatpak_manifest="$repository_root/build-aux/flatpak/io.github.jm2.tributary.yml"
 flatpak_validator="$repository_root/build-aux/flatpak/validate-bundle-compliance.sh"
 ci_workflow="$repository_root/.github/workflows/ci.yml"
 release_workflow="$repository_root/.github/workflows/release.yml"

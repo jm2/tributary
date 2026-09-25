@@ -1082,7 +1082,7 @@ fn run_macos_runtime_probe(
 ) -> anyhow::Result<()> {
     let icon = layout
         .resources_dir
-        .join("share/icons/hicolor/128x128/apps/io.github.tributary.Tributary.png");
+        .join("share/icons/hicolor/128x128/apps/io.github.jm2.tributary.png");
     let pixbuf = gdk_pixbuf::Pixbuf::from_file(&icon).with_context(|| {
         format!(
             "bundled app icon did not load through GDK-Pixbuf: {}",
