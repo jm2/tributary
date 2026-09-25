@@ -137,6 +137,7 @@ preferences:
   add_folder: "Ajouter un dossier…"
   remove_folder: "Retirer le dossier"
   group_by_album_artist: "Regrouper par artiste de l'album"
+  import: "Importation"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

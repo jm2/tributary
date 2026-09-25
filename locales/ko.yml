@@ -137,6 +137,7 @@ preferences:
   add_folder: "폴더 추가…"
   remove_folder: "폴더 제거"
   group_by_album_artist: "앨범 아티스트별로 묶기"
+  import: "가져오기"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

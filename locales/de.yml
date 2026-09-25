@@ -137,6 +137,7 @@ preferences:
   add_folder: "Ordner hinzufügen…"
   remove_folder: "Ordner entfernen"
   group_by_album_artist: "Nach Albumkünstler gruppieren"
+  import: "Import"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

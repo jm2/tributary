@@ -3775,7 +3775,9 @@ pub(crate) fn build_window(
                         size.pixel_size(),
                     );
                 });
-            let page = preferences::show_preferences(
+            let lastfm_group =
+                crate::ui::lastfm_settings::build_lastfm_group(&win, &lastfm_settings);
+            preferences::show_preferences(
                 &win,
                 &layout,
                 &cfg,
@@ -3784,11 +3786,8 @@ pub(crate) fn build_window(
                 on_art_change,
                 on_art_size_change,
                 &output_for_prefs,
+                std::slice::from_ref(&lastfm_group),
             );
-            page.add(&crate::ui::lastfm_settings::build_lastfm_group(
-                &win,
-                &lastfm_settings,
-            ));
         });
         window.add_action(&prefs_action);
     }

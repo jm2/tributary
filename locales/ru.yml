@@ -139,6 +139,7 @@ preferences:
   add_folder: "Добавить папку…"
   remove_folder: "Удалить папку"
   group_by_album_artist: "Группировать по исполнителю альбома"
+  import: "Импорт"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

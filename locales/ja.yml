@@ -137,6 +137,7 @@ preferences:
   add_folder: "フォルダーを追加…"
   remove_folder: "フォルダーを削除"
   group_by_album_artist: "アルバムアーティストでまとめる"
+  import: "インポート"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

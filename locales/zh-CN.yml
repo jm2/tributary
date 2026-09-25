@@ -137,6 +137,7 @@ preferences:
   add_folder: "添加文件夹…"
   remove_folder: "移除文件夹"
   group_by_album_artist: "按专辑艺术家分组"
+  import: "导入"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

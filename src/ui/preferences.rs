@@ -1,8 +1,9 @@
 //! Preferences window — unified settings for library location, browser
 //! views, and column visibility.
 //!
-//! Uses `adw::PreferencesDialog` with a single page containing four
-//! groups: Library Location, Browser Views, Visible Columns, and Equalizer.
+//! Uses `adw::PreferencesDialog` with a single page: Library Location,
+//! Downloads, Browser Views, Visible Columns, Equalizer, Privacy, any
+//! integration groups the window supplies (Last.fm), and Import last.
 
 use adw::prelude::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -885,8 +886,8 @@ impl LayoutTargets {
 /// * `on_album_pane_artwork_changed` — invoked when the album artwork toggle flips
 /// * `on_album_pane_artwork_size_changed` — invoked when the size dropdown changes
 /// * `active_output` — the output the equalizer group applies its settings to
-///
-/// Returns the page so the caller can append integration groups (Last.fm).
+/// * `integration_groups` — groups for optional integrations (Last.fm), placed
+///   after the app's own settings and before the Import group
 #[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the dialog drives
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
@@ -897,7 +898,8 @@ pub fn show_preferences(
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
     active_output: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::audio::output::AudioOutput>>>,
-) -> adw::PreferencesPage {
+    integration_groups: &[adw::PreferencesGroup],
+) {
     let prefs_dialog = adw::PreferencesDialog::builder()
         .title(rust_i18n::t!("preferences.title").as_ref())
         .build();
@@ -1209,11 +1211,15 @@ pub fn show_preferences(
     ));
     page.add(&privacy_group(config, saves));
 
+    for group in integration_groups {
+        page.add(group);
+    }
+    page.add(&import_group());
+
     prefs_dialog.add(&page);
     drop(cfg);
 
     prefs_dialog.present(Some(parent));
-    page
 }
 
 /// The Library Location group: one row per library folder, laid out like
@@ -1235,15 +1241,6 @@ fn library_group(
             rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref(),
         ));
     }
-    let import_rhythmbox_btn = adw::ButtonRow::builder()
-        .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
-        .start_icon_name("document-open-symbolic")
-        // Reuse the window action so the Preferences entry follows the same
-        // admission, shutdown, and migration-dialog path as the former menu
-        // item.
-        .action_name("win.migrate-rhythmbox")
-        .build();
-    group.add(&import_rhythmbox_btn);
     for lib_path in &config.borrow().library_paths {
         group.add(&library_folder_row(lib_path, config, &group, parent));
     }
@@ -1300,6 +1297,25 @@ fn library_group(
             },
         );
     });
+    group
+}
+
+/// The Import group, last on the page: bringing in another player's library
+/// is a one-time step rather than a setting.
+fn import_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.import").as_ref())
+        .build();
+    group.add(
+        &adw::ButtonRow::builder()
+            .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
+            .start_icon_name("document-open-symbolic")
+            // Reuse the window action so the Preferences entry follows the
+            // same admission, shutdown, and migration-dialog path as the
+            // former menu item.
+            .action_name("win.migrate-rhythmbox")
+            .build(),
+    );
     group
 }
 
@@ -2715,12 +2731,8 @@ pub mod widget_tests {
         let group = super::library_group(&parent, &config);
 
         let rows = descendants::<gtk::ListBoxRow>(group.upcast_ref());
-        assert_eq!(
-            rows.len(),
-            4,
-            "the Rhythmbox import, two folders, and Add Folder…"
-        );
-        let folders: Vec<adw::ActionRow> = rows[1..3]
+        assert_eq!(rows.len(), 3, "two folders and Add Folder…");
+        let folders: Vec<adw::ActionRow> = rows[..2]
             .iter()
             .map(|row| row.clone().downcast().expect("folder rows are action rows"))
             .collect();
@@ -2751,7 +2763,7 @@ pub mod widget_tests {
                 assert_eq!(button.is_sensitive(), !locked);
             }
         }
-        let add = rows[3]
+        let add = rows[2]
             .clone()
             .downcast::<adw::ButtonRow>()
             .expect("the list ends with Add Folder…");

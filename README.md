@@ -782,7 +782,7 @@ of video IDs or watch URLs is not enough to match a local library.
 
 ### Importing from Rhythmbox
 
-Open **Preferences → Library** and choose **Import from Rhythmbox…**, then select the Rhythmbox
+Open **Preferences → Import** and choose **Import from Rhythmbox…**, then select the Rhythmbox
 profile folder containing `rhythmdb.xml` (and `playlists.xml` when present). The preview shows
 what will be imported before anything is written. Ratings and play counts are enabled by default;
 last-played timestamps and overwriting an existing Tributary rating are explicit choices, and an
@@ -845,12 +845,14 @@ Open **Preferences** from the hamburger menu (☰) to:
   folder may be a symbolic link to another location; its tracks keep the path you added. Symbolic
   links inside a library folder are not followed. Removing a folder forgets its tracks, with their
   play counts and ratings, at the next start; playlists keep those entries as unmatched items.
-- Reauthorize a library folder or import from Rhythmbox
+- Reauthorize a library folder
 - Choose the folder that downloaded tracks are saved to (see [Downloading Remote Tracks](#downloading-remote-tracks))
 - Toggle browser panes (Genre, Artist, Album, Folder) and album-pane artwork
 - Show/hide tracklist columns
 - Set up the equalizer for playback on this computer
 - Turn the location lookup for Stations Near Me on or off (see [Internet Radio](#internet-radio))
+- Import ratings, play counts, and playlists from Rhythmbox (see
+  [Importing from Rhythmbox](#importing-from-rhythmbox))
 
 ---
 
