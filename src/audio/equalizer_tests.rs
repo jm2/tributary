@@ -24,7 +24,7 @@ fn presets_load_their_gains_and_custom_keeps_the_current_ones() {
 
     settings.select_preset(Preset::Rock);
     assert_eq!(settings.bands_db, Preset::Rock.band_gains_db().unwrap());
-    assert_eq!(settings.preamp_db, -1.0);
+    assert_eq!(settings.preamp_db, -6.5);
 
     settings.bands_db[0] = 4.5;
     settings.select_preset(Preset::Custom);
@@ -33,7 +33,7 @@ fn presets_load_their_gains_and_custom_keeps_the_current_ones() {
         settings.bands_db[0], 4.5,
         "Custom must keep the edited gains"
     );
-    assert_eq!(settings.preamp_db, -1.0);
+    assert_eq!(settings.preamp_db, -6.5);
 
     for preset in Preset::ALL {
         let mut selected = EqualizerSettings::default();
@@ -60,6 +60,71 @@ fn the_bands_are_iso_octaves_with_twelve_db_either_way() {
     assert_eq!((MIN_GAIN_DB, MAX_GAIN_DB), (-12.0, 12.0));
 }
 
+#[allow(clippy::float_cmp)] // preset tables are exact half-dB steps
+#[test]
+fn the_presets_are_winamps_classic_presets_within_twelve_db() {
+    let named: Vec<Preset> = Preset::ALL
+        .into_iter()
+        .filter(|preset| *preset != Preset::Custom)
+        .collect();
+    assert_eq!(named.len(), 18, "Flat and Winamp's seventeen presets");
+    for preset in named {
+        let bands = preset.band_gains_db().unwrap();
+        for gain in bands {
+            assert_eq!(snap_gain_db(gain), gain, "{preset:?} {gain} is on the grid");
+        }
+        let boost = bands.iter().copied().fold(0.0, f64::max);
+        assert_eq!(
+            preset.preamp_db(),
+            -boost,
+            "{preset:?} preamp cancels its boost"
+        );
+        assert!(preset.preamp_db().is_sign_positive() || boost > 0.0);
+    }
+    assert_eq!(Preset::Custom.band_gains_db(), None);
+    assert_eq!(Preset::Custom.preamp_db(), 0.0);
+
+    // Spot checks against Winamp's values at 0.12 dB per unit: Full Treble's
+    // 85 at 16 kHz, Full Bass's 70 held flat below 60 Hz, Classical's -50.
+    assert_eq!(Preset::FullTreble.band_gains_db().unwrap()[9], 10.0);
+    assert_eq!(Preset::FullTreble.preamp_db(), -10.0);
+    assert_eq!(Preset::FullBass.band_gains_db().unwrap()[0], 8.5);
+    assert_eq!(Preset::Classical.band_gains_db().unwrap()[9], -6.0);
+    assert_eq!(Preset::Classical.preamp_db(), 0.0);
+}
+
+#[test]
+fn preset_names_are_saved_in_snake_case() {
+    let names: Vec<String> = Preset::ALL
+        .iter()
+        .map(|preset| serde_json::to_string(preset).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "\"flat\"",
+            "\"classical\"",
+            "\"club\"",
+            "\"dance\"",
+            "\"full_bass\"",
+            "\"full_bass_treble\"",
+            "\"full_treble\"",
+            "\"headphones\"",
+            "\"large_hall\"",
+            "\"live\"",
+            "\"party\"",
+            "\"pop\"",
+            "\"reggae\"",
+            "\"rock\"",
+            "\"ska\"",
+            "\"soft\"",
+            "\"soft_rock\"",
+            "\"techno\"",
+            "\"custom\"",
+        ]
+    );
+}
+
 #[allow(clippy::float_cmp)] // snapped gains are exact half-dB steps
 #[test]
 fn validation_clamps_snaps_and_relabels_edited_presets() {
@@ -74,7 +139,7 @@ fn validation_clamps_snaps_and_relabels_edited_presets() {
 
     let mut rock = EqualizerSettings::default();
     rock.select_preset(Preset::Rock);
-    rock.bands_db[0] = 3.1; // snaps back onto the preset value
+    rock.bands_db[0] = 5.1; // snaps back onto the preset value
     assert_eq!(rock.validated().preset, Preset::Rock);
 
     let mut edited = rock;
@@ -95,12 +160,13 @@ fn the_config_field_round_trips_and_a_malformed_block_resets_only_the_equalizer(
         clip_protection: ClipProtection::Soft,
         ..EqualizerSettings::default()
     };
-    settings.select_preset(Preset::Jazz);
+    settings.select_preset(Preset::FullBassTreble);
     let config = AppConfig {
         equalizer: settings,
         ..AppConfig::default()
     };
     let json = serde_json::to_string(&config).expect("serialize config");
+    assert!(json.contains(r#""preset":"full_bass_treble""#), "{json}");
     let reloaded: AppConfig = serde_json::from_str(&json).expect("reload config");
     assert_eq!(reloaded.equalizer, settings);
 
@@ -109,7 +175,7 @@ fn the_config_field_round_trips_and_a_malformed_block_resets_only_the_equalizer(
 
     for malformed in [
         r#""loud""#,
-        r#"{"preset":"disco"}"#,
+        r#"{"preset":7}"#,
         r#"{"bands_db":[1.0,2.0]}"#,
         r#"{"enabled":"yes"}"#,
     ] {
@@ -128,6 +194,59 @@ fn the_config_field_round_trips_and_a_malformed_block_resets_only_the_equalizer(
     assert!(partial.equalizer.enabled);
     assert!((partial.equalizer.preamp_db - MAX_GAIN_DB).abs() < f64::EPSILON);
     assert_eq!(partial.equalizer.preset, Preset::Custom);
+}
+
+/// Load `equalizer` as the `equalizer` field of an otherwise ordinary config.
+fn load(equalizer: &str) -> EqualizerSettings {
+    let json = format!(r#"{{"library_paths":["/music"],"equalizer":{equalizer}}}"#);
+    let config: AppConfig = serde_json::from_str(&json).expect("config still loads");
+    assert_eq!(config.library_paths, ["/music"], "{equalizer}");
+    config.equalizer
+}
+
+#[allow(clippy::float_cmp)] // saved and snapped gains are exact half-dB steps
+#[test]
+fn earlier_configs_load_with_their_gains_clamped_to_twelve_db() {
+    // An earlier version's Jazz preset no longer exists: it loads as Custom
+    // with its gains, as does any other unknown name.
+    let jazz = load(
+        r#"{"enabled":true,"preset":"jazz","preamp_db":-1.0,
+            "bands_db":[2.0,1.0,0.0,1.0,1.0,0.0,1.0,2.0,2.0,1.0],"clip_protection":"soft"}"#,
+    );
+    assert_eq!(jazz.preset, Preset::Custom);
+    assert!(jazz.enabled);
+    assert_eq!(jazz.preamp_db, -1.0);
+    assert_eq!(
+        jazz.bands_db,
+        [2.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 2.0, 2.0, 1.0]
+    );
+    assert_eq!(jazz.clip_protection, ClipProtection::Soft);
+    assert_eq!(load(r#"{"preset":"disco"}"#).preset, Preset::Custom);
+
+    // Pop still exists, but the saved gains are the earlier version's Pop.
+    let old_pop = load(
+        r#"{"preset":"pop","preamp_db":-2.0,
+            "bands_db":[1.0,2.0,3.0,2.0,0.0,-1.0,-1.0,0.0,1.0,2.0]}"#,
+    );
+    assert_eq!(old_pop.preset, Preset::Custom);
+    assert_eq!(
+        old_pop.bands_db,
+        [1.0, 2.0, 3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 1.0, 2.0]
+    );
+
+    // The earlier range reached -24 dB; those gains clamp to -12 dB.
+    let deep = load(
+        r#"{"preset":"custom","preamp_db":-24.0,
+            "bands_db":[-24.0,-18.0,-12.5,0.0,0.0,0.0,0.0,0.0,12.0,30.0]}"#,
+    );
+    assert_eq!(deep.preamp_db, -12.0);
+    assert_eq!(
+        deep.bands_db,
+        [-12.0, -12.0, -12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 12.0, 12.0]
+    );
+
+    let flat = load(r#"{"preset":"flat","bands_db":[0,0,0,0,0,0,0,0,0,0]}"#);
+    assert_eq!(flat.preset, Preset::Flat);
 }
 
 // ── Real pipelines ──────────────────────────────────────────────────────

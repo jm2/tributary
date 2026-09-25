@@ -56,10 +56,23 @@ fn unavailable_reason(output: &dyn AudioOutput) -> Option<String> {
 fn preset_label(preset: Preset) -> String {
     match preset {
         Preset::Flat => rust_i18n::t!("equalizer.preset_flat"),
-        Preset::Pop => rust_i18n::t!("equalizer.preset_pop"),
-        Preset::Rock => rust_i18n::t!("equalizer.preset_rock"),
-        Preset::Jazz => rust_i18n::t!("equalizer.preset_jazz"),
         Preset::Classical => rust_i18n::t!("equalizer.preset_classical"),
+        Preset::Club => rust_i18n::t!("equalizer.preset_club"),
+        Preset::Dance => rust_i18n::t!("equalizer.preset_dance"),
+        Preset::FullBass => rust_i18n::t!("equalizer.preset_full_bass"),
+        Preset::FullBassTreble => rust_i18n::t!("equalizer.preset_full_bass_treble"),
+        Preset::FullTreble => rust_i18n::t!("equalizer.preset_full_treble"),
+        Preset::Headphones => rust_i18n::t!("equalizer.preset_headphones"),
+        Preset::LargeHall => rust_i18n::t!("equalizer.preset_large_hall"),
+        Preset::Live => rust_i18n::t!("equalizer.preset_live"),
+        Preset::Party => rust_i18n::t!("equalizer.preset_party"),
+        Preset::Pop => rust_i18n::t!("equalizer.preset_pop"),
+        Preset::Reggae => rust_i18n::t!("equalizer.preset_reggae"),
+        Preset::Rock => rust_i18n::t!("equalizer.preset_rock"),
+        Preset::Ska => rust_i18n::t!("equalizer.preset_ska"),
+        Preset::Soft => rust_i18n::t!("equalizer.preset_soft"),
+        Preset::SoftRock => rust_i18n::t!("equalizer.preset_soft_rock"),
+        Preset::Techno => rust_i18n::t!("equalizer.preset_techno"),
         Preset::Custom => rust_i18n::t!("equalizer.preset_custom"),
     }
     .into_owned()
@@ -341,6 +354,35 @@ mod tests {
     }
 
     #[test]
+    fn every_preset_has_its_own_name() {
+        let names: Vec<String> = Preset::ALL.into_iter().map(preset_label).collect();
+        assert_eq!(
+            names,
+            [
+                "Flat",
+                "Classical",
+                "Club",
+                "Dance",
+                "Full Bass",
+                "Full Bass & Treble",
+                "Full Treble",
+                "Headphones",
+                "Large Hall",
+                "Live",
+                "Party",
+                "Pop",
+                "Reggae",
+                "Rock",
+                "Ska",
+                "Soft",
+                "Soft Rock",
+                "Techno",
+                "Custom",
+            ]
+        );
+    }
+
+    #[test]
     fn every_catalog_translates_every_equalizer_key() {
         use std::collections::BTreeMap;
 
@@ -433,15 +475,16 @@ pub mod widget_tests {
         let (_group, panel, changes) = panel(saved);
         assert!(panel.enabled.is_active());
         assert_eq!(panel.preset.selected(), position(Preset::Pop));
-        assert_eq!(panel.bands[2].value(), 3.0);
+        assert_eq!(panel.bands[3].value(), 4.0);
+        assert_eq!(panel.preamp.value(), -4.5);
         assert!(panel.preamp.is_sensitive());
 
         panel.preset.set_selected(position(Preset::Rock));
         let rock = last(&changes);
         assert_eq!(rock.preset, Preset::Rock);
         assert_eq!(rock.bands_db, Preset::Rock.band_gains_db().unwrap());
-        assert_eq!(panel.bands[0].value(), 3.0, "sliders follow the preset");
-        assert_eq!(panel.preamp.value(), -1.0);
+        assert_eq!(panel.bands[0].value(), 5.0, "sliders follow the preset");
+        assert_eq!(panel.preamp.value(), -6.5);
         assert_eq!(
             changes.borrow().len(),
             1,

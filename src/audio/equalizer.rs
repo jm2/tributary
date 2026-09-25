@@ -53,49 +53,114 @@ pub const fn band_width_hz(index: usize) -> u32 {
 }
 
 /// A named set of band gains and a matching preamp.
+///
+/// The named presets are Winamp's classic presets. Saved names this version
+/// does not know, such as an earlier version's `jazz`, load as
+/// [`Preset::Custom`] and keep their gains.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Preset {
     #[default]
     Flat,
-    Pop,
-    Rock,
-    Jazz,
     Classical,
+    Club,
+    Dance,
+    FullBass,
+    FullBassTreble,
+    FullTreble,
+    /// Winamp's "Laptop speakers/headphones".
+    Headphones,
+    LargeHall,
+    Live,
+    Party,
+    Pop,
+    Reggae,
+    Rock,
+    Ska,
+    Soft,
+    SoftRock,
+    Techno,
     /// Gains the user edited by hand.
+    #[serde(other)]
     Custom,
 }
 
 impl Preset {
     /// Every preset, in menu order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 19] = [
         Self::Flat,
-        Self::Pop,
-        Self::Rock,
-        Self::Jazz,
         Self::Classical,
+        Self::Club,
+        Self::Dance,
+        Self::FullBass,
+        Self::FullBassTreble,
+        Self::FullTreble,
+        Self::Headphones,
+        Self::LargeHall,
+        Self::Live,
+        Self::Party,
+        Self::Pop,
+        Self::Reggae,
+        Self::Rock,
+        Self::Ska,
+        Self::Soft,
+        Self::SoftRock,
+        Self::Techno,
         Self::Custom,
     ];
 
     /// The band gains this preset sets, or `None` for [`Preset::Custom`].
+    ///
+    /// The named presets are Winamp's classic presets, as Strawberry
+    /// carries them (`src/equalizer/equalizer.cpp`): -100…100 over Winamp's
+    /// bands at 60, 170, 310, 600 Hz and 1, 3, 6, 12, 14, 16 kHz. Each unit is
+    /// 0.12 dB for boosts and cuts alike, so ±100 is ±12 dB. Each ISO band
+    /// takes the Winamp curve's value at its centre, interpolated linearly
+    /// on a log-frequency axis and held flat below 60 Hz, then snapped to
+    /// [`GAIN_STEP_DB`].
     pub const fn band_gains_db(self) -> Option<[f64; 10]> {
         match self {
             Self::Flat => Some([0.0; 10]),
-            Self::Pop => Some([1.0, 2.0, 3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 1.0, 2.0]),
-            Self::Rock => Some([3.0, 2.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 3.0, 2.0]),
-            Self::Jazz => Some([2.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 2.0, 2.0, 1.0]),
-            Self::Classical => Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0]),
+            Self::Classical => Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0, -5.0, -6.0]),
+            Self::Club => Some([0.0, 0.0, 0.0, 1.5, 3.5, 3.5, 3.5, 3.0, 1.5, 0.0]),
+            Self::Dance => Some([6.0, 6.0, 4.5, 2.5, 0.5, 0.0, -2.5, -4.0, -5.0, 0.0]),
+            Self::FullBass => Some([8.5, 8.5, 8.5, 8.5, 6.0, 2.5, -2.5, -5.5, -6.0, -6.5]),
+            Self::FullBassTreble => Some([4.0, 4.0, 4.0, 1.5, -3.5, -3.0, -0.5, 3.0, 6.0, 7.0]),
+            Self::FullTreble => Some([-6.0, -6.0, -6.0, -6.0, -4.0, 2.0, 5.0, 8.0, 9.5, 10.0]),
+            Self::Headphones => Some([3.0, 3.0, 5.0, 4.0, -1.0, 0.0, -2.5, -4.0, -5.0, 0.0]),
+            Self::LargeHall => Some([6.0, 6.0, 6.0, 4.5, 3.5, 0.0, -2.0, -3.0, -3.0, 0.0]),
+            Self::Live => Some([-3.0, -3.0, -1.0, 1.5, 3.0, 3.5, 3.5, 3.0, 2.0, 1.0]),
+            Self::Party => Some([4.0, 4.0, 4.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0]),
+            Self::Pop => Some([-1.0, -1.0, 2.0, 4.0, 4.5, 3.0, 0.5, -1.0, -2.0, -1.0]),
+            Self::Reggae => Some([0.0, 0.0, 0.0, -0.5, -3.0, 0.0, -2.5, -4.0, -2.5, 0.0]),
+            Self::Rock => Some([5.0, 4.5, 3.5, -1.0, -4.5, -2.5, 0.5, 3.5, 6.0, 6.5]),
+            Self::Ska => Some([-2.0, -2.0, -2.5, -3.0, -1.5, 2.5, 3.0, 4.5, 5.5, 6.0]),
+            Self::Soft => Some([3.0, 3.0, 1.5, 0.0, -1.5, -0.5, 1.5, 3.5, 5.5, 7.0]),
+            Self::SoftRock => Some([2.5, 2.5, 2.5, 1.5, 0.0, -3.0, -3.5, -3.0, -1.5, 5.5]),
+            Self::Techno => Some([5.0, 4.5, 4.0, 1.5, -2.5, -3.0, -1.0, 2.0, 5.5, 5.5]),
             Self::Custom => None,
         }
     }
 
-    /// The preamp that keeps this preset's boosted bands clear of clipping.
+    /// The preamp that keeps this preset's boosted bands clear of clipping:
+    /// it cuts by the preset's largest band boost, so no single band lifts a
+    /// full-scale signal above full scale. A preset that only cuts gets 0 dB.
+    /// Neighbouring boosted bands overlap and can still add a few dB between
+    /// them, which Soft clip protection catches.
     pub const fn preamp_db(self) -> f64 {
-        match self {
-            Self::Pop | Self::Classical => -2.0,
-            Self::Rock | Self::Jazz => -1.0,
-            Self::Flat | Self::Custom => 0.0,
+        let Some(bands) = self.band_gains_db() else {
+            return 0.0;
+        };
+        let mut boost = 0.0;
+        let mut index = 0;
+        while index < bands.len() {
+            if bands[index] > boost {
+                boost = bands[index];
+            }
+            index += 1;
         }
+        // `0.0 - 0.0` is +0.0, so a cut-only preset saves `0.0`, not `-0.0`.
+        0.0 - boost
     }
 }
 
