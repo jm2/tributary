@@ -61,7 +61,8 @@ browser:
   unknown_genre: "不明"
   folder_no_sources: "フォルダー表示の対象はローカルライブラリのソースだけです"
   folder_no_roots: "ライブラリフォルダーが設定されていません"
-  album_artwork: "アルバム表示のアートワーク"
+  album_artwork: "アルバムアートワーク"
+  album_artwork_off: "オフ"
   album_artwork_size_small: "小"
   album_artwork_size_medium: "中"
   album_artwork_size_large: "大"
@@ -134,9 +135,10 @@ preferences:
   privacy: "プライバシー"
   location_title: "近くの局のための位置情報"
   location_subtitle: "ipapi.co、ipwho.is、または freeipapi.com を使って、IP アドレスからおおよその位置を調べます。"
-  add_folder: "フォルダーを追加"
+  add_folder: "フォルダーを追加…"
   remove_folder: "フォルダーを削除"
   group_by_album_artist: "アルバムアーティストでまとめる"
+  import: "インポート"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

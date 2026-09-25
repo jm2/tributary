@@ -63,7 +63,8 @@ browser:
   unknown_genre: "Nieznany"
   folder_no_sources: "Przeglądanie folderów obejmuje tylko źródła biblioteki lokalnej"
   folder_no_roots: "Nie skonfigurowano folderów biblioteki"
-  album_artwork: "Okładki w panelu albumów"
+  album_artwork: "Okładki albumów"
+  album_artwork_off: "Wyłączone"
   album_artwork_size_small: "Mały"
   album_artwork_size_medium: "Średni"
   album_artwork_size_large: "Duży"
@@ -136,9 +137,10 @@ preferences:
   privacy: "Prywatność"
   location_title: "Lokalizacja dla Stacji w pobliżu"
   location_subtitle: "Ustalaj przybliżoną lokalizację na podstawie adresu IP za pomocą ipapi.co, ipwho.is lub freeipapi.com."
-  add_folder: "Dodaj folder"
+  add_folder: "Dodaj folder…"
   remove_folder: "Usuń folder"
   group_by_album_artist: "Grupuj według artysty albumu"
+  import: "Import"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

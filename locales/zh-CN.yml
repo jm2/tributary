@@ -61,7 +61,8 @@ browser:
   unknown_genre: "未知"
   folder_no_sources: "文件夹浏览仅适用于本地音乐库来源"
   folder_no_roots: "未配置音乐库文件夹"
-  album_artwork: "专辑视图封面"
+  album_artwork: "专辑封面"
+  album_artwork_off: "关闭"
   album_artwork_size_small: "小"
   album_artwork_size_medium: "中"
   album_artwork_size_large: "大"
@@ -134,9 +135,10 @@ preferences:
   privacy: "隐私"
   location_title: "附近电台的位置"
   location_subtitle: "通过 ipapi.co、ipwho.is 或 freeipapi.com，根据你的 IP 地址查询大致位置。"
-  add_folder: "添加文件夹"
+  add_folder: "添加文件夹…"
   remove_folder: "移除文件夹"
   group_by_album_artist: "按专辑艺术家分组"
+  import: "导入"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

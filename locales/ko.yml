@@ -61,7 +61,8 @@ browser:
   unknown_genre: "알 수 없음"
   folder_no_sources: "폴더 탐색은 로컬 라이브러리 소스에서만 사용할 수 있습니다"
   folder_no_roots: "설정된 라이브러리 폴더가 없습니다"
-  album_artwork: "앨범 보기 아트워크"
+  album_artwork: "앨범 아트워크"
+  album_artwork_off: "끄기"
   album_artwork_size_small: "작게"
   album_artwork_size_medium: "보통"
   album_artwork_size_large: "크게"
@@ -134,9 +135,10 @@ preferences:
   privacy: "개인정보"
   location_title: "내 주변 방송국 위치"
   location_subtitle: "ipapi.co, ipwho.is 또는 freeipapi.com을 통해 IP 주소로 대략적인 위치를 확인합니다."
-  add_folder: "폴더 추가"
+  add_folder: "폴더 추가…"
   remove_folder: "폴더 제거"
   group_by_album_artist: "앨범 아티스트별로 묶기"
+  import: "가져오기"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:

@@ -61,7 +61,8 @@ browser:
   unknown_genre: "Desconocido"
   folder_no_sources: "La navegación por carpetas solo incluye las fuentes de la biblioteca local"
   folder_no_roots: "No hay carpetas de biblioteca configuradas"
-  album_artwork: "Carátulas en el panel de álbumes"
+  album_artwork: "Carátulas de álbumes"
+  album_artwork_off: "Desactivadas"
   album_artwork_size_small: "Pequeño"
   album_artwork_size_medium: "Mediano"
   album_artwork_size_large: "Grande"
@@ -134,9 +135,10 @@ preferences:
   privacy: "Privacidad"
   location_title: "Ubicación para Estaciones cercanas"
   location_subtitle: "Obtener tu ubicación aproximada a partir de tu dirección IP mediante ipapi.co, ipwho.is o freeipapi.com."
-  add_folder: "Añadir carpeta"
+  add_folder: "Añadir carpeta…"
   remove_folder: "Quitar carpeta"
   group_by_album_artist: "Agrupar por artista del álbum"
+  import: "Importación"
 
 # ── Settings files ─────────────────────────────────────────────────
 settings:
