@@ -134,7 +134,7 @@ preferences:
   privacy: "개인정보"
   location_title: "내 주변 방송국 위치"
   location_subtitle: "ipapi.co, ipwho.is 또는 freeipapi.com을 통해 IP 주소로 대략적인 위치를 확인합니다."
-  add_folder: "폴더 추가"
+  add_folder: "폴더 추가…"
   remove_folder: "폴더 제거"
   group_by_album_artist: "앨범 아티스트별로 묶기"
 

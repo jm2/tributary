@@ -908,133 +908,9 @@ pub fn show_preferences(
     }
 
     let page = adw::PreferencesPage::new();
-    let cfg = config.borrow();
-
-    // ── Library Location group (supports multiple folders) ──────────
-    let library_group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.library_location").as_ref())
-        .build();
-
-    // The "+" (add) and the per-row "−" (remove) buttons all live inside this
-    // one content box, so they share its trailing edge and line up by
-    // construction — no DPI-fragile fixed margins. (A header-suffix "+" can't
-    // be made to align with the rows, because adw lays the group header and
-    // the row list out in separate containers with different insets.)
-    let library_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .build();
-
-    // "+" at the bottom-right of the group body, after the folder rows.
-    let add_folder_btn = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .halign(gtk::Align::End)
-        .css_classes(["flat", "circular"])
-        .tooltip_text(rust_i18n::t!("preferences.add_folder").as_ref())
-        .build();
-
-    // Hint shown once the user adds or removes a folder. The running
-    // library engine only reads the configured paths at startup, so a
-    // restart is required before a newly-added folder is scanned/watched
-    // (and a removed folder stops being watched). Hidden until a change.
-    let restart_hint_text = if cfg.pending_root_reauthorizations.is_empty() {
-        rust_i18n::t!("preferences.library_restart_hint")
-    } else {
-        rust_i18n::t!("preferences.reauthorization_restart_hint")
-    };
-    let restart_hint = gtk::Label::builder()
-        .label(restart_hint_text.as_ref())
-        .css_classes(["dim-label", "caption"])
-        .halign(gtk::Align::Start)
-        .wrap(true)
-        .visible(!cfg.pending_root_reauthorizations.is_empty())
-        .margin_top(2)
-        .build();
-
-    // One row per folder: path on the left, "−" flush to the right edge.
-    let paths_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .build();
-    for lib_path in &cfg.library_paths {
-        paths_box.append(&build_library_path_row(
-            lib_path,
-            config.clone(),
-            paths_box.clone(),
-            restart_hint.clone(),
-            parent.clone(),
-        ));
-    }
-    library_box.append(&paths_box);
-    library_box.append(&add_folder_btn);
-    library_box.append(&restart_hint);
-
-    // Add a folder via the file chooser.
-    {
-        let config = config.clone();
-        let paths_box = paths_box.clone();
-        let parent = parent.clone();
-        let restart_hint = restart_hint.clone();
-        add_folder_btn.connect_clicked(move |_| {
-            let config = config.clone();
-            let paths_box = paths_box.clone();
-            let restart_hint = restart_hint.clone();
-            let dialog = gtk::FileDialog::builder()
-                .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
-                .modal(true)
-                .build();
-            let parent_for_result = parent.clone();
-
-            dialog.select_folder(
-                Some(&parent),
-                None::<&gtk::gio::Cancellable>,
-                move |result| {
-                    if let Ok(folder) = result {
-                        if let Some(path) = folder.path() {
-                            let Some(path_str) = path.to_str().map(str::to_string) else {
-                                warn!("Ignoring a selected library folder with a non-Unicode path");
-                                return;
-                            };
-                            if !add_library_path(&config, &path_str) {
-                                return;
-                            }
-
-                            let row = build_library_path_row(
-                                &path_str,
-                                config.clone(),
-                                paths_box.clone(),
-                                restart_hint.clone(),
-                                parent_for_result.clone(),
-                            );
-                            paths_box.append(&row);
-                            // The engine won't pick up the new folder until
-                            // the next launch — tell the user a restart is
-                            // needed instead of leaving them with an empty
-                            // library.
-                            restart_hint.set_label(
-                                rust_i18n::t!("preferences.library_restart_hint").as_ref(),
-                            );
-                            restart_hint.set_visible(true);
-                        }
-                    }
-                },
-            );
-        });
-    }
-
-    let import_rhythmbox_btn = adw::ButtonRow::builder()
-        .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
-        .start_icon_name("document-open-symbolic")
-        // Reuse the window action so the Preferences entry follows the same
-        // admission, shutdown, and migration-dialog path as the former menu
-        // item.
-        .action_name("win.migrate-rhythmbox")
-        .build();
-
-    library_group.add(&library_box);
-    library_group.add(&import_rhythmbox_btn);
-    page.add(&library_group);
+    page.add(&library_group(parent, config));
     page.add(&downloads_group(parent, config, saves));
+    let cfg = config.borrow();
 
     // ── Browser Views group (dense horizontal checkboxes) ───────────
     let browser_group = adw::PreferencesGroup::builder()
@@ -1340,6 +1216,93 @@ pub fn show_preferences(
     page
 }
 
+/// The Library Location group: one row per library folder, laid out like
+/// the Downloads row, and an Add Folder… row closing the list.
+///
+/// The running library engine reads the configured folders only at startup,
+/// so adding or removing a folder shows a restart hint as the group
+/// description, and a pending reauthorization shows its own hint from the
+/// start.
+fn library_group(
+    parent: &adw::ApplicationWindow,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.library_location").as_ref())
+        .build();
+    if !config.borrow().pending_root_reauthorizations.is_empty() {
+        group.set_description(Some(
+            rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref(),
+        ));
+    }
+    let import_rhythmbox_btn = adw::ButtonRow::builder()
+        .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
+        .start_icon_name("document-open-symbolic")
+        // Reuse the window action so the Preferences entry follows the same
+        // admission, shutdown, and migration-dialog path as the former menu
+        // item.
+        .action_name("win.migrate-rhythmbox")
+        .build();
+    group.add(&import_rhythmbox_btn);
+    for lib_path in &config.borrow().library_paths {
+        group.add(&library_folder_row(lib_path, config, &group, parent));
+    }
+
+    let add_row = adw::ButtonRow::builder()
+        .title(rust_i18n::t!("preferences.add_folder").as_ref())
+        .start_icon_name("list-add-symbolic")
+        .build();
+    group.add(&add_row);
+
+    // Add a folder via the file chooser.
+    let (parent, config, group_ref) = (parent.clone(), config.clone(), group.downgrade());
+    add_row.connect_activated(move |add_row| {
+        let Some(group) = group_ref.upgrade() else {
+            return;
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title(rust_i18n::t!("preferences.select_music_folder").as_ref())
+            .modal(true)
+            .build();
+        let (config, parent_for_result, add_row) =
+            (config.clone(), parent.clone(), add_row.clone());
+        dialog.select_folder(
+            Some(&parent),
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                let Some(path) = result.ok().and_then(|folder| folder.path()) else {
+                    return;
+                };
+                let Some(path) = path.to_str() else {
+                    warn!("Ignoring a selected library folder with a non-Unicode path");
+                    return;
+                };
+                if !add_library_path(&config, path) {
+                    return;
+                }
+                // A group only appends rows, so Add Folder… moves back below
+                // the new folder, keeping the focus it had.
+                group.remove(&add_row);
+                group.add(&library_folder_row(
+                    path,
+                    &config,
+                    &group,
+                    &parent_for_result,
+                ));
+                group.add(&add_row);
+                add_row.grab_focus();
+                // The engine won't pick up the new folder until the next
+                // launch — tell the user a restart is needed instead of
+                // leaving them with an empty library.
+                group.set_description(Some(
+                    rust_i18n::t!("preferences.library_restart_hint").as_ref(),
+                ));
+            },
+        );
+    });
+    group
+}
+
 /// The Downloads group: where downloaded remote tracks are saved.
 fn downloads_group(
     parent: &adw::ApplicationWindow,
@@ -1555,43 +1518,47 @@ fn settle_pending_separators(pending_separators: &mut Vec<gtk::Widget>, gutter_v
     }
 }
 
-/// Build a library-folder row: the path (left, ellipsized) and its own "−"
-/// remove button flush to the right edge, so it lines up under the group's
-/// "+". A plain `Label` is used (no Pango markup), so no escaping is needed.
+/// One library folder as a row laid out like the Downloads one: the folder's
+/// name over its full path, with flat Reauthorize… and remove buttons.
 ///
 /// An empty list is valid (for example on first launch), but a root with an
 /// in-flight reauthorization is locked until its exact intent settles.
-fn build_library_path_row(
+fn library_folder_row(
     path: &str,
-    config: std::rc::Rc<std::cell::RefCell<AppConfig>>,
-    paths_box: gtk::Box,
-    restart_hint: gtk::Label,
-    parent: adw::ApplicationWindow,
-) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    group: &adw::PreferencesGroup,
+    parent: &adw::ApplicationWindow,
+) -> adw::ActionRow {
+    let name = std::path::Path::new(path).file_name().map_or_else(
+        || path.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    // Folder names are plain text, never Pango markup. The labels only take
+    // `use-markup` once construction ends, so the text is set afterwards.
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .subtitle_selectable(true)
         .build();
+    row.set_title(&name);
+    row.set_subtitle(path);
 
-    let label = gtk::Label::builder()
-        .label(path)
-        .hexpand(true)
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
+    let reauthorize_label = rust_i18n::t!("preferences.reauthorize_folder");
+    let reauthorize_btn = gtk::Button::builder()
+        .icon_name("folder-open-symbolic")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text(reauthorize_label.as_ref())
         .build();
+    reauthorize_btn.update_property(&[gtk::accessible::Property::Label(&reauthorize_label)]);
 
+    let remove_label = rust_i18n::t!("preferences.remove_folder");
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
         .valign(gtk::Align::Center)
-        .css_classes(["flat", "circular"])
-        .tooltip_text(rust_i18n::t!("preferences.remove_folder").as_ref())
-        .build();
-
-    let reauthorize_btn = gtk::Button::builder()
-        .label(rust_i18n::t!("preferences.reauthorize_folder").as_ref())
-        .valign(gtk::Align::Center)
         .css_classes(["flat"])
+        .tooltip_text(remove_label.as_ref())
         .build();
+    remove_btn.update_property(&[gtk::accessible::Property::Label(&remove_label)]);
 
     let has_pending_request = config
         .borrow()
@@ -1601,17 +1568,16 @@ fn build_library_path_row(
     reauthorize_btn.set_sensitive(!has_pending_request);
     remove_btn.set_sensitive(!has_pending_request);
 
-    row.append(&label);
-    row.append(&reauthorize_btn);
-    row.append(&remove_btn);
+    row.add_suffix(&reauthorize_btn);
+    row.add_suffix(&remove_btn);
 
     let old_path = path.to_string();
     {
         let config = config.clone();
         let parent = parent.clone();
-        let restart_hint = restart_hint.clone();
-        let reauthorize_btn_for_state = reauthorize_btn.clone();
-        let remove_btn_for_state = remove_btn.clone();
+        let group = group.downgrade();
+        let reauthorize_btn_for_state = reauthorize_btn.downgrade();
+        let remove_btn_for_state = remove_btn.downgrade();
         reauthorize_btn.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::builder()
                 .title(
@@ -1622,7 +1588,7 @@ fn build_library_path_row(
             let config = config.clone();
             let parent = parent.clone();
             let old_path = old_path.clone();
-            let restart_hint = restart_hint.clone();
+            let group = group.clone();
             let reauthorize_btn = reauthorize_btn_for_state.clone();
             let remove_btn = remove_btn_for_state.clone();
             let parent_for_result = parent.clone();
@@ -1697,7 +1663,7 @@ fn build_library_path_row(
                     let config = config.clone();
                     let parent = parent_for_result.clone();
                     let parent_for_response = parent.clone();
-                    let restart_hint = restart_hint.clone();
+                    let group = group.clone();
                     let reauthorize_btn = reauthorize_btn.clone();
                     let remove_btn = remove_btn.clone();
                     confirmation.connect_response(None, move |_dialog, response| {
@@ -1727,15 +1693,19 @@ fn build_library_path_row(
                         match result {
                             Ok(RootReauthorizationSchedule::Scheduled { request_id }) => {
                                 info!(%request_id, old_path = %old_path, new_path = %new_path, "Library root reauthorization scheduled");
-                                restart_hint.set_label(
-                                    rust_i18n::t!(
-                                        "preferences.reauthorization_restart_hint"
-                                    )
-                                    .as_ref(),
-                                );
-                                restart_hint.set_visible(true);
-                                reauthorize_btn.set_sensitive(false);
-                                remove_btn.set_sensitive(false);
+                                if let Some(group) = group.upgrade() {
+                                    group.set_description(Some(
+                                        rust_i18n::t!(
+                                            "preferences.reauthorization_restart_hint"
+                                        )
+                                        .as_ref(),
+                                    ));
+                                }
+                                for button in [&reauthorize_btn, &remove_btn] {
+                                    if let Some(button) = button.upgrade() {
+                                        button.set_sensitive(false);
+                                    }
+                                }
                             }
                             Err(error) => present_reauthorization_error(
                                 &parent_for_response,
@@ -1751,8 +1721,10 @@ fn build_library_path_row(
         });
     }
 
+    let config = config.clone();
     let path_owned = path.to_string();
-    let row_clone = row.clone();
+    let group = group.downgrade();
+    let row_ref = row.downgrade();
     remove_btn.connect_clicked(move |_| {
         let removed = {
             let mut cfg = config.borrow_mut();
@@ -1767,12 +1739,16 @@ fn build_library_path_row(
         if !removed {
             return;
         }
-        paths_box.remove(&row_clone);
+        let (Some(group), Some(row)) = (group.upgrade(), row_ref.upgrade()) else {
+            return;
+        };
+        group.remove(&row);
         // The engine keeps watching the removed folder until the next
         // launch — surface a restart hint so the stale tracks aren't
         // mistaken for a bug.
-        restart_hint.set_label(rust_i18n::t!("preferences.library_restart_hint").as_ref());
-        restart_hint.set_visible(true);
+        group.set_description(Some(
+            rust_i18n::t!("preferences.library_restart_hint").as_ref(),
+        ));
     });
 
     row
@@ -2369,9 +2345,12 @@ pub mod widget_tests {
     use super::BrowserViewsConfig;
     use super::{
         apply_column_order, apply_column_visibility, column_title, identified_columns,
-        read_column_order, AppConfig, ALL_COLUMNS,
+        read_column_order, AppConfig, PendingRootReauthorization, ALL_COLUMNS,
     };
+    use adw::prelude::*;
     use gtk::prelude::{BoxExt, CastNone, ListModelExt, WidgetExt};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// Mirror of `build_browser`'s pane row: SearchEntry stand-in, then
     /// the horizontal panes_box alternating genre, gutter, artist,
@@ -2702,5 +2681,89 @@ pub mod widget_tests {
                 Some(column_title(&id, &locale).as_str())
             );
         }
+    }
+
+    /// Every descendant of `root` of type `T`, in tree order.
+    fn descendants<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Vec<T> {
+        let mut found = Vec::new();
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            if let Some(typed) = widget.downcast_ref::<T>() {
+                found.push(typed.clone());
+            }
+            found.extend(descendants::<T>(&widget));
+            child = widget.next_sibling();
+        }
+        found
+    }
+
+    /// Library folders are rows like the Downloads one — name, full path,
+    /// and flat suffix buttons — closed by the Add Folder… row, and a folder
+    /// with a pending reauthorization stays locked.
+    pub fn library_folders_are_listed_like_the_downloads_row() {
+        let pending = "/media/usb & co/Rock";
+        let config = Rc::new(RefCell::new(AppConfig {
+            library_paths: vec!["/music/Main".to_string(), pending.to_string()],
+            pending_root_reauthorizations: vec![PendingRootReauthorization {
+                request_id: "21c020ca-57df-4fd9-a950-e34fb40a6c1b".to_string(),
+                old_path: pending.to_string(),
+                new_path: "/media/usb/Rock".to_string(),
+            }],
+            ..AppConfig::default()
+        }));
+        let parent = adw::ApplicationWindow::builder().build();
+        let group = super::library_group(&parent, &config);
+
+        let rows = descendants::<gtk::ListBoxRow>(group.upcast_ref());
+        assert_eq!(
+            rows.len(),
+            4,
+            "the Rhythmbox import, two folders, and Add Folder…"
+        );
+        let folders: Vec<adw::ActionRow> = rows[1..3]
+            .iter()
+            .map(|row| row.clone().downcast().expect("folder rows are action rows"))
+            .collect();
+        let shown: Vec<(String, String)> = folders
+            .iter()
+            .map(|row| {
+                (
+                    row.title().into(),
+                    row.subtitle().unwrap_or_default().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Main".to_string(), "/music/Main".to_string()),
+                ("Rock".to_string(), pending.to_string()),
+            ]
+        );
+        for (row, locked) in folders.iter().zip([false, true]) {
+            assert!(!row.uses_markup(), "paths are plain text");
+            assert!(row.is_subtitle_selectable());
+            let buttons = descendants::<gtk::Button>(row.upcast_ref());
+            assert_eq!(buttons.len(), 2, "Reauthorize… and remove");
+            for button in &buttons {
+                assert!(button.has_css_class("flat"));
+                assert_eq!(button.valign(), gtk::Align::Center);
+                assert_eq!(button.is_sensitive(), !locked);
+            }
+        }
+        let add = rows[3]
+            .clone()
+            .downcast::<adw::ButtonRow>()
+            .expect("the list ends with Add Folder…");
+        assert_eq!(
+            add.title().as_str(),
+            rust_i18n::t!("preferences.add_folder").as_ref()
+        );
+        assert_eq!(
+            group.description().as_deref(),
+            Some(rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref()),
+            "a pending reauthorization asks for a restart from the start"
+        );
+        parent.destroy();
     }
 }

@@ -344,10 +344,11 @@ rather than in software. It does not expose the whole home directory:
   the host.
 - Media mounted under `/media`, `/run/media`, and `/mnt` is exposed read/write for the automatic
   **Devices** entries, playback, tag editing, and **Copy to Device**.
-- A custom path saved by an older Flatpak build may become unavailable under this policy. Use that
-  root's **Reauthorize…** action in Preferences to reselect the same folder through the portal,
-  confirm the move, and restart Tributary so the relocation completes before scanning. Removing and
-  re-adding the folder instead would lose track IDs, history, and playlist links.
+- A custom path saved by an older Flatpak build may become unavailable under this policy. Use the
+  folder button (**Reauthorize…**) on that root's row in Preferences to reselect the same folder
+  through the portal, confirm the move, and restart Tributary so the relocation completes before
+  scanning. Removing and re-adding the folder instead would lose track IDs, history, and playlist
+  links.
 
 #### Moving Flatpak data to the new app ID
 

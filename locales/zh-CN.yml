@@ -134,7 +134,7 @@ preferences:
   privacy: "隐私"
   location_title: "附近电台的位置"
   location_subtitle: "通过 ipapi.co、ipwho.is 或 freeipapi.com，根据你的 IP 地址查询大致位置。"
-  add_folder: "添加文件夹"
+  add_folder: "添加文件夹…"
   remove_folder: "移除文件夹"
   group_by_album_artist: "按专辑艺术家分组"
 

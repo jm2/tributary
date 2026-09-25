@@ -134,7 +134,7 @@ preferences:
   privacy: "Confidentialité"
   location_title: "Localisation pour Stations à proximité"
   location_subtitle: "Déterminer votre position approximative à partir de votre adresse IP via ipapi.co, ipwho.is ou freeipapi.com."
-  add_folder: "Ajouter un dossier"
+  add_folder: "Ajouter un dossier…"
   remove_folder: "Retirer le dossier"
   group_by_album_artist: "Regrouper par artiste de l'album"
 

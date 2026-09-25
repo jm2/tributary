@@ -134,7 +134,7 @@ preferences:
   privacy: "Datenschutz"
   location_title: "Standort für Sender in der Nähe"
   location_subtitle: "Ihren ungefähren Standort anhand Ihrer IP-Adresse über ipapi.co, ipwho.is oder freeipapi.com ermitteln."
-  add_folder: "Ordner hinzufügen"
+  add_folder: "Ordner hinzufügen…"
   remove_folder: "Ordner entfernen"
   group_by_album_artist: "Nach Albumkünstler gruppieren"
 

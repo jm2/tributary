@@ -134,7 +134,7 @@ preferences:
   privacy: "Privacidade"
   location_title: "Localização para Estações próximas"
   location_subtitle: "Descobrir sua localização aproximada pelo seu endereço IP usando ipapi.co, ipwho.is ou freeipapi.com."
-  add_folder: "Adicionar pasta"
+  add_folder: "Adicionar pasta…"
   remove_folder: "Remover pasta"
   group_by_album_artist: "Agrupar por artista do álbum"
 
