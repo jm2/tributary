@@ -83,7 +83,7 @@ These need a person, a live service, or real hardware; CI can't produce them. Re
 the exact commit or artifact, the environment, and the result on the linked issue or release PR.
 
 - **O1 — Merge gate policy.** Done (#339, #414): eleven required checks including Coverage at an
-  80.3% floor, strict mode off, admin bypass through pull requests only. See "Merge gate" in
+  84.0% floor (widget tests included), strict mode off, admin bypass through pull requests only. See "Merge gate" in
   `docs/refinery-config.md`.
 - **O2 — Live CI timeout and check names.** Done (#288).
 - **V1 — Removable media.** Browse, play, and detach/reconnect on real removable hardware.
