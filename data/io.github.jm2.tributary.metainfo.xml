@@ -49,6 +49,20 @@
   </screenshots>
 
   <releases>
+    <release version="0.7.0" date="2026-09-29">
+      <description>
+        <p>Feature and reliability release:</p>
+        <ul>
+          <li>Download server tracks for offline listening, and copy tracks or playlists to USB drives and SD cards</li>
+          <li>Drag tracks to a file manager or onto playlists, and browse the library by folder</li>
+          <li>A ten-band graphic equalizer with classic presets, opened from the header bar</li>
+          <li>Album artwork in the browser, and seeking and artwork in the system media controls</li>
+          <li>Jellyfin 12 sign-in and many fixes for Subsonic, Plex, DAAP, Chromecast, and MPD</li>
+          <li>Safer library upgrades with automatic backups, and fewer freezes during scans</li>
+          <li>A new application ID, io.github.jm2.tributary; Flatpak users can move their library as the release notes describe</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.2" date="2026-09-01">
       <description>
         <p>Compatibility and maintenance release:</p>

@@ -1,6 +1,6 @@
 # Tributary roadmap
 
-Last reviewed: 2026-09-24.
+Last reviewed: 2026-09-29.
 
 This page describes where Tributary is heading. It is a direction, not a release promise.
 **GitHub issues are the source of truth** for scope, acceptance, and state;
@@ -19,13 +19,13 @@ what works today, and the [changelog](../CHANGELOG.md) lists what changed.
 - **Link the issue.** Implementing PRs say `Closes #N` or `Refs #N`; closing the issue is how the
   work is marked done.
 
-## Now: release 0.7.0
+## Now: after 0.7.0
 
-The 2026-09-23 review's fixes are merged (merge trains #371 through #416), along with the
-Download, Copy to Device, drag-to-file-manager, equalizer, folder browsing, album artwork, and
-media-control features. The version is 0.7.0 and is not released yet. Before tagging it, the
-features need the real-server and hardware checks listed as V5 in [`task.md`](task.md); CI can't
-produce that evidence. After the release, close [#46] and publish the AppStream release notes.
+0.7.0 was released on 2026-09-29 with the 2026-09-23 review's fixes and the Download, Copy to
+Device, drag-to-file-manager, graphic equalizer, folder browsing, album artwork, and
+media-control features. It also moved to the application ID `io.github.jm2.tributary`, which
+Flathub requires. The next release gets the same real-server and hardware checks, listed as V5 in
+[`task.md`](task.md).
 
 ## Next
 
@@ -35,7 +35,9 @@ produce that evidence. After the release, close [#46] and publish the AppStream 
    after that: the library must first record which fields came from tags, so a title taken from
    the file name is never scrobbled. The [Last.fm design](lastfm-scrobbling.md) records the
    privacy and consent rules.
-2. **Flathub ([#266]).** Requested; publishing there hasn't been scheduled.
+2. **Flathub ([#266]).** The application ID now matches the repository, as Flathub requires. What's
+   left is the submission: a Flathub repository with the manifest and generated Cargo sources,
+   and answers to the review's questions about the drive-access permissions.
 3. **UI refinement ([#29]).** The separator, item-count, and alignment changes are merged; a
    visual and accessibility sign-off remains ([acceptance-p2.3-c.md](acceptance-p2.3-c.md)).
 
