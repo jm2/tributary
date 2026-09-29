@@ -1,6 +1,6 @@
 # Tributary backlog index
 
-Last reconciled: 2026-09-24 (main `c2ac8630`, version 0.7.0 unreleased).
+Last reconciled: 2026-09-29 (0.7.0 released from main `44fc35ce`).
 
 **GitHub issues are the source of truth.** Each issue holds its own scope, acceptance criteria,
 discussion, and state. This file only maps the stable IDs used in older docs, commits, and PR
@@ -25,7 +25,6 @@ GitHub.
 | --- | --- | --- | --- |
 | R11 | [#258](https://github.com/jm2/tributary/issues/258) | Non-UTF-8 local file names | Safe refusal shipped (#410): such files are skipped with a notice. Quarantining rows stored by older versions and a lossless path key remain |
 | P2.1-B | [#50](https://github.com/jm2/tributary/issues/50) | Last.fm scrobbling | LF1 (#289), LF2 (#305), LF3 (#308) merged; #335 and #337 fixed (#391). LF4 (packaged credentials, live acceptance) and [#336](https://github.com/jm2/tributary/issues/336) (local-library attribution, after LF4) open |
-| P2.2-B | [#46](https://github.com/jm2/tributary/issues/46) | Remaining drag-and-drop targets | Drag to a file manager shipped (#405); dragging remote tracks stays unavailable. Close with the 0.7.0 release |
 | P2.3-C | [#29](https://github.com/jm2/tributary/issues/29) | Separator, count-opacity, and alignment refinements | Merged (#179); visual and accessibility sign-off per [acceptance-p2.3-c.md](acceptance-p2.3-c.md) pending |
 | P2.4-F | — | Chromecast IPv6 media | Merged (#174, #278); a check against a real IPv6 receiver is pending |
 | P3.2 | [#8](https://github.com/jm2/tributary/issues/8) | Copy to devices | Copy to Device shipped (#404) for mounted storage; Android sync over MTP is not supported and keeps #8 open |
@@ -54,6 +53,7 @@ GitHub.
 | Q6 | [#300](https://github.com/jm2/tributary/issues/300) | Reduced scope chosen by the owner: an incomplete-library notice and a Jellyfin repeated-page guard, #418 |
 | Q7 | [#276](https://github.com/jm2/tributary/issues/276) | #280; the checker was retired on 2026-09-23 along with the counters it checked |
 | P2.2-A | [#46](https://github.com/jm2/tributary/issues/46) | Drops onto local playlists: #182, #242, #290 |
+| P2.2-B | [#46](https://github.com/jm2/tributary/issues/46) | Drag to a file manager: #405, released in 0.7.0; dragging remote tracks stays unavailable |
 | P2.3-A | [#14](https://github.com/jm2/tributary/issues/14) | Folder browsing: `455e786`, with R3–R6 and R10 |
 | P2.3-B | [#39](https://github.com/jm2/tributary/issues/39) | Album artwork in the browser: #171 |
 | P2.4-A, P2.4-B | [#49](https://github.com/jm2/tributary/issues/49) | Equalizer design #183; implementation #368 (replaced #220) |
@@ -92,7 +92,8 @@ the exact commit or artifact, the environment, and the result on the linked issu
   servers.
 - **V4 — macOS package.** Protected playback and output-device switching (including unplug and
   replug) in a bundle without Homebrew.
-- **V5 — 0.7.0 release checks.** Before tagging 0.7.0, check against real servers and hardware:
+- **V5 — Release checks** (written for 0.7.0, released 2026-09-29). Before tagging a release,
+  check against real servers and hardware:
   Jellyfin 12 sign-in; Plex discovery and sign-in; Chromecast track changes, volume, and seeking;
   the equalizer by ear; Download for offline, including a Subsonic account without download
   permission; Copy to Device onto a FAT-formatted drive; dragging tracks into Nautilus or Dolphin,
