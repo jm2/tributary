@@ -129,6 +129,8 @@ registry seam in detail.
 
 - **Intel Macs are not supported.** There is no x86_64 macOS build, so the `.dmg` does not run on
   Intel Macs.
+- **The `.dmg` needs macOS 15 (Sequoia) or newer.** It bundles Homebrew libraries built on
+  macOS 15, and the app declares that minimum, so macOS won't open it on an older version.
 - **Windows on ARM** is built, tested, and packaged natively on Windows 11 ARM64, like the x86_64
   build.
 - **Native Linux packages** need GTK 4.16 or newer and libadwaita 1.6 or newer, which Debian 12,

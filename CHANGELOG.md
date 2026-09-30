@@ -5,6 +5,14 @@ All notable changes to Tributary are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **macOS version requirement** — The macOS app now declares that it needs macOS 15 or newer,
+  which its bundled libraries require, so older Macs refuse to open it with a clear message
+  instead of it failing at launch.
+
 ## [0.7.0] — 2026-09-29
 
 ### Added

@@ -451,7 +451,7 @@ jobs:
       matrix:
         include:
           - arch: aarch64
-            runner: macos-15
+            runner: macos-26
             rust_target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -480,8 +480,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: macos-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: macos-${{ matrix.arch }}-cargo-
+          # The runner is part of the key: build output linked against one macOS
+          # version's Homebrew libraries must not be reused on another.
+          key: ${{ matrix.runner }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.runner }}-${{ matrix.arch }}-cargo-
 
       - name: Check formatting
         run: cargo fmt --check
