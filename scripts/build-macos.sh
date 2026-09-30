@@ -393,7 +393,6 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>  <string>APPL</string>
   <key>CFBundleIconFile</key>     <string>tributary</string>
   <key>NSHighResolutionCapable</key> <true/>
-  <key>LSMinimumSystemVersion</key>  <string>13.0</string>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
@@ -626,6 +625,25 @@ if [[ -d "$ADWAITA_SCALABLE" ]]; then
   ADWAITA_SVG_COUNT=$(find "$ADWAITA_SCALABLE" -name '*.svg' 2>/dev/null | wc -l | tr -d ' ')
   info "Adwaita scalable icons: ${ADWAITA_SVG_COUNT} SVGs found."
 fi
+
+# ── Minimum macOS version ────────────────────────────────────────────────────
+# Homebrew builds its libraries for the macOS version of the machine that built
+# them, so the bundle can't run on anything older than the newest `minos` among
+# its executables, dylibs, and plugins. Declare exactly that in Info.plist, so
+# macOS refuses to open the app on an older system instead of it failing at
+# launch with a missing-library error. It follows the build machine: a bundle
+# built on macOS 15 declares 15.0.
+MINIMUM_MACOS="$(
+  find "${APP_BUNDLE}/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*/Contents/MacOS/*' \) -print0 \
+    | while IFS= read -r -d '' binary; do
+        "$MACOS_OTOOL_COMMAND" -l "$binary" 2>/dev/null \
+          | awk '/LC_BUILD_VERSION/ { found = 1 } found && $1 == "minos" { print $2; exit }'
+      done \
+    | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+)"
+[[ -n "$MINIMUM_MACOS" ]] || error "Could not read the minimum macOS version from the bundled binaries."
+/usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string ${MINIMUM_MACOS}" "${APP_BUNDLE}/Contents/Info.plist"
+info "Info.plist declares macOS ${MINIMUM_MACOS} or newer, from the bundled binaries."
 
 if ! macos_validate_bundle_copy_control "$APP_BUNDLE"; then
   error "macOS bundle component-policy validation failed before signing: ${MACOS_PACKAGE_POLICY_REASON}"
