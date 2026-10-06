@@ -1,6 +1,6 @@
 # Tributary roadmap
 
-Last reviewed: 2026-09-29.
+Last reviewed: 2026-10-06.
 
 This page describes where Tributary is heading. It is a direction, not a release promise.
 **GitHub issues are the source of truth** for scope, acceptance, and state;
@@ -24,7 +24,8 @@ what works today, and the [changelog](../CHANGELOG.md) lists what changed.
 0.7.0 was released on 2026-09-29 with the 2026-09-23 review's fixes and the Download, Copy to
 Device, drag-to-file-manager, graphic equalizer, folder browsing, album artwork, and
 media-control features. It also moved to the application ID `io.github.jm2.tributary`, which
-Flathub requires. The next release gets the same real-server and hardware checks, listed as V5 in
+Flathub requires. 0.7.1 (2026-10-06) fixed the Preferences overflow, the EQ button, and the
+track list width that users reported in 0.7.0. The next release gets the same real-server and hardware checks, listed as V5 in
 [`task.md`](task.md).
 
 ## Next

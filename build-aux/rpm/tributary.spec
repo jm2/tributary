@@ -1,6 +1,6 @@
 Name:           tributary
 # Packit replaces Version with the release tag minus its "v" (see .packit.yaml).
-Version:        0.7.0
+Version:        0.7.1
 Release:        1%{?dist}
 Summary:        A high-performance media manager with unified local and remote backends
 
@@ -79,6 +79,9 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.metainfo.xml
 %{_datadir}/icons/hicolor/scalable/actions/io.github.jm2.tributary-equalizer-symbolic.svg
 
 %changelog
+* Tue Oct 06 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.7.1-1
+- Update to 0.7.1.
+
 * Thu Sep 24 2026 John-Michael Mulesa <jmulesa@gmail.com> - 0.7.0-1
 - Update to 0.7.0.
 

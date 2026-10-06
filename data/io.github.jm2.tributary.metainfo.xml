@@ -49,6 +49,17 @@
   </screenshots>
 
   <releases>
+    <release version="0.7.1" date="2026-10-06">
+      <description>
+        <p>Bug-fix release:</p>
+        <ul>
+          <li>Preferences fits its window in every language instead of cutting off settings on the right</li>
+          <li>The EQ button stays visible while the equalizer is on, with every desktop theme</li>
+          <li>The track list fills the window width</li>
+          <li>The macOS app declares that it needs macOS 15 or newer</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-09-29">
       <description>
         <p>Feature and reliability release:</p>
