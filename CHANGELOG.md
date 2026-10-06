@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **macOS version requirement** — The macOS app now declares that it needs macOS 15 or newer,
   which its bundled libraries require, so older Macs refuse to open it with a clear message
   instead of it failing at launch.
+- **Track list fills the window** — The Title column now widens to take up any spare width, so the
+  track list always reaches the window's right edge instead of leaving an empty band, including after
+  resizing. With Title hidden, Album (then Artist) takes the space. Column widths you drag are kept,
+  and a narrow window still scrolls sideways.
 
 ## [0.7.0] — 2026-09-29
 
