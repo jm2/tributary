@@ -573,6 +573,7 @@ pub(super) fn build_tracklist(
             .build();
         column_view.append_column(&sentinel);
     }
+    follow_expanding_column(&column_view);
 
     // Connect the ColumnView's composite sorter to the SortListModel
     // so that clicking headers actually re-orders the rows.
@@ -702,6 +703,61 @@ fn status_text(count: usize, total_secs: u64, locale: &str) -> String {
 // ---------------------------------------------------------------------------
 // Column helper
 // ---------------------------------------------------------------------------
+
+/// Columns that take the view's spare width, in priority order. The first
+/// visible one expands, so the rows always reach the view's right edge.
+const EXPANDING_COLUMN_PRIORITY: [&str; 5] = ["Title", "Album", "Artist", "Composer", "Genre"];
+
+/// Keep exactly one visible column expanding as columns are shown and
+/// hidden (by Preferences, radio mode, or a restored configuration).
+fn follow_expanding_column(column_view: &gtk::ColumnView) {
+    let columns = column_view.columns();
+    for column in columns
+        .iter::<gtk::ColumnViewColumn>()
+        .filter_map(Result::ok)
+    {
+        let view = column_view.downgrade();
+        column.connect_visible_notify(move |_| {
+            if let Some(view) = view.upgrade() {
+                update_expanding_column(&view);
+            }
+        });
+    }
+    update_expanding_column(column_view);
+}
+
+/// Mark the first visible column of `EXPANDING_COLUMN_PRIORITY` (else the
+/// first visible column) as the one that expands.
+///
+/// Expansion is allocation-only: GTK adds the spare width on top of each
+/// column's `fixed-width` without writing it back, so a width the user
+/// dragged survives a wide window untouched and still bounds the column
+/// when the window narrows (the view then scrolls horizontally). The
+/// sentinel column, having no ID, never expands and stays last, so the
+/// expanding column keeps its resize handle.
+fn update_expanding_column(column_view: &gtk::ColumnView) {
+    let columns: Vec<gtk::ColumnViewColumn> = column_view
+        .columns()
+        .iter::<gtk::ColumnViewColumn>()
+        .filter_map(Result::ok)
+        .filter(|column| column.id().is_some())
+        .collect();
+    let visible = |id: &str| {
+        columns
+            .iter()
+            .find(|column| column.is_visible() && column.id().is_some_and(|c| c == id))
+    };
+    let chosen = EXPANDING_COLUMN_PRIORITY
+        .iter()
+        .find_map(|id| visible(id))
+        .or_else(|| columns.iter().find(|column| column.is_visible()));
+    for column in &columns {
+        let expand = Some(column) == chosen;
+        if column.expands() != expand {
+            column.set_expand(expand);
+        }
+    }
+}
 
 fn add_sorted_column<F, S>(
     column_view: &gtk::ColumnView,
@@ -1634,5 +1690,178 @@ mod tests {
         assert_eq!(local_rating_track_id(&unavailable), None);
         assert_eq!(local_rating_track_id(&missing_source), None);
         assert_eq!(local_rating_track_id(&malformed_id), None);
+    }
+}
+
+/// GTK-touching tracklist layout contracts. They run inside the crate's
+/// single consolidated GTK-initializing test (browser.rs
+/// `gtk_widget_contracts_hold_on_one_session`), never as standalone
+/// `#[test]`s, and mirror its macOS gate so they are not dead code there.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    use gtk::prelude::*;
+
+    use super::build_tracklist;
+    use crate::ui::library_commands::LibraryCommandAdmission;
+    use crate::ui::preferences::apply_column_visibility;
+
+    /// The shown columns, and their widths' sum once Artist is dragged
+    /// from 180px to 333px.
+    const SHOWN: [&str; 5] = ["#", "Title", "Time", "Artist", "Album"];
+    const SHOWN_WIDTH: f64 = 893.0;
+
+    struct Shown {
+        window: gtk::Window,
+        column_view: gtk::ColumnView,
+        scrolled: gtk::ScrolledWindow,
+    }
+
+    /// The production tracklist showing `SHOWN`, with Artist dragged to
+    /// 333px, presented in a window `width` wide.
+    fn present_tracklist(width: i32) -> Shown {
+        let (admission, _commands) = LibraryCommandAdmission::channel();
+        let (outer, _, _, column_view, _, _) = build_tracklist(&[], admission);
+        apply_column_visibility(&column_view, &SHOWN.map(String::from));
+        column(&column_view, "Artist").set_fixed_width(333);
+        let scrolled = outer
+            .first_child()
+            .and_downcast::<gtk::ScrolledWindow>()
+            .expect("the tracklist scrolls");
+        let window = gtk::Window::builder()
+            .default_width(width)
+            .default_height(300)
+            .child(&outer)
+            .build();
+        window.present();
+        settle(|| column_view.width() > 0, "the tracklist is allocated");
+        Shown {
+            window,
+            column_view,
+            scrolled,
+        }
+    }
+
+    fn settle(done: impl Fn() -> bool, what: &str) {
+        let context = gtk::glib::MainContext::default();
+        for _ in 0..5_000 {
+            if done() {
+                // One more pass lets the column headers follow the view.
+                while context.pending() {
+                    context.iteration(false);
+                }
+                return;
+            }
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    fn column(column_view: &gtk::ColumnView, id: &str) -> gtk::ColumnViewColumn {
+        column_view
+            .columns()
+            .iter::<gtk::ColumnViewColumn>()
+            .filter_map(Result::ok)
+            .find(|column| column.id().is_some_and(|c| c == id))
+            .unwrap_or_else(|| panic!("column {id} exists"))
+    }
+
+    /// The `(left, width)` of each shown column header, in view order.
+    /// Broadway's screen is 1024px wide, which bounds the windows here.
+    fn header_spans(column_view: &gtk::ColumnView) -> Vec<(i32, i32)> {
+        fn walk(widget: &gtk::Widget, view: &gtk::ColumnView, out: &mut Vec<(i32, i32)>) {
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if current.type_().name() == "GtkColumnViewTitle" && current.is_visible() {
+                    let bounds = current.compute_bounds(view).expect("header in the view");
+                    if bounds.width() > 0.0 {
+                        out.push((bounds.x().round() as i32, bounds.width().round() as i32));
+                    }
+                } else {
+                    walk(&current, view, out);
+                }
+                child = current.next_sibling();
+            }
+        }
+        let mut spans = Vec::new();
+        walk(column_view.upcast_ref(), column_view, &mut spans);
+        // The zero-width sentinel's header still draws at its minimum
+        // size, just past the last column.
+        let right_edge = column_view.width();
+        spans.retain(|(left, _)| *left < right_edge);
+        spans
+    }
+
+    fn header_width(column_view: &gtk::ColumnView, index: usize) -> i32 {
+        header_spans(column_view)[index].1
+    }
+
+    fn assert_headers_fill(column_view: &gtk::ColumnView) {
+        let spans = header_spans(column_view);
+        assert_eq!(
+            spans.len(),
+            SHOWN.len() - usize::from(!column(column_view, "Title").is_visible()),
+            "{spans:?} in {}",
+            column_view.width()
+        );
+        let (left, width) = *spans.last().expect("shown headers");
+        assert!(
+            left + width == column_view.width(),
+            "the columns reach the view's right edge: {spans:?} in {}",
+            column_view.width()
+        );
+    }
+
+    /// A window wider than the columns is filled by the Title column (or,
+    /// with Title hidden, by Album), while every column's own width, the
+    /// one a user drags, stays exactly as set.
+    pub fn columns_fill_a_wide_view_and_keep_their_set_widths() {
+        let wide = present_tracklist(1000);
+        let view = &wide.column_view;
+        assert_headers_fill(view);
+        assert!(header_width(view, 1) > 250, "Title takes the spare width");
+        assert_eq!(header_width(view, 3), 333, "Artist keeps its dragged width");
+        assert_eq!(column(view, "Title").fixed_width(), 250);
+        assert_eq!(column(view, "Artist").fixed_width(), 333);
+
+        let without_title: Vec<String> = SHOWN
+            .iter()
+            .filter(|id| **id != "Title")
+            .map(|id| id.to_string())
+            .collect();
+        apply_column_visibility(view, &without_title);
+        assert!(column(view, "Album").expands() && !column(view, "Title").expands());
+        settle(
+            || header_spans(view).len() == SHOWN.len() - 1,
+            "Title is hidden",
+        );
+        assert_headers_fill(view);
+
+        apply_column_visibility(view, &SHOWN.map(String::from));
+        assert!(column(view, "Title").expands() && !column(view, "Album").expands());
+        settle(|| header_spans(view).len() == SHOWN.len(), "Title is shown");
+        assert_headers_fill(view);
+        assert_eq!(
+            column(view, "Title").fixed_width(),
+            250,
+            "the width round-trips"
+        );
+        assert_eq!(column(view, "Artist").fixed_width(), 333);
+        wide.window.destroy();
+
+        // A window narrower than the columns scrolls instead of squeezing.
+        let narrow = present_tracklist(500);
+        let hadjustment = narrow.scrolled.hadjustment();
+        settle(
+            || hadjustment.page_size() > 0.0,
+            "the narrow view is allocated",
+        );
+        assert!(hadjustment.upper() >= SHOWN_WIDTH);
+        assert!(
+            hadjustment.upper() > hadjustment.page_size(),
+            "the view scrolls"
+        );
+        assert_eq!(header_width(&narrow.column_view, 1), 250);
+        narrow.window.destroy();
     }
 }

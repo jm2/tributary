@@ -3922,6 +3922,7 @@ mod tests {
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
                 crate::ui::preferences::widget_tests::column_state_is_keyed_by_id_under_a_non_english_locale();
                 crate::ui::preferences::widget_tests::radio_columns_keep_their_ids();
+                crate::ui::tracklist::widget_tests::columns_fill_a_wide_view_and_keep_their_set_widths();
                 crate::ui::preferences::widget_tests::preference_toggles_leave_the_radio_layout_alone();
                 crate::ui::preferences::widget_tests::library_folders_are_listed_like_the_downloads_row();
                 crate::ui::preferences::widget_tests::browser_views_rows_drive_the_saved_settings();

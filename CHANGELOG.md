@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **EQ button visible while the equalizer is on** — The EQ button in the header bar now shows
   that the equalizer is on by staying pressed in, like Repeat and Shuffle, instead of tinting its
   icon, which some desktop themes drew invisibly.
+- **Track list fills the window** — The Title column now widens to take up any spare width, so the
+  track list always reaches the window's right edge instead of leaving an empty band, including after
+  resizing. With Title hidden, Album (then Artist) takes the space. Column widths you drag are kept,
+  and a narrow window still scrolls sideways.
 
 ## [0.7.0] — 2026-09-29
 
