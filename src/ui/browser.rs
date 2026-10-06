@@ -3922,9 +3922,11 @@ mod tests {
                 crate::ui::preferences::widget_tests::separator_gutters_join_visible_panes_around_hidden_ones();
                 crate::ui::preferences::widget_tests::column_state_is_keyed_by_id_under_a_non_english_locale();
                 crate::ui::preferences::widget_tests::radio_columns_keep_their_ids();
+                crate::ui::tracklist::widget_tests::columns_fill_a_wide_view_and_keep_their_set_widths();
                 crate::ui::preferences::widget_tests::preference_toggles_leave_the_radio_layout_alone();
                 crate::ui::preferences::widget_tests::library_folders_are_listed_like_the_downloads_row();
                 crate::ui::preferences::widget_tests::browser_views_rows_drive_the_saved_settings();
+                crate::ui::preferences::widget_tests::preferences_page_fits_its_clamp_in_every_locale();
                 crate::ui::lastfm_settings::widget_tests::render_shows_only_the_offered_actions();
                 crate::ui::confirm_dialog::widget_tests::nothing_is_removed_until_the_destructive_response();
                 crate::ui::album_art_cell::widget_tests::show_placeholder_keeps_the_missing_art_visible();
@@ -3944,6 +3946,7 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::the_equalizer_window_opens_once_and_escape_closes_it();
                 crate::ui::equalizer_panel::widget_tests::the_equalizer_window_follows_the_selected_output();
                 crate::ui::equalizer_panel::widget_tests::the_eq_button_shows_whether_the_equalizer_is_on();
+                crate::ui::equalizer_panel::widget_tests::clicking_the_eq_button_opens_the_window_without_toggling_it();
                 crate::ui::equalizer_panel::widget_tests::the_wheel_in_the_equalizer_window_moves_nothing();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 crate::ui::header_bar::widget_tests::equalizer_button_follows_shuffle();

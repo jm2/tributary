@@ -247,6 +247,8 @@ impl ServerPlaylistCoordinatorHandle {
         if self.inner.commands.is_closed() {
             return Err(ServerPlaylistRequestStampError::Closed);
         }
+        // `try_update` replaces `fetch_update` but needs Rust newer than the 1.94 MSRV.
+        #[allow(deprecated)]
         let sequence = self
             .inner
             .request_sequence

@@ -906,10 +906,41 @@ pub fn show_preferences(
         let saves = saves.clone();
         prefs_dialog.connect_closed(move |_| saves.flush());
     }
+    let page = preferences_page(
+        parent,
+        layout,
+        config,
+        saves,
+        on_album_artist_changed,
+        on_album_pane_artwork_changed,
+        on_album_pane_artwork_size_changed,
+        integration_groups,
+        &rust_i18n::locale(),
+    );
+    prefs_dialog.add(&page);
+    prefs_dialog.present(Some(parent));
+}
 
+/// The preferences page, its text in `locale`: Library Location, Downloads,
+/// Browser Views, Visible Columns, Privacy, the integration groups, and
+/// Import last.
+///
+/// Dialogs the page's buttons open later follow the session locale.
+#[allow(clippy::too_many_arguments)] // the dialog's handles and callbacks, plus the locale
+fn preferences_page(
+    parent: &adw::ApplicationWindow,
+    layout: &LayoutTargets,
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
+    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    integration_groups: &[adw::PreferencesGroup],
+    locale: &str,
+) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
-    page.add(&library_group(parent, config));
-    page.add(&downloads_group(parent, config, saves));
+    page.add(&library_group(parent, config, locale));
+    page.add(&downloads_group(parent, config, saves, locale));
     for group in browser_views_groups(
         config,
         saves,
@@ -917,23 +948,36 @@ pub fn show_preferences(
         on_album_artist_changed,
         on_album_pane_artwork_changed,
         on_album_pane_artwork_size_changed,
+        locale,
     ) {
         page.add(&group);
     }
+    page.add(&columns_group(config, saves, layout, locale));
+    page.add(&privacy_group(config, saves, locale));
+    for group in integration_groups {
+        page.add(group);
+    }
+    page.add(&import_group(locale));
+    page
+}
 
-    let cfg = config.borrow();
-
-    // ── Visible Columns group (dense checkbox grid) ─────────────────
+/// The Visible Columns group: one checkbox per tracklist column in the same
+/// grid as Browser Views, and a Reset to Defaults button.
+fn columns_group(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    layout: &LayoutTargets,
+    locale: &str,
+) -> adw::PreferencesGroup {
     let columns_group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.visible_columns").as_ref())
+        .title(rust_i18n::t!("preferences.visible_columns", locale = locale).as_ref())
         .build();
 
-    let locale = rust_i18n::locale();
     let column_checks: Vec<(&str, gtk::CheckButton)> = ALL_COLUMNS
         .iter()
         .map(|&col_id| {
-            let is_visible = cfg.visible_columns.iter().any(|c| c == col_id);
-            let check = grid_check(&column_title(col_id, &locale), is_visible);
+            let is_visible = config.borrow().visible_columns.iter().any(|c| c == col_id);
+            let check = grid_check(&column_title(col_id, locale), is_visible);
 
             // Wire each column toggle
             let config = config.clone();
@@ -955,62 +999,63 @@ pub fn show_preferences(
             (col_id, check)
         })
         .collect();
-    let columns_grid = check_grid(column_checks.iter().map(|(_, check)| check));
+    columns_group.add(&check_grid(column_checks.iter().map(|(_, check)| check)));
+    columns_group.add(&reset_columns_button(
+        config,
+        saves,
+        layout,
+        &column_checks,
+        locale,
+    ));
+    columns_group
+}
 
-    // Reset to Defaults button
+/// The Reset to Defaults button under the Visible Columns grid.
+fn reset_columns_button(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    layout: &LayoutTargets,
+    column_checks: &[(&str, gtk::CheckButton)],
+    locale: &str,
+) -> gtk::Button {
     let reset_btn = gtk::Button::builder()
-        .label(rust_i18n::t!("preferences.reset_to_defaults").as_ref())
+        .label(rust_i18n::t!("preferences.reset_to_defaults", locale = locale).as_ref())
         .css_classes(["flat"])
         .halign(gtk::Align::Center)
         .margin_top(4)
         .build();
-    {
-        let config = config.clone();
-        let saves = saves.clone();
-        let layout = layout.clone();
-        let checks = column_checks
-            .iter()
-            .map(|(t, c)| ((*t).to_string(), c.clone()))
-            .collect::<Vec<_>>();
-        reset_btn.connect_clicked(move |_| {
-            // Scope the mutable borrow so it is dropped before `set_active`
-            // below. `set_active` synchronously re-enters each column's
-            // `connect_toggled` handler, which takes its own `borrow_mut` —
-            // holding the borrow across the loop would panic with
-            // `BorrowMutError` (and abort across the GLib FFI boundary).
-            {
-                let mut cfg = config.borrow_mut();
-                cfg.visible_columns = DEFAULT_VISIBLE
-                    .iter()
-                    .copied()
-                    .map(str::to_string)
-                    .collect();
-                cfg.column_order = default_column_order();
-            }
-            for (id, check) in &checks {
-                check.set_active(DEFAULT_VISIBLE.contains(&id.as_str()));
-            }
-            let cfg = config.borrow();
-            layout.show_columns(&cfg.visible_columns);
-            apply_column_order(&layout.column_view, &cfg.column_order);
-            saves.schedule();
-            info!("Column visibility and order reset to defaults");
-        });
-    }
-
-    columns_group.add(&columns_grid);
-    columns_group.add(&reset_btn);
-    page.add(&columns_group);
-    page.add(&privacy_group(config, saves));
-    for group in integration_groups {
-        page.add(group);
-    }
-    page.add(&import_group());
-
-    prefs_dialog.add(&page);
-    drop(cfg);
-
-    prefs_dialog.present(Some(parent));
+    let config = config.clone();
+    let saves = saves.clone();
+    let layout = layout.clone();
+    let checks = column_checks
+        .iter()
+        .map(|(t, c)| ((*t).to_string(), c.clone()))
+        .collect::<Vec<_>>();
+    reset_btn.connect_clicked(move |_| {
+        // Scope the mutable borrow so it is dropped before `set_active`
+        // below. `set_active` synchronously re-enters each column's
+        // `connect_toggled` handler, which takes its own `borrow_mut` —
+        // holding the borrow across the loop would panic with
+        // `BorrowMutError` (and abort across the GLib FFI boundary).
+        {
+            let mut cfg = config.borrow_mut();
+            cfg.visible_columns = DEFAULT_VISIBLE
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect();
+            cfg.column_order = default_column_order();
+        }
+        for (id, check) in &checks {
+            check.set_active(DEFAULT_VISIBLE.contains(&id.as_str()));
+        }
+        let cfg = config.borrow();
+        layout.show_columns(&cfg.visible_columns);
+        apply_column_order(&layout.column_view, &cfg.column_order);
+        saves.schedule();
+        info!("Column visibility and order reset to defaults");
+    });
+    reset_btn
 }
 
 /// The Library Location group: one row per library folder, laid out like
@@ -1023,21 +1068,24 @@ pub fn show_preferences(
 fn library_group(
     parent: &adw::ApplicationWindow,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    locale: &str,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.library_location").as_ref())
+        .title(rust_i18n::t!("preferences.library_location", locale = locale).as_ref())
         .build();
     if !config.borrow().pending_root_reauthorizations.is_empty() {
         group.set_description(Some(
-            rust_i18n::t!("preferences.reauthorization_restart_hint").as_ref(),
+            rust_i18n::t!("preferences.reauthorization_restart_hint", locale = locale).as_ref(),
         ));
     }
     for lib_path in &config.borrow().library_paths {
-        group.add(&library_folder_row(lib_path, config, &group, parent));
+        group.add(&library_folder_row(
+            lib_path, config, &group, parent, locale,
+        ));
     }
 
     let add_row = adw::ButtonRow::builder()
-        .title(rust_i18n::t!("preferences.add_folder").as_ref())
+        .title(rust_i18n::t!("preferences.add_folder", locale = locale).as_ref())
         .start_icon_name("list-add-symbolic")
         .build();
     group.add(&add_row);
@@ -1089,6 +1137,7 @@ fn choose_library_folder(
                 &config,
                 &group,
                 &parent_for_result,
+                &rust_i18n::locale(),
             ));
             group.add(&add_row);
             add_row.grab_focus();
@@ -1107,13 +1156,28 @@ const CHECK_GRID_COLUMNS: usize = 4;
 
 /// A checkbox that fills its grid cell but keeps its label left-aligned, so
 /// the labels line up down each grid column.
+///
+/// The label wraps, so a long column name (French "Fréquence
+/// d'échantillonnage") takes more lines instead of widening every column
+/// of the homogeneous grid past the dialog.
 fn grid_check(label: &str, active: bool) -> gtk::CheckButton {
-    gtk::CheckButton::builder()
+    let text = gtk::Label::builder()
         .label(label)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .natural_wrap_mode(gtk::NaturalWrapMode::Word)
+        .xalign(0.0)
+        .build();
+    let check = gtk::CheckButton::builder()
+        .child(&text)
         .active(active)
         .hexpand(true)
         .halign(gtk::Align::Start)
-        .build()
+        .build();
+    // Relate the child label explicitly, so it names the checkbox for
+    // assistive technology as the `label` property would.
+    check.update_relation(&[gtk::accessible::Relation::LabelledBy(&[text.upcast_ref()])]);
+    check
 }
 
 /// Lay checkboxes out row by row in a homogeneous grid.
@@ -1180,14 +1244,16 @@ fn browser_views_groups(
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    locale: &str,
 ) -> [adw::PreferencesGroup; 2] {
-    let panes_group = browser_panes_group(config, saves, layout);
-    let album_artist = album_artist_row(config, saves, on_album_artist_changed);
+    let panes_group = browser_panes_group(config, saves, layout, locale);
+    let album_artist = album_artist_row(config, saves, on_album_artist_changed, locale);
     let artwork = album_artwork_row(
         config,
         saves,
         on_album_pane_artwork_changed,
         on_album_pane_artwork_size_changed,
+        locale,
     );
     let rows_group = adw::PreferencesGroup::new();
     rows_group.add(&album_artist);
@@ -1201,6 +1267,7 @@ fn browser_panes_group(
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
     layout: &LayoutTargets,
+    locale: &str,
 ) -> adw::PreferencesGroup {
     let mut saved_views = config.borrow().browser_views.clone();
     let panes: [(&str, PaneFlag); 4] = [
@@ -1210,7 +1277,10 @@ fn browser_panes_group(
         ("browser.folder", |views| &mut views.folder),
     ];
     let pane_checks = panes.map(|(key, flag)| {
-        let check = grid_check(rust_i18n::t!(key).as_ref(), *flag(&mut saved_views));
+        let check = grid_check(
+            rust_i18n::t!(key, locale = locale).as_ref(),
+            *flag(&mut saved_views),
+        );
         let (config, saves, layout) = (config.clone(), saves.clone(), layout.clone());
         check.connect_toggled(move |btn| {
             let mut cfg = config.borrow_mut();
@@ -1221,7 +1291,7 @@ fn browser_panes_group(
         check
     });
     let panes_group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.browser_views").as_ref())
+        .title(rust_i18n::t!("preferences.browser_views", locale = locale).as_ref())
         .build();
     panes_group.add(&check_grid(&pane_checks));
     panes_group
@@ -1232,9 +1302,10 @@ fn album_artist_row(
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
+    locale: &str,
 ) -> adw::SwitchRow {
     let album_artist = adw::SwitchRow::builder()
-        .title(rust_i18n::t!("preferences.group_by_album_artist").as_ref())
+        .title(rust_i18n::t!("preferences.group_by_album_artist", locale = locale).as_ref())
         .active(config.borrow().group_by_album_artist)
         .build();
     let (config, saves) = (config.clone(), saves.clone());
@@ -1254,16 +1325,18 @@ fn album_artwork_row(
     saves: &ConfigSaveQueue,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    locale: &str,
 ) -> adw::ComboRow {
     let cfg = config.borrow();
     let choices = [
-        rust_i18n::t!("browser.album_artwork_off"),
-        rust_i18n::t!("browser.album_artwork_size_small"),
-        rust_i18n::t!("browser.album_artwork_size_medium"),
-        rust_i18n::t!("browser.album_artwork_size_large"),
-    ];
+        "browser.album_artwork_off",
+        "browser.album_artwork_size_small",
+        "browser.album_artwork_size_medium",
+        "browser.album_artwork_size_large",
+    ]
+    .map(|key| rust_i18n::t!(key, locale = locale));
     let artwork = adw::ComboRow::builder()
-        .title(rust_i18n::t!("browser.album_artwork").as_ref())
+        .title(rust_i18n::t!("browser.album_artwork", locale = locale).as_ref())
         .model(&gtk::StringList::new(
             &choices.each_ref().map(AsRef::as_ref),
         ))
@@ -1312,13 +1385,13 @@ fn set_album_artwork(cfg: &mut AppConfig, size: Option<AlbumArtSize>) -> (bool, 
 
 /// The Import group, last on the page: bringing in another player's library
 /// is a one-time step rather than a setting.
-fn import_group() -> adw::PreferencesGroup {
+fn import_group(locale: &str) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.import").as_ref())
+        .title(rust_i18n::t!("preferences.import", locale = locale).as_ref())
         .build();
     group.add(
         &adw::ButtonRow::builder()
-            .title(rust_i18n::t!("rhythmbox_migration.menu_action").as_ref())
+            .title(rust_i18n::t!("rhythmbox_migration.menu_action", locale = locale).as_ref())
             .start_icon_name("document-open-symbolic")
             // Reuse the window action so the Preferences entry follows the
             // same admission, shutdown, and migration-dialog path as the
@@ -1334,15 +1407,16 @@ fn downloads_group(
     parent: &adw::ApplicationWindow,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
+    locale: &str,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.downloads").as_ref())
+        .title(rust_i18n::t!("preferences.downloads", locale = locale).as_ref())
         .build();
     let folder_label = |config: &AppConfig| {
         download_dir(config).map_or_else(String::new, |folder| folder.display().to_string())
     };
     let row = adw::ActionRow::builder()
-        .title(rust_i18n::t!("preferences.download_folder").as_ref())
+        .title(rust_i18n::t!("preferences.download_folder", locale = locale).as_ref())
         .subtitle(folder_label(&config.borrow()))
         .subtitle_selectable(true)
         .build();
@@ -1350,7 +1424,7 @@ fn downloads_group(
         .icon_name("folder-open-symbolic")
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
-        .tooltip_text(rust_i18n::t!("preferences.select_download_folder").as_ref())
+        .tooltip_text(rust_i18n::t!("preferences.select_download_folder", locale = locale).as_ref())
         .build();
     {
         let (parent, config, saves, row) =
@@ -1391,13 +1465,14 @@ fn downloads_group(
 fn privacy_group(
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
+    locale: &str,
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
-        .title(rust_i18n::t!("preferences.privacy").as_ref())
+        .title(rust_i18n::t!("preferences.privacy", locale = locale).as_ref())
         .build();
     let location = adw::SwitchRow::builder()
-        .title(rust_i18n::t!("preferences.location_title").as_ref())
-        .subtitle(rust_i18n::t!("preferences.location_subtitle").as_ref())
+        .title(rust_i18n::t!("preferences.location_title", locale = locale).as_ref())
+        .subtitle(rust_i18n::t!("preferences.location_subtitle", locale = locale).as_ref())
         .active(config.borrow().location_enabled == Some(true))
         .build();
     let config = config.clone();
@@ -1554,6 +1629,7 @@ fn library_folder_row(
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     group: &adw::PreferencesGroup,
     parent: &adw::ApplicationWindow,
+    locale: &str,
 ) -> adw::ActionRow {
     let name = std::path::Path::new(path).file_name().map_or_else(
         || path.to_string(),
@@ -1568,7 +1644,7 @@ fn library_folder_row(
     row.set_title(&name);
     row.set_subtitle(path);
 
-    let (reauthorize_btn, remove_btn) = library_folder_buttons(path, config);
+    let (reauthorize_btn, remove_btn) = library_folder_buttons(path, config, locale);
     row.add_suffix(&reauthorize_btn);
     row.add_suffix(&remove_btn);
 
@@ -1599,8 +1675,9 @@ fn library_folder_row(
 fn library_folder_buttons(
     path: &str,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    locale: &str,
 ) -> (gtk::Button, gtk::Button) {
-    let reauthorize_label = rust_i18n::t!("preferences.reauthorize_folder");
+    let reauthorize_label = rust_i18n::t!("preferences.reauthorize_folder", locale = locale);
     let reauthorize_btn = gtk::Button::builder()
         .icon_name("folder-open-symbolic")
         .valign(gtk::Align::Center)
@@ -1609,7 +1686,7 @@ fn library_folder_buttons(
         .build();
     reauthorize_btn.update_property(&[gtk::accessible::Property::Label(&reauthorize_label)]);
 
-    let remove_label = rust_i18n::t!("preferences.remove_folder");
+    let remove_label = rust_i18n::t!("preferences.remove_folder", locale = locale);
     let remove_btn = gtk::Button::builder()
         .icon_name("list-remove-symbolic")
         .valign(gtk::Align::Center)
@@ -2800,6 +2877,16 @@ pub mod widget_tests {
         found
     }
 
+    /// The text of a grid checkbox's wrapping label.
+    fn check_text(check: &gtk::CheckButton) -> String {
+        check
+            .child()
+            .and_downcast::<gtk::Label>()
+            .expect("grid checkboxes carry a label child")
+            .text()
+            .into()
+    }
+
     /// Library folders are rows like the Downloads one — name, full path,
     /// and flat suffix buttons — closed by the Add Folder… row, and a folder
     /// with a pending reauthorization stays locked.
@@ -2815,7 +2902,7 @@ pub mod widget_tests {
             ..AppConfig::default()
         }));
         let parent = adw::ApplicationWindow::builder().build();
-        let group = super::library_group(&parent, &config);
+        let group = super::library_group(&parent, &config, &rust_i18n::locale());
 
         let rows = descendants::<gtk::ListBoxRow>(group.upcast_ref());
         assert_eq!(rows.len(), 3, "two folders and Add Folder…");
@@ -2866,6 +2953,77 @@ pub mod widget_tests {
         parent.destroy();
     }
 
+    /// Every locale's preferences page fits the width libadwaita clamps a
+    /// preferences page's groups to, so no row loses its switch or dropdown
+    /// past the dialog's edge, and the Browser Views and Visible Columns
+    /// checkbox columns still line up at that width.
+    pub fn preferences_page_fits_its_clamp_in_every_locale() {
+        let config = Rc::new(RefCell::new(AppConfig {
+            library_paths: vec!["/music/Main".to_string()],
+            download_path: Some("/music/Downloads".to_string()),
+            ..AppConfig::default()
+        }));
+        let saves = ConfigSaveQueue::with_writer(config.clone(), Rc::new(|_: &AppConfig| true));
+        let layout = super::LayoutTargets {
+            column_view: german_tracklist(),
+            browser_box: PaneRow::build().browser_box,
+            active_source_key: Rc::new(RefCell::new("local".to_string())),
+        };
+        let parent = adw::ApplicationWindow::builder().build();
+        let locales = rust_i18n::available_locales!();
+        assert_eq!(locales.len(), 13, "every catalog is checked");
+        for locale in locales.iter().map(AsRef::as_ref) {
+            let page = super::preferences_page(
+                &parent,
+                &layout,
+                &config,
+                &saves,
+                Rc::new(|_| {}),
+                Rc::new(|_| {}),
+                Rc::new(|_| {}),
+                &[],
+                locale,
+            );
+            let clamps = descendants::<adw::Clamp>(page.upcast_ref());
+            assert_eq!(clamps.len(), 1, "the page clamps its groups once");
+            let width = clamps[0].maximum_size();
+            let (minimum, ..) = page.measure(gtk::Orientation::Horizontal, -1);
+            assert!(
+                minimum <= width,
+                "the {locale} page needs {minimum} px, wider than its {width} px clamp"
+            );
+            let (_, height, ..) = page.measure(gtk::Orientation::Vertical, width);
+            page.allocate(width, height, -1, None);
+            assert_check_columns_line_up(&page, locale);
+        }
+        parent.destroy();
+    }
+
+    /// The Browser Views checkboxes start at the same x as the Visible
+    /// Columns checkboxes in their grid column.
+    fn assert_check_columns_line_up(page: &adw::PreferencesPage, locale: &str) {
+        let grids = descendants::<gtk::Grid>(page.upcast_ref());
+        assert_eq!(grids.len(), 2, "Browser Views and Visible Columns");
+        let start = |check: &gtk::CheckButton| {
+            check
+                .compute_bounds(page)
+                .expect("the checkbox is allocated inside the page")
+                .x()
+        };
+        let panes = descendants::<gtk::CheckButton>(grids[0].upcast_ref());
+        let columns = descendants::<gtk::CheckButton>(grids[1].upcast_ref());
+        assert_eq!(columns.len(), ALL_COLUMNS.len());
+        for (index, column) in columns.iter().enumerate() {
+            let pane = &panes[index % panes.len()];
+            assert!(
+                (start(pane) - start(column)).abs() < 0.5,
+                "{locale}: column checkbox {index} starts at {} px, its pane checkbox at {} px",
+                start(column),
+                start(pane)
+            );
+        }
+    }
+
     /// Browser Views puts exactly the four pane checkboxes on one grid row,
     /// then the grouping switch and the artwork dropdown in an untitled group
     /// below, and each control updates the config and calls the browser the
@@ -2899,6 +3057,7 @@ pub mod widget_tests {
             Rc::new(move |on| grouping.borrow_mut().push(format!("grouping {on}"))),
             Rc::new(move |on| artwork.borrow_mut().push(format!("artwork {on}"))),
             Rc::new(move |chosen: AlbumArtSize| size.borrow_mut().push(format!("size {chosen:?}"))),
+            &rust_i18n::locale(),
         );
 
         let grids = descendants::<gtk::Grid>(panes_group.upcast_ref());
@@ -2908,7 +3067,7 @@ pub mod widget_tests {
             .iter()
             .map(|check| {
                 let (column, row, _, _) = grids[0].query_child(check);
-                (column, row, check.label().unwrap_or_default().into())
+                (column, row, check_text(check))
             })
             .collect();
         let expected: Vec<(i32, i32, String)> = [

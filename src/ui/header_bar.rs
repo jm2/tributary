@@ -27,7 +27,7 @@ pub struct HeaderBarWidgets {
     pub repeat_button: gtk::ToggleButton,
     pub repeat_mode: Rc<Cell<RepeatMode>>,
     pub shuffle_button: gtk::ToggleButton,
-    pub equalizer_button: gtk::Button,
+    pub equalizer_button: gtk::ToggleButton,
     pub album_art: gtk::Image,
     pub title_label: gtk::Label,
     pub artist_label: gtk::Label,
@@ -101,14 +101,11 @@ pub fn show_play_button_state(button: &gtk::Button, playing: bool) {
 /// theme has no equalizer icon.
 pub const EQUALIZER_ICON: &str = "io.github.jm2.tributary-equalizer-symbolic";
 
-/// Show on the EQ button whether the equalizer is on: its icon takes the
-/// accent colour, as a toggled button's background would.
-pub fn show_equalizer_state(button: &gtk::Button, enabled: bool) {
-    if enabled {
-        button.add_css_class("accent");
-    } else {
-        button.remove_css_class("accent");
-    }
+/// Show on the EQ button whether the equalizer is on by toggling it, the way
+/// Repeat and Shuffle show theirs, rather than with a style class a theme
+/// may restyle.
+pub fn show_equalizer_state(button: &gtk::ToggleButton, enabled: bool) {
+    button.set_active(enabled);
 }
 
 /// Build the full header bar and return all interactive widgets.
@@ -157,10 +154,11 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .tooltip_text(rust_i18n::t!("header.shuffle").as_ref())
         .build();
 
-    // Opens the Equalizer window, which keeps the button's accent colour in
-    // step with its switch.
+    // Opens the Equalizer window, which keeps the button's toggled state in
+    // step with its switch. A toggle button with an action leaves `active`
+    // alone on a click, so only `show_equalizer_state` changes it.
     let equalizer_title = rust_i18n::t!("equalizer.title");
-    let btn_equalizer = gtk::Button::builder()
+    let btn_equalizer = gtk::ToggleButton::builder()
         .icon_name(EQUALIZER_ICON)
         .tooltip_text(equalizer_title.as_ref())
         .action_name("win.show-equalizer")
@@ -491,11 +489,11 @@ pub mod widget_tests {
             button,
             gtk::AccessibleProperty::Label
         ));
-        assert!(!button.has_css_class("accent"));
+        assert!(!button.is_active());
         show_equalizer_state(button, true);
-        assert!(button.has_css_class("accent"));
+        assert!(button.is_active());
         show_equalizer_state(button, false);
-        assert!(!button.has_css_class("accent"));
+        assert!(!button.is_active());
 
         // Only the app's icon folder, as a development build adds it.
         let theme = gtk::IconTheme::new();

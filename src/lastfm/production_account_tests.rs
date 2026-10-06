@@ -55,6 +55,8 @@ impl SessionCredentialStore for TestVault {
         Ok(())
     }
 
+    // `try_update` replaces `fetch_update` but needs Rust newer than the 1.94 MSRV.
+    #[allow(deprecated)]
     fn delete(&self) -> Result<(), CredentialError> {
         if self
             .failing_deletes

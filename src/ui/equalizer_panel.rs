@@ -55,7 +55,7 @@ impl EqualizerWindow {
         config: &Rc<RefCell<AppConfig>>,
         saves: &ConfigSaveQueue,
         output: &Rc<RefCell<Box<dyn AudioOutput>>>,
-        button: &gtk::Button,
+        button: &gtk::ToggleButton,
     ) -> Self {
         let apply = {
             let config = config.clone();
@@ -83,7 +83,7 @@ impl EqualizerWindow {
     /// the switch.
     fn with(
         parent: &gtk::Window,
-        button: &gtk::Button,
+        button: &gtk::ToggleButton,
         settings: impl Fn() -> EqualizerSettings + 'static,
         unavailable: impl Fn() -> Option<String> + 'static,
         apply: impl Fn(&EqualizerSettings) + 'static,
@@ -1017,9 +1017,9 @@ pub mod widget_tests {
     fn opener(
         saved: EqualizerSettings,
         unavailable: &Rc<RefCell<Option<String>>>,
-    ) -> (EqualizerWindow, gtk::Window, gtk::Button, Changes) {
+    ) -> (EqualizerWindow, gtk::Window, gtk::ToggleButton, Changes) {
         let parent = gtk::Window::new();
-        let button = gtk::Button::new();
+        let button = gtk::ToggleButton::new();
         let changes: Changes = Rc::default();
         let recorded = changes.clone();
         let reason = unavailable.clone();
@@ -1171,19 +1171,49 @@ pub mod widget_tests {
             ..EqualizerSettings::default()
         };
         let (opener, parent, button, changes) = opener(saved, &Rc::default());
-        assert!(button.has_css_class("accent"), "on from the saved settings");
+        assert!(button.is_active(), "on from the saved settings");
         opener.present();
         let (window, panel) = opened(&opener);
 
         panel.enabled.set_active(false);
         assert!(!last(&changes).enabled);
-        assert!(!button.has_css_class("accent"));
+        assert!(!button.is_active());
         panel.bands[0].set_value(3.0);
-        assert!(!button.has_css_class("accent"), "gains leave it alone");
+        assert!(!button.is_active(), "gains leave it alone");
         panel.enabled.set_active(true);
-        assert!(button.has_css_class("accent"));
+        assert!(button.is_active());
         window.close();
         parent.destroy();
+    }
+
+    /// Clicking the EQ button, as the header wires it, opens the window
+    /// and leaves the button showing the equalizer's state.
+    pub fn clicking_the_eq_button_opens_the_window_without_toggling_it() {
+        for enabled in [false, true] {
+            let saved = EqualizerSettings {
+                enabled,
+                ..EqualizerSettings::default()
+            };
+            let (opener, parent, button, _changes) = opener(saved, &Rc::default());
+            let opener = Rc::new(opener);
+            let actions = gtk::gio::SimpleActionGroup::new();
+            let show = gtk::gio::SimpleAction::new("show-equalizer", None);
+            let presenter = opener.clone();
+            show.connect_activate(move |_, _| presenter.present());
+            actions.add_action(&show);
+            parent.insert_action_group("win", Some(&actions));
+            button.set_action_name(Some("win.show-equalizer"));
+            parent.set_child(Some(&button));
+
+            button.emit_clicked();
+            let (window, _panel) = opened(&opener);
+            assert_eq!(button.is_active(), enabled, "the click opened, not toggled");
+            assert!(button.is_focusable(), "reached with Tab");
+            assert!(button.activate(), "Enter clicks it");
+            assert_eq!(button.is_active(), enabled, "nor does Enter toggle it");
+            window.close();
+            parent.destroy();
+        }
     }
 
     pub fn the_wheel_in_the_equalizer_window_moves_nothing() {
