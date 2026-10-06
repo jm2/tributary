@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   track list always reaches the window's right edge instead of leaving an empty band, including after
   resizing. With Title hidden, Album (then Artist) takes the space. Column widths you drag are kept,
   and a narrow window still scrolls sideways.
+- **Preferences cut off in some languages** — In French, German, Russian, and other languages
+  with long column names, the Preferences window no longer runs past its right edge and hides
+  switches and dropdowns. Long names in the Browser Views and Visible Columns checkboxes now wrap
+  onto a second line.
 
 ## [0.7.0] — 2026-09-29
 
