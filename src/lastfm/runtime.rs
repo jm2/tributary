@@ -4212,6 +4212,8 @@ mod tests {
             Ok(())
         }
 
+        // `try_update` replaces `fetch_update` but needs Rust newer than the 1.94 MSRV.
+        #[allow(deprecated)]
         fn delete(&self) -> Result<(), CredentialError> {
             self.delete_attempts.fetch_add(1, Ordering::SeqCst);
             if self

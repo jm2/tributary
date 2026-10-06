@@ -21,6 +21,7 @@
     clippy::doc_markdown,            // Too many false positives on technical terms (GLib, SQLite, etc.)
     clippy::similar_names,           // Intentional: artist_resp/artists_resp, value/value2 are clear
     clippy::too_many_lines,          // GTK UI builders are inherently long
+    clippy::assert_is_empty,         // Emptiness checks on maps, sets and strings can't use assert_eq!(x, []); assert! already prints the expression
     clippy::redundant_clone,         // GTK GObject clones are required for move closures
     clippy::wildcard_imports,        // Standard pattern for gtk::prelude::*
     clippy::cast_possible_truncation,// Deliberate u64↔i64↔u32 conversions for DB/UI interop

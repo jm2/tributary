@@ -26,7 +26,7 @@ env:
   # The exact stable Rust release for every rustup-based release build. Bump it
   # deliberately to a release CI's stable jobs have already run on; it must not
   # fall below Cargo.toml's rust-version.
-  RUST_RELEASE_TOOLCHAIN: "1.98.1"
+  RUST_RELEASE_TOOLCHAIN: "1.99.0"
 
 jobs:
   # Resolve the event tag once, validate it against the tagged source, and
