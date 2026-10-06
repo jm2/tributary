@@ -3944,6 +3944,7 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::the_equalizer_window_opens_once_and_escape_closes_it();
                 crate::ui::equalizer_panel::widget_tests::the_equalizer_window_follows_the_selected_output();
                 crate::ui::equalizer_panel::widget_tests::the_eq_button_shows_whether_the_equalizer_is_on();
+                crate::ui::equalizer_panel::widget_tests::clicking_the_eq_button_opens_the_window_without_toggling_it();
                 crate::ui::equalizer_panel::widget_tests::the_wheel_in_the_equalizer_window_moves_nothing();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 crate::ui::header_bar::widget_tests::equalizer_button_follows_shuffle();
