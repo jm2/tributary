@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **macOS version requirement** — The macOS app now declares that it needs macOS 15 or newer,
   which its bundled libraries require, so older Macs refuse to open it with a clear message
   instead of it failing at launch.
+- **Preferences cut off in some languages** — In French, German, Russian, and other languages
+  with long column names, the Preferences window no longer runs past its right edge and hides
+  switches and dropdowns. Long names in the Browser Views and Visible Columns checkboxes now wrap
+  onto a second line.
 
 ## [0.7.0] — 2026-09-29
 
