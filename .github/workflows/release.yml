@@ -250,6 +250,12 @@ jobs:
       - name: Install system dependencies (Homebrew)
         run: |
           brew update
+          # The macos-15 runner image links a preinstalled openssl@1.1 into
+          # /opt/homebrew/bin, so linking openssl@3 (a GStreamer dependency)
+          # fails and `brew install` exits non-zero. Unlink the old one first.
+          if brew list --versions openssl@1.1 >/dev/null 2>&1; then
+            brew unlink openssl@1.1
+          fi
           brew install gtk4 libadwaita pkg-config create-dmg \
             gstreamer gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav \
             adwaita-icon-theme
