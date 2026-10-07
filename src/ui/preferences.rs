@@ -911,9 +911,11 @@ pub fn show_preferences(
         layout,
         config,
         saves,
-        on_album_artist_changed,
-        on_album_pane_artwork_changed,
-        on_album_pane_artwork_size_changed,
+        BrowserViewCallbacks {
+            album_artist: on_album_artist_changed,
+            album_pane_artwork: on_album_pane_artwork_changed,
+            album_pane_artwork_size: on_album_pane_artwork_size_changed,
+        },
         integration_groups,
         &rust_i18n::locale(),
     );
@@ -921,35 +923,34 @@ pub fn show_preferences(
     prefs_dialog.present(Some(parent));
 }
 
+/// What the window does when a Browser Views setting changes.
+struct BrowserViewCallbacks {
+    /// The artist grouping switch flipped.
+    album_artist: std::rc::Rc<dyn Fn(bool)>,
+    /// Album artwork turned on or off.
+    album_pane_artwork: std::rc::Rc<dyn Fn(bool)>,
+    /// The artwork size changed.
+    album_pane_artwork_size: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+}
+
 /// The preferences page, its text in `locale`: Library Location, Downloads,
 /// Browser Views, Visible Columns, Privacy, the integration groups, and
 /// Import last.
 ///
 /// Dialogs the page's buttons open later follow the session locale.
-#[allow(clippy::too_many_arguments)] // the dialog's handles and callbacks, plus the locale
 fn preferences_page(
     parent: &adw::ApplicationWindow,
     layout: &LayoutTargets,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
-    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
-    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
-    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    callbacks: BrowserViewCallbacks,
     integration_groups: &[adw::PreferencesGroup],
     locale: &str,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(&library_group(parent, config, locale));
     page.add(&downloads_group(parent, config, saves, locale));
-    for group in browser_views_groups(
-        config,
-        saves,
-        layout,
-        on_album_artist_changed,
-        on_album_pane_artwork_changed,
-        on_album_pane_artwork_size_changed,
-        locale,
-    ) {
+    for group in browser_views_groups(config, saves, layout, callbacks, locale) {
         page.add(&group);
     }
     page.add(&columns_group(config, saves, layout, locale));
@@ -1241,18 +1242,16 @@ fn browser_views_groups(
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
     layout: &LayoutTargets,
-    on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
-    on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
-    on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    callbacks: BrowserViewCallbacks,
     locale: &str,
 ) -> [adw::PreferencesGroup; 2] {
     let panes_group = browser_panes_group(config, saves, layout, locale);
-    let album_artist = album_artist_row(config, saves, on_album_artist_changed, locale);
+    let album_artist = album_artist_row(config, saves, callbacks.album_artist, locale);
     let artwork = album_artwork_row(
         config,
         saves,
-        on_album_pane_artwork_changed,
-        on_album_pane_artwork_size_changed,
+        callbacks.album_pane_artwork,
+        callbacks.album_pane_artwork_size,
         locale,
     );
     let rows_group = adw::PreferencesGroup::new();
@@ -2978,9 +2977,11 @@ pub mod widget_tests {
                 &layout,
                 &config,
                 &saves,
-                Rc::new(|_| {}),
-                Rc::new(|_| {}),
-                Rc::new(|_| {}),
+                super::BrowserViewCallbacks {
+                    album_artist: Rc::new(|_| {}),
+                    album_pane_artwork: Rc::new(|_| {}),
+                    album_pane_artwork_size: Rc::new(|_| {}),
+                },
                 &[],
                 locale,
             );
@@ -3054,9 +3055,17 @@ pub mod widget_tests {
             &config,
             &saves,
             &layout,
-            Rc::new(move |on| grouping.borrow_mut().push(format!("grouping {on}"))),
-            Rc::new(move |on| artwork.borrow_mut().push(format!("artwork {on}"))),
-            Rc::new(move |chosen: AlbumArtSize| size.borrow_mut().push(format!("size {chosen:?}"))),
+            super::BrowserViewCallbacks {
+                album_artist: Rc::new(move |on| {
+                    grouping.borrow_mut().push(format!("grouping {on}"));
+                }),
+                album_pane_artwork: Rc::new(move |on| {
+                    artwork.borrow_mut().push(format!("artwork {on}"));
+                }),
+                album_pane_artwork_size: Rc::new(move |chosen: AlbumArtSize| {
+                    size.borrow_mut().push(format!("size {chosen:?}"));
+                }),
+            },
             &rust_i18n::locale(),
         );
 

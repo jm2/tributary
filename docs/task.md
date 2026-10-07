@@ -1,6 +1,6 @@
 # Tributary backlog index
 
-Last reconciled: 2026-09-29 (0.7.0 released from main `44fc35ce`).
+Last reconciled: 2026-10-06 (0.7.1 released; 0.7.0 released 2026-09-29).
 
 **GitHub issues are the source of truth.** Each issue holds its own scope, acceptance criteria,
 discussion, and state. This file only maps the stable IDs used in older docs, commits, and PR
