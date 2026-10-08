@@ -264,7 +264,7 @@ jobs:
           brew list --versions
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
@@ -345,7 +345,7 @@ jobs:
         run: pacman -Q
 
       - name: Install Rust (${{ matrix.rust_target }})
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
           targets: ${{ matrix.rust_target }}
@@ -439,7 +439,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
 
@@ -497,7 +497,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ env.RUST_RELEASE_TOOLCHAIN }}
 
