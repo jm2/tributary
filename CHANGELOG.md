@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Maintenance** — Dependencies were refreshed with routine patch and minor updates, including
+  SeaORM, Tokio, rustls, mDNS discovery and translation support, along with the Flatpak build
+  tooling and the GitHub Actions used to build and test releases.
+
 ### Fixed
 
 - **EQ button icon when installed** — The EQ button's icon is now built into Tributary, so it shows
