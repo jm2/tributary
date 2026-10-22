@@ -22,6 +22,7 @@ header:
   main_menu: "主選單"
   playback_position: "播放位置"
   volume: "音量"
+  jump_to_playing_menu: "跳至正在播放的曲目(_J)"
   rescan_library: "重新掃描音樂庫"
   equalizer_menu: "等化器(_E)"
   my_computer: "我的電腦"

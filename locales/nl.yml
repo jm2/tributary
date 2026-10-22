@@ -22,6 +22,7 @@ header:
   main_menu: "Hoofdmenu"
   playback_position: "Afspeelpositie"
   volume: "Volume"
+  jump_to_playing_menu: "_Ga naar het huidige nummer"
   rescan_library: "Bibliotheek opnieuw scannen"
   equalizer_menu: "_Equalizer"
   my_computer: "Mijn computer"

@@ -2996,25 +2996,11 @@ fn update_now_playing_ui(
     // has filtered the playing item out. Scrolling leaves the selection and
     // keyboard focus alone: they belong to the user.
     let active_source_key = ctx.active_source_key.borrow().clone();
-    if let Some((identity, view)) = identity
-        .filter(|identity| identity_belongs_to_source(identity, &active_source_key))
-        .zip(queue_view(&active_source_key))
+    if let Some(position) =
+        visible_queue_item_position(&ctx.model, &active_source_key, item, identity)
     {
-        if let Some(position) = find_queue_item_position(
-            ctx.model.n_items(),
-            &identity.media_key,
-            item.occurrence,
-            item.row_instance_id,
-            |index| {
-                ctx.model
-                    .item(index)
-                    .and_downcast::<TrackObject>()
-                    .and_then(|track| row_position_identity(&view, &track))
-            },
-        ) {
-            ctx.column_view
-                .scroll_to(position, None, gtk::ListScrollFlags::NONE, None);
-        }
+        ctx.column_view
+            .scroll_to(position, None, gtk::ListScrollFlags::NONE, None);
     }
 
     // ── Update album art ─────────────────────────────────────────
@@ -3065,6 +3051,64 @@ fn update_now_playing_ui(
         // load is accepted and let a later Paused/Stopped event correct it.
         ctrl.update_playback(true);
     }
+}
+
+/// Where `item` sits in the track list, when the list shows the queue's
+/// source and the item hasn't been filtered out of it.
+fn visible_queue_item_position(
+    model: &impl IsA<gtk::gio::ListModel>,
+    active_source_key: &str,
+    item: &QueueItem,
+    identity: Option<&PlaybackIdentity>,
+) -> Option<u32> {
+    let identity =
+        identity.filter(|identity| identity_belongs_to_source(identity, active_source_key))?;
+    let view = queue_view(active_source_key)?;
+    find_queue_item_position(
+        model.n_items(),
+        &identity.media_key,
+        item.occurrence,
+        item.row_instance_id,
+        |index| {
+            model
+                .item(index)
+                .and_downcast::<TrackObject>()
+                .and_then(|track| row_position_identity(&view, &track))
+        },
+    )
+}
+
+/// Scroll the track list to the playing track, then select and focus it.
+/// Unlike the scroll on each track change, this is the user asking to land on
+/// the row, so it takes the selection. Returns `false`, changing nothing,
+/// when nothing is playing or the playing track isn't in the current view.
+pub fn jump_to_playing(
+    session: &RefCell<PlaybackSession>,
+    model: &impl IsA<gtk::gio::ListModel>,
+    active_source_key: &RefCell<String>,
+    column_view: &gtk::ColumnView,
+) -> bool {
+    let position = {
+        let session = session.borrow();
+        session.current().and_then(|item| {
+            visible_queue_item_position(
+                model,
+                &active_source_key.borrow(),
+                item,
+                Some(&item.identity),
+            )
+        })
+    };
+    let Some(position) = position else {
+        return false;
+    };
+    column_view.scroll_to(
+        position,
+        None,
+        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+        None,
+    );
+    true
 }
 
 fn find_queue_item_position(
@@ -3756,6 +3800,79 @@ mod tests {
 
     fn playback_row(id: &str) -> TrackObject {
         projected_row(id, &format!("file:///music/{id}.flac"))
+    }
+
+    /// See [`super::widget_tests::jump_to_playing_selects_the_playing_row`].
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn jump_to_playing_selects_the_playing_row() {
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for id in ["a", "b", "c"] {
+            store.append(&playback_row(id));
+        }
+        let selection = gtk::SingleSelection::builder()
+            .model(&store)
+            .autoselect(false)
+            .can_unselect(true)
+            .build();
+        // Attaching the model autoselected the first row; start from none.
+        selection.set_selected(gtk::INVALID_LIST_POSITION);
+        let column_view = gtk::ColumnView::new(Some(selection.clone()));
+        let source_key = RefCell::new(LOCAL_SOURCE_KEY.to_string());
+        let session = RefCell::new(PlaybackSession::default());
+
+        assert!(
+            !jump_to_playing(&session, &store, &source_key, &column_view),
+            "nothing is playing"
+        );
+        assert_eq!(selection.selected(), gtk::INVALID_LIST_POSITION);
+
+        assert!(session
+            .borrow_mut()
+            .replace_queue(vec![item(LOCAL_SOURCE_KEY, "b")], 0));
+        assert!(jump_to_playing(&session, &store, &source_key, &column_view));
+        assert_eq!(selection.selected(), 1);
+
+        selection.set_selected(0);
+        source_key.replace("playlist:mix".to_string());
+        assert!(
+            !jump_to_playing(&session, &store, &source_key, &column_view),
+            "the playing track isn't in this view"
+        );
+        assert_eq!(selection.selected(), 0, "the selection is left alone");
+    }
+
+    #[test]
+    fn the_playing_item_is_found_only_in_its_own_view() {
+        let store = gtk::gio::ListStore::new::<TrackObject>();
+        for id in ["a", "b", "c"] {
+            store.append(&playback_row(id));
+        }
+        let playing = item(LOCAL_SOURCE_KEY, "b");
+
+        assert_eq!(
+            visible_queue_item_position(
+                &store,
+                LOCAL_SOURCE_KEY,
+                &playing,
+                Some(&playing.identity)
+            ),
+            Some(1)
+        );
+        // Another source is on show, or the item was filtered out of this one.
+        assert_eq!(
+            visible_queue_item_position(&store, "playlist:mix", &playing, Some(&playing.identity)),
+            None
+        );
+        store.remove(1);
+        assert_eq!(
+            visible_queue_item_position(
+                &store,
+                LOCAL_SOURCE_KEY,
+                &playing,
+                Some(&playing.identity)
+            ),
+            None
+        );
     }
 
     fn write_lastfm_flac(path: &std::path::Path, title: Option<&str>, artist: Option<&str>) {
@@ -7866,5 +7983,18 @@ mod tests {
         assert_eq!(session.borrow().current_duration_ms(), None);
         session.borrow_mut().queue[0].duration_ms = Some(214_000);
         assert_eq!(session.borrow().current_duration_ms(), Some(214_000));
+    }
+}
+
+/// GTK-touching contracts folded into the crate's single consolidated
+/// GTK-initializing test (browser.rs `gtk_widget_contracts_hold_on_one_session`);
+/// see `ui::widget_test_session`. Mirrors the caller's macOS gate so these
+/// helpers are never dead code there.
+#[cfg(all(test, not(target_os = "macos")))]
+pub mod widget_tests {
+    /// Ctrl+J selects the playing row when the list shows it, and otherwise
+    /// leaves the list alone.
+    pub fn jump_to_playing_selects_the_playing_row() {
+        super::tests::jump_to_playing_selects_the_playing_row();
     }
 }

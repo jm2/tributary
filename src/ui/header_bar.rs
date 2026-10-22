@@ -375,6 +375,7 @@ fn primary_menu(locale: &str) -> gtk::gio::Menu {
     let menu = gtk::gio::Menu::new();
     let section = gtk::gio::Menu::new();
     for (key, action) in [
+        ("header.jump_to_playing_menu", "win.jump-to-playing"),
         ("header.rescan_library", "win.rescan-library"),
         ("header.equalizer_menu", "win.show-equalizer"),
         ("header.preferences_menu", "win.show-preferences"),
@@ -529,6 +530,7 @@ mod tests {
         assert_eq!(
             labels,
             [
+                "Zum laufenden _Titel springen",
                 "Bibliothek neu einlesen",
                 "E_qualizer",
                 "_Einstellungen",

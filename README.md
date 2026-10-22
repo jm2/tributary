@@ -842,6 +842,7 @@ Tributary. Remote, radio, and removable tracks are not counted.
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+F` / `Cmd+F` | Focus search bar |
+| `Ctrl+J` / `Cmd+J` | Jump to the playing track |
 | `Escape` | Clear the search |
 | `Shift+F10` / `Menu` | Open the tracklist context menu |
 | `Ctrl+Q` / `Cmd+Q` | Quit |
