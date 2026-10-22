@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **EQ button icon when installed** — The EQ button's icon is now built into Tributary, so it shows
+  when Tributary is installed system-wide (for example in `/usr/bin`) instead of a broken-image
+  placeholder. It also follows the desktop's text colour, so it stays visible with a dark theme.
+
 ### Security
 
 - **Network library updates** — Updated the QUIC and TLS certificate-checking libraries Tributary

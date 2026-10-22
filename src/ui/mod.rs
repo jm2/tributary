@@ -13,6 +13,7 @@ mod downloads;
 pub mod equalizer_panel;
 pub mod folder_browser;
 pub mod header_bar;
+pub mod icons;
 mod l10n;
 pub mod lastfm_settings;
 mod library_commands;

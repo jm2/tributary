@@ -97,7 +97,7 @@ pub fn show_play_button_state(button: &gtk::Button, playing: bool) {
     button.update_property(&[gtk::accessible::Property::Label(&name)]);
 }
 
-/// The EQ button's icon, installed with the app's other icons: GNOME's icon
+/// The EQ button's icon, bundled with the app (see `ui::icons`): GNOME's icon
 /// theme has no equalizer icon.
 pub const EQUALIZER_ICON: &str = "io.github.jm2.tributary-equalizer-symbolic";
 

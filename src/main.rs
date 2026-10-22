@@ -423,10 +423,14 @@ fn main() {
             return;
         };
 
-        // Register the app icon search path now that GTK has a display.
-        if let Some(ref exe) = exe_path {
-            if let Some(display) = gtk::gdk::Display::default() {
-                let icon_theme = gtk::IconTheme::for_display(&display);
+        // Register icon locations now that GTK has a display. The embedded
+        // resource carries the app's own icons wherever the binary is
+        // installed; the search paths below find the rest in a source tree
+        // or a Windows/macOS bundle.
+        if let Some(display) = gtk::gdk::Display::default() {
+            let icon_theme = gtk::IconTheme::for_display(&display);
+            ui::icons::add_bundled_icons(&icon_theme);
+            if let Some(ref exe) = exe_path {
                 // Development: <repo>/target/release/tributary → <repo>/data/icons
                 // Also handles `-Run` mode where exe is in target/<profile>/.
                 if let Some(repo) = exe
