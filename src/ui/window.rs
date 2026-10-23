@@ -3850,6 +3850,20 @@ pub(crate) fn build_window(
     }
     app.set_accels_for_action("win.focus-search", &["<primary>f"]);
 
+    // ── Ctrl+J: jump to the playing track ────────────────────────────
+    {
+        let session = playback_session.clone();
+        let model = sort_model.clone();
+        let source_key = active_source_key.clone();
+        let view = column_view.clone();
+        let jump_action = gtk::gio::SimpleAction::new("jump-to-playing", None);
+        jump_action.connect_activate(move |_, _| {
+            super::playback::jump_to_playing(&session, &model, &source_key, &view);
+        });
+        window.add_action(&jump_action);
+    }
+    app.set_accels_for_action("win.jump-to-playing", &["<primary>j"]);
+
     // ── Receive LibraryEvents on GTK main thread ─────────────────────
     setup_library_events(
         &window,

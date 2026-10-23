@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Jump to the playing track** — Press Ctrl+J (Cmd+J on macOS), click the song's title in the
+  header bar, or choose Jump to Playing Track from the main menu, to scroll the track list back to
+  the song that's playing and select it. It works while the list shows the source the song is
+  playing from.
+
 ### Changed
 
 - **Maintenance** — Dependencies were refreshed with routine patch and minor updates, including

@@ -3950,7 +3950,9 @@ mod tests {
                 crate::ui::equalizer_panel::widget_tests::the_wheel_in_the_equalizer_window_moves_nothing();
                 crate::ui::header_bar::widget_tests::play_button_tooltip_follows_state();
                 crate::ui::header_bar::widget_tests::equalizer_button_follows_shuffle();
+                crate::ui::header_bar::widget_tests::now_playing_click_jumps_to_playing();
                 crate::ui::icons::widget_tests::bundled_icons_resolve_without_a_search_path();
+                crate::ui::playback::widget_tests::jump_to_playing_selects_the_playing_row();
                 crate::ui::playlist_editor::widget_tests::number_and_date_rows_gate_ok();
                 crate::ui::playlist_editor::widget_tests::rows_are_labelled_for_the_locale_they_are_built_for();
                 crate::ui::server_dialogs::widget_tests::connect_waits_for_required_credentials();

@@ -22,6 +22,8 @@ header:
   main_menu: "Menú principal"
   playback_position: "Posición de reproducción"
   volume: "Volumen"
+  jump_to_playing_menu: "_Ir a la pista en reproducción"
+  jump_to_playing: "Ir a la pista en reproducción"
   rescan_library: "Volver a escanear la biblioteca"
   equalizer_menu: "_Ecualizador"
   my_computer: "Mi equipo"
