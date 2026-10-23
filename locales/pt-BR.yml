@@ -23,6 +23,7 @@ header:
   playback_position: "Posição da reprodução"
   volume: "Volume"
   jump_to_playing_menu: "_Ir para a faixa em reprodução"
+  jump_to_playing: "Ir para a faixa em reprodução"
   rescan_library: "Reexaminar a biblioteca"
   equalizer_menu: "_Equalizador"
   my_computer: "Meu computador"

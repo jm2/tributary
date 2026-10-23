@@ -25,6 +25,7 @@ header:
   playback_position: "Pozycja odtwarzania"
   volume: "Głośność"
   jump_to_playing_menu: "_Przejdź do odtwarzanego utworu"
+  jump_to_playing: "Przejdź do odtwarzanego utworu"
   rescan_library: "Przeskanuj bibliotekę ponownie"
   equalizer_menu: "_Korektor"
   my_computer: "Mój komputer"

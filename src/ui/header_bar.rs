@@ -215,6 +215,7 @@ pub fn build_header_bar() -> HeaderBarWidgets {
         .build();
     now_playing.append(&album_art);
     now_playing.append(&text_box);
+    attach_jump_to_playing(&now_playing);
 
     // ── Right: Progress + Volume + Menu ──────────────────────────────
     let position_label = gtk::Label::builder()
@@ -448,6 +449,25 @@ pub fn build_output_row(name: &str, icon_name: &str, active: bool) -> gtk::Box {
     row
 }
 
+/// Clicking the now-playing area runs `win.jump-to-playing`, like Ctrl+J.
+/// It acts on release so a drag still moves the window: the header bar's
+/// window handle claims a drag, which cancels this gesture.
+fn attach_jump_to_playing(now_playing: &gtk::Box) {
+    now_playing.set_tooltip_text(Some(rust_i18n::t!("header.jump_to_playing").as_ref()));
+    now_playing.set_cursor_from_name(Some("pointer"));
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
+    gesture.connect_released(|gesture, n_press, _, _| {
+        if n_press != 1 {
+            return;
+        }
+        if let Some(widget) = gesture.widget() {
+            let _ = widget.activate_action("win.jump-to-playing", None);
+        }
+    });
+    now_playing.add_controller(gesture);
+}
+
 /// GTK-touching contracts folded into the crate's single consolidated
 /// GTK-initializing test (browser.rs `gtk_widget_contracts_hold_on_one_session`);
 /// see `ui::widget_test_session`. Mirrors the caller's macOS gate so these
@@ -502,6 +522,39 @@ pub mod widget_tests {
         theme.set_search_path(&[icons.as_path()]);
         theme.set_theme_name(Some("hicolor"));
         assert!(theme.has_icon(EQUALIZER_ICON));
+    }
+
+    /// A single click on the now-playing area runs the jump action; the
+    /// second press of a double-click does not run it again.
+    pub fn now_playing_click_jumps_to_playing() {
+        let now_playing = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        attach_jump_to_playing(&now_playing);
+        assert_eq!(
+            now_playing.tooltip_text().as_deref(),
+            Some("Jump to Playing Track")
+        );
+
+        let jumps = Rc::new(Cell::new(0));
+        let action = gtk::gio::SimpleAction::new("jump-to-playing", None);
+        {
+            let jumps = Rc::clone(&jumps);
+            action.connect_activate(move |_, _| jumps.set(jumps.get() + 1));
+        }
+        let group = gtk::gio::SimpleActionGroup::new();
+        group.add_action(&action);
+        now_playing.insert_action_group("win", Some(&group));
+
+        let gesture = now_playing
+            .observe_controllers()
+            .iter::<gtk::glib::Object>()
+            .filter_map(Result::ok)
+            .find_map(|controller| controller.downcast::<gtk::GestureClick>().ok())
+            .expect("a click gesture");
+        assert_eq!(gesture.button(), gtk::gdk::BUTTON_PRIMARY);
+        gesture.emit_by_name::<()>("released", &[&1i32, &0.0f64, &0.0f64]);
+        assert_eq!(jumps.get(), 1);
+        gesture.emit_by_name::<()>("released", &[&2i32, &0.0f64, &0.0f64]);
+        assert_eq!(jumps.get(), 1);
     }
 }
 

@@ -23,6 +23,7 @@ header:
   playback_position: "Position de lecture"
   volume: "Volume"
   jump_to_playing_menu: "Aller à la piste en _cours"
+  jump_to_playing: "Aller à la piste en cours"
   rescan_library: "Réanalyser la bibliothèque"
   equalizer_menu: "_Égaliseur"
   my_computer: "Mon ordinateur"
