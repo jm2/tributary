@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses for network connections to fix published vulnerabilities: a malicious server could crash
   Tributary or make it use excessive memory, and certificates from distrusted authorities could be
   accepted.
+- **Hashing library update** — Updated a constant-time helper library used by Tributary's SHA-256
+  hashing, to fix a published timing weakness in it (RUSTSEC-2026-0385).
 
 ## [0.7.1] — 2026-10-06
 
