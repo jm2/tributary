@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-10-23
+
 ### Added
 
 - **Jump to the playing track** — Press Ctrl+J (Cmd+J on macOS), click the song's title in the
@@ -816,7 +818,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
-[Unreleased]: https://github.com/jm2/tributary/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jm2/tributary/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/jm2/tributary/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jm2/tributary/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jm2/tributary/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/jm2/tributary/compare/v0.6.1...v0.6.2

@@ -50,6 +50,7 @@ Tributary provides a unified interface for managing and streaming music from mul
 | Batch metadata editing (multi-select) | ✅ |
 | MusicBrainz auto-fill lookup | ✅ |
 | Keyboard shortcut: `Ctrl+F` / `Cmd+F` to search | ✅ |
+| Jump to the playing track (`Ctrl+J` / `Cmd+J`, or click the title) | ✅ |
 | XDG music directory support (non-English locales) | ✅ |
 | Network connection guard (prevents duplicate auth) | ✅ |
 | i18n/l10n framework (13 languages, auto locale detection) | ✅ |
@@ -826,10 +827,13 @@ volume. Packaged Windows and macOS builds follow changes to the system default a
   before continuing
 - **Repeat** — cycles through Off → All → One
 - **Equalizer** — the EQ button after Shuffle, or **Equalizer** in the main menu, opens the
-  ten-band equalizer for playback on this computer in its own window. The button's icon is
-  highlighted while the equalizer is on. See the [equalizer design](docs/equalizer.md)
+  ten-band equalizer for playback on this computer in its own window. The button stays pressed in
+  while the equalizer is on. See the [equalizer design](docs/equalizer.md)
 - **Seek** — drag the progress scrubber
 - **Volume** — drag the volume slider (cubic perceptual curve)
+- **Jump to the playing track** — click the song's title in the header bar, press `Ctrl+J` /
+  `Cmd+J`, or choose **Jump to Playing Track** in the main menu to scroll the track list back to
+  the playing song and select it
 
 A local track with a known duration counts as played once half of it has been heard (capped at
 four minutes); tracks with no known duration use a more conservative rule described in the
