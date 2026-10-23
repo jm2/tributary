@@ -5299,7 +5299,7 @@ dependencies = [
 
 [[package]]
 name = "tributary"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
