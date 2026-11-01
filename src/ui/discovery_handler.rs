@@ -243,12 +243,6 @@ fn publish_to_existing_row(
         source,
         is_configured_source(source_registry, source_id),
         advertised_route,
-        |source_id| {
-            // A pending constructor or active adapter may have captured the
-            // withdrawn address. Claims and the logical row remain; only exact
-            // lifecycle/session authority is revoked.
-            let _ = source_registry.disconnect(source_id);
-        },
     ))
 }
 
@@ -533,34 +527,44 @@ fn accepts_daap_probe_result(
         && !source.connected()
 }
 
-/// Replace the latest discovery route while revoking any operation or session
-/// that could still be bound to a withdrawn advertised address.
+/// Replace the latest discovery route without touching work already under way.
 ///
 /// A configured (Saved or Environment) row never takes a discovery route: its
 /// connections use the endpoint the user configured, and discovery only marks
-/// it available. On a purely discovered row, adding the first route or more
-/// addresses leaves existing work alone; withdrawing any address the row
-/// offered revokes it. Returns whether the row's route changed.
+/// it available. On a purely discovered row the newest route is used for
+/// connections made from now on, while an existing session, or a connect
+/// already in flight, keeps the route it captured.
+///
+/// A change in the advertised address set is deliberately *not* treated as
+/// the host giving up an address. Multihomed responders announce only the
+/// receiving interface's addresses with the cache-flush bit set, so the set
+/// that mdns-sd reports flips between interfaces, and transiently drops
+/// link-local addresses, while every address stays reachable. Revoking on
+/// those changes tore down healthy sessions mid-playback. Only a real `Lost`
+/// event ([`withdraw_discovery_route`]) revokes work. Returns whether the
+/// row's route changed.
 fn reconcile_discovery_route(
     source: &SourceObject,
     configured: bool,
     advertised_route: Option<AdvertisedHttpRoute>,
-    mut disconnect: impl FnMut(crate::architecture::SourceId),
 ) -> bool {
     let advertised_route = advertised_route.filter(|_| !configured);
     let previous = source.advertised_route();
     let changed = previous != advertised_route;
-    let withdrew_address = previous.is_some_and(|previous| {
-        !advertised_route
-            .as_ref()
-            .is_some_and(|next| previous.is_covered_by(next))
-    });
-    source.set_advertised_route(advertised_route);
-    if withdrew_address {
-        if let Some(source_id) = source.source_id() {
-            disconnect(source_id);
-        }
+    if changed {
+        let addresses = |route: Option<&AdvertisedHttpRoute>| {
+            route
+                .map(|route| route.addresses().to_vec())
+                .unwrap_or_default()
+        };
+        tracing::debug!(
+            backend = %source.backend_type(),
+            previous = ?addresses(previous.as_ref()),
+            next = ?addresses(advertised_route.as_ref()),
+            "Discovery route changed; existing sessions keep their route"
+        );
     }
+    source.set_advertised_route(advertised_route);
     changed
 }
 
@@ -825,6 +829,31 @@ mod tests {
         (source, source_id)
     }
 
+    /// A purely discovered row with a live connection attempt, published into
+    /// `store`. The attempt never completes, so it stays pending unless
+    /// revoked.
+    fn discovered_row_with_pending_connect(
+        store: &gtk::gio::ListStore,
+        registry: &SourceRegistry,
+        claims: &ProvenanceClaims,
+        backend_type: &str,
+        server_url: &str,
+    ) -> (SourceObject, SourceId) {
+        let source = SourceObject::discovered("Discovered", backend_type, server_url);
+        let source_id = source.source_id().expect("stable source");
+        store.append(&source);
+        let publisher = discovery_publisher(backend_type, server_url).expect("publisher");
+        assert!(claims.ensure(registry, source_id, SourceProvenance::Discovery, publisher));
+        assert!(registry
+            .connect_standard::<crate::subsonic::SubsonicBackend, _, _, _>(
+                source_id,
+                |_| {},
+                std::future::pending,
+            )
+            .is_some());
+        (source, source_id)
+    }
+
     fn has_pending_connect(registry: &SourceRegistry, source_id: SourceId) -> bool {
         registry
             .snapshot(source_id)
@@ -884,48 +913,88 @@ mod tests {
     }
 
     #[test]
-    fn active_route_replacement_revokes_session_but_preserves_row_and_new_route() {
+    fn active_route_replacement_keeps_session_and_takes_new_route() {
+        // Multihomed hosts flip between per-interface address sets; a
+        // disjoint replacement is still not grounds to revoke the session.
         let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
         source.set_connected(true);
         let source_id = source.source_id().expect("stable source");
         let old_route = advertised_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689)));
         let new_route = advertised_route(SocketAddr::from(([127, 0, 0, 2], 3_689)));
         source.set_advertised_route(Some(old_route));
-        let mut disconnected = Vec::new();
 
         assert!(reconcile_discovery_route(
             &source,
             false,
             Some(new_route.clone()),
-            |id| disconnected.push(id),
         ));
 
-        assert_eq!(disconnected, vec![source_id]);
         assert_eq!(source.source_id(), Some(source_id));
-        assert!(
-            source.connected(),
-            "GTK demotion belongs to the baseline reducer"
-        );
+        assert!(source.connected());
         assert_eq!(source.advertised_route(), Some(new_route));
     }
 
     #[test]
-    fn pending_route_reduction_cancels_captured_route_without_dropping_row() {
+    fn address_subset_keeps_the_session_and_takes_the_new_route() {
+        // Observed: a refresh that drops only the link-local addresses.
+        let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
+        source.set_connected(true);
+        let ipv4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689));
+        let ipv6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 3_689));
+        source.set_advertised_route(Some(advertised_route_with(&[ipv4, ipv6])));
+        let subset = advertised_route(ipv4);
+
+        assert!(reconcile_discovery_route(
+            &source,
+            false,
+            Some(subset.clone())
+        ));
+
+        assert!(source.connected());
+        assert_eq!(source.advertised_route(), Some(subset));
+    }
+
+    #[test]
+    fn pending_route_reduction_keeps_captured_work_without_dropping_row() {
         let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
         source.set_connecting_generation(41);
         let source_id = source.source_id().expect("stable source");
         let old_route = advertised_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689)));
         source.set_advertised_route(Some(old_route));
-        let mut disconnected = Vec::new();
 
-        assert!(reconcile_discovery_route(&source, false, None, |id| {
-            disconnected.push(id);
-        }));
+        assert!(reconcile_discovery_route(&source, false, None));
 
-        assert_eq!(disconnected, vec![source_id]);
         assert_eq!(source.source_id(), Some(source_id));
         assert_eq!(source.connecting_generation(), Some(41));
         assert_eq!(source.advertised_route(), None);
+    }
+
+    #[tokio::test]
+    async fn route_change_on_a_discovered_row_never_disconnects_pending_work() {
+        let store = gtk::gio::ListStore::new::<SourceObject>();
+        let registry = SourceRegistry::new(tokio::runtime::Handle::current());
+        let claims = ProvenanceClaims::default();
+        let url = "http://mini.local:3689";
+        let (source, source_id) =
+            discovered_row_with_pending_connect(&store, &registry, &claims, "daap", url);
+        let publisher = discovery_publisher("daap", url).expect("publisher");
+        let first = advertised_route(SocketAddr::from(([192, 0, 2, 10], 3_689)));
+        let flipped = advertised_route(SocketAddr::from(([192, 0, 2, 11], 3_689)));
+        source.set_advertised_route(Some(first));
+
+        assert_eq!(
+            publish_to_existing_row(
+                &source,
+                &registry,
+                &claims,
+                publisher,
+                Some(flipped.clone())
+            ),
+            Some(true)
+        );
+
+        assert_eq!(source.advertised_route(), Some(flipped));
+        assert!(has_pending_connect(&registry, source_id));
     }
 
     #[test]
@@ -933,18 +1002,14 @@ mod tests {
         let source = SourceObject::discovered("mini", "daap", "http://mini.local:3689");
         source.set_connecting_generation(7);
         let route = advertised_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 3_689)));
-        let mut disconnects = 0;
 
         assert!(reconcile_discovery_route(
             &source,
             false,
-            Some(route.clone()),
-            |_| {
-                disconnects += 1;
-            }
+            Some(route.clone())
         ));
 
-        assert_eq!(disconnects, 0);
+        assert_eq!(source.connecting_generation(), Some(7));
         assert_eq!(source.advertised_route(), Some(route));
     }
 
@@ -956,16 +1021,14 @@ mod tests {
         let ipv6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 3_689));
         source.set_advertised_route(Some(advertised_route(ipv4)));
         let superset = advertised_route_with(&[ipv4, ipv6]);
-        let mut disconnects = 0;
 
         assert!(reconcile_discovery_route(
             &source,
             false,
             Some(superset.clone()),
-            |_| disconnects += 1
         ));
 
-        assert_eq!(disconnects, 0);
+        assert!(source.connected());
         assert_eq!(source.advertised_route(), Some(superset));
     }
 
