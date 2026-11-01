@@ -11,7 +11,7 @@
 //! All discovered servers are streamed to the GTK main thread via a
 //! single [`async_channel`] carrying [`DiscoveryEvent`] messages.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -27,22 +27,6 @@ use crate::architecture::AdvertisedHttpRoute;
 const MAX_MDNS_PUBLICATIONS: usize = 512;
 const MAX_MDNS_INSTANCES_PER_ORIGIN: usize = 32;
 const MAX_MDNS_ADDRESSES_PER_ROUTE: usize = 16;
-
-/// How long an address keeps riding in an instance's advertised route after a
-/// re-resolution of that same instance stops listing it.
-///
-/// mdns-sd re-emits `ServiceResolved` while it refreshes cached records, and a
-/// refresh can briefly report only a subset of the host's A/AAAA records
-/// before the rest arrive (observed: one address dropped for ~1 s during a
-/// periodic re-announcement). The UI treats any withdrawn address as grounds
-/// to revoke sessions that may have connected through it, so publishing that
-/// transient subset tore down healthy DAAP sessions mid-playback. Holding a
-/// dropped address for this grace window absorbs the flap; an address that
-/// stays gone is withdrawn once the window elapses. Only a resolution that
-/// narrows the set is held back: one that introduces a new address is treated
-/// as a renumbering and applied at once. `ServiceRemoved` is not delayed — a
-/// real goodbye still retires the instance immediately.
-const MDNS_ADDRESS_WITHDRAWAL_GRACE: Duration = Duration::from_secs(30);
 
 /// A server found via network discovery.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -123,64 +107,6 @@ impl PublishedOrigin {
 struct MdnsPublication {
     server: DiscoveredServer,
     advertised_addresses: Vec<SocketAddr>,
-    /// Addresses an earlier resolution of this same instance advertised but
-    /// the latest one omitted, keyed to when they were first omitted. They
-    /// stay in the aggregated route until [`MDNS_ADDRESS_WITHDRAWAL_GRACE`]
-    /// elapses or the instance re-advertises them.
-    withdrawn_addresses: BTreeMap<SocketAddr, Instant>,
-}
-
-impl MdnsPublication {
-    fn new(server: DiscoveredServer, advertised_addresses: Vec<SocketAddr>) -> Self {
-        Self {
-            server,
-            advertised_addresses,
-            withdrawn_addresses: BTreeMap::new(),
-        }
-    }
-
-    /// Carry forward addresses `previous` advertised that this resolution
-    /// omits, unless their grace window has already elapsed at `now`.
-    fn retain_withdrawn_from(&mut self, previous: &Self, now: Instant) {
-        let still_advertised = |address: &SocketAddr| self.advertised_addresses.contains(address);
-        let mut withdrawn: BTreeMap<SocketAddr, Instant> = previous
-            .withdrawn_addresses
-            .iter()
-            .filter(|(address, _)| !still_advertised(address))
-            .map(|(address, since)| (*address, *since))
-            .collect();
-        for address in &previous.advertised_addresses {
-            if !still_advertised(address) {
-                withdrawn.entry(*address).or_insert(now);
-            }
-        }
-        withdrawn.retain(|_, since| {
-            now.saturating_duration_since(*since) < MDNS_ADDRESS_WITHDRAWAL_GRACE
-        });
-        // Keep the combined route within the per-route bound; retained
-        // addresses are the first to go.
-        let room = MAX_MDNS_ADDRESSES_PER_ROUTE.saturating_sub(self.advertised_addresses.len());
-        while withdrawn.len() > room {
-            withdrawn.pop_last();
-        }
-        self.withdrawn_addresses = withdrawn;
-    }
-
-    /// Drop retained addresses whose grace window has elapsed at `now`.
-    /// Returns whether anything was dropped.
-    fn expire_withdrawn(&mut self, now: Instant) -> bool {
-        let before = self.withdrawn_addresses.len();
-        self.withdrawn_addresses.retain(|_, since| {
-            now.saturating_duration_since(*since) < MDNS_ADDRESS_WITHDRAWAL_GRACE
-        });
-        self.withdrawn_addresses.len() != before
-    }
-
-    fn route_addresses(&self) -> impl Iterator<Item = &SocketAddr> {
-        self.advertised_addresses
-            .iter()
-            .chain(self.withdrawn_addresses.keys())
-    }
 }
 
 /// Live mDNS publications keyed by exact service identity.
@@ -207,35 +133,9 @@ impl MdnsPublications {
         key: ServiceInstanceKey,
         publication: MdnsPublication,
     ) -> Vec<DiscoveryEvent> {
-        self.upsert_at(key, publication, Instant::now())
-    }
-
-    /// [`Self::upsert`] with an injected clock for the withdrawal grace.
-    fn upsert_at(
-        &mut self,
-        key: ServiceInstanceKey,
-        mut publication: MdnsPublication,
-        now: Instant,
-    ) -> Vec<DiscoveryEvent> {
         let mut affected = BTreeSet::new();
         if let Some(previous) = self.by_instance.get(&key) {
             affected.insert(PublishedOrigin::of(&previous.server));
-            // A re-resolution of the same instance at the same origin may
-            // transiently list only a subset of its addresses; keep the
-            // omitted ones for the grace window instead of withdrawing them
-            // on the spot. A resolution that introduces a new address is a
-            // genuine renumbering and applies immediately, so a stale address
-            // never lingers in the connection override alongside its
-            // replacement.
-            let same_origin =
-                PublishedOrigin::of(&previous.server) == PublishedOrigin::of(&publication.server);
-            let only_narrows = publication
-                .advertised_addresses
-                .iter()
-                .all(|address| previous.route_addresses().any(|known| known == address));
-            if same_origin && only_narrows {
-                publication.retain_withdrawn_from(previous, now);
-            }
         }
         let new_origin = PublishedOrigin::of(&publication.server);
         affected.insert(new_origin.clone());
@@ -267,37 +167,6 @@ impl MdnsPublications {
 
     fn contains(&self, key: &ServiceInstanceKey) -> bool {
         self.by_instance.contains_key(key)
-    }
-
-    /// Withdraw retained addresses whose grace window has elapsed at `now`,
-    /// returning the resulting route updates.
-    fn expire_withdrawn_addresses(&mut self, now: Instant) -> Vec<DiscoveryEvent> {
-        let expiring: Vec<ServiceInstanceKey> = self
-            .by_instance
-            .iter()
-            .filter(|(_, publication)| {
-                publication.withdrawn_addresses.values().any(|since| {
-                    now.saturating_duration_since(*since) >= MDNS_ADDRESS_WITHDRAWAL_GRACE
-                })
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        if expiring.is_empty() {
-            return Vec::new();
-        }
-        let affected: BTreeSet<PublishedOrigin> = expiring
-            .iter()
-            .filter_map(|key| self.by_instance.get(key))
-            .map(|publication| PublishedOrigin::of(&publication.server))
-            .collect();
-        let before = self.snapshot(&affected);
-        for key in &expiring {
-            if let Some(publication) = self.by_instance.get_mut(key) {
-                publication.expire_withdrawn(now);
-            }
-        }
-        let after = self.snapshot(&affected);
-        Self::changes(affected, &before, &after)
     }
 
     fn remove(&mut self, key: &ServiceInstanceKey) -> Vec<DiscoveryEvent> {
@@ -347,7 +216,7 @@ impl MdnsPublications {
             let Some(publication) = self.by_instance.get(key) else {
                 continue;
             };
-            for address in publication.route_addresses() {
+            for address in &publication.advertised_addresses {
                 addresses.insert(*address);
                 if addresses.len() > MAX_MDNS_ADDRESSES_PER_ROUTE {
                     addresses.pop_last();
@@ -593,11 +462,6 @@ fn run_mdns_discovery(tx: async_channel::Sender<DiscoveryEvent>) {
             }
         }
 
-        // Withdraw any transiently-dropped address whose grace has elapsed.
-        let expired = publications.expire_withdrawn_addresses(Instant::now());
-        got_event |= !expired.is_empty();
-        publish_mdns_events(expired, &tx);
-
         // ── macOS: re-browse if no servers found yet ─────────────────
         // After the user grants Local Network permission, the daemon
         // needs fresh browse() calls to discover services.
@@ -697,7 +561,10 @@ fn process_mdns_event(
             };
             let events = publications.upsert(
                 ServiceInstanceKey::new(service_type, &fullname),
-                MdnsPublication::new(server, addresses),
+                MdnsPublication {
+                    server,
+                    advertised_addresses: addresses,
+                },
             );
             publish_mdns_events(events, tx);
         }
@@ -1137,7 +1004,13 @@ fn process_chromecast_event(
                 advertised_route: None,
                 device_id: None,
             };
-            let events = publications.upsert(key, MdnsPublication::new(server, addresses));
+            let events = publications.upsert(
+                key,
+                MdnsPublication {
+                    server,
+                    advertised_addresses: addresses,
+                },
+            );
             publish_mdns_events(events, tx);
         }
 
@@ -1288,7 +1161,7 @@ mod tests {
         validate_jellyfin_discovery_address, DiscoveredServer, DiscoveryEvent, JellyfinServers,
         MdnsPublication, MdnsPublications, PublishedOrigin, ServiceInstanceKey, CHROMECAST_SERVICE,
         JELLYFIN_MISS_THRESHOLD, MAX_MDNS_INSTANCES_PER_ORIGIN, MAX_MDNS_PUBLICATIONS,
-        MDNS_ADDRESS_WITHDRAWAL_GRACE, RAOP_SERVICE, SUBSONIC_SERVICE,
+        RAOP_SERVICE, SUBSONIC_SERVICE,
     };
 
     fn resolved_event(
@@ -1782,8 +1655,8 @@ mod tests {
                 "subsonic",
                 &format!("Instance-{instance}._subsonic._tcp.local."),
             ),
-            MdnsPublication::new(
-                DiscoveredServer {
+            MdnsPublication {
+                server: DiscoveredServer {
                     name: format!("Instance {instance}"),
                     url,
                     service_type: "subsonic".to_string(),
@@ -1791,151 +1664,9 @@ mod tests {
                     advertised_route: None,
                     device_id: None,
                 },
-                vec!["192.0.2.1:4533".parse().unwrap()],
-            ),
+                advertised_addresses: vec!["192.0.2.1:4533".parse().unwrap()],
+            },
         )
-    }
-
-    fn daap_publication(addresses: &[&str]) -> (ServiceInstanceKey, MdnsPublication) {
-        let url = "http://antec.local:3689".to_string();
-        let addresses: Vec<SocketAddr> = addresses.iter().map(|a| a.parse().unwrap()).collect();
-        (
-            ServiceInstanceKey::new("daap", "antec._daap._tcp.local."),
-            MdnsPublication::new(
-                DiscoveredServer {
-                    name: "antec".to_string(),
-                    url,
-                    service_type: "daap".to_string(),
-                    requires_password: None,
-                    advertised_route: None,
-                    device_id: None,
-                },
-                addresses,
-            ),
-        )
-    }
-
-    fn found_route_addresses(events: &[DiscoveryEvent]) -> Vec<Vec<SocketAddr>> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                DiscoveryEvent::Found(server) => Some(
-                    server
-                        .advertised_route
-                        .as_ref()
-                        .map(|route| route.addresses().to_vec())
-                        .unwrap_or_default(),
-                ),
-                DiscoveryEvent::Lost { .. } => None,
-            })
-            .collect()
-    }
-
-    const ADDR_A: &str = "192.0.2.10:3689";
-    const ADDR_B: &str = "192.0.2.11:3689";
-
-    #[test]
-    fn transient_partial_resolution_does_not_withdraw_an_address() {
-        let mut publications = MdnsPublications::default();
-        let t0 = Instant::now();
-
-        let (key, both) = daap_publication(&[ADDR_A, ADDR_B]);
-        let events = publications.upsert_at(key, both, t0);
-        assert_eq!(found_route_addresses(&events).len(), 1);
-
-        // A refresh briefly lists only one address: no route change at all.
-        let (key, partial) = daap_publication(&[ADDR_A]);
-        let events = publications.upsert_at(key, partial, t0 + Duration::from_secs(1));
-        assert!(
-            events.is_empty(),
-            "partial re-resolution must not publish a narrower route"
-        );
-
-        // The full set returns: still nothing to publish.
-        let (key, both) = daap_publication(&[ADDR_A, ADDR_B]);
-        let events = publications.upsert_at(key, both, t0 + Duration::from_secs(2));
-        assert!(events.is_empty());
-
-        // And the restored address is no longer pending withdrawal.
-        assert!(publications
-            .expire_withdrawn_addresses(t0 + MDNS_ADDRESS_WITHDRAWAL_GRACE * 2)
-            .is_empty());
-    }
-
-    #[test]
-    fn address_that_stays_gone_is_withdrawn_after_the_grace_window() {
-        let mut publications = MdnsPublications::default();
-        let t0 = Instant::now();
-        let dropped_at = t0 + Duration::from_secs(1);
-
-        let (key, both) = daap_publication(&[ADDR_A, ADDR_B]);
-        let _ = publications.upsert_at(key, both, t0);
-        let (key, partial) = daap_publication(&[ADDR_A]);
-        assert!(publications.upsert_at(key, partial, dropped_at).is_empty());
-
-        // A repeated partial resolution does not restart the grace window.
-        let (key, partial) = daap_publication(&[ADDR_A]);
-        assert!(publications
-            .upsert_at(key, partial, dropped_at + Duration::from_secs(10))
-            .is_empty());
-
-        let just_before = dropped_at
-            + MDNS_ADDRESS_WITHDRAWAL_GRACE
-                .checked_sub(Duration::from_millis(1))
-                .expect("grace exceeds 1 ms");
-        assert!(publications
-            .expire_withdrawn_addresses(just_before)
-            .is_empty());
-
-        let events =
-            publications.expire_withdrawn_addresses(dropped_at + MDNS_ADDRESS_WITHDRAWAL_GRACE);
-        assert_eq!(
-            found_route_addresses(&events),
-            vec![vec![ADDR_A.parse::<SocketAddr>().unwrap()]]
-        );
-    }
-
-    #[test]
-    fn renumbering_replaces_the_route_immediately() {
-        let mut publications = MdnsPublications::default();
-        let t0 = Instant::now();
-        const ADDR_C: &str = "192.0.2.12:3689";
-
-        let (key, both) = daap_publication(&[ADDR_A, ADDR_B]);
-        let _ = publications.upsert_at(key, both, t0);
-        // B is replaced by C: a new address means this is not a transient
-        // subset, so B must not linger next to its replacement.
-        let (key, renumbered) = daap_publication(&[ADDR_A, ADDR_C]);
-        let events = publications.upsert_at(key, renumbered, t0 + Duration::from_secs(1));
-        assert_eq!(
-            found_route_addresses(&events),
-            vec![vec![
-                ADDR_A.parse::<SocketAddr>().unwrap(),
-                ADDR_C.parse::<SocketAddr>().unwrap(),
-            ]]
-        );
-    }
-
-    #[test]
-    fn service_removal_is_not_delayed_by_the_withdrawal_grace() {
-        let mut publications = MdnsPublications::default();
-        let t0 = Instant::now();
-
-        let (key, both) = daap_publication(&[ADDR_A, ADDR_B]);
-        let _ = publications.upsert_at(key.clone(), both, t0);
-        let (_, partial) = daap_publication(&[ADDR_A]);
-        let _ = publications.upsert_at(key.clone(), partial, t0 + Duration::from_secs(1));
-
-        assert_eq!(
-            publications.remove(&key),
-            [DiscoveryEvent::Lost {
-                url: "http://antec.local:3689".to_string(),
-                service_type: "daap".to_string(),
-            }]
-        );
-        assert!(publications
-            .expire_withdrawn_addresses(t0 + MDNS_ADDRESS_WITHDRAWAL_GRACE * 2)
-            .is_empty());
     }
 
     #[test]

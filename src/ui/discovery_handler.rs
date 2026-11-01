@@ -550,7 +550,7 @@ fn reconcile_discovery_route(
     let advertised_route = advertised_route.filter(|_| !configured);
     let previous = source.advertised_route();
     let changed = previous != advertised_route;
-    let withdrew_address = previous.as_ref().is_some_and(|previous| {
+    let withdrew_address = previous.is_some_and(|previous| {
         !advertised_route
             .as_ref()
             .is_some_and(|next| previous.is_covered_by(next))
@@ -558,17 +558,6 @@ fn reconcile_discovery_route(
     source.set_advertised_route(advertised_route);
     if withdrew_address {
         if let Some(source_id) = source.source_id() {
-            let addresses = |route: Option<&AdvertisedHttpRoute>| {
-                route
-                    .map(|route| route.addresses().to_vec())
-                    .unwrap_or_default()
-            };
-            tracing::warn!(
-                backend = %source.backend_type(),
-                previous = ?addresses(previous.as_ref()),
-                next = ?addresses(source.advertised_route().as_ref()),
-                "Discovery withdrew an advertised address; revoking the source session"
-            );
             disconnect(source_id);
         }
     }
