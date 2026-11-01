@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Network library playback stopping on its own** — Playback from a discovered DAAP, Plex or
+  Subsonic server no longer stops mid-track, and the server no longer logs you out, when the
+  addresses it announces on the network change. This mostly affected servers with more than one
+  network connection, which announce different addresses over time. Tributary now only
+  disconnects when the server actually leaves the network.
+
 ## [0.7.2] — 2026-10-23
 
 ### Added
