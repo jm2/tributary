@@ -1259,8 +1259,35 @@ fn repopulate_panes(
         populate_albums(&store, &borrowed, genre, artist, use_aa);
     }
     restore_selection(genre_pane, genre);
+    scroll_to_selection(genre_pane);
     restore_selection(artist_pane, artist);
+    scroll_to_selection(artist_pane);
     restore_selection(album_pane, album);
+    scroll_to_selection(album_pane);
+}
+
+/// After `restore_selection` repaints a pane's store, scroll its `ListView`
+/// to the restored selection so the picked artist/album stays visible instead
+/// of snapping to the top of the list. `remove_all()` + re-append in
+/// `repopulate_panes` resets the scrolled window to the top, and
+/// `SingleSelection::set_selected` does not auto-scroll to the newly
+/// selected row — `gtk_list_view_scroll_to` must be called explicitly.
+fn scroll_to_selection(pane: &gtk::Box) {
+    let Some(list_view) = pane_list_view(pane) else {
+        return;
+    };
+    let Some(selection) = list_view.model().and_downcast::<gtk::SingleSelection>() else {
+        return;
+    };
+    let position = selection.selected();
+    if position == gtk::INVALID_LIST_POSITION {
+        return;
+    }
+    let n_items = selection.model().map_or(0, |model| model.n_items());
+    if position >= n_items {
+        return;
+    }
+    list_view.scroll_to(position, gtk::ListScrollFlags::NONE, None);
 }
 
 /// Replace the browser's data wholesale and reset every filter axis.
@@ -3731,6 +3758,70 @@ mod tests {
         view.close();
     }
 
+    /// Selecting an artist deep in the list keeps that row scrolled into
+    /// view after a cross-filter repopulates the artist pane, instead of
+    /// snapping back to the top. All tracks share one album so picking it
+    /// repopulates the artist pane without dropping the chosen artist.
+    fn artist_selection_stays_selected_after_cross_filter_repopulation() {
+        let tracks: Vec<TrackObject> = (1..=30)
+            .map(|i| {
+                fixture_track(
+                    "G1",
+                    &format!("Artist {i:02}"),
+                    "Album X",
+                    &format!("Track {i}"),
+                )
+            })
+            .collect();
+        let (browser_box, _state) =
+            build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let panes = browser_panes(&browser_box).expect("panes");
+        let artist_pane = &panes[1];
+
+        // Narrow by genre: artist pane lists All + 30 artists.
+        get_selection(&panes[0]).set_selected(1);
+        // Pick a deep artist: All=0, Artist 01=1 … Artist 15=15.
+        force_scrolled_layout(artist_pane);
+        get_selection(&panes[1]).set_selected(15);
+        assert_eq!(
+            get_selected_label(&get_selection(artist_pane)).as_deref(),
+            Some("Artist 15"),
+            "the deep artist must be selected"
+        );
+
+        // A cross-filter repopulation (pick the shared album) restores the
+        // artist selection instead of resetting the pane to "All".
+        get_selection(&panes[2]).set_selected(1);
+        assert_eq!(
+            get_selected_label(&get_selection(artist_pane)).as_deref(),
+            Some("Artist 15"),
+            "cross-filter repopulation must keep the artist selected"
+        );
+
+        drop(browser_box);
+    }
+
+    /// Force a layout pass on a pane's `ScrolledWindow` and its `ListView`
+    /// so `ListView::scroll_to` can compute a real scroll offset, mirroring
+    /// `LiveTrackView::layout`.
+    fn force_scrolled_layout(pane: &gtk::Box) {
+        let context = session_context();
+        while context.pending() {
+            context.iteration(false);
+        }
+        let scrolled = pane
+            .last_child()
+            .and_downcast::<gtk::ScrolledWindow>()
+            .expect("pane must wrap a ScrolledWindow");
+        let list_view = pane_list_view(pane).expect("pane must wrap a ListView");
+        list_view.measure(gtk::Orientation::Horizontal, -1);
+        list_view.measure(gtk::Orientation::Vertical, 400);
+        list_view.allocate(300, 400, -1, None);
+        scrolled.measure(gtk::Orientation::Horizontal, -1);
+        scrolled.measure(gtk::Orientation::Vertical, 400);
+        scrolled.allocate(300, 400, -1, None);
+    }
+
     /// Committed library rows "Song 0000" … for `numbers`; even numbers are
     /// Rock, odd ones Jazz.
     fn full_sync_library(
@@ -3989,6 +4080,7 @@ mod tests {
                 playlist_view_keeps_search_and_scroll_across_a_play_count_event();
                 playlist_reload_keeps_search_and_scroll();
                 local_view_keeps_filters_search_and_scroll_across_a_same_source_full_sync();
+                artist_selection_stays_selected_after_cross_filter_repopulation();
             },
         ) else {
             return;
