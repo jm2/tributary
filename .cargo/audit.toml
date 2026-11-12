@@ -2,9 +2,17 @@
 # https://docs.rs/cargo-audit/latest/cargo_audit/config/
 
 [advisories]
-# No advisory exceptions. RUSTSEC-2026-0235 (rkyv 0.7) left Cargo.lock on 2026-09-24 with
-# rust_decimal 1.43.0, which no longer declares an rkyv dependency. `paste` (RUSTSEC-2024-0436)
-# is reported as unmaintained, a warning that doesn't fail the audit; it is a compile-time
-# macro dependency with no runtime code. Add an exception here only with the reason it is
-# inactive and a review date.
-ignore = []
+# RUSTSEC-2026-0235 (rkyv 0.7) left Cargo.lock on 2026-09-24 with rust_decimal 1.43.0, which no
+# longer declares an rkyv dependency. `paste` (RUSTSEC-2024-0436) is reported as unmaintained, a
+# warning that doesn't fail the audit; it is a compile-time macro dependency with no runtime code.
+# Add an exception here only with the reason it is inactive and a review date.
+ignore = [
+    # RUSTSEC-2026-0459 (2026-11-12): bundled SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when it opens a database with a crafted sibling `-wal` file of a different
+    # page size. Tributary opens only its own `library.db` in its private data directory, so
+    # exploiting it needs someone who can already write there. The fix is `libsqlite3-sys` 0.39,
+    # but every released `sqlx-sqlite` (0.9.0 is the newest) caps it below 0.38; sqlx's main
+    # branch already allows `<0.40`. Remove this once a released sqlx accepts 0.39.
+    # Review by 2026-12-12.
+    "RUSTSEC-2026-0459",
+]

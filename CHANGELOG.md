@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Maintenance** — Dependencies were refreshed with routine patch and minor updates, including
+  Tokio, the tag reader, file watching, mDNS discovery and UUID support, along with the GitHub
+  Actions used to build and publish releases.
+
 ## [0.7.2] — 2026-10-23
 
 ### Added
