@@ -49,6 +49,15 @@
   </screenshots>
 
   <releases>
+    <release version="0.7.3" date="2026-11-12">
+      <description>
+        <p>Bug-fix release:</p>
+        <ul>
+          <li>The Genre, Artist and Album lists keep the selected entry in view instead of scrolling back to the top</li>
+          <li>Routine dependency updates</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.2" date="2026-10-23">
       <description>
         <p>Small feature and bug-fix release:</p>

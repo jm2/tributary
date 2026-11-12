@@ -1,6 +1,6 @@
 # Tributary roadmap
 
-Last reviewed: 2026-10-23.
+Last reviewed: 2026-11-12.
 
 This page describes where Tributary is heading. It is a direction, not a release promise.
 **GitHub issues are the source of truth** for scope, acceptance, and state;
@@ -19,7 +19,7 @@ what works today, and the [changelog](../CHANGELOG.md) lists what changed.
 - **Link the issue.** Implementing PRs say `Closes #N` or `Refs #N`; closing the issue is how the
   work is marked done.
 
-## Now: after 0.7.2
+## Now: after 0.7.3
 
 0.7.0 was released on 2026-09-29 with the 2026-09-23 review's fixes and the Download, Copy to
 Device, drag-to-file-manager, graphic equalizer, folder browsing, album artwork, and
@@ -27,7 +27,8 @@ media-control features. It also moved to the application ID `io.github.jm2.tribu
 Flathub requires. 0.7.1 (2026-10-06) fixed the Preferences overflow, the EQ button, and the
 track list width that users reported in 0.7.0. 0.7.2 (2026-10-23) added Jump to Playing Track,
 fixed the EQ button's icon in system-wide installs, and updated network and hashing libraries for
-security advisories. The next release gets the same real-server and
+security advisories. 0.7.3 (2026-11-12) kept the browser lists' selected entries in view.
+The next release gets the same real-server and
 hardware checks, listed as V5 in [`task.md`](task.md).
 
 ## Next
