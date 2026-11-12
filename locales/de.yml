@@ -22,6 +22,8 @@ header:
   main_menu: "Hauptmenü"
   playback_position: "Wiedergabeposition"
   volume: "Lautstärke"
+  jump_to_playing_menu: "Zum laufenden _Titel springen"
+  jump_to_playing: "Zum laufenden Titel springen"
   rescan_library: "Bibliothek neu einlesen"
   equalizer_menu: "E_qualizer"
   my_computer: "Mein Computer"
