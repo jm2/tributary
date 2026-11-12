@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tokio, the tag reader, file watching, mDNS discovery and UUID support, along with the GitHub
   Actions used to build and publish releases.
 
+### Fixed
+
+- **Browser lists keep your place** — Picking a genre, artist or album far down a long list no
+  longer scrolls that list, and the others, back to the top; each list keeps its selected entry in
+  view. Thanks to @ggtrigg! (#464)
+
 ## [0.7.2] — 2026-10-23
 
 ### Added
