@@ -6898,9 +6898,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconnect_runtime_applies_exact_presence_reports_failures_and_marks_only_proven_absence(
     ) {
-        let database = Database::connect("sqlite::memory:")
+        // File-backed, not `sqlite::memory:`: the session swaps below cancel
+        // in-flight work, and if the pool replaces its connection an
+        // in-memory database comes back empty ("no such table").
+        let directory = tempfile::tempdir().expect("temporary runtime database directory");
+        let pool = sea_orm::sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_with(
+                sea_orm::sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(directory.path().join("runtime.db"))
+                    .create_if_missing(true)
+                    .foreign_keys(true),
+            )
             .await
             .expect("connect runtime database");
+        let database = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
         Migrator::up(&database, None)
             .await
             .expect("migrate runtime database");
