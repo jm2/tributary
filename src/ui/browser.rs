@@ -3762,8 +3762,8 @@ mod tests {
     /// view after a cross-filter repopulates the artist pane, instead of
     /// snapping back to the top. All tracks share one album so picking it
     /// repopulates the artist pane without dropping the chosen artist.
-    fn artist_selection_stays_selected_after_cross_filter_repopulation() {
-        let tracks: Vec<TrackObject> = (1..=30)
+    fn deep_artist_stays_in_view_after_cross_filter_repopulation() {
+        let tracks: Vec<TrackObject> = (1..=60)
             .map(|i| {
                 fixture_track(
                     "G1",
@@ -3775,17 +3775,18 @@ mod tests {
             .collect();
         let (browser_box, _state) =
             build_browser(&tracks, false, false, 48, Box::new(|_, _, _, _, _| {}));
+        let window = gtk::Window::builder().child(&browser_box).build();
         let panes = browser_panes(&browser_box).expect("panes");
         let artist_pane = &panes[1];
 
-        // Narrow by genre: artist pane lists All + 30 artists.
+        // Narrow by genre: artist pane lists All + 60 artists.
         get_selection(&panes[0]).set_selected(1);
-        // Pick a deep artist: All=0, Artist 01=1 … Artist 15=15.
-        force_scrolled_layout(artist_pane);
-        get_selection(&panes[1]).set_selected(15);
+        // Pick a deep artist: All=0, Artist 01=1 … Artist 50=50.
+        layout_browser(&browser_box);
+        get_selection(&panes[1]).set_selected(50);
         assert_eq!(
             get_selected_label(&get_selection(artist_pane)).as_deref(),
-            Some("Artist 15"),
+            Some("Artist 50"),
             "the deep artist must be selected"
         );
 
@@ -3794,32 +3795,43 @@ mod tests {
         get_selection(&panes[2]).set_selected(1);
         assert_eq!(
             get_selected_label(&get_selection(artist_pane)).as_deref(),
-            Some("Artist 15"),
+            Some("Artist 50"),
             "cross-filter repopulation must keep the artist selected"
         );
 
-        drop(browser_box);
+        // ...and keeps its row on screen.
+        layout_browser(&browser_box);
+        let adjustment = pane_list_view(artist_pane)
+            .and_then(|list_view| list_view.vadjustment())
+            .expect("the artist list scrolls");
+        let row_height = adjustment.upper() / 61.0;
+        let row_top = 50.0 * row_height;
+        assert!(
+            adjustment.page_size() < adjustment.upper(),
+            "precondition: the artist list must be taller than the pane"
+        );
+        assert!(
+            row_top >= adjustment.value()
+                && row_top + row_height <= adjustment.value() + adjustment.page_size(),
+            "the selected artist must stay visible: row {row_top}..{} outside view {}..{}",
+            row_top + row_height,
+            adjustment.value(),
+            adjustment.value() + adjustment.page_size()
+        );
+
+        window.destroy();
     }
 
-    /// Force a layout pass on a pane's `ScrolledWindow` and its `ListView`
-    /// so `ListView::scroll_to` can compute a real scroll offset, mirroring
-    /// `LiveTrackView::layout`.
-    fn force_scrolled_layout(pane: &gtk::Box) {
+    /// Lay out a browser inside its window, as `LiveTrackView::layout` does,
+    /// so the panes' lists build their rows and can scroll.
+    fn layout_browser(browser_box: &gtk::Box) {
         let context = session_context();
         while context.pending() {
             context.iteration(false);
         }
-        let scrolled = pane
-            .last_child()
-            .and_downcast::<gtk::ScrolledWindow>()
-            .expect("pane must wrap a ScrolledWindow");
-        let list_view = pane_list_view(pane).expect("pane must wrap a ListView");
-        list_view.measure(gtk::Orientation::Horizontal, -1);
-        list_view.measure(gtk::Orientation::Vertical, 400);
-        list_view.allocate(300, 400, -1, None);
-        scrolled.measure(gtk::Orientation::Horizontal, -1);
-        scrolled.measure(gtk::Orientation::Vertical, 400);
-        scrolled.allocate(300, 400, -1, None);
+        browser_box.measure(gtk::Orientation::Horizontal, -1);
+        browser_box.measure(gtk::Orientation::Vertical, 900);
+        browser_box.allocate(900, 400, -1, None);
     }
 
     /// Committed library rows "Song 0000" … for `numbers`; even numbers are
@@ -4082,7 +4094,7 @@ mod tests {
                 playlist_view_keeps_search_and_scroll_across_a_play_count_event();
                 playlist_reload_keeps_search_and_scroll();
                 local_view_keeps_filters_search_and_scroll_across_a_same_source_full_sync();
-                artist_selection_stays_selected_after_cross_filter_repopulation();
+                deep_artist_stays_in_view_after_cross_filter_repopulation();
             },
         ) else {
             return;
