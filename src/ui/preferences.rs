@@ -106,6 +106,7 @@ fn normalize_column_keys(keys: &mut Vec<String>) {
 // ── Persisted configuration ─────────────────────────────────────────────
 
 /// Application configuration persisted to `config.json`.
+#[allow(clippy::struct_excessive_bools)] // independent persisted user switches
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Which browser panes are visible.
@@ -174,6 +175,14 @@ pub struct AppConfig {
     /// [`crate::download::default_download_dir`].
     #[serde(default)]
     pub download_path: Option<String>,
+    /// Whether mounted volumes (USB drives, network shares mounted on the
+    /// host) are listed under Devices and scanned for music. Default: true.
+    #[serde(default = "default_scan_local_devices")]
+    pub scan_local_devices: bool,
+}
+
+fn default_scan_local_devices() -> bool {
+    true
 }
 
 /// Thumbnail side length for the browser Album pane.
@@ -395,6 +404,7 @@ impl Default for AppConfig {
             album_pane_artwork_size: AlbumArtSize::default(),
             equalizer: crate::audio::equalizer::EqualizerSettings::default(),
             download_path: None,
+            scan_local_devices: true,
         }
     }
 }
@@ -896,6 +906,7 @@ pub fn show_preferences(
     on_album_artist_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_changed: std::rc::Rc<dyn Fn(bool)>,
     on_album_pane_artwork_size_changed: std::rc::Rc<dyn Fn(AlbumArtSize)>,
+    on_scan_local_devices_changed: std::rc::Rc<dyn Fn(bool)>,
     integration_groups: &[adw::PreferencesGroup],
 ) {
     let prefs_dialog = adw::PreferencesDialog::builder()
@@ -916,6 +927,7 @@ pub fn show_preferences(
             album_pane_artwork: on_album_pane_artwork_changed,
             album_pane_artwork_size: on_album_pane_artwork_size_changed,
         },
+        on_scan_local_devices_changed,
         integration_groups,
         &rust_i18n::locale(),
     );
@@ -938,18 +950,26 @@ struct BrowserViewCallbacks {
 /// Import last.
 ///
 /// Dialogs the page's buttons open later follow the session locale.
+#[allow(clippy::too_many_arguments)] // window-owned handles and callbacks the page drives
 fn preferences_page(
     parent: &adw::ApplicationWindow,
     layout: &LayoutTargets,
     config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
     saves: &ConfigSaveQueue,
     callbacks: BrowserViewCallbacks,
+    on_scan_local_devices_changed: std::rc::Rc<dyn Fn(bool)>,
     integration_groups: &[adw::PreferencesGroup],
     locale: &str,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(&library_group(parent, config, locale));
     page.add(&downloads_group(parent, config, saves, locale));
+    page.add(&devices_group(
+        config,
+        saves,
+        on_scan_local_devices_changed,
+        locale,
+    ));
     for group in browser_views_groups(config, saves, layout, callbacks, locale) {
         page.add(&group);
     }
@@ -1398,6 +1418,34 @@ fn import_group(locale: &str) -> adw::PreferencesGroup {
             .action_name("win.migrate-rhythmbox")
             .build(),
     );
+    group
+}
+
+/// The Devices group: whether mounted volumes are listed and scanned.
+fn devices_group(
+    config: &std::rc::Rc<std::cell::RefCell<AppConfig>>,
+    saves: &ConfigSaveQueue,
+    on_scan_local_devices_changed: std::rc::Rc<dyn Fn(bool)>,
+    locale: &str,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(rust_i18n::t!("preferences.devices", locale = locale).as_ref())
+        .build();
+    let row = adw::SwitchRow::builder()
+        .title(rust_i18n::t!("preferences.scan_local_devices_title", locale = locale).as_ref())
+        .subtitle(
+            rust_i18n::t!("preferences.scan_local_devices_subtitle", locale = locale).as_ref(),
+        )
+        .active(config.borrow().scan_local_devices)
+        .build();
+    let (config, saves) = (config.clone(), saves.clone());
+    row.connect_active_notify(move |row| {
+        let active = row.is_active();
+        config.borrow_mut().scan_local_devices = active;
+        saves.schedule();
+        on_scan_local_devices_changed(active);
+    });
+    group.add(&row);
     group
 }
 
@@ -2982,6 +3030,7 @@ pub mod widget_tests {
                     album_pane_artwork: Rc::new(|_| {}),
                     album_pane_artwork_size: Rc::new(|_| {}),
                 },
+                Rc::new(|_| {}),
                 &[],
                 locale,
             );

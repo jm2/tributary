@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Option to stop scanning mounted devices** — Preferences has a new Devices switch, "Scan
+  Mounted Devices". Turn it off to stop Tributary from listing and scanning mounted drives and
+  network shares, such as an SMB share mounted on your computer. It takes effect immediately.
+
 ## [0.7.3] — 2026-11-12
 
 ### Changed
