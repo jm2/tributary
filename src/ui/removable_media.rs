@@ -143,6 +143,8 @@ struct RemovableMediaController {
     monitor: gio::VolumeMonitor,
     monitor_handlers: RefCell<Vec<glib::SignalHandlerId>>,
     stopped: Cell<bool>,
+    /// Off hides every mounted volume without touching the monitor.
+    scan_enabled: Cell<bool>,
     reconcile_scheduled: Cell<bool>,
     devices: RefCell<BTreeMap<String, DeviceInfo>>,
     pending_reconnect: RefCell<HashSet<String>>,
@@ -164,11 +166,13 @@ impl RemovableMediaController {
         state: &WindowState,
         monitor: gio::VolumeMonitor,
         invalidate_source_playback: SourcePlaybackInvalidator,
+        scan_enabled: bool,
     ) -> Rc<Self> {
         Rc::new(Self {
             monitor,
             monitor_handlers: RefCell::new(Vec::new()),
             stopped: Cell::new(false),
+            scan_enabled: Cell::new(scan_enabled),
             reconcile_scheduled: Cell::new(false),
             devices: RefCell::new(BTreeMap::new()),
             pending_reconnect: RefCell::new(HashSet::new()),
@@ -254,7 +258,11 @@ impl RemovableMediaController {
             return;
         }
 
-        let next = inventory(crate::device::usb::mounted_devices(&self.monitor));
+        let next = if self.scan_enabled.get() {
+            inventory(crate::device::usb::mounted_devices(&self.monitor))
+        } else {
+            BTreeMap::new()
+        };
         let current = self.devices.borrow().clone();
         let active = self.active_source_key.borrow().clone();
         let plan = plan_reconciliation(&current, &next, &active);
@@ -550,9 +558,14 @@ impl RemovableMediaController {
 pub(super) fn setup_removable_media(
     state: &WindowState,
     invalidate_source_playback: SourcePlaybackInvalidator,
-) {
-    let controller =
-        RemovableMediaController::new(state, gio::VolumeMonitor::get(), invalidate_source_playback);
+    scan_enabled: bool,
+) -> Rc<dyn Fn(bool)> {
+    let controller = RemovableMediaController::new(
+        state,
+        gio::VolumeMonitor::get(),
+        invalidate_source_playback,
+        scan_enabled,
+    );
     controller.connect_monitor();
     controller.reconcile();
 
@@ -563,6 +576,17 @@ pub(super) fn setup_removable_media(
     state.window.connect_destroy(move |_| {
         controller_for_destroy.shutdown();
     });
+
+    // Disabling reconciles against an empty inventory, which cancels scans
+    // and removes the rows; enabling picks up the current mounts.
+    let weak = Rc::downgrade(&controller);
+    Rc::new(move |enabled| {
+        if let Some(controller) = weak.upgrade() {
+            if controller.scan_enabled.replace(enabled) != enabled {
+                controller.reconcile();
+            }
+        }
+    })
 }
 
 #[cfg(test)]
