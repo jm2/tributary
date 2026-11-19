@@ -125,7 +125,7 @@ tower-http = { version = "0.7", features = ["cors"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"], default-features = false }
 
 # Desktop media controls (MPRIS / SMTC / Now Playing)
-souvlaki = "0.8"
+souvlaki = "0.9"
 
 # Windows-only: GDK4 Win32 backend (HWND extraction for souvlaki SMTC)
 [target.'cfg(target_os = "windows")'.dependencies]
