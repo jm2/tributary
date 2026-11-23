@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Web address library update** — Updated the URL parsing library to fix a published flaw where a
+  crafted nested `blob:` address could crash Tributary (RUSTSEC-2026-0592). A QUIC networking
+  package listed in the lockfile was also updated for RUSTSEC-2026-0538; Tributary doesn't build
+  that code, so it was never exposed.
+
 ## [0.7.3] — 2026-11-12
 
 ### Changed
