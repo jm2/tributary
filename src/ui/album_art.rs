@@ -972,23 +972,15 @@ fn extract_album_art_bytes(file: &mut std::fs::File, extension: Option<&str>) ->
     ) -> Option<lofty::file::TaggedFile> {
         use lofty::config::ParseOptions;
         use lofty::file::FileType;
-        use lofty::probe::Probe;
 
         rewind(file)?;
         let reader = BufReader::new(file);
         let options = ParseOptions::new().read_properties(false);
-        match extension.and_then(FileType::from_ext) {
-            Some(file_type) => Probe::with_file_type(reader, file_type)
-                .options(options)
-                .read()
-                .ok(),
-            None => Probe::new(reader)
-                .options(options)
-                .guess_file_type()
-                .ok()?
-                .read()
-                .ok(),
-        }
+        crate::local::tag_parser::probe_by_extension(reader, extension.and_then(FileType::from_ext))
+            .ok()?
+            .options(options)
+            .read()
+            .ok()
     }
 
     fn extract(file: &mut std::fs::File, extension: Option<&str>) -> Option<Vec<u8>> {

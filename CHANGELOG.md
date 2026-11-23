@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Opus files named `.ogg` import** — Opus audio saved with the `.ogg` extension is now added to
+  the library with its tags and cover art instead of being skipped, and its tags can be edited.
+  Thanks to @bwrinkle1 for the report! (#475)
+
 ### Security
 
 - **Web address library update** — Updated the URL parsing library to fix a published flaw where a
