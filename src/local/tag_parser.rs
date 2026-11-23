@@ -1,6 +1,7 @@
 //! Audio tag parser — wraps `lofty` to extract metadata from audio files.
 
 use std::fs::File;
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -27,6 +28,28 @@ pub fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false);
 
     supported && !is_tag_write_temp_file(path)
+}
+
+/// Build a lofty probe for `reader`, choosing the format from the extension
+/// except where one Ogg extension can hold several codecs.
+///
+/// lofty maps `.ogg` to Vorbis, yet `.ogg` (like `.oga`, and `.opus` in
+/// mislabelled files) is just the Ogg container: Opus and Speex streams are
+/// commonly saved under it. Forcing the extension's guess makes lofty reject
+/// such a file outright (issue #475), so for the Ogg family the stream header
+/// decides and the extension is only the fallback. Every other extension keeps
+/// its extension-selected parser, as `lofty::read_from_path` would.
+pub fn probe_by_extension<R: Read + Seek>(
+    reader: R,
+    file_type: Option<FileType>,
+) -> std::io::Result<Probe<R>> {
+    match file_type {
+        Some(file_type @ (FileType::Vorbis | FileType::Opus | FileType::Speex)) => {
+            Probe::with_file_type(reader, file_type).guess_file_type()
+        }
+        Some(file_type) => Ok(Probe::with_file_type(reader, file_type)),
+        None => Probe::new(reader).guess_file_type(),
+    }
 }
 
 /// Parsed metadata from a single audio file.
@@ -94,14 +117,13 @@ pub fn parse_audio_file(path: &Path) -> Result<ParsedTrack> {
 /// the exact object they opened beneath a retained library-root handle instead
 /// of resolving the pathname a second time.
 pub fn parse_audio_file_from_file(mut file: File, path: &Path) -> Result<ParsedTrack> {
-    // Preserve `read_from_path`'s extension-based format selection while
-    // giving lofty the already-authorized descriptor instead of letting it
-    // reopen `path`. Fall back to content probing only for an unknown suffix.
-    let tagged_file = match FileType::from_path(path) {
-        Some(file_type) => Probe::with_file_type(&mut file, file_type).read(),
-        None => lofty::read_from(&mut file),
-    }
-    .with_context(|| format!("Failed to read tags from {}", path.display()))?;
+    // Give lofty the already-authorized descriptor instead of letting it
+    // reopen `path`; `probe_by_extension` picks the parser from the suffix,
+    // or from the content for an unknown suffix or an Ogg-family one.
+    let tagged_file = probe_by_extension(BufReader::new(&mut file), FileType::from_path(path))
+        .map_err(anyhow::Error::from)
+        .and_then(|probe| probe.read().map_err(anyhow::Error::from))
+        .with_context(|| format!("Failed to read tags from {}", path.display()))?;
 
     let tag = tagged_file
         .primary_tag()
@@ -355,6 +377,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/audio/ogg_date_2007.ogg"
     ));
+    const OPUS_IN_OGG_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/audio/opus_in_ogg.ogg"
+    ));
     const ID3V1_PADDED_FIXTURE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/audio/id3v1_padded.mp3"
@@ -389,6 +415,28 @@ mod tests {
 
         assert_eq!(parsed.year, Some(2007));
         assert_eq!(parsed.format, "OGG");
+    }
+
+    /// `.ogg` is only the container: an Opus stream saved under it must import
+    /// with its tags, not be rejected as malformed Vorbis (issue #475). The
+    /// same Ogg-Vorbis file named `.opus` must likewise follow its content.
+    #[test]
+    fn ogg_family_extensions_follow_the_stream_codec() {
+        let opus = parse_fixture("opus.ogg", OPUS_IN_OGG_FIXTURE);
+        assert_eq!(opus.title, "Opus Title");
+        assert_eq!(opus.artist_name, "Opus Artist");
+        assert_eq!(opus.album_title, "Opus Album");
+        assert_eq!(opus.year, Some(2007));
+        assert_eq!(opus.format, "OGG");
+        assert_eq!(opus.sample_rate_hz, Some(48_000));
+
+        for name in ["opus.oga", "opus.opus"] {
+            assert_eq!(parse_fixture(name, OPUS_IN_OGG_FIXTURE).title, "Opus Title");
+        }
+
+        let vorbis = parse_fixture("vorbis.opus", OGG_DATE_FIXTURE);
+        assert_eq!(vorbis.year, Some(2007));
+        assert_eq!(vorbis.artist_name, "  Ogg Artist");
     }
 
     /// Trailing padding — including the space-padded fixed-width ID3v1 fields

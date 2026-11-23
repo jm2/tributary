@@ -127,3 +127,31 @@ cac290ca53fedcf1bec644e5f644f687e66f6f888c6db9e782861892fc875642  mp3_tdrc_2007.
 The audio payloads are mechanically generated silence and contain no
 third-party recording. The fixtures are distributed under Tributary's
 GPL-3.0-or-later license.
+
+## `opus_in_ogg.ogg`
+
+This is a 200 ms Ogg Opus stream of 48 kHz mono silence saved under the `.ogg`
+extension, as many encoders do. It carries `DATE=2007`, `title` = `Opus Title`,
+`artist` = `Opus Artist` and `album` = `Opus Album`, and checks that an `.ogg`
+file holding Opus imports by its content rather than being parsed as Vorbis
+(issue #475).
+
+It was generated with `ffmpeg 9.0.2`; the `bitexact` flags keep encoder tags out:
+
+```sh
+ffmpeg -f lavfi -i anullsrc=r=48000:cl=mono -t 0.2 -c:a libopus \
+  -fflags +bitexact -flags:a +bitexact \
+  -metadata date=2007 -metadata title='Opus Title' \
+  -metadata artist='Opus Artist' -metadata album='Opus Album' \
+  tests/fixtures/audio/opus_in_ogg.ogg
+```
+
+SHA-256:
+
+```text
+ee119384b32a5bc36c999081426ecffefa25082a5e198bbd1f0c5a13dbcaa628  opus_in_ogg.ogg
+```
+
+The audio payload is mechanically generated silence and contains no
+third-party recording. The fixture is distributed under Tributary's
+GPL-3.0-or-later license.
