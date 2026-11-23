@@ -647,6 +647,8 @@ while they are attached. Tributary uses GIO's volume monitor, listing mounts the
 as removable or ejectable and following mount, change, and unmount events live. That metadata is
 optional, so a non-removable or network mount can occasionally appear too. Selecting a device
 shows its scanned tracks; the scan stays on the device's own filesystem and does not follow links.
+To stop listing and scanning mounted volumes altogether, such as a network share mounted on your
+computer, turn off **Preferences → Devices → Scan Mounted Devices**.
 
 Tributary does not mount or eject volumes, and MTP-only devices are not supported. In the Flatpak,
 file access for the automatic Devices entries is limited to `/media`, `/run/media`, and `/mnt`; a
@@ -726,8 +728,8 @@ All edits require an explicit **Save** click. Cancel discards all changes. Befor
 editing, Tributary checks that every selected file is readable and that its folder allows creating
 and replacing files, since saves replace the file by rename; a read-only device is explained up
 front. Saves are written to a temporary sibling file and atomically replace the original, so a
-failed write leaves the track untouched. Supported formats: MP3 (ID3v2), M4A/AAC, OGG Vorbis, and
-FLAC.
+failed write leaves the track untouched. Supported formats: MP3 (ID3v2), M4A/AAC, OGG (Vorbis, or Opus saved as `.ogg`),
+and FLAC.
 
 ### Track Ratings
 
