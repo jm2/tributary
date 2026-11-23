@@ -116,7 +116,6 @@ rust_cast = "0.21"
 # Chromecast local-file HTTP server (LAN-only axum server for file:// → http:// rewrite)
 axum = "0.8"
 dashmap = "6"
-tower-http = { version = "0.7", features = ["cors"] }
 
 # TLS — aws-lc-rs is the only rustls crypto provider in the build: reqwest's
 # `rustls` feature selects it, and rust_cast verifies Cast handshake
