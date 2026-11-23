@@ -2607,9 +2607,10 @@ pub(crate) fn build_window(
     // GVolumeMonitor must stay on the GTK main thread. Its cached mount
     // metadata drives idempotent lifecycle reconciliation; each eligible mount
     // starts its registry-owned walk/tag parse on a bounded blocking worker.
-    super::removable_media::setup_removable_media(
+    let set_scan_local_devices = super::removable_media::setup_removable_media(
         &source_connection_state,
         invalidate_source_playback.clone(),
+        app_config.borrow().scan_local_devices,
     );
 
     // ── Create GStreamer player ──────────────────────────────────────
@@ -3774,6 +3775,9 @@ pub(crate) fn build_window(
                         size.pixel_size(),
                     );
                 });
+            let set_scan = set_scan_local_devices.clone();
+            let on_scan_devices_change: std::rc::Rc<dyn Fn(bool)> =
+                std::rc::Rc::new(move |enabled: bool| set_scan(enabled));
             // A build without Last.fm credentials leaves the group out.
             let lastfm_group = lastfm_settings
                 .available_in_build()
@@ -3786,6 +3790,7 @@ pub(crate) fn build_window(
                 on_aa_change,
                 on_art_change,
                 on_art_size_change,
+                on_scan_devices_change,
                 lastfm_group.as_slice(),
             );
         });
