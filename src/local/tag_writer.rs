@@ -2318,8 +2318,17 @@ fn flush_to_disk(path: &Path) -> std::io::Result<()> {
 /// location the redacted label exists to protect.
 #[cfg(any(test, not(unix)))]
 fn write_tags_to(temp_path: &Path, target_label: &str, edits: &TagEdits) -> Result<()> {
-    let mut tagged_file = lofty::read_from_path(temp_path)
+    // The staged copy keeps the target's extension, so pick the parser the
+    // way the importer does: an Opus stream in a `.ogg` file is not Vorbis.
+    let staged = File::open(temp_path)
         .with_context(|| format!("Failed to read tags from {target_label}"))?;
+    let mut tagged_file = super::tag_parser::probe_by_extension(
+        std::io::BufReader::new(staged),
+        lofty::file::FileType::from_path(temp_path),
+    )
+    .map_err(anyhow::Error::from)
+    .and_then(|probe| probe.read().map_err(anyhow::Error::from))
+    .with_context(|| format!("Failed to read tags from {target_label}"))?;
 
     let tag = ensure_primary_tag(&mut tagged_file, target_label)?;
     apply_tag_edits(tag, edits)?;

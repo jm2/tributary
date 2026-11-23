@@ -1112,13 +1112,9 @@ async fn root_reauthorization_receipt_is_consistent(
     }
 
     let tracks = track::Entity::find().all(db).await?;
-    if tracks
+    Ok(!tracks
         .iter()
-        .any(|row| path_is_descendant(Path::new(&row.file_path), &request.old_path))
-    {
-        return Ok(false);
-    }
-    Ok(true)
+        .any(|row| path_is_descendant(Path::new(&row.file_path), &request.old_path)))
 }
 
 fn validate_reauthorization_database_scopes(

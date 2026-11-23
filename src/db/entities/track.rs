@@ -35,6 +35,8 @@ pub struct Model {
 }
 
 /// No relations for now (flat schema).
+// sea-orm requires a `Relation` type even for an entity with no relations.
+#[allow(clippy::empty_enums)]
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
 
