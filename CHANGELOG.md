@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-11-23
+
 ### Added
 
 - **Option to stop scanning mounted devices** — Preferences has a new Devices switch, "Scan
@@ -862,7 +864,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.desktop` file and AppStream metainfo for Linux desktop integration.
 - Windows resource file with icon embedding.
 
-[Unreleased]: https://github.com/jm2/tributary/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/jm2/tributary/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/jm2/tributary/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/jm2/tributary/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/jm2/tributary/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jm2/tributary/compare/v0.7.0...v0.7.1

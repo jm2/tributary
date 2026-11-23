@@ -49,6 +49,17 @@
   </screenshots>
 
   <releases>
+    <release version="0.7.4" date="2026-11-23">
+      <description>
+        <p>A small release with a new setting, an import fix and security updates:</p>
+        <ul>
+          <li>A new Preferences switch stops Tributary from listing and scanning mounted drives and network shares</li>
+          <li>Opus audio saved with the .ogg extension is now imported</li>
+          <li>The built-in SQLite database engine and the web address library were updated to fix published security advisories</li>
+          <li>Routine dependency updates</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.3" date="2026-11-12">
       <description>
         <p>Bug-fix release:</p>
