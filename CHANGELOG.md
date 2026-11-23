@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Option to stop scanning mounted devices** — Preferences has a new Devices switch, "Scan
   Mounted Devices". Turn it off to stop Tributary from listing and scanning mounted drives and
   network shares, such as an SMB share mounted on your computer. It takes effect immediately.
+  Thanks to @crt0512! (#472)
+
+### Changed
+
+- **Maintenance** — Routine dependency updates, including UUID support, file watching, mDNS
+  discovery, the database driver, and the library behind media keys and the desktop's media
+  controls.
 
 ### Fixed
 
@@ -25,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crafted nested `blob:` address could crash Tributary (RUSTSEC-2026-0592). A QUIC networking
   package listed in the lockfile was also updated for RUSTSEC-2026-0538; Tributary doesn't build
   that code, so it was never exposed.
+- **SQLite update** — The SQLite database engine built into Tributary is now 3.54.1, fixing a
+  published flaw where opening a database next to a crafted write-ahead log file could return
+  uninitialized memory (RUSTSEC-2026-0459). Tributary only opens its own library database in its
+  private data folder, so this needed someone who could already write there.
 
 ## [0.7.3] — 2026-11-12
 

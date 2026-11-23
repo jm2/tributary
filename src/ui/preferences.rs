@@ -2330,6 +2330,25 @@ mod tests {
         );
     }
 
+    /// Configs written before the Devices switch keep scanning mounted
+    /// volumes, and a saved "off" survives a round trip (#472).
+    #[test]
+    fn scan_local_devices_defaults_on_and_persists_off() {
+        let older: AppConfig = serde_json::from_str(r#"{"library_paths":["/music"]}"#)
+            .expect("deserialize config written before the Devices switch");
+        assert!(older.scan_local_devices);
+        assert!(AppConfig::default().scan_local_devices);
+
+        let off = AppConfig {
+            scan_local_devices: false,
+            ..AppConfig::default()
+        };
+        let round_trip: AppConfig =
+            serde_json::from_value(serde_json::to_value(&off).expect("serialize config"))
+                .expect("deserialize config");
+        assert!(!round_trip.scan_local_devices);
+    }
+
     #[test]
     fn only_a_parsed_folder_list_counts_as_loaded() {
         let parse = |raw| parse_config(raw).expect("valid config");
